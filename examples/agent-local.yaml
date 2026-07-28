@@ -1,0 +1,14 @@
+node_id: local-node
+advertise_address: 127.0.0.1
+controllers:
+  - http://127.0.0.1:18080
+  - http://127.0.0.1:18081
+auth_token: local-test-token
+docker_socket: /var/run/docker.sock
+state_file: /tmp/swarmlite-agent-state.json
+heartbeat_interval_seconds: 2
+labels:
+  role: app
+port_range:
+  start: 21000
+  end: 21020
