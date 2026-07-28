@@ -1,46 +1,140 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
-use swarmlite::{agent, config, controller};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use swarmlite::{
+    config::RuntimeKind,
+    model::{ClusterCaddyConfig, ClusterConfigResponse, ClusterConfigUpdate, ClusterSettings},
+    node,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "swarmlite", version, about)]
 struct Cli {
+    /// Directory for generated node identity, state, and CLI connection settings.
+    #[arg(long, global = true, env = "SWARMLITE_DATA_DIR")]
+    data_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run a controller candidate. Exactly one candidate is active per cluster.
-    Controller {
-        #[arg(short, long)]
-        config: PathBuf,
+    /// Initialize a new Raft cluster on this node.
+    Init {
+        #[command(flatten)]
+        options: InitArgs,
     },
-    /// Run the node agent and reconcile containers through the local Docker socket.
-    Agent {
-        #[arg(short, long)]
-        config: PathBuf,
+    /// Run this node according to the role assigned by init or join.
+    Serve {
+        /// Address other machines use to reach containers on this node.
+        #[arg(long, env = "SWARMLITE_ADVERTISE_ADDRESS")]
+        advertise_address: Option<String>,
+        #[arg(long, value_enum)]
+        runtime: Option<RuntimeKind>,
+        #[arg(long)]
+        runtime_socket: Option<String>,
+        /// Persistent node label in KEY=VALUE form.
+        #[arg(long = "label")]
+        labels: Vec<String>,
+    },
+    /// Pull cluster settings and configure this machine to join an existing cluster.
+    Join {
+        controller: String,
+        #[arg(long, env = "SWARMLITE_TOKEN")]
+        token: String,
+        #[arg(long, env = "SWARMLITE_ADVERTISE_ADDRESS")]
+        advertise_address: Option<String>,
+        #[arg(long, value_enum)]
+        runtime: Option<RuntimeKind>,
+        #[arg(long)]
+        runtime_socket: Option<String>,
+        #[arg(long = "label")]
+        labels: Vec<String>,
+    },
+    /// Print a join command for this node's cluster.
+    JoinToken,
+    /// Read or update cluster-wide configuration.
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommand,
     },
     /// Deploy or update a Swarm-style stack file.
     Deploy {
         #[arg(short = 'u', long)]
-        controller: String,
+        controller: Option<String>,
         #[arg(short = 'n', long)]
         name: String,
         #[arg(short = 'c', long)]
         file: PathBuf,
         #[arg(long, env = "SWARMLITE_TOKEN")]
-        token: String,
+        token: Option<String>,
     },
     /// Display the current cluster state.
     Status {
         #[arg(short = 'u', long)]
-        controller: String,
+        controller: Option<String>,
         #[arg(long, env = "SWARMLITE_TOKEN")]
-        token: String,
+        token: Option<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Print the current cluster configuration.
+    Get {
+        #[command(flatten)]
+        connection: ConnectionArgs,
+    },
+    /// Update mutable cluster configuration.
+    Set {
+        /// Configuration key to update.
+        key: ConfigKey,
+        /// New value for the configuration key.
+        value: String,
+        #[command(flatten)]
+        connection: ConnectionArgs,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ConfigKey {
+    Controllers,
+}
+
+#[derive(Debug, Args)]
+struct ConnectionArgs {
+    #[arg(short = 'u', long)]
+    controller: Option<String>,
+    #[arg(long, env = "SWARMLITE_TOKEN")]
+    token: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct InitArgs {
+    #[arg(long, env = "SWARMLITE_TOKEN")]
+    token: Option<String>,
+    #[arg(long, default_value_t = 8080)]
+    controller_port: u16,
+    /// Desired number of Raft managers. Use 1 or an odd number such as 3 or 5.
+    #[arg(long, default_value_t = 1)]
+    controllers: u16,
+    /// Rebuild the control plane and collect containers from the previous cluster.
+    #[arg(long)]
+    recover: bool,
+    #[arg(long, env = "SWARMLITE_ADVERTISE_ADDRESS")]
+    advertise_address: Option<String>,
+    #[arg(long, value_enum)]
+    runtime: Option<RuntimeKind>,
+    #[arg(long)]
+    runtime_socket: Option<String>,
+    #[arg(long = "label")]
+    labels: Vec<String>,
+    #[arg(long = "caddy-admin")]
+    caddy_admin_endpoints: Vec<String>,
+    #[arg(long = "caddy-listen")]
+    caddy_listen: Vec<String>,
 }
 
 #[tokio::main]
@@ -52,19 +146,154 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    match Cli::parse().command {
-        Command::Controller { config: path } => {
-            controller::run(config::load_controller(&path)?).await
+    let cli = Cli::parse();
+    let data_dir = node::resolve_data_dir(cli.data_dir)?;
+    match cli.command {
+        Command::Init { options } => {
+            let cluster = ClusterSettings {
+                schema_version: 2,
+                cluster_id: node::new_cluster_id(),
+                controllers: options.controllers,
+                controller_port: options.controller_port,
+                caddy: ClusterCaddyConfig {
+                    admin_endpoints: options.caddy_admin_endpoints.clone(),
+                    listen: options.caddy_listen.clone(),
+                },
+            };
+            let message = node::init(node::InitOptions {
+                data_dir,
+                cluster,
+                token: options.token,
+                advertise_address: options.advertise_address,
+                runtime: options.runtime,
+                runtime_socket: options.runtime_socket,
+                labels: node::parse_labels(options.labels)?,
+                recovery: options.recover,
+            })
+            .await?;
+            println!("{message}");
+            Ok(())
         }
-        Command::Agent { config: path } => agent::run(config::load_agent(&path)?).await,
+        Command::Serve {
+            advertise_address,
+            runtime,
+            runtime_socket,
+            labels,
+        } => {
+            node::run(node::ServeOptions {
+                data_dir,
+                advertise_address,
+                runtime,
+                runtime_socket,
+                labels: node::parse_labels(labels)?,
+            })
+            .await
+        }
+        Command::Join {
+            controller,
+            token,
+            advertise_address,
+            runtime,
+            runtime_socket,
+            labels,
+        } => {
+            let message = node::join(node::JoinOptions {
+                data_dir,
+                controller,
+                token,
+                advertise_address,
+                runtime,
+                runtime_socket,
+                labels: node::parse_labels(labels)?,
+            })
+            .await?;
+            println!("{message}");
+            Ok(())
+        }
+        Command::JoinToken => {
+            println!("{}", node::join_command(&data_dir).await?);
+            Ok(())
+        }
+        Command::Config { action } => {
+            let (connection, update) = match action {
+                ConfigCommand::Get { connection } => (connection, None),
+                ConfigCommand::Set {
+                    key,
+                    value,
+                    connection,
+                } => {
+                    let update = match key {
+                        ConfigKey::Controllers => ClusterConfigUpdate {
+                            controllers: value.parse().map_err(|_| {
+                                anyhow::anyhow!("controllers must be an unsigned integer")
+                            })?,
+                        },
+                    };
+                    (connection, Some(update))
+                }
+            };
+            let (controller, token) =
+                node::resolve_connection(&data_dir, connection.controller, connection.token)
+                    .await?;
+            let response = cluster_config(controller, token, update.as_ref()).await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+            Ok(())
+        }
         Command::Deploy {
             controller,
             name,
             file,
             token,
-        } => deploy(controller, name, file, token).await,
-        Command::Status { controller, token } => status(controller, token).await,
+        } => {
+            let (controller, token) =
+                node::resolve_connection(&data_dir, controller, token).await?;
+            deploy(controller, name, file, token).await
+        }
+        Command::Status { controller, token } => {
+            let (controller, token) =
+                node::resolve_connection(&data_dir, controller, token).await?;
+            status(controller, token).await
+        }
     }
+}
+
+async fn cluster_config(
+    controller: String,
+    token: String,
+    update: Option<&ClusterConfigUpdate>,
+) -> Result<ClusterConfigResponse> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let method = if update.is_some() {
+        reqwest::Method::PATCH
+    } else {
+        reqwest::Method::GET
+    };
+    let mut url = format!("{}/v1/config", controller.trim_end_matches('/'));
+    for _ in 0..3 {
+        let mut request = client.request(method.clone(), &url).bearer_auth(&token);
+        if let Some(update) = update {
+            request = request.json(update);
+        }
+        let response = request.send().await?;
+        if response.status() == reqwest::StatusCode::TEMPORARY_REDIRECT {
+            url = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| anyhow::anyhow!("controller redirect omitted Location"))?
+                .to_owned();
+            continue;
+        }
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            anyhow::bail!("controller returned {status}: {body}");
+        }
+        return serde_json::from_str(&body).map_err(Into::into);
+    }
+    anyhow::bail!("too many controller redirects")
 }
 
 async fn deploy(controller: String, name: String, file: PathBuf, token: String) -> Result<()> {
@@ -121,12 +350,81 @@ async fn status(controller: String, token: String) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
 
     use super::Cli;
 
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn exposes_only_the_unified_node_runtime() {
+        let command = Cli::command();
+        let names = command
+            .get_subcommands()
+            .map(|subcommand| subcommand.get_name())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"init"));
+        assert!(names.contains(&"join"));
+        assert!(names.contains(&"serve"));
+        assert!(names.contains(&"config"));
+        assert!(!names.contains(&"controller"));
+        assert!(!names.contains(&"agent"));
+    }
+
+    #[test]
+    fn config_exposes_only_get_and_set() {
+        let command = Cli::command();
+        let config = command
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "config")
+            .unwrap();
+        let names = config
+            .get_subcommands()
+            .map(|subcommand| subcommand.get_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["get", "set"]);
+        let set = config
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "set")
+            .unwrap();
+        let arguments = set
+            .get_arguments()
+            .map(|argument| argument.get_id().as_str())
+            .collect::<Vec<_>>();
+        assert!(arguments.contains(&"key"));
+        assert!(arguments.contains(&"value"));
+        assert!(!arguments.contains(&"controllers"));
+    }
+
+    #[test]
+    fn config_set_accepts_key_value_arguments() {
+        assert!(Cli::try_parse_from(["swarmlite", "config", "set", "controllers", "3"]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "config", "set", "unknown", "3"]).is_err());
+    }
+
+    #[test]
+    fn init_uses_only_a_manager_count() {
+        let command = Cli::command();
+        let init = command
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "init")
+            .unwrap();
+        assert_eq!(init.get_subcommands().count(), 0);
+        let arguments = init
+            .get_arguments()
+            .map(|argument| argument.get_id().as_str())
+            .collect::<Vec<_>>();
+        assert!(arguments.contains(&"controllers"));
+        assert!(arguments.contains(&"recover"));
+        assert!(!arguments.iter().any(|argument| argument.contains("s3")));
+    }
+
+    #[test]
+    fn init_exposes_one_recovery_switch() {
+        assert!(Cli::try_parse_from(["swarmlite", "init", "--recover"]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "init", "--cluster-id", "old"]).is_err());
     }
 }

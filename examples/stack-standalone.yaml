@@ -1,0 +1,14 @@
+version: "3.8"
+
+services:
+  web:
+    image: nginx:1.29-alpine
+    ports:
+      - "8088:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ >/dev/null"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+    deploy:
+      replicas: 1

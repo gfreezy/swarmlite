@@ -1,22 +1,27 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet};
 
 use uuid::Uuid;
 
-use crate::model::{
-    ClusterState, DesiredTaskState, NodeRecord, ObservedTaskState, PortBinding, ServicePort,
-    ServiceRecord, ServiceSpec, TaskRecord,
+use crate::{
+    caddy,
+    model::{
+        ClusterState, DesiredTaskState, NodeRecord, ObservedTaskState, PortBinding, ServicePort,
+        ServiceRecord, ServiceSpec, TaskRecord,
+    },
 };
 
 pub fn reconcile(state: &mut ClusterState, live_nodes: &BTreeSet<String>) -> bool {
     let mut changed = false;
 
     for task in state.tasks.values_mut() {
-        if task.desired == DesiredTaskState::Running
-            && (!live_nodes.contains(&task.node_id)
-                || matches!(
-                    task.observed,
-                    ObservedTaskState::Failed | ObservedTaskState::Lost
-                ))
+        if matches!(
+            task.desired,
+            DesiredTaskState::Running | DesiredTaskState::Draining
+        ) && (!live_nodes.contains(&task.node_id)
+            || matches!(
+                task.observed,
+                ObservedTaskState::Failed | ObservedTaskState::Lost
+            ))
         {
             task.desired = DesiredTaskState::Stopped;
             if !live_nodes.contains(&task.node_id) {
@@ -30,7 +35,7 @@ pub fn reconcile(state: &mut ClusterState, live_nodes: &BTreeSet<String>) -> boo
     for service_id in service_ids {
         let service = state.services[&service_id].clone();
         if service.deleted || service.spec.replicas == 0 {
-            changed |= stop_all_service_tasks(state, &service_id);
+            changed |= stop_all_service_tasks(state, &service);
             continue;
         }
         changed |= reconcile_service(state, &service, live_nodes);
@@ -78,8 +83,7 @@ fn reconcile_service(
     // Scale down surplus current-revision tasks first.
     while current_running.len() > service.spec.replicas as usize {
         if let Some(id) = current_running.pop() {
-            state.tasks.get_mut(&id).unwrap().desired = DesiredTaskState::Stopped;
-            changed = true;
+            changed |= retire_task(state, &id, service);
         }
     }
 
@@ -90,8 +94,7 @@ fn reconcile_service(
     let old_to_keep = (service.spec.replicas as usize).saturating_sub(healthy_current);
     while old_running.len() > old_to_keep {
         if let Some(id) = old_running.pop() {
-            state.tasks.get_mut(&id).unwrap().desired = DesiredTaskState::Stopped;
-            changed = true;
+            changed |= retire_task(state, &id, service);
         }
     }
 
@@ -101,8 +104,7 @@ fn reconcile_service(
         && current_running.len() < service.spec.replicas as usize
     {
         let id = old_running.remove(0);
-        state.tasks.get_mut(&id).unwrap().desired = DesiredTaskState::Stopped;
-        changed = true;
+        changed |= retire_task(state, &id, service);
     }
 
     let occupying = state
@@ -153,14 +155,43 @@ fn reconcile_service(
     changed
 }
 
-fn stop_all_service_tasks(state: &mut ClusterState, service_id: &str) -> bool {
+fn stop_all_service_tasks(state: &mut ClusterState, service: &ServiceRecord) -> bool {
     let mut changed = false;
-    for task in state
+    let ids = state
         .tasks
-        .values_mut()
-        .filter(|task| task.service_id == service_id)
-    {
-        if task.desired != DesiredTaskState::Stopped {
+        .values()
+        .filter(|task| task.service_id == service.id)
+        .map(|task| task.id.clone())
+        .collect::<Vec<_>>();
+    for id in ids {
+        changed |= retire_task(state, &id, service);
+    }
+    changed
+}
+
+fn retire_task(state: &mut ClusterState, task_id: &str, service: &ServiceRecord) -> bool {
+    let task = state.tasks.get_mut(task_id).unwrap();
+    if task.desired != DesiredTaskState::Running {
+        return false;
+    }
+    task.desired =
+        if caddy::is_enabled(&service.spec) && task.observed == ObservedTaskState::Healthy {
+            DesiredTaskState::Draining
+        } else {
+            DesiredTaskState::Stopped
+        };
+    task.drain_until_unix_ms = None;
+    true
+}
+
+pub fn finish_drains(state: &mut ClusterState, now_unix_ms: i64) -> bool {
+    let mut changed = false;
+    for task in state.tasks.values_mut() {
+        if task.desired == DesiredTaskState::Draining
+            && task
+                .drain_until_unix_ms
+                .is_some_and(|deadline| deadline <= now_unix_ms)
+        {
             task.desired = DesiredTaskState::Stopped;
             changed = true;
         }
@@ -220,6 +251,7 @@ fn schedule_task(
         observed: ObservedTaskState::Pending,
         ports,
         container_id: None,
+        drain_until_unix_ms: None,
     })
 }
 
@@ -261,7 +293,7 @@ fn allocate_ports(
     spec: &ServiceSpec,
 ) -> Option<Vec<PortBinding>> {
     let mut requested = spec.ports.clone();
-    if let Some(target) = traefik_target_port(&spec.service_labels)
+    if let Some(target) = caddy::target_port(spec)
         && !requested.iter().any(|port| port.target == target)
     {
         requested.push(ServicePort {
@@ -308,18 +340,10 @@ fn used_ports(state: &ClusterState, node_id: &str) -> BTreeSet<u16> {
         .collect()
 }
 
-pub fn traefik_target_port(labels: &BTreeMap<String, String>) -> Option<u16> {
-    labels.iter().find_map(|(key, value)| {
-        if key.starts_with("traefik.http.services.") && key.ends_with(".loadbalancer.server.port") {
-            value.parse().ok()
-        } else {
-            None
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     fn service(revision: u64, replicas: u32) -> ServiceRecord {
@@ -364,6 +388,10 @@ mod tests {
                     memory_bytes: 1024,
                     port_range_start: 20_000,
                     port_range_end: 20_010,
+                    controller_capable: false,
+                    controller_url: None,
+                    raft_id: None,
+                    raft_url: None,
                 },
             );
         }
@@ -431,5 +459,90 @@ mod tests {
         state.services.insert(constrained.id.clone(), constrained);
         reconcile(&mut state, &live);
         assert_eq!(state.tasks.values().next().unwrap().node_id, "node-b");
+    }
+
+    #[test]
+    fn ingress_rollout_drains_old_task_until_caddy_acknowledges_it() {
+        let (mut state, live) = state_with_nodes();
+        let mut original = service(1, 1);
+        original
+            .spec
+            .service_labels
+            .insert(caddy::ENABLE_LABEL.into(), "true".into());
+        original
+            .spec
+            .service_labels
+            .insert(caddy::HOST_LABEL.into(), "example.com".into());
+        state.services.insert(original.id.clone(), original.clone());
+        reconcile(&mut state, &live);
+        state.tasks.values_mut().for_each(|task| {
+            task.observed = ObservedTaskState::Healthy;
+        });
+
+        let mut updated = original;
+        updated.revision = 2;
+        updated.spec.image = "example/web:v2".into();
+        state.services.insert(updated.id.clone(), updated);
+        reconcile(&mut state, &live);
+        let new_id = state
+            .tasks
+            .values()
+            .find(|task| task.revision == 2)
+            .unwrap()
+            .id
+            .clone();
+        state.tasks.get_mut(&new_id).unwrap().observed = ObservedTaskState::Healthy;
+        reconcile(&mut state, &live);
+
+        let old = state
+            .tasks
+            .values()
+            .find(|task| task.revision == 1)
+            .unwrap();
+        assert_eq!(old.desired, DesiredTaskState::Draining);
+        assert_eq!(old.drain_until_unix_ms, None);
+    }
+
+    #[test]
+    fn ingress_port_label_allocates_a_host_port_without_compose_ports() {
+        let (mut state, live) = state_with_nodes();
+        let mut service = service(1, 1);
+        service.spec.ports.clear();
+        service
+            .spec
+            .service_labels
+            .insert(caddy::ENABLE_LABEL.into(), "true".into());
+        service
+            .spec
+            .service_labels
+            .insert(caddy::HOST_LABEL.into(), "example.com".into());
+        service
+            .spec
+            .service_labels
+            .insert(caddy::PORT_LABEL.into(), "8080".into());
+        state.services.insert(service.id.clone(), service);
+
+        reconcile(&mut state, &live);
+
+        let binding = &state.tasks.values().next().unwrap().ports[0];
+        assert_eq!(binding.target, 8080);
+        assert!((20_000..=20_010).contains(&binding.published));
+    }
+
+    #[test]
+    fn finishes_only_acknowledged_expired_drains() {
+        let (mut state, live) = state_with_nodes();
+        let service = service(1, 1);
+        state.services.insert(service.id.clone(), service);
+        reconcile(&mut state, &live);
+        let task = state.tasks.values_mut().next().unwrap();
+        task.desired = DesiredTaskState::Draining;
+        task.drain_until_unix_ms = Some(100);
+        assert!(!finish_drains(&mut state, 99));
+        assert!(finish_drains(&mut state, 100));
+        assert_eq!(
+            state.tasks.values().next().unwrap().desired,
+            DesiredTaskState::Stopped
+        );
     }
 }

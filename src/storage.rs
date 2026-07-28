@@ -1,24 +1,24 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
-use async_trait::async_trait;
-use aws_config::{BehaviorVersion, Region};
-use aws_sdk_s3::{Client, primitives::ByteStream};
-use aws_smithy_types::error::metadata::ProvideErrorMetadata;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
+use swarmlite_raft::{CommandOutcome, ManagerNode, NodeId, RaftNode, ReplicatedState, SubmitError};
 use thiserror::Error;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::{
-    config::S3Config,
-    model::{ClusterMeta, ClusterState},
+use crate::model::{
+    ClusterSettings, ClusterState, ControllerRecord, DesiredTaskState, ObservedTaskState,
+    PortBinding, ServiceRecord, StackRecord, TaskRecord,
 };
+
+const PERSISTED_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
-    #[error("object was modified concurrently")]
+    #[error("control-plane state was modified concurrently")]
     Conflict,
-    #[error("object storage error: {0}")]
+    #[error("this manager is not the Raft leader")]
+    NotLeader(Option<String>),
+    #[error("Raft storage error: {0}")]
     Backend(String),
     #[error("invalid persisted data: {0}")]
     InvalidData(String),
@@ -27,330 +27,459 @@ pub enum StorageError {
 pub type StorageResult<T> = Result<T, StorageError>;
 
 #[derive(Debug, Clone)]
-pub struct StoredObject {
-    pub body: Vec<u8>,
-    pub etag: String,
+pub struct VersionedState {
+    pub generation: u64,
+    pub cluster: ClusterSettings,
+    pub state: ClusterState,
 }
 
-#[derive(Debug, Clone)]
-pub enum PutCondition {
-    Unconditional,
-    IfAbsent,
-    IfMatch(String),
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedControlPlane {
+    schema_version: u32,
+    cluster_id: String,
+    cluster: ClusterSettings,
+    state: PersistedClusterState,
 }
 
-#[async_trait]
-pub trait ObjectStore: Send + Sync {
-    async fn get(&self, key: &str) -> StorageResult<Option<StoredObject>>;
-    async fn put(&self, key: &str, body: Vec<u8>, condition: PutCondition)
-    -> StorageResult<String>;
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PersistedClusterState {
+    stacks: BTreeMap<String, StackRecord>,
+    services: BTreeMap<String, ServiceRecord>,
+    tasks: BTreeMap<String, PersistedTaskRecord>,
+    controllers: BTreeMap<String, ControllerRecord>,
 }
 
-pub struct S3ObjectStore {
-    client: Client,
-    bucket: String,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedTaskRecord {
+    id: String,
+    service_id: String,
+    revision: u64,
+    slot: u32,
+    node_id: String,
+    desired: DesiredTaskState,
+    ports: Vec<PortBinding>,
+    drain_until_unix_ms: Option<i64>,
 }
 
-impl S3ObjectStore {
-    pub async fn new(config: &S3Config) -> StorageResult<Self> {
-        let shared = aws_config::defaults(BehaviorVersion::latest())
-            .region(Region::new(config.region.clone()))
-            .load()
-            .await;
-        let mut builder =
-            aws_sdk_s3::config::Builder::from(&shared).force_path_style(config.force_path_style);
-        if let Some(endpoint) = &config.endpoint_url {
-            builder = builder.endpoint_url(endpoint);
-        }
-        Ok(Self {
-            client: Client::from_conf(builder.build()),
-            bucket: config.bucket.clone(),
-        })
-    }
-}
-
-#[async_trait]
-impl ObjectStore for S3ObjectStore {
-    async fn get(&self, key: &str) -> StorageResult<Option<StoredObject>> {
-        let output = match self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-        {
-            Ok(output) => output,
-            Err(error) => {
-                if error
-                    .as_service_error()
-                    .and_then(|value| value.code())
-                    .is_some_and(|code| code == "NoSuchKey" || code == "NotFound")
-                {
-                    return Ok(None);
-                }
-                return Err(StorageError::Backend(error.to_string()));
-            }
-        };
-        let etag = output
-            .e_tag()
-            .ok_or_else(|| StorageError::Backend(format!("GET {key} returned no ETag")))?
-            .to_owned();
-        let body = output
-            .body
-            .collect()
-            .await
-            .map_err(|error| StorageError::Backend(error.to_string()))?
-            .into_bytes()
-            .to_vec();
-        Ok(Some(StoredObject { body, etag }))
-    }
-
-    async fn put(
-        &self,
-        key: &str,
-        body: Vec<u8>,
-        condition: PutCondition,
-    ) -> StorageResult<String> {
-        let mut request = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .content_type("application/json")
-            .body(ByteStream::from(body));
-        request = match condition {
-            PutCondition::Unconditional => request,
-            PutCondition::IfAbsent => request.if_none_match("*"),
-            PutCondition::IfMatch(etag) => request.if_match(etag),
-        };
-        match request.send().await {
-            Ok(output) => output
-                .e_tag()
-                .map(ToOwned::to_owned)
-                .ok_or_else(|| StorageError::Backend(format!("PUT {key} returned no ETag"))),
-            Err(error) => {
-                let code = error.as_service_error().and_then(|value| value.code());
-                if code.is_some_and(|value| {
-                    value == "PreconditionFailed" || value == "ConditionalRequestConflict"
-                }) {
-                    Err(StorageError::Conflict)
-                } else {
-                    Err(StorageError::Backend(error.to_string()))
-                }
-            }
-        }
-    }
-}
-
+/// Adapts Swarmlite's durable desired state to the opaque CAS value replicated
+/// by `swarmlite-raft`. Node heartbeats and task observations are deliberately
+/// removed before persistence and are rebuilt after leadership changes.
 #[derive(Clone)]
 pub struct StateRepository {
-    store: Arc<dyn ObjectStore>,
-    prefix: String,
-    cluster_id: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct VersionedMeta {
-    pub value: ClusterMeta,
-    pub etag: String,
+    raft: Arc<RaftNode>,
+    cluster: ClusterSettings,
 }
 
 impl StateRepository {
-    pub fn new(store: Arc<dyn ObjectStore>, prefix: String, cluster_id: String) -> Self {
-        Self {
-            store,
-            prefix: prefix.trim_matches('/').to_owned(),
-            cluster_id,
-        }
+    pub fn new(raft: Arc<RaftNode>, cluster: ClusterSettings) -> Self {
+        Self { raft, cluster }
     }
 
-    pub fn from_s3(store: Arc<dyn ObjectStore>, config: &S3Config, cluster_id: String) -> Self {
-        Self::new(store, config.prefix.clone(), cluster_id)
+    pub fn raft(&self) -> &Arc<RaftNode> {
+        &self.raft
     }
 
-    pub async fn initialize(&self) -> StorageResult<VersionedMeta> {
-        if let Some(meta) = self.load_meta().await? {
-            self.verify_cluster(&meta.value)?;
-            return Ok(meta);
+    pub fn is_leader(&self) -> bool {
+        self.raft.is_leader()
+    }
+
+    pub fn current_term(&self) -> u64 {
+        self.raft.current_term()
+    }
+
+    pub fn leader_url(&self) -> Option<String> {
+        self.raft.leader().map(|(_, node)| node.api_url)
+    }
+
+    pub fn voter_ids(&self) -> std::collections::BTreeSet<NodeId> {
+        self.raft.voter_ids()
+    }
+
+    pub fn is_voter(&self, node_id: NodeId) -> bool {
+        self.raft.voter_ids().contains(&node_id)
+    }
+
+    pub async fn ensure_voter(&self, node_id: NodeId, node: ManagerNode) -> StorageResult<()> {
+        if let Some(existing) = self.raft.member(node_id) {
+            if self.is_voter(node_id) {
+                if existing != node {
+                    self.raft
+                        .add_learner(node_id, node)
+                        .await
+                        .map_err(map_raft_error)?;
+                }
+                return Ok(());
+            }
+            if existing != node {
+                self.raft
+                    .add_learner(node_id, node.clone())
+                    .await
+                    .map_err(map_raft_error)?;
+            }
+        } else {
+            self.raft
+                .add_learner(node_id, node)
+                .await
+                .map_err(map_raft_error)?;
+        }
+        self.raft.promote(node_id).await.map_err(map_raft_error)
+    }
+
+    pub async fn remove_voter(&self, node_id: NodeId) -> StorageResult<()> {
+        self.raft
+            .remove_voter(node_id, false)
+            .await
+            .map_err(map_raft_error)
+    }
+
+    pub async fn initialize_with_cluster(
+        &self,
+        cluster: &ClusterSettings,
+    ) -> StorageResult<VersionedState> {
+        if cluster != &self.cluster {
+            return Err(StorageError::InvalidData(
+                "repository was opened with different cluster settings".to_owned(),
+            ));
+        }
+        let replica = self.raft.local_state().await;
+        if let Some(value) = self.decode_replica(&replica)? {
+            return Ok(VersionedState {
+                generation: replica.generation,
+                cluster: value.cluster,
+                state: value.state.into_runtime(),
+            });
         }
 
-        let snapshot_key = self.snapshot_key(0);
-        let snapshot = encode(&ClusterState::default())?;
-        match self
-            .store
-            .put(&snapshot_key, snapshot, PutCondition::IfAbsent)
-            .await
-        {
-            Ok(_) | Err(StorageError::Conflict) => {}
-            Err(error) => return Err(error),
+        let state = ClusterState::default();
+        if !self.raft.is_leader() {
+            return Ok(VersionedState {
+                generation: replica.generation,
+                cluster: cluster.clone(),
+                state,
+            });
         }
-
-        let meta = ClusterMeta {
-            schema_version: 1,
-            cluster_id: self.cluster_id.clone(),
-            leader: None,
-            generation: 0,
-            snapshot_key,
-        };
-        match self
-            .store
-            .put(&self.meta_key(), encode(&meta)?, PutCondition::IfAbsent)
-            .await
-        {
-            Ok(etag) => Ok(VersionedMeta { value: meta, etag }),
-            Err(StorageError::Conflict) => self.load_meta().await?.ok_or_else(|| {
-                StorageError::Backend("meta object disappeared after concurrent create".to_owned())
+        match self.replace(replica.generation, cluster, &state).await {
+            Ok(generation) => Ok(VersionedState {
+                generation,
+                cluster: cluster.clone(),
+                state,
             }),
+            Err(StorageError::Conflict) => self.load_local().await,
             Err(error) => Err(error),
         }
     }
 
-    pub async fn load_meta(&self) -> StorageResult<Option<VersionedMeta>> {
-        self.store
-            .get(&self.meta_key())
-            .await?
-            .map(|object| {
-                let value: ClusterMeta = decode(&object.body)?;
-                self.verify_cluster(&value)?;
-                Ok(VersionedMeta {
-                    value,
-                    etag: object.etag,
-                })
-            })
-            .transpose()
+    pub async fn load_local(&self) -> StorageResult<VersionedState> {
+        let replica = self.raft.local_state().await;
+        self.versioned_state(replica)
     }
 
-    pub async fn load_state(&self, meta: &ClusterMeta) -> StorageResult<ClusterState> {
-        let object = self.store.get(&meta.snapshot_key).await?.ok_or_else(|| {
-            StorageError::Backend(format!("snapshot {} does not exist", meta.snapshot_key))
-        })?;
-        decode(&object.body)
+    pub async fn load_consistent(&self) -> StorageResult<VersionedState> {
+        let replica = self
+            .raft
+            .consistent_state()
+            .await
+            .map_err(map_check_is_leader_error)?;
+        self.versioned_state(replica)
     }
 
-    pub async fn put_snapshot(
+    pub async fn replace(
         &self,
-        generation: u64,
+        expected_generation: u64,
+        cluster: &ClusterSettings,
         state: &ClusterState,
-    ) -> StorageResult<String> {
-        let key = self.snapshot_key(generation);
-        self.store
-            .put(&key, encode(state)?, PutCondition::IfAbsent)
-            .await?;
-        Ok(key)
-    }
-
-    pub async fn cas_meta(&self, meta: &ClusterMeta, expected_etag: &str) -> StorageResult<String> {
-        self.store
-            .put(
-                &self.meta_key(),
-                encode(meta)?,
-                PutCondition::IfMatch(expected_etag.to_owned()),
+    ) -> StorageResult<u64> {
+        if !same_cluster_identity(cluster, &self.cluster) {
+            return Err(StorageError::InvalidData(
+                "cluster identity cannot be changed".to_owned(),
+            ));
+        }
+        let value = PersistedControlPlane {
+            schema_version: PERSISTED_SCHEMA_VERSION,
+            cluster_id: cluster.cluster_id.clone(),
+            cluster: cluster.clone(),
+            state: PersistedClusterState::from_runtime(state),
+        };
+        let body = serde_json::to_vec(&value)
+            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        let response = self
+            .raft
+            .replace(
+                format!("control-plane-{}", Uuid::new_v4().simple()),
+                expected_generation,
+                body,
             )
             .await
-    }
-
-    fn verify_cluster(&self, meta: &ClusterMeta) -> StorageResult<()> {
-        if meta.cluster_id == self.cluster_id {
-            Ok(())
-        } else {
-            Err(StorageError::InvalidData(format!(
-                "expected cluster {}, storage contains {}",
-                self.cluster_id, meta.cluster_id
-            )))
+            .map_err(map_submit_error)?;
+        match response.outcome {
+            CommandOutcome::Applied => Ok(response.generation),
+            CommandOutcome::Conflict => Err(StorageError::Conflict),
+            CommandOutcome::Ignored => Err(StorageError::Backend(
+                "Raft ignored a control-plane command".to_owned(),
+            )),
         }
     }
 
-    fn meta_key(&self) -> String {
-        self.key("meta.json")
-    }
-
-    fn snapshot_key(&self, generation: u64) -> String {
-        self.key(&format!(
-            "snapshots/{generation:020}-{}.json",
-            Uuid::new_v4()
-        ))
-    }
-
-    fn key(&self, suffix: &str) -> String {
-        if self.prefix.is_empty() {
-            suffix.to_owned()
-        } else {
-            format!("{}/{}", self.prefix, suffix.trim_start_matches('/'))
-        }
-    }
-}
-
-fn encode<T: Serialize>(value: &T) -> StorageResult<Vec<u8>> {
-    serde_json::to_vec(value).map_err(|error| StorageError::InvalidData(error.to_string()))
-}
-
-fn decode<T: DeserializeOwned>(value: &[u8]) -> StorageResult<T> {
-    serde_json::from_slice(value).map_err(|error| StorageError::InvalidData(error.to_string()))
-}
-
-#[derive(Default)]
-pub struct MemoryObjectStore {
-    objects: Mutex<HashMap<String, StoredObject>>,
-    sequence: Mutex<u64>,
-}
-
-#[async_trait]
-impl ObjectStore for MemoryObjectStore {
-    async fn get(&self, key: &str) -> StorageResult<Option<StoredObject>> {
-        Ok(self.objects.lock().await.get(key).cloned())
-    }
-
-    async fn put(
-        &self,
-        key: &str,
-        body: Vec<u8>,
-        condition: PutCondition,
-    ) -> StorageResult<String> {
-        let mut objects = self.objects.lock().await;
-        let allowed = match &condition {
-            PutCondition::Unconditional => true,
-            PutCondition::IfAbsent => !objects.contains_key(key),
-            PutCondition::IfMatch(expected) => objects
-                .get(key)
-                .is_some_and(|object| object.etag == *expected),
-        };
-        if !allowed {
-            return Err(StorageError::Conflict);
-        }
-        let mut sequence = self.sequence.lock().await;
-        *sequence += 1;
-        let etag = format!("\"{}\"", *sequence);
-        objects.insert(
-            key.to_owned(),
-            StoredObject {
-                body,
-                etag: etag.clone(),
-            },
+    fn versioned_state(&self, replica: ReplicatedState) -> StorageResult<VersionedState> {
+        let (cluster, state) = self.decode_replica(&replica)?.map_or_else(
+            || (self.cluster.clone(), ClusterState::default()),
+            |value| (value.cluster, value.state.into_runtime()),
         );
-        Ok(etag)
+        Ok(VersionedState {
+            generation: replica.generation,
+            cluster,
+            state,
+        })
+    }
+
+    fn decode_replica(
+        &self,
+        replica: &ReplicatedState,
+    ) -> StorageResult<Option<PersistedControlPlane>> {
+        if replica.value.is_empty() {
+            return Ok(None);
+        }
+        let value: PersistedControlPlane = serde_json::from_slice(&replica.value)
+            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        if value.schema_version != PERSISTED_SCHEMA_VERSION
+            || value.cluster_id != self.cluster.cluster_id
+            || !same_cluster_identity(&value.cluster, &self.cluster)
+        {
+            return Err(StorageError::InvalidData(
+                "persisted Raft state belongs to a different or unsupported cluster".to_owned(),
+            ));
+        }
+        Ok(Some(value))
+    }
+}
+
+fn same_cluster_identity(left: &ClusterSettings, right: &ClusterSettings) -> bool {
+    left.schema_version == right.schema_version
+        && left.cluster_id == right.cluster_id
+        && left.controller_port == right.controller_port
+        && left.caddy == right.caddy
+}
+
+impl PersistedClusterState {
+    fn from_runtime(state: &ClusterState) -> Self {
+        Self {
+            stacks: state.stacks.clone(),
+            services: state.services.clone(),
+            tasks: state
+                .tasks
+                .iter()
+                .map(|(id, task)| (id.clone(), PersistedTaskRecord::from_runtime(task)))
+                .collect(),
+            controllers: state.controllers.clone(),
+        }
+    }
+
+    fn into_runtime(self) -> ClusterState {
+        ClusterState {
+            stacks: self.stacks,
+            services: self.services,
+            nodes: BTreeMap::new(),
+            tasks: self
+                .tasks
+                .into_iter()
+                .map(|(id, task)| (id, task.into_runtime()))
+                .collect(),
+            controllers: self.controllers,
+            unclaimed_tasks: BTreeMap::new(),
+        }
+    }
+}
+
+impl PersistedTaskRecord {
+    fn from_runtime(task: &TaskRecord) -> Self {
+        Self {
+            id: task.id.clone(),
+            service_id: task.service_id.clone(),
+            revision: task.revision,
+            slot: task.slot,
+            node_id: task.node_id.clone(),
+            desired: task.desired.clone(),
+            ports: task.ports.clone(),
+            drain_until_unix_ms: task.drain_until_unix_ms,
+        }
+    }
+
+    fn into_runtime(self) -> TaskRecord {
+        TaskRecord {
+            id: self.id,
+            service_id: self.service_id,
+            revision: self.revision,
+            slot: self.slot,
+            node_id: self.node_id,
+            desired: self.desired,
+            observed: ObservedTaskState::Pending,
+            ports: self.ports,
+            container_id: None,
+            drain_until_unix_ms: self.drain_until_unix_ms,
+        }
+    }
+}
+
+fn map_submit_error(error: SubmitError) -> StorageError {
+    match error {
+        SubmitError::EmptyRequestId => StorageError::Backend(error.to_string()),
+        SubmitError::Raft(error) => {
+            if let Some(forward) = error.forward_to_leader::<ManagerNode>() {
+                StorageError::NotLeader(
+                    forward
+                        .leader_node
+                        .as_ref()
+                        .map(|node| node.api_url.clone()),
+                )
+            } else {
+                StorageError::Backend(error.to_string())
+            }
+        }
+    }
+}
+
+fn map_raft_error(error: swarmlite_raft::ClientWriteRaftError) -> StorageError {
+    if let Some(forward) = error.forward_to_leader::<ManagerNode>() {
+        StorageError::NotLeader(
+            forward
+                .leader_node
+                .as_ref()
+                .map(|node| node.api_url.clone()),
+        )
+    } else {
+        StorageError::Backend(error.to_string())
+    }
+}
+
+fn map_check_is_leader_error(error: swarmlite_raft::CheckIsLeaderRaftError) -> StorageError {
+    if let Some(forward) = error.forward_to_leader::<ManagerNode>() {
+        StorageError::NotLeader(
+            forward
+                .leader_node
+                .as_ref()
+                .map(|node| node.api_url.clone()),
+        )
+    } else {
+        StorageError::Backend(error.to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use swarmlite_raft::{ManagerNode, NodeConfig};
+
+    use crate::model::{ClusterCaddyConfig, NodeRecord, ServiceRecord, ServiceSpec, TaskRecord};
+
     use super::*;
 
     #[tokio::test]
-    async fn initializes_once_and_enforces_cas() {
-        let store = Arc::new(MemoryObjectStore::default());
-        let repo = StateRepository::new(store, "clusters/test".into(), "test".into());
-        let first = repo.initialize().await.unwrap();
-        let second = repo.initialize().await.unwrap();
-        assert_eq!(first.value.snapshot_key, second.value.snapshot_key);
+    async fn persists_only_durable_state_through_raft_cas() {
+        let directory = tempfile::tempdir().unwrap();
+        let raft = RaftNode::open(NodeConfig::new(
+            1,
+            ManagerNode {
+                raft_url: "http://127.0.0.1:19090/internal/raft".into(),
+                api_url: "http://127.0.0.1:19090".into(),
+            },
+            directory.path(),
+            "storage-test",
+            "0123456789abcdef0123456789abcdef",
+        ))
+        .await
+        .unwrap();
+        raft.initialize().await.unwrap();
+        raft.raft()
+            .wait(Some(Duration::from_secs(5)))
+            .current_leader(1, "test node becomes leader")
+            .await
+            .unwrap();
+        let cluster = ClusterSettings {
+            schema_version: 2,
+            cluster_id: "storage-test".into(),
+            controllers: 1,
+            controller_port: 19090,
+            caddy: ClusterCaddyConfig::default(),
+        };
+        let repository = StateRepository::new(raft.clone(), cluster.clone());
+        let first = repository.initialize_with_cluster(&cluster).await.unwrap();
+        let mut state = ClusterState::default();
+        state.nodes.insert(
+            "soft-node".into(),
+            NodeRecord {
+                id: "soft-node".into(),
+                address: "10.0.0.2".into(),
+                labels: Default::default(),
+                cpu_millis: 1000,
+                memory_bytes: 1024,
+                port_range_start: 20_000,
+                port_range_end: 29_999,
+                controller_capable: false,
+                controller_url: None,
+                raft_id: None,
+                raft_url: None,
+            },
+        );
+        state.services.insert(
+            "demo.web".into(),
+            ServiceRecord {
+                id: "demo.web".into(),
+                stack: "demo".into(),
+                name: "web".into(),
+                revision: 1,
+                spec: ServiceSpec {
+                    image: "nginx".into(),
+                    command: Vec::new(),
+                    entrypoint: Vec::new(),
+                    environment: Vec::new(),
+                    ports: Vec::new(),
+                    volumes: Vec::new(),
+                    container_labels: Default::default(),
+                    service_labels: Default::default(),
+                    healthcheck: None,
+                    replicas: 1,
+                    constraints: Vec::new(),
+                    max_surge: 0,
+                    stop_grace_period_seconds: 10,
+                },
+                deleted: false,
+            },
+        );
+        state.tasks.insert(
+            "task-1".into(),
+            TaskRecord {
+                id: "task-1".into(),
+                service_id: "demo.web".into(),
+                revision: 1,
+                slot: 0,
+                node_id: "soft-node".into(),
+                desired: crate::model::DesiredTaskState::Running,
+                observed: ObservedTaskState::Healthy,
+                ports: Vec::new(),
+                container_id: Some("container-1".into()),
+                drain_until_unix_ms: None,
+            },
+        );
 
-        let mut changed = first.value.clone();
-        changed.generation = 1;
-        let new_etag = repo.cas_meta(&changed, &first.etag).await.unwrap();
-        assert_ne!(new_etag, first.etag);
-        assert!(matches!(
-            repo.cas_meta(&changed, &first.etag).await,
-            Err(StorageError::Conflict)
-        ));
+        repository
+            .replace(first.generation, &cluster, &state)
+            .await
+            .unwrap();
+        let raw = raft.local_state().await;
+        let json = std::str::from_utf8(&raw.value).unwrap();
+        assert!(!json.contains("\"nodes\""));
+        assert!(!json.contains("\"observed\""));
+        assert!(!json.contains("\"container_id\""));
+        let loaded = repository.load_consistent().await.unwrap();
+        assert_eq!(loaded.cluster, cluster);
+        assert!(loaded.state.nodes.is_empty());
+        assert_eq!(loaded.state.services.len(), 1);
+        assert_eq!(
+            loaded.state.tasks["task-1"].observed,
+            ObservedTaskState::Pending
+        );
+        assert!(loaded.state.tasks["task-1"].container_id.is_none());
+        raft.shutdown().await.unwrap();
     }
 }

@@ -1,0 +1,24 @@
+[package]
+name = "swarmlite-raft"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Embedded OpenRaft control-plane storage for Swarmlite"
+
+[dependencies]
+axum = { version = "0.8", features = ["json"] }
+openraft = { version = "0.9.25", features = ["serde", "storage-v2"] }
+redb = "4.1"
+reqwest = { version = "0.13", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.49", features = ["fs", "net", "rt", "sync"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3.24"
+tokio = { version = "1.49", features = ["full"] }
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -1,87 +1,76 @@
-use std::{collections::HashMap, path::Path, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
-use bollard::{
-    API_DEFAULT_VERSION, Docker,
-    models::{
-        ContainerCreateBody, HealthConfig, HealthStatusEnum, HostConfig,
-        PortBinding as DockerPortBinding, RestartPolicy, RestartPolicyNameEnum,
-    },
-    query_parameters::{
-        CreateContainerOptionsBuilder, CreateImageOptionsBuilder, ListContainersOptionsBuilder,
-        RemoveContainerOptionsBuilder, StopContainerOptionsBuilder,
-    },
-};
-use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
 use crate::{
     config::AgentConfig,
+    local_state::{AgentFence, FENCE_KEY, LocalState},
     model::{
-        HeartbeatResponse, NodeHeartbeat, NodeRecord, ObservedTaskState, TaskAssignment, TaskReport,
+        HeartbeatResponse, NodeControl, NodeHeartbeat, NodeRecord, ObservedTaskState, TaskReport,
     },
+    runtime::{ContainerRuntime, DockerCompatibleRuntime, ManagedContainer},
 };
 
-const MANAGED_LABEL: &str = "io.swarmlite.managed";
-const TASK_LABEL: &str = "io.swarmlite.task_id";
-const SERVICE_LABEL: &str = "io.swarmlite.service_id";
-const REVISION_LABEL: &str = "io.swarmlite.revision";
-const TERM_LABEL: &str = "io.swarmlite.term";
-const GENERATION_LABEL: &str = "io.swarmlite.generation";
-const STOP_GRACE_LABEL: &str = "io.swarmlite.stop_grace_seconds";
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct FenceState {
-    term: u64,
-    generation: u64,
+pub(crate) async fn run_with_token_and_updates(
+    config: AgentConfig,
+    token: String,
+    updates: tokio::sync::watch::Sender<NodeControl>,
+    local_state: LocalState,
+) -> Result<()> {
+    let runtime_config = config.resolved_runtime()?;
+    let runtime = DockerCompatibleRuntime::connect(&runtime_config)?;
+    run_with_runtime(config, token, updates, local_state, runtime).await
 }
 
-#[derive(Debug, Clone)]
-struct ManagedContainer {
-    id: String,
-    task_id: String,
-    observed: ObservedTaskState,
-    labels: HashMap<String, String>,
-}
-
-pub async fn run(config: AgentConfig) -> Result<()> {
-    let token = config.token()?;
-    let docker = Docker::connect_with_socket(&config.docker_socket, 120, API_DEFAULT_VERSION)
-        .with_context(|| format!("failed to connect to Docker at {}", config.docker_socket))?;
-    docker
-        .ping()
-        .await
-        .context("Docker daemon did not answer ping")?;
-    let system = docker
-        .info()
-        .await
-        .context("failed to read Docker system info")?;
+async fn run_with_runtime<R: ContainerRuntime>(
+    config: AgentConfig,
+    token: String,
+    updates: tokio::sync::watch::Sender<NodeControl>,
+    local_state: LocalState,
+    runtime: R,
+) -> Result<()> {
+    runtime.ping().await?;
+    let system = runtime.system_info().await?;
     let node = NodeRecord {
         id: config.node_id.clone(),
         address: config.advertise_address.clone(),
         labels: config.labels.clone(),
-        cpu_millis: system.ncpu.unwrap_or(0).max(0) as u64 * 1000,
-        memory_bytes: system.mem_total.unwrap_or(0).max(0) as u64,
+        cpu_millis: system.cpu_millis,
+        memory_bytes: system.memory_bytes,
         port_range_start: config.port_range.start,
         port_range_end: config.port_range.end,
+        controller_capable: config.controller_capable,
+        controller_url: config.controller_url.clone(),
+        raft_id: config.raft_id,
+        raft_url: config.raft_url.clone(),
     };
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
-    let mut fence = load_fence(Path::new(&config.state_file)).await?;
+    let mut fence = local_state
+        .get::<AgentFence>(FENCE_KEY)?
+        .unwrap_or_default();
+    let mut controllers = config.controllers.clone();
     let (assignments_tx, assignments_rx) = tokio::sync::watch::channel(None);
-    let worker_docker = docker.clone();
+    let runtime = Arc::new(runtime);
+    let worker_runtime = Arc::clone(&runtime);
+    let worker_cluster_id = config.cluster_id.clone();
     tokio::spawn(async move {
-        reconciliation_worker(worker_docker, assignments_rx).await;
+        reconciliation_worker(worker_runtime, assignments_rx, worker_cluster_id).await;
     });
     let mut ticker = tokio::time::interval(Duration::from_secs(config.heartbeat_interval_seconds));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    info!(node_id = %config.node_id, "node agent started");
+    info!(
+        node_id = %config.node_id,
+        runtime = %runtime.kind(),
+        socket = runtime.socket(),
+        "node agent started"
+    );
 
     loop {
         ticker.tick().await;
-        let containers = match list_managed(&docker).await {
+        let containers = match runtime.list_managed(&config.cluster_id).await {
             Ok(containers) => containers,
             Err(error) => {
                 error!(%error, "failed to inspect managed containers");
@@ -96,10 +85,25 @@ pub async fn run(config: AgentConfig) -> Result<()> {
                     id: container.task_id.clone(),
                     observed: container.observed.clone(),
                     container_id: Some(container.id.clone()),
+                    cluster_id: container.cluster_id.clone(),
+                    stack: container.stack.clone(),
+                    service: container.service.clone(),
+                    slot: container.slot,
+                    revision: container.revision,
+                    spec_hash: container.spec_hash.clone(),
+                    ports: container.ports.clone(),
                 })
                 .collect(),
         };
-        let response = match send_heartbeat(&client, &config, &token, &heartbeat).await {
+        let response = match send_heartbeat(
+            &client,
+            &controllers,
+            &config.node_id,
+            &token,
+            &heartbeat,
+        )
+        .await
+        {
             Ok(response) => response,
             Err(error) => {
                 warn!(%error, "all controllers are unavailable; leaving current containers unchanged");
@@ -120,32 +124,48 @@ pub async fn run(config: AgentConfig) -> Result<()> {
         }
         fence.term = response.leader_term;
         fence.generation = response.generation;
-        if let Err(error) = save_fence(Path::new(&config.state_file), &fence).await {
+        if let Err(error) = local_state.put(FENCE_KEY, &fence) {
             error!(%error, "failed to persist fencing state; refusing to change containers");
             continue;
         }
+        if !response.controllers.is_empty() {
+            controllers.clone_from(&response.controllers);
+        }
+        let next_control = NodeControl {
+            role: response.node_role,
+            controllers: controllers.clone(),
+        };
+        updates.send_if_modified(|current| {
+            if *current == next_control {
+                false
+            } else {
+                current.clone_from(&next_control);
+                true
+            }
+        });
         if assignments_tx.send(Some(response)).is_err() {
             bail!("container reconciliation worker stopped unexpectedly");
         }
     }
 }
 
-async fn reconciliation_worker(
-    docker: Docker,
+async fn reconciliation_worker<R: ContainerRuntime>(
+    runtime: Arc<R>,
     mut assignments: tokio::sync::watch::Receiver<Option<HeartbeatResponse>>,
+    cluster_id: String,
 ) {
     while assignments.changed().await.is_ok() {
         let Some(response) = assignments.borrow_and_update().clone() else {
             continue;
         };
-        let existing = match list_managed(&docker).await {
+        let existing = match runtime.list_managed(&cluster_id).await {
             Ok(containers) => containers,
             Err(error) => {
                 error!(%error, "failed to inspect containers in reconciliation worker");
                 continue;
             }
         };
-        if let Err(error) = reconcile_containers(&docker, &existing, &response).await {
+        if let Err(error) = reconcile_containers(runtime.as_ref(), &existing, &response).await {
             error!(error = %format!("{error:#}"), "container reconciliation failed");
         }
     }
@@ -153,16 +173,17 @@ async fn reconciliation_worker(
 
 async fn send_heartbeat(
     client: &reqwest::Client,
-    config: &AgentConfig,
+    controllers: &[String],
+    node_id: &str,
     token: &str,
     heartbeat: &NodeHeartbeat,
 ) -> Result<HeartbeatResponse> {
     let mut errors = Vec::new();
-    for controller in &config.controllers {
+    for controller in controllers {
         let url = format!(
             "{}/v1/nodes/{}/heartbeat",
             controller.trim_end_matches('/'),
-            config.node_id
+            node_id
         );
         match post_heartbeat(client, &url, token, heartbeat).await {
             Ok(response) if response.status().is_success() => {
@@ -209,239 +230,189 @@ async fn post_heartbeat(
     bail!("too many controller redirects")
 }
 
-async fn list_managed(docker: &Docker) -> Result<HashMap<String, ManagedContainer>> {
-    let filters = HashMap::from([("label".to_owned(), vec![format!("{MANAGED_LABEL}=true")])]);
-    let options = ListContainersOptionsBuilder::default()
-        .all(true)
-        .filters(&filters)
-        .build();
-    let summaries = docker.list_containers(Some(options)).await?;
-    let mut result = HashMap::new();
-    for summary in summaries {
-        let Some(id) = summary.id else { continue };
-        let labels = summary.labels.unwrap_or_default();
-        let Some(task_id) = labels.get(TASK_LABEL).cloned() else {
-            continue;
-        };
-        let inspect = docker.inspect_container(&id, None).await?;
-        let observed = inspect
-            .state
-            .map(observed_state)
-            .unwrap_or(ObservedTaskState::Failed);
-        result.insert(
-            task_id.clone(),
-            ManagedContainer {
-                id,
-                task_id,
-                observed,
-                labels,
-            },
-        );
-    }
-    Ok(result)
-}
-
-fn observed_state(state: bollard::models::ContainerState) -> ObservedTaskState {
-    if state.running != Some(true) {
-        return if state.restarting == Some(true) {
-            ObservedTaskState::Starting
-        } else {
-            ObservedTaskState::Failed
-        };
-    }
-    match state.health.and_then(|health| health.status) {
-        Some(HealthStatusEnum::STARTING) => ObservedTaskState::Starting,
-        Some(HealthStatusEnum::UNHEALTHY) => ObservedTaskState::Failed,
-        Some(HealthStatusEnum::HEALTHY) => ObservedTaskState::Healthy,
-        _ => ObservedTaskState::Healthy,
-    }
-}
-
-async fn reconcile_containers(
-    docker: &Docker,
+async fn reconcile_containers<R: ContainerRuntime>(
+    runtime: &R,
     existing: &HashMap<String, ManagedContainer>,
     response: &HeartbeatResponse,
 ) -> Result<()> {
-    let desired: HashMap<_, _> = response
-        .assignments
-        .iter()
-        .map(|assignment| (assignment.id.as_str(), assignment))
-        .collect();
-
-    for (task_id, container) in existing {
-        if !desired.contains_key(task_id.as_str()) {
-            remove_container(docker, container).await?;
+    for task_id in &response.remove_tasks {
+        if let Some(container) = existing.get(task_id) {
+            runtime.remove_task(container).await?;
         }
     }
 
     for assignment in &response.assignments {
         match existing.get(&assignment.id) {
             Some(container)
-                if container.observed == ObservedTaskState::Failed
-                    || container.labels.get(REVISION_LABEL)
-                        != Some(&assignment.revision.to_string()) =>
+                if container.spec_hash.as_deref().map_or_else(
+                    || container.revision != Some(assignment.revision),
+                    |hash| hash != assignment.spec_hash,
+                ) =>
             {
-                remove_container(docker, container).await?;
-                create_container(docker, assignment).await?;
+                runtime.remove_task(container).await?;
+                runtime.create_task(assignment).await?;
+            }
+            Some(container) if !container.running => runtime.start_task(container).await?,
+            Some(container) if container.observed == ObservedTaskState::Failed => {
+                runtime.remove_task(container).await?;
+                runtime.create_task(assignment).await?;
             }
             Some(_) => {}
-            None => create_container(docker, assignment).await?,
+            None => runtime.create_task(assignment).await?,
         }
     }
     Ok(())
 }
 
-async fn create_container(docker: &Docker, assignment: &TaskAssignment) -> Result<()> {
-    info!(
-        task_id = %assignment.id,
-        image = %assignment.spec.image,
-        "creating task container"
-    );
-    if docker.inspect_image(&assignment.spec.image).await.is_err() {
-        let options = CreateImageOptionsBuilder::default()
-            .from_image(&assignment.spec.image)
-            .build();
-        let mut pull = docker.create_image(Some(options), None, None);
-        while let Some(item) = pull.next().await {
-            item.with_context(|| format!("failed to pull {}", assignment.spec.image))?;
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use crate::{
+        config::RuntimeKind,
+        model::{HeartbeatResponse, NodeRole},
+        runtime::RuntimeSystemInfo,
+    };
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct FakeRuntime {
+        removed: Arc<Mutex<Vec<String>>>,
+        started: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ContainerRuntime for FakeRuntime {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Docker
+        }
+
+        fn socket(&self) -> &str {
+            "fake"
+        }
+
+        async fn ping(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn system_info(&self) -> Result<RuntimeSystemInfo> {
+            Ok(RuntimeSystemInfo {
+                cpu_millis: 1,
+                memory_bytes: 1,
+            })
+        }
+
+        async fn list_managed(
+            &self,
+            _cluster_id: &str,
+        ) -> Result<HashMap<String, ManagedContainer>> {
+            Ok(HashMap::new())
+        }
+
+        async fn create_task(&self, _assignment: &crate::model::TaskAssignment) -> Result<()> {
+            Ok(())
+        }
+
+        async fn start_task(&self, container: &ManagedContainer) -> Result<()> {
+            self.started.lock().unwrap().push(container.task_id.clone());
+            Ok(())
+        }
+
+        async fn remove_task(&self, container: &ManagedContainer) -> Result<()> {
+            self.removed.lock().unwrap().push(container.task_id.clone());
+            Ok(())
         }
     }
 
-    let mut port_bindings = HashMap::new();
-    let exposed_ports = assignment
-        .ports
-        .iter()
-        .map(|port| format!("{}/{}", port.target, port.protocol))
-        .collect::<Vec<_>>();
-    for port in &assignment.ports {
-        port_bindings.insert(
-            format!("{}/{}", port.target, port.protocol),
-            Some(vec![DockerPortBinding {
-                host_ip: Some("0.0.0.0".to_owned()),
-                host_port: Some(port.published.to_string()),
-            }]),
-        );
+    fn managed(task_id: &str) -> ManagedContainer {
+        ManagedContainer {
+            id: format!("container-{task_id}"),
+            task_id: task_id.to_owned(),
+            revision: Some(1),
+            running: true,
+            observed: ObservedTaskState::Healthy,
+            stop_grace_seconds: 10,
+            cluster_id: Some("cluster-test".into()),
+            stack: Some("demo".into()),
+            service: Some("web".into()),
+            slot: Some(0),
+            spec_hash: Some("hash".into()),
+            ports: Vec::new(),
+        }
     }
-    let mut labels: HashMap<String, String> = assignment
-        .spec
-        .container_labels
-        .clone()
-        .into_iter()
-        .collect();
-    labels.extend([
-        (MANAGED_LABEL.to_owned(), "true".to_owned()),
-        (TASK_LABEL.to_owned(), assignment.id.clone()),
-        (SERVICE_LABEL.to_owned(), assignment.service_id.clone()),
-        (REVISION_LABEL.to_owned(), assignment.revision.to_string()),
-        (TERM_LABEL.to_owned(), assignment.leader_term.to_string()),
-        (
-            GENERATION_LABEL.to_owned(),
-            assignment.generation.to_string(),
-        ),
-        (
-            STOP_GRACE_LABEL.to_owned(),
-            assignment.spec.stop_grace_period_seconds.to_string(),
-        ),
-    ]);
-    let host_config = HostConfig {
-        binds: (!assignment.spec.volumes.is_empty()).then_some(assignment.spec.volumes.clone()),
-        port_bindings: (!port_bindings.is_empty()).then_some(port_bindings),
-        restart_policy: Some(RestartPolicy {
-            name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
-            maximum_retry_count: None,
-        }),
-        ..Default::default()
-    };
-    let body = ContainerCreateBody {
-        image: Some(assignment.spec.image.clone()),
-        cmd: (!assignment.spec.command.is_empty()).then_some(assignment.spec.command.clone()),
-        entrypoint: (!assignment.spec.entrypoint.is_empty())
-            .then_some(assignment.spec.entrypoint.clone()),
-        env: (!assignment.spec.environment.is_empty())
-            .then_some(assignment.spec.environment.clone()),
-        exposed_ports: (!exposed_ports.is_empty()).then_some(exposed_ports),
-        labels: Some(labels),
-        healthcheck: assignment
-            .spec
-            .healthcheck
-            .as_ref()
-            .map(|healthcheck| HealthConfig {
-                test: Some(healthcheck.test.clone()),
-                interval: healthcheck.interval_nanos,
-                timeout: healthcheck.timeout_nanos,
-                retries: healthcheck.retries,
-                start_period: healthcheck.start_period_nanos,
-                start_interval: healthcheck.start_interval_nanos,
-            }),
-        stop_timeout: Some(assignment.spec.stop_grace_period_seconds as i64),
-        host_config: Some(host_config),
-        ..Default::default()
-    };
-    let short = assignment.id.chars().take(8).collect::<String>();
-    let name = format!(
-        "swarmlite-{}-{}-{short}",
-        sanitize_name(&assignment.service_id),
-        assignment.slot
-    );
-    let create_options = CreateContainerOptionsBuilder::default().name(&name).build();
-    let created = docker
-        .create_container(Some(create_options), body)
-        .await
-        .with_context(|| format!("failed to create task {}", assignment.id))?;
-    docker
-        .start_container(&created.id, None)
-        .await
-        .with_context(|| format!("failed to start task {}", assignment.id))?;
-    Ok(())
-}
 
-async fn remove_container(docker: &Docker, container: &ManagedContainer) -> Result<()> {
-    let grace = container
-        .labels
-        .get(STOP_GRACE_LABEL)
-        .and_then(|value| value.parse::<i32>().ok())
-        .unwrap_or(10);
-    info!(task_id = %container.task_id, "removing obsolete task container");
-    let stop = StopContainerOptionsBuilder::default().t(grace).build();
-    if let Err(error) = docker.stop_container(&container.id, Some(stop)).await {
-        warn!(task_id = %container.task_id, %error, "graceful stop failed; forcing removal");
+    #[tokio::test]
+    async fn leaves_unknown_containers_untouched_until_explicitly_removed() {
+        let runtime = FakeRuntime::default();
+        let existing = HashMap::from([("old-task".into(), managed("old-task"))]);
+        let mut response = HeartbeatResponse {
+            leader_term: 1,
+            generation: 1,
+            assignments: Vec::new(),
+            node_role: NodeRole::Worker,
+            controllers: Vec::new(),
+            remove_tasks: Vec::new(),
+        };
+
+        reconcile_containers(&runtime, &existing, &response)
+            .await
+            .unwrap();
+        assert!(runtime.removed.lock().unwrap().is_empty());
+
+        response.remove_tasks.push("old-task".into());
+        reconcile_containers(&runtime, &existing, &response)
+            .await
+            .unwrap();
+        assert_eq!(&*runtime.removed.lock().unwrap(), &["old-task"]);
     }
-    let remove = RemoveContainerOptionsBuilder::default().force(true).build();
-    docker
-        .remove_container(&container.id, Some(remove))
-        .await
-        .with_context(|| format!("failed to remove task {}", container.task_id))?;
-    Ok(())
-}
 
-fn sanitize_name(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
+    #[tokio::test]
+    async fn starts_a_matching_stopped_recovered_container_in_place() {
+        let runtime = FakeRuntime::default();
+        let mut container = managed("task-1");
+        container.running = false;
+        container.observed = ObservedTaskState::Failed;
+        let existing = HashMap::from([("task-1".into(), container)]);
+        let response = HeartbeatResponse {
+            leader_term: 1,
+            generation: 1,
+            assignments: vec![crate::model::TaskAssignment {
+                id: "task-1".into(),
+                cluster_id: "cluster-test".into(),
+                stack: "demo".into(),
+                service: "web".into(),
+                service_id: "demo.web".into(),
+                revision: 1,
+                slot: 0,
+                spec: crate::model::ServiceSpec {
+                    image: "nginx:alpine".into(),
+                    command: Vec::new(),
+                    entrypoint: Vec::new(),
+                    environment: Vec::new(),
+                    ports: Vec::new(),
+                    volumes: Vec::new(),
+                    container_labels: Default::default(),
+                    service_labels: Default::default(),
+                    healthcheck: None,
+                    replicas: 1,
+                    constraints: Vec::new(),
+                    max_surge: 1,
+                    stop_grace_period_seconds: 10,
+                },
+                ports: Vec::new(),
+                leader_term: 1,
+                generation: 1,
+                spec_hash: "hash".into(),
+            }],
+            node_role: NodeRole::Worker,
+            controllers: Vec::new(),
+            remove_tasks: Vec::new(),
+        };
 
-async fn load_fence(path: &Path) -> Result<FenceState> {
-    match tokio::fs::read(path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .with_context(|| format!("invalid agent state {}", path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FenceState::default()),
-        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+        reconcile_containers(&runtime, &existing, &response)
+            .await
+            .unwrap();
+        assert_eq!(&*runtime.started.lock().unwrap(), &["task-1"]);
+        assert!(runtime.removed.lock().unwrap().is_empty());
     }
-}
-
-async fn save_fence(path: &Path, state: &FenceState) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let temporary = path.with_extension("tmp");
-    tokio::fs::write(&temporary, serde_json::to_vec(state)?).await?;
-    tokio::fs::rename(&temporary, path).await?;
-    Ok(())
 }

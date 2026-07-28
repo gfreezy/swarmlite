@@ -4,7 +4,10 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_yaml::Value;
 
-use crate::model::{HealthcheckSpec, ServicePort, ServiceSpec};
+use crate::{
+    caddy,
+    model::{HealthcheckSpec, ServicePort, ServiceSpec},
+};
 
 #[derive(Debug, Clone)]
 pub struct ParsedStack {
@@ -231,7 +234,7 @@ fn normalize_service(name: &str, raw: RawService) -> Result<ServiceSpec> {
         .unwrap_or(Duration::from_secs(10))
         .as_secs();
 
-    Ok(ServiceSpec {
+    let spec = ServiceSpec {
         image,
         command: raw
             .command
@@ -256,7 +259,9 @@ fn normalize_service(name: &str, raw: RawService) -> Result<ServiceSpec> {
         constraints: raw.deploy.placement.constraints,
         max_surge,
         stop_grace_period_seconds,
-    })
+    };
+    caddy::validate_service(name, &spec).map_err(anyhow::Error::msg)?;
+    Ok(spec)
 }
 
 fn normalize_healthcheck(name: &str, raw: RawHealthcheck) -> Result<HealthcheckSpec> {
@@ -383,7 +388,7 @@ mod tests {
 version: "3.8"
 services:
   web:
-    image: traefik/whoami:v1.11
+    image: nginx:1.29-alpine
     command: ["--name", "demo"]
     environment:
       MODE: production
@@ -407,8 +412,9 @@ services:
         parallelism: 2
         order: start-first
       labels:
-        traefik.enable: "true"
-        traefik.http.routers.web.rule: Host(`example.com`)
+        swarmlite.ingress.enable: "true"
+        swarmlite.ingress.host: example.com
+        swarmlite.ingress.port: "80"
 "#,
         )
         .unwrap();
@@ -423,10 +429,7 @@ services:
         );
         assert_eq!(web.ports[0].published, Some(8080));
         assert_eq!(web.environment, ["DEBUG=false", "MODE=production"]);
-        assert_eq!(
-            web.service_labels["traefik.http.routers.web.rule"],
-            "Host(`example.com`)"
-        );
+        assert_eq!(web.service_labels[caddy::HOST_LABEL], "example.com");
     }
 
     #[test]
@@ -442,5 +445,22 @@ services:
         )
         .unwrap_err();
         assert!(error.to_string().contains("only deploy.mode=replicated"));
+    }
+
+    #[test]
+    fn rejects_incomplete_ingress_configuration() {
+        let error = parse_stack(
+            r#"
+services:
+  web:
+    image: nginx
+    ports: [80]
+    deploy:
+      labels:
+        swarmlite.ingress.enable: "true"
+"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(caddy::HOST_LABEL));
     }
 }
