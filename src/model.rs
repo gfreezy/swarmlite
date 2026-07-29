@@ -9,7 +9,7 @@ pub use swarmlite_stack::{
 };
 
 pub const CLUSTER_SCHEMA_VERSION: u32 = 5;
-pub const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/swarmlite/swarmlite-caddy:latest";
+pub const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/gfreezy/swarmlite-caddy:latest";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClusterGatewayConfig {

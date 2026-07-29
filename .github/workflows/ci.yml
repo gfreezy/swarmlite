@@ -1,0 +1,211 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Run Rust tests
+        run: cargo test --workspace --all-features --locked
+
+  cli-build:
+    name: CLI (${{ matrix.artifact }})
+    needs: rust
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact: swarmlite-linux-amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: swarmlite-linux-arm64
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            artifact: swarmlite-macos-arm64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release CLI
+        run: cargo build --release --locked --bin swarmlite --target ${{ matrix.target }}
+
+      - name: Package CLI
+        shell: bash
+        run: |
+          mkdir -p dist
+          artifact_filename="${{ matrix.artifact }}.tar.gz"
+          artifact_path="dist/$artifact_filename"
+          tar -C "target/${{ matrix.target }}/release" -czf "$artifact_path" swarmlite
+          cd dist
+          shasum -a 256 "$artifact_filename" > "$artifact_filename.sha256"
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.tar.gz*
+          if-no-files-found: error
+
+  cli-release:
+    name: Publish CLI release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: cli-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Download CLI artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: swarmlite-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/* \
+            install.sh \
+            packaging/systemd/swarmlite.service \
+            --verify-tag \
+            --generate-notes \
+            --title "$GITHUB_REF_NAME"
+
+  go:
+    name: Go
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: caddy-storage
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Go from go.mod
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: caddy-storage/go.mod
+          cache-dependency-path: caddy-storage/go.sum
+
+      - name: Run Go tests
+        run: go test ./...
+
+  packaging:
+    name: Packaging
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Check installer
+        run: |
+          test -x install.sh
+          sh -n install.sh
+          shellcheck install.sh
+
+      - name: Verify systemd unit
+        run: |
+          sudo install -m 0755 /bin/true /usr/local/bin/swarmlite
+          systemd-analyze verify packaging/systemd/swarmlite.service
+
+  caddy-image:
+    name: Caddy image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/swarmlite-caddy
+          tags: |
+            type=sha,format=long
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and optionally push Caddy image
+        uses: docker/build-push-action@v7
+        with:
+          context: caddy-storage
+          file: caddy-storage/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=caddy-image
+          cache-to: type=gha,mode=max,scope=caddy-image

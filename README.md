@@ -12,6 +12,71 @@ Roles are composable:
 This is an MVP, not a drop-in replacement for Docker Swarm or Kubernetes. It intentionally has
 no overlay network or routing mesh.
 
+## Install
+
+### Linux server
+
+The one-command installer detects an existing Docker or Podman installation, installs Docker when
+neither is present, downloads and verifies the matching CLI, and installs the systemd service:
+
+```bash
+curl -fsSL https://github.com/gfreezy/swarmlite/releases/latest/download/install.sh | sudo sh
+```
+
+`auto` reuses the runtime selected by an earlier installation, then prefers an installed Docker,
+then an installed Podman. A new machine gets Docker by default. Select rootful Podman explicitly
+with:
+
+```bash
+curl -fsSL https://github.com/gfreezy/swarmlite/releases/latest/download/install.sh \
+  | sudo sh -s -- --runtime podman
+```
+
+Podman is often the shorter package installation on Fedora and RHEL. Docker remains the default
+because Swarmlite talks to the Docker API directly, while Podman is reached through its
+Docker-compatible API and an additional systemd socket.
+
+The installer supports Docker's official repositories on Ubuntu, Debian, Fedora, RHEL, and CentOS.
+Podman installation uses the distribution package manager (`apt`, `dnf`, `yum`, `zypper`, or
+`pacman`). It enables Docker or the rootful Podman API socket, but it does not guess whether this
+node should initialize or join a cluster.
+
+Initialize the first node and start it:
+
+```bash
+. /etc/swarmlite/runtime.env
+sudo swarmlite --data-dir /var/lib/swarmlite init --mode standalone \
+  --runtime "$SWARMLITE_RUNTIME" --runtime-socket "$SWARMLITE_RUNTIME_SOCKET"
+sudo systemctl enable --now swarmlite
+```
+
+For another node, replace `init` with the generated `join` command and pass the same runtime flags,
+then enable the service. Logs and status are available through systemd:
+
+```bash
+sudo systemctl status swarmlite
+sudo journalctl -u swarmlite -f
+```
+
+The installed unit is maintained in
+[`packaging/systemd/swarmlite.service`](packaging/systemd/swarmlite.service). It runs the node from
+`/usr/local/bin/swarmlite`, stores durable local state in `/var/lib/swarmlite`, and reads the chosen
+runtime from `/etc/swarmlite/runtime.env`.
+
+### macOS ARM64 CLI
+
+macOS does not install systemd or a container runtime. Docker Desktop must already be installed and
+running; otherwise the installer exits without installing Swarmlite. Run the installer without
+`sudo` so it can verify the current user's Docker Desktop socket:
+
+```bash
+curl -fsSL https://github.com/gfreezy/swarmlite/releases/latest/download/install.sh | sh
+```
+
+The installer supports Apple silicon, verifies the CLI archive, and asks for `sudo` only if writing
+to `/usr/local/bin` requires it. It accepts either `/var/run/docker.sock` or Docker Desktop's
+per-user `$HOME/.docker/run/docker.sock`.
+
 ## Build
 
 Rust 1.97 or newer is required to build Swarmlite:
@@ -20,8 +85,12 @@ Rust 1.97 or newer is required to build Swarmlite:
 cargo build --release --locked
 ```
 
+GitHub Actions also builds downloadable archives for Linux AMD64, Linux ARM64, and macOS ARM64.
+Each workflow run stores one archive and SHA-256 checksum per platform as an Actions artifact;
+tag pushes additionally publish them in a GitHub Release.
+
 The project [Dockerfile](Dockerfile) builds Swarmlite. Gateway nodes automatically pull the
-prebuilt `ghcr.io/swarmlite/swarmlite-caddy:latest` image, which contains Caddy plus the
+prebuilt `ghcr.io/gfreezy/swarmlite-caddy:latest` image, which contains Caddy plus the
 Swarmlite storage module. A Docker-compatible runtime is therefore required on deployed nodes;
 Go is needed only when developing or publishing the gateway image itself.
 
@@ -50,6 +119,10 @@ Initialize and serve the first node:
 swarmlite init --mode standalone
 swarmlite serve
 ```
+
+Those commands show foreground operation. On a Linux server installed with `install.sh`, initialize
+or join the node under `/var/lib/swarmlite` as shown above, then use
+`sudo systemctl enable --now swarmlite` instead of starting `serve` manually.
 
 The first node receives `controller,agent,gateway`. Later standalone joins receive only `agent`
 unless roles are requested explicitly.
@@ -215,7 +288,7 @@ controller discovers active gateways and publishes routing configuration automat
 listen on `:80` and `:443` by default, so normal public HTTPS needs no listener configuration.
 Advanced deployments can override the listeners with repeated `--gateway-listen` options at init.
 
-The default gateway image is `ghcr.io/swarmlite/swarmlite-caddy:latest`. Select another
+The default gateway image is `ghcr.io/gfreezy/swarmlite-caddy:latest`. Select another
 registry and tag during initialization, or roll the cluster to another image later:
 
 ```bash
