@@ -8,14 +8,14 @@ pub type NodeId = u64;
 
 /// Addresses replicated as part of Raft membership.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManagerNode {
+pub struct ControllerNode {
     /// Base URL at which the internal Raft router is mounted.
     pub raft_url: String,
     /// Public Swarmlite controller URL used for client redirects.
     pub api_url: String,
 }
 
-impl fmt::Display for ManagerNode {
+impl fmt::Display for ControllerNode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{} ({})", self.api_url, self.raft_url)
     }
@@ -117,20 +117,20 @@ openraft::declare_raft_types!(
         D = Command,
         R = CommandResponse,
         NodeId = NodeId,
-        Node = ManagerNode,
+        Node = ControllerNode,
 );
 
 pub type Entry = openraft::Entry<TypeConfig>;
 pub type Raft = openraft::Raft<TypeConfig>;
 
-pub type ClientWriteError = openraft::error::ClientWriteError<NodeId, ManagerNode>;
+pub type ClientWriteError = openraft::error::ClientWriteError<NodeId, ControllerNode>;
 pub type ClientWriteRaftError = openraft::error::RaftError<NodeId, ClientWriteError>;
-pub type CheckIsLeaderError = openraft::error::CheckIsLeaderError<NodeId, ManagerNode>;
+pub type CheckIsLeaderError = openraft::error::CheckIsLeaderError<NodeId, ControllerNode>;
 pub type CheckIsLeaderRaftError = openraft::error::RaftError<NodeId, CheckIsLeaderError>;
-pub type InitializeError = openraft::error::InitializeError<NodeId, ManagerNode>;
+pub type InitializeError = openraft::error::InitializeError<NodeId, ControllerNode>;
 pub type InitializeRaftError = openraft::error::RaftError<NodeId, InitializeError>;
 pub type RpcError<E = openraft::error::Infallible> =
-    openraft::error::RPCError<NodeId, ManagerNode, openraft::error::RaftError<NodeId, E>>;
+    openraft::error::RPCError<NodeId, ControllerNode, openraft::error::RaftError<NodeId, E>>;
 
 #[cfg(test)]
 mod tests {

@@ -1,156 +1,79 @@
 # Swarmlite
 
-Swarmlite is a small Rust container orchestrator for a single LAN or region. Every machine runs the same `swarmlite serve` command. A node initialized or assigned as a manager runs the controller, Raft, and local agent together; a worker runs only the agent.
+Swarmlite is a small Rust container orchestrator for one LAN or region. Every machine runs the
+same `swarmlite serve` command; a node's role set decides which components that process starts.
 
-All clusters use the same embedded OpenRaft control plane and local `redb` storage. One manager is the minimal setup; three managers provide HA and tolerate one manager failure. Caddy ingress is optional.
+Roles are composable:
 
-This is an MVP, not a drop-in replacement for Docker Swarm or Kubernetes. It intentionally has no overlay network or routing mesh.
+- `agent` runs containers. It is mandatory on every node and cannot be removed.
+- `controller` runs the API and a Raft voter.
+- `gateway` runs the bundled Caddy build and publishes service routes.
+
+This is an MVP, not a drop-in replacement for Docker Swarm or Kubernetes. It intentionally has
+no overlay network or routing mesh.
 
 ## Build
 
-Rust 1.97 or newer is required.
+Rust 1.97 or newer is required. A gateway node also needs the included Caddy build:
 
 ```bash
 cargo build --release --locked
+(cd caddy-storage && go build -o ../target/release/caddy ./cmd/caddy)
 ```
 
-The binary is `target/release/swarmlite`. A multi-stage [Dockerfile](Dockerfile) is also included.
+Keep `swarmlite` and `caddy` on `PATH`, or set `SWARMLITE_GATEWAY_BINARY`. The project
+[Dockerfile](Dockerfile) builds both binaries into one image.
 
 ## Commands
 
-The node lifecycle has three commands, plus cluster configuration management:
-
 ```text
-init   create a Raft cluster
-join   pull cluster settings and configure another node
-serve  run the components assigned to this node
-config get|set  read or update cluster-wide settings
+init                 initialize a standalone or HA cluster
+join                 pull cluster settings and configure another node
+serve                run this node's assigned components
+config get|set       read or update cluster-wide settings
+role get|set|add|remove
+                     read or update one node's role set
+deploy               deploy or update a stack
+status               inspect cluster state
 ```
 
-There are no separate public `controller` or `agent` commands.
+There are no separate public `controller`, `agent`, or `gateway` runtime commands.
 
 ## Quick start
 
-Initialize the first machine once, then serve it:
+Initialize and serve the first node:
 
 ```bash
-swarmlite init
+swarmlite init --mode standalone
 swarmlite serve
 ```
 
-`init` generates the cluster ID, stable node ID, and authentication token. `serve` detects the Docker or Podman socket and the address selected by the operating system's default route. If no reachable address can be detected, provide it once:
+The first node receives `controller,agent,gateway`. Later standalone joins receive only `agent`
+unless roles are requested explicitly.
+
+`serve` detects Docker or Podman and automatically selects the address used by the operating
+system's default route. Specify an address only when detection cannot choose a reachable one:
 
 ```bash
 swarmlite serve --advertise-address 10.0.0.21
 ```
 
-The override is saved in the node settings. Local node identity, credentials, CLI defaults,
-and the agent fencing cursor are stored together in `local.redb`; Swarmlite does not maintain
-separate JSON state files. The data directory defaults to `$XDG_STATE_HOME/swarmlite`, or
-`$HOME/.local/state/swarmlite` when `XDG_STATE_HOME` is unset. A system service should normally use:
+The override is persisted. Node identity, credentials, roles, CLI defaults, and the agent fence
+are stored together in `local.redb`; Swarmlite does not maintain separate JSON state files. The
+default data directory is `$XDG_STATE_HOME/swarmlite`, or `$HOME/.local/state/swarmlite`.
 
 ```bash
 swarmlite --data-dir /var/lib/swarmlite serve
 ```
 
-The manager count passed to `init` is one-time bootstrap data. The first successful `serve`
-writes it into Raft and clears the bootstrap marker in `local.redb`. Joined nodes never persist
-a local copy of the desired manager count; Raft remains the authoritative source.
-
-Deploy and inspect a stack without repeating the controller URL or token:
+Deploy and inspect a stack using the saved controller URL and token:
 
 ```bash
-swarmlite deploy --name demo --file examples/stack-standalone.yaml
+swarmlite deploy --name demo --file examples/stack.yaml
 swarmlite status
 ```
 
-A one-manager cluster can have multiple workers. Node-local state is stored in `local.redb`,
-while controller-only Raft state is stored in `raft/raft.redb`.
-
-## Raft persistence boundary
-
-Raft stores only state needed to reconstruct the desired cluster:
-
-- cluster settings, stacks, and service specifications;
-- desired task assignments, allocated ports, and drain deadlines;
-- manager identities and pending manager reservations;
-- the optional generic KV namespace and its short-lived lock leases;
-- Raft's own log, membership, term, vote, and snapshot metadata.
-
-Heartbeat-derived state is intentionally disposable. Node liveness and resources, task observed state and container IDs, the current leader record, and request-deduplication history stay in memory. After a leader change, nodes rebuild that state through heartbeats; existing task assignments receive one node-timeout grace period before failover decisions are made.
-
-## Generic KV service
-
-The controller exposes a small authenticated KV API. It has no Caddy, certificate, or TLS
-semantics; integrations decide what their keys and values mean. Values are opaque base64 data,
-keys are slash-separated strings, and each mutation carries a client-generated hybrid-clock
-version. Conflicts use last-write-wins ordering by
-`(physical_unix_ms, logical, replica_id)`.
-
-- `GET`, `PUT`, and `DELETE /v1/kv` read, write, or tombstone a key.
-- `GET /v1/kv/keys` lists a prefix, directly or recursively.
-- `GET /v1/kv/stat` reads value or prefix metadata.
-- `POST /v1/kv/locks/{acquire,renew,release}` provides generic expiring locks with fencing tokens.
-
-All endpoints use the cluster bearer token and redirect followers to the Raft leader. A key is
-limited to 1024 bytes, a value to 4 MiB, and a lock lease to 1 second through 5 minutes. Writes
-need a Raft quorum. Consumers that use this service as an optional cache should continue locally
-when it is unavailable. Extreme control-plane recovery does not attempt to reconstruct KV data.
-Request and response bodies are documented in [docs/kv-api.md](docs/kv-api.md).
-
-## Recover a lost control plane
-
-Every newly created task container carries the minimal recovery identity labels for its
-cluster, task, stack, service, replica slot, service-spec hash, published ports, and task
-revision. Runtime-management labels also mark the container as managed and retain its
-service ID and stop grace period. Raft terms, state generations, cluster epochs, and claim
-signatures are not stored as container labels. The labels do not contain the complete stack
-file. Keep the original stack file separately.
-
-Extreme recovery deliberately rebuilds the control plane instead of trying to restore an old
-Raft membership. Stop every old `swarmlite serve` process, then run this on a machine that
-still has local cluster state or managed containers:
-
-```bash
-swarmlite init --recover
-swarmlite serve
-```
-
-`init --recover` detects the single old cluster ID, archives the previous `local.redb` and Raft
-directory under `recovery-backup/`, prepares a fresh single-voter Raft,
-and rotates the join token. If `local.redb` is unreadable, a single consistent cluster ID on the
-managed containers is sufficient. Recovery never deletes or changes a container.
-
-Join and serve the other machines with the new token. `join` may be run on an already
-initialized node: when the target has the same cluster ID but a different token, it archives
-the stale local control plane, assigns a fresh node and Raft identity, resets the local fence,
-and leaves the runtime untouched. Once every machine has reported its containers, deploy the
-same stack file and stack name:
-
-```bash
-swarmlite deploy --name demo --file stack.yaml
-```
-
-The controller adopts containers whose cluster ID, stack name, service name, replica slot,
-and normalized service-spec hash match. Adoption preserves a running container and its
-published ports; a matching stopped container is started in place. Containers that do not
-match remain unclaimed and are never deleted merely because they are absent from the new
-control plane. `swarmlite status` reports `recovery.awaiting_adoption` and duplicate logical
-slots in `recovery.conflicting_slots`.
-
-Normal `init` refuses to run when the local data directory, local Raft directory, controller
-port, or local managed containers indicate an existing cluster. Recovery refuses mixed
-cluster IDs and managed containers without the required cluster ID. These checks are local:
-before recovery, make sure every old `serve` process is stopped to avoid two control planes or
-agents managing the same workload. A per-node `serve.lock` prevents init or join from rewriting
-local state while a local service is still running.
-
-Existing containers continue running while the control plane is unavailable, but deploy,
-rescheduling, failover, and ingress updates are unavailable until recovery completes.
-Containers created by versions that predate the recovery labels cannot be adopted
-automatically.
-
-## Join another machine
+## Join nodes and assign roles
 
 Print a join command on an initialized node:
 
@@ -158,150 +81,177 @@ Print a join command on an initialized node:
 swarmlite join-token
 ```
 
-Run the printed command on the new machine, then use the same runtime command as every other node:
+Run it on another machine, then start the same runtime command:
 
 ```bash
 swarmlite join http://10.0.0.21:8080 --token '<generated-token>'
 swarmlite serve
 ```
 
-`join` automatically:
+The default role allocation is:
 
-- pulls the manager count, Caddy settings, and controller addresses;
-- detects and persists the node address; `serve` detects the container runtime;
-- receives a manager or worker assignment from the Raft leader;
-- saves the node identity, role, token, and controller list locally.
+| Mode | First node | Later automatic joins |
+| --- | --- | --- |
+| `standalone` | `controller,agent,gateway` | `agent` |
+| `ha` | `controller,agent,gateway` | `controller,agent` until 3 controllers exist, then `agent` |
 
-With one configured manager, joined nodes are workers. With three or more, joined nodes receive available manager slots automatically.
+Gateway is never assigned automatically after `init`. A cluster must retain at least one gateway,
+but gateway count has no upper limit. Request an exact role set during join when needed; `agent`
+is added automatically:
 
-## Three-manager HA
+```bash
+swarmlite join http://10.0.0.21:8080 \
+  --token '<generated-token>' \
+  --roles gateway
+```
 
-Initialize the first manager with an odd manager count:
+An explicit join is all-or-nothing. It fails if its controller request would exceed the mode's
+limit. Existing nodes keep their reserved roles while offline.
+
+Read or change a joined node after startup:
+
+```bash
+swarmlite role get node-a
+swarmlite role set node-a agent,gateway
+swarmlite role add node-b controller
+swarmlite role remove node-c controller
+```
+
+`set` replaces the role set except for mandatory `agent`; `add` and `remove` change only the
+listed roles. Swarmlite refuses to remove the final controller or final gateway. To move a
+controller, remove it from the old node before adding it to the new one. Removing the current
+leader first commits the new role set, removes that voter, and lets the remaining voters elect a
+new leader. To move a gateway, add the new gateway first, then remove the old one.
+
+## HA
+
+Initialize HA directly:
 
 ```console
-first$ swarmlite init --controllers 3
+first$ swarmlite init --mode ha
 first$ swarmlite serve
 ```
 
-Join and serve two more machines using the command printed by `join-token`:
+The next two default joins receive `controller,agent`; later joins receive only `agent`. Three
+controller voters tolerate one controller failure. A joining controller starts as a Raft learner
+and is promoted after it starts and reports the assigned role.
 
-```console
-second$ swarmlite join http://10.0.0.21:8080 --token '<generated-token>'
-second$ swarmlite serve
+A live standalone cluster can be promoted in place:
 
-third$ swarmlite join http://10.0.0.21:8080 --token '<generated-token>'
-third$ swarmlite serve
+```bash
+swarmlite config set mode ha
 ```
 
-Each new manager starts as a Raft learner. The leader waits for it to catch up before promoting it to a voter. Raft RPC is authenticated with the cluster token and shares the controller port under `/internal/raft`; that port must be mutually reachable between managers.
-
-Use 1, 3, or 5 managers. Three voters tolerate one failure; five tolerate two. Two managers are rejected because they still lose quorum after one failure.
-
-Controller addresses are included in heartbeat responses and persisted by every node, so workers do not need a hand-written controller list.
-
-## Update cluster configuration
-
-Read the current configuration from the Raft leader:
+The controller deterministically assigns existing automatically joined agent nodes until the cluster
+has three controllers. Future joins fill any remaining slots. Switching HA back to standalone is
+not supported.
 
 ```bash
 swarmlite config get
 ```
 
-Change the desired manager count after initialization:
+Cluster configuration and node roles are replicated through Raft. Controller addresses are sent
+in heartbeats and persisted locally, so agents do not need a hand-written controller list.
+
+## Gateway and HTTPS
+
+A gateway role makes `serve` start the bundled Caddy binary. The first node is always a gateway;
+additional gateways are opt-in. The controller discovers active gateways and publishes routing
+configuration automatically. Use `--gateway-listen` during init to change the default `:80`:
 
 ```bash
-swarmlite config set controllers 3
+swarmlite init --gateway-listen :80 --gateway-listen :443
 ```
 
-The value must be `1` or an odd number greater than or equal to `3`. The setting is replicated through Raft. Increasing it lets eligible workers fill the new manager slots through their normal heartbeats. Decreasing it makes the leader remove excess non-leader managers one at a time. The command changes the cluster-wide desired count; there are no per-node role commands.
+Supported service labels under `deploy.labels` are:
 
-Both commands use the controller address and token saved by `init` or `join`. From an uninitialized machine, pass them explicitly with `--controller` and `--token`.
+- `swarmlite.gateway.enable=true`
+- `swarmlite.gateway.host`, containing one host or a comma-separated host list
+- `swarmlite.gateway.port`, the container HTTP port
+- `swarmlite.gateway.scheme=http|https`, defaulting to `http`
 
-## Optional Caddy ingress
+Caddy performs normal automatic HTTPS for routed hostnames. Its local certificate storage lives
+under the node data directory at `caddy/` and remains authoritative. The included generic
+Swarmlite storage adapter uses the controller KV and lock APIs only as a best-effort cross-gateway
+cache to reduce duplicate certificate requests. Loss of quorum or total loss of Swarmlite's KV
+state does not remove local certificates; a gateway can fall back to local locking and may issue a
+duplicate certificate. See [caddy-storage/README.md](caddy-storage/README.md).
 
-Caddy is unnecessary when services publish host ports directly. Configure it during initialization when host-based ingress is needed:
+The gateway admin API listens on port 2019 so the controller can publish routes. Restrict that
+port to trusted cluster nodes.
+
+During rolling updates, old healthy tasks remain routable until replacements are healthy and all
+active gateways acknowledge the new routing configuration.
+
+## Generic KV service
+
+The authenticated controller KV API has no Caddy, certificate, or TLS semantics. Integrations
+choose their own keys and values. Values are opaque base64 data and mutations use last-write-wins
+ordering by `(physical_unix_ms, logical, replica_id)`.
+
+- `GET`, `PUT`, and `DELETE /v1/kv`
+- `GET /v1/kv/keys`
+- `GET /v1/kv/stat`
+- `POST /v1/kv/locks/{acquire,renew,release}`
+
+Consumers that treat it as an optional cache should continue locally when it is unavailable.
+Request and response bodies are documented in [docs/kv-api.md](docs/kv-api.md).
+
+## Persistence and extreme recovery
+
+Raft persists cluster settings, member roles, stacks, service specifications, desired task
+assignments, ports, drain deadlines, controller identities, KV state, and Raft metadata.
+Heartbeat liveness, resources, and observed container state are rebuilt from agent heartbeats.
+
+Every managed container carries the minimal labels needed to collect it after total control-plane
+loss: cluster, task, stack, service, slot, revision, normalized spec hash, and published ports.
+The labels do not contain the full stack. Keep the original stack file separately.
+
+Stop every old `swarmlite serve`, then rebuild the control plane on a machine that still has local
+cluster state or managed containers:
 
 ```bash
-caddy run --config examples/caddy.json
-
-swarmlite init \
-  --caddy-admin http://127.0.0.1:2019 \
-  --caddy-listen :80
+swarmlite init --recover
+swarmlite serve
 ```
 
-Use the same flags together with `--controllers 3` for a three-manager cluster. The settings are cluster-wide and automatically pulled by joined managers.
+Recovery detects the old cluster ID, archives stale `local.redb` and Raft data under
+`recovery-backup/`, creates a fresh standalone control plane, and rotates the join token. It never
+deletes or changes a container. Rejoin and serve other nodes using the new token, then deploy the
+same stack name and file:
 
-Supported service labels under `deploy.labels`:
+```bash
+swarmlite deploy --name demo --file stack.yaml
+```
 
-- `swarmlite.ingress.enable=true`
-- `swarmlite.ingress.host`, with one host or a comma-separated host list
-- `swarmlite.ingress.port`, the container HTTP port
-- `swarmlite.ingress.scheme=http|https`, defaulting to `http`
-
-Only the leader publishes Caddy configuration. During rolling updates, old healthy tasks remain routable until replacements are healthy and every Caddy endpoint acknowledges the new routing configuration.
-
-Swarmlite's KV API can optionally reduce duplicate certificate issuance across Caddy instances.
-This is implemented by the independent [Caddy storage adapter](caddy-storage/README.md), not by
-the Rust control plane. Caddy's normal local filesystem remains authoritative: loss of quorum,
-loss of all Swarmlite state, or removing the adapter does not remove local certificates or stop
-Caddy. In those cases, different machines may request the same certificate again.
+Matching containers are adopted by cluster ID, stack, service, slot, and spec hash. Running
+containers stay running; matching stopped containers are started in place. Unmatched containers
+remain unclaimed. `swarmlite status` reports `recovery.awaiting_adoption` and
+`recovery.conflicting_slots`.
 
 ## Runtime and networking
 
-Swarmlite detects these sockets automatically:
-
-```text
-Docker          /var/run/docker.sock
-Docker Desktop  $HOME/.docker/run/docker.sock
-Podman          /run/podman/podman.sock
-Rootless Podman $XDG_RUNTIME_DIR/podman/podman.sock
-```
-
-Override detection when needed:
+Detected runtime sockets include Docker, Docker Desktop, Podman, and rootless Podman. Override
+detection when necessary:
 
 ```bash
 swarmlite serve --runtime podman --runtime-socket /run/podman/podman.sock
 ```
 
-Runtime socket access is equivalent to root privileges. A manager role does not change this: every served node also runs its local agent.
-
-There is no cross-node container network. The controller assigns host ports from each agent's configured range, and Caddy connects to:
-
-```text
-node-advertise-address:allocated-host-port
-```
-
-The controller API port and allocated node port range must be reachable inside the LAN.
-
-## Implemented stack fields
-
-- `services.*.image`
-- `command`, `entrypoint`, `environment`
-- short and long `ports`
-- short and long `volumes`
-- container `labels`
-- `healthcheck`
-- `stop_grace_period`
-- `deploy.replicas`
-- `deploy.placement.constraints`
-- `deploy.update_config.parallelism` and `order`
-- `deploy.labels`, including Swarmlite ingress labels
-
-Supported constraints are `node.id`, `node.hostname`, and `node.labels.*` with `==` or `!=`.
+Every served node runs the agent, so runtime socket access is required everywhere and is
+equivalent to root privileges. There is no cross-node container network. The controller allocates
+host ports and gateways connect to `node-advertise-address:allocated-host-port`.
 
 ## Current limitations
 
-- Linux Docker and Podman nodes are the intended targets; Windows containers are not tested.
+- Linux Docker and Podman nodes are the intended targets.
 - No overlay networking, service VIP, routing mesh, or cross-node DNS.
-- `deploy.mode: global` is rejected; only replicated services are supported.
+- Only replicated services are supported; `deploy.mode: global` is rejected.
 - No Compose `build`, `configs`, `secrets`, resource reservations, or autoscaling.
-- Named volumes and bind mounts remain node-local. Pin stateful services with placement constraints.
-- Automatic task failover is intended for stateless services. Databases need their own replication and leader election.
-- Private-registry authentication is not yet forwarded to image pulls.
-- Ingress supports host matching and HTTP/HTTPS upstreams, but not arbitrary Caddy handlers.
-- Every configured Caddy instance must already contain `apps.http.servers`.
-- The API is HTTP. Use a trusted private network or terminate TLS in front of it.
-- Adding managers requires an active Raft quorum. If every Raft copy is permanently lost, only containers carrying the recovery labels can be adopted into a new control plane; the original stack files are still required.
+- Named volumes and bind mounts remain node-local.
+- Gateway routing supports host matching and HTTP/HTTPS upstreams, not arbitrary Caddy handlers.
+- The controller API is HTTP; use a trusted private network or terminate TLS in front of it.
+- Controller membership changes require a live Raft quorum.
 
 ## Test
 
@@ -309,4 +259,5 @@ Supported constraints are `node.id`, `node.hostname`, and `node.labels.*` with `
 cargo fmt --all --check
 cargo test --locked
 cargo clippy --all-targets --all-features -- -D warnings
+(cd caddy-storage && go test ./...)
 ```

@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_yaml::Value;
 
 use crate::{
-    caddy,
+    gateway,
     model::{HealthcheckSpec, ServicePort, ServiceSpec},
 };
 
@@ -260,7 +260,7 @@ fn normalize_service(name: &str, raw: RawService) -> Result<ServiceSpec> {
         max_surge,
         stop_grace_period_seconds,
     };
-    caddy::validate_service(name, &spec).map_err(anyhow::Error::msg)?;
+    gateway::validate_service(name, &spec).map_err(anyhow::Error::msg)?;
     Ok(spec)
 }
 
@@ -412,9 +412,9 @@ services:
         parallelism: 2
         order: start-first
       labels:
-        swarmlite.ingress.enable: "true"
-        swarmlite.ingress.host: example.com
-        swarmlite.ingress.port: "80"
+        swarmlite.gateway.enable: "true"
+        swarmlite.gateway.host: example.com
+        swarmlite.gateway.port: "80"
 "#,
         )
         .unwrap();
@@ -429,7 +429,7 @@ services:
         );
         assert_eq!(web.ports[0].published, Some(8080));
         assert_eq!(web.environment, ["DEBUG=false", "MODE=production"]);
-        assert_eq!(web.service_labels[caddy::HOST_LABEL], "example.com");
+        assert_eq!(web.service_labels[gateway::HOST_LABEL], "example.com");
     }
 
     #[test]
@@ -448,7 +448,7 @@ services:
     }
 
     #[test]
-    fn rejects_incomplete_ingress_configuration() {
+    fn rejects_incomplete_gateway_configuration() {
         let error = parse_stack(
             r#"
 services:
@@ -457,10 +457,10 @@ services:
     ports: [80]
     deploy:
       labels:
-        swarmlite.ingress.enable: "true"
+        swarmlite.gateway.enable: "true"
 "#,
         )
         .unwrap_err();
-        assert!(error.to_string().contains(caddy::HOST_LABEL));
+        assert!(error.to_string().contains(gateway::HOST_LABEL));
     }
 }

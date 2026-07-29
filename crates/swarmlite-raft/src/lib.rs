@@ -22,14 +22,14 @@ pub use network::{HttpNetwork, rpc_router};
 pub use storage::{RedbLogStore, RedbStateMachine, open_storage};
 pub use types::{
     CheckIsLeaderError, CheckIsLeaderRaftError, ClientWriteError, ClientWriteRaftError, Command,
-    CommandOutcome, CommandResponse, InitializeError, InitializeRaftError, ManagerNode, NodeId,
+    CommandOutcome, CommandResponse, ControllerNode, InitializeError, InitializeRaftError, NodeId,
     Raft, ReplicatedState, RpcError, TypeConfig,
 };
 
 #[derive(Clone)]
 pub struct NodeConfig {
     pub node_id: NodeId,
-    pub node: ManagerNode,
+    pub node: ControllerNode,
     pub data_dir: PathBuf,
     pub cluster_name: String,
     pub token: String,
@@ -39,7 +39,7 @@ pub struct NodeConfig {
 impl NodeConfig {
     pub fn new(
         node_id: NodeId,
-        node: ManagerNode,
+        node: ControllerNode,
         data_dir: impl Into<PathBuf>,
         cluster_name: impl Into<String>,
         token: impl Into<String>,
@@ -124,10 +124,10 @@ impl From<ClientWriteRaftError> for SubmitError {
     }
 }
 
-/// One embedded manager node. Workers do not construct this type.
+/// One embedded controller node. Agent-only nodes do not construct this type.
 pub struct RaftNode {
     node_id: NodeId,
-    node: ManagerNode,
+    node: ControllerNode,
     token: String,
     raft: Raft,
     state_machine: RedbStateMachine,
@@ -169,7 +169,7 @@ impl RaftNode {
         self.node_id
     }
 
-    pub fn local_node(&self) -> &ManagerNode {
+    pub fn local_node(&self) -> &ControllerNode {
         &self.node
     }
 
@@ -222,11 +222,11 @@ impl RaftNode {
         Ok(self.state_machine.state().await)
     }
 
-    /// Add a manager as a learner and wait until it catches up.
+    /// Add a controller as a learner and wait until it catches up.
     pub async fn add_learner(
         &self,
         node_id: NodeId,
-        node: ManagerNode,
+        node: ControllerNode,
     ) -> Result<(), ClientWriteRaftError> {
         self.raft.add_learner(node_id, node, true).await?;
         Ok(())
@@ -240,7 +240,7 @@ impl RaftNode {
         Ok(())
     }
 
-    /// Remove a voter. Callers must enforce their desired odd-manager policy.
+    /// Remove a voter. Callers must enforce their controller-count policy.
     pub async fn remove_voter(
         &self,
         node_id: NodeId,
@@ -274,7 +274,7 @@ impl RaftNode {
             .collect()
     }
 
-    pub fn member(&self, node_id: NodeId) -> Option<ManagerNode> {
+    pub fn member(&self, node_id: NodeId) -> Option<ControllerNode> {
         self.raft
             .metrics()
             .borrow()
@@ -288,11 +288,11 @@ impl RaftNode {
         self.raft.metrics().borrow().current_term
     }
 
-    pub fn metrics(&self) -> RaftMetrics<NodeId, ManagerNode> {
+    pub fn metrics(&self) -> RaftMetrics<NodeId, ControllerNode> {
         self.raft.metrics().borrow().clone()
     }
 
-    pub fn leader(&self) -> Option<(NodeId, ManagerNode)> {
+    pub fn leader(&self) -> Option<(NodeId, ControllerNode)> {
         let metrics = self.metrics();
         let leader_id = metrics.current_leader?;
         let node = metrics
@@ -335,7 +335,7 @@ mod tests {
     #[tokio::test]
     async fn single_node_commits_and_recovers_state() {
         let directory = tempfile::tempdir().unwrap();
-        let node = ManagerNode {
+        let node = ControllerNode {
             raft_url: "http://127.0.0.1:19090/internal/raft".into(),
             api_url: "http://127.0.0.1:19090".into(),
         };

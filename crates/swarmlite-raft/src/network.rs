@@ -14,7 +14,7 @@ use openraft::raft::{
 use reqwest::Client;
 use serde::{Serialize, de::DeserializeOwned};
 
-use crate::types::{ManagerNode, NodeId, Raft, RpcError, TypeConfig};
+use crate::types::{ControllerNode, NodeId, Raft, RpcError, TypeConfig};
 
 #[derive(Debug, Clone)]
 pub struct HttpNetwork {
@@ -33,10 +33,10 @@ impl HttpNetwork {
     async fn send_rpc<Req, Resp, Err>(
         &self,
         target: NodeId,
-        target_node: &ManagerNode,
+        target_node: &ControllerNode,
         route: &str,
         request: &Req,
-    ) -> Result<Resp, openraft::error::RPCError<NodeId, ManagerNode, Err>>
+    ) -> Result<Resp, openraft::error::RPCError<NodeId, ControllerNode, Err>>
     where
         Req: Serialize + ?Sized,
         Resp: DeserializeOwned,
@@ -81,7 +81,7 @@ impl HttpNetwork {
 impl RaftNetworkFactory<TypeConfig> for HttpNetwork {
     type Network = HttpConnection;
 
-    async fn new_client(&mut self, target: NodeId, node: &ManagerNode) -> Self::Network {
+    async fn new_client(&mut self, target: NodeId, node: &ControllerNode) -> Self::Network {
         HttpConnection {
             network: self.clone(),
             target,
@@ -93,7 +93,7 @@ impl RaftNetworkFactory<TypeConfig> for HttpNetwork {
 pub struct HttpConnection {
     network: HttpNetwork,
     target: NodeId,
-    node: ManagerNode,
+    node: ControllerNode,
 }
 
 impl RaftNetwork<TypeConfig> for HttpConnection {
@@ -135,7 +135,7 @@ struct RpcState {
 }
 
 /// Returns the authenticated internal router. Mount this router at the URL
-/// stored in [`ManagerNode::raft_url`], for example `/internal/raft`.
+/// stored in [`ControllerNode::raft_url`], for example `/internal/raft`.
 pub fn rpc_router(raft: Raft, token: impl Into<String>) -> Router {
     Router::new()
         .route("/vote", post(vote))

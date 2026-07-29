@@ -32,7 +32,7 @@ async fn run_with_runtime<R: ContainerRuntime>(
 ) -> Result<()> {
     runtime.ping().await?;
     let system = runtime.system_info().await?;
-    let node = NodeRecord {
+    let mut node = NodeRecord {
         id: config.node_id.clone(),
         address: config.advertise_address.clone(),
         labels: config.labels.clone(),
@@ -40,7 +40,7 @@ async fn run_with_runtime<R: ContainerRuntime>(
         memory_bytes: system.memory_bytes,
         port_range_start: config.port_range.start,
         port_range_end: config.port_range.end,
-        controller_capable: config.controller_capable,
+        roles: config.roles.clone(),
         controller_url: config.controller_url.clone(),
         raft_id: config.raft_id,
         raft_url: config.raft_url.clone(),
@@ -54,10 +54,10 @@ async fn run_with_runtime<R: ContainerRuntime>(
     let mut controllers = config.controllers.clone();
     let (assignments_tx, assignments_rx) = tokio::sync::watch::channel(None);
     let runtime = Arc::new(runtime);
-    let worker_runtime = Arc::clone(&runtime);
-    let worker_cluster_id = config.cluster_id.clone();
+    let reconcile_runtime = Arc::clone(&runtime);
+    let reconcile_cluster_id = config.cluster_id.clone();
     tokio::spawn(async move {
-        reconciliation_worker(worker_runtime, assignments_rx, worker_cluster_id).await;
+        reconciliation_loop(reconcile_runtime, assignments_rx, reconcile_cluster_id).await;
     });
     let mut ticker = tokio::time::interval(Duration::from_secs(config.heartbeat_interval_seconds));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -132,9 +132,11 @@ async fn run_with_runtime<R: ContainerRuntime>(
             controllers.clone_from(&response.controllers);
         }
         let next_control = NodeControl {
-            role: response.node_role,
+            cluster: response.cluster.clone(),
+            roles: response.roles.clone(),
             controllers: controllers.clone(),
         };
+        node.roles.clone_from(&response.roles);
         updates.send_if_modified(|current| {
             if *current == next_control {
                 false
@@ -144,12 +146,12 @@ async fn run_with_runtime<R: ContainerRuntime>(
             }
         });
         if assignments_tx.send(Some(response)).is_err() {
-            bail!("container reconciliation worker stopped unexpectedly");
+            bail!("container reconciliation loop stopped unexpectedly");
         }
     }
 }
 
-async fn reconciliation_worker<R: ContainerRuntime>(
+async fn reconciliation_loop<R: ContainerRuntime>(
     runtime: Arc<R>,
     mut assignments: tokio::sync::watch::Receiver<Option<HeartbeatResponse>>,
     cluster_id: String,
@@ -161,7 +163,7 @@ async fn reconciliation_worker<R: ContainerRuntime>(
         let existing = match runtime.list_managed(&cluster_id).await {
             Ok(containers) => containers,
             Err(error) => {
-                error!(%error, "failed to inspect containers in reconciliation worker");
+                error!(%error, "failed to inspect containers in reconciliation loop");
                 continue;
             }
         };
@@ -270,7 +272,9 @@ mod tests {
 
     use crate::{
         config::RuntimeKind,
-        model::{HeartbeatResponse, NodeRole},
+        model::{
+            ClusterGatewayConfig, ClusterMode, ClusterSettings, HeartbeatResponse, agent_roles,
+        },
         runtime::RuntimeSystemInfo,
     };
 
@@ -341,6 +345,18 @@ mod tests {
         }
     }
 
+    fn test_cluster() -> ClusterSettings {
+        ClusterSettings {
+            schema_version: 3,
+            cluster_id: "cluster-test".into(),
+            mode: ClusterMode::Standalone,
+            controller_port: 8080,
+            gateway: ClusterGatewayConfig {
+                listen: vec![":80".into()],
+            },
+        }
+    }
+
     #[tokio::test]
     async fn leaves_unknown_containers_untouched_until_explicitly_removed() {
         let runtime = FakeRuntime::default();
@@ -348,8 +364,9 @@ mod tests {
         let mut response = HeartbeatResponse {
             leader_term: 1,
             generation: 1,
+            cluster: test_cluster(),
             assignments: Vec::new(),
-            node_role: NodeRole::Worker,
+            roles: agent_roles(),
             controllers: Vec::new(),
             remove_tasks: Vec::new(),
         };
@@ -376,6 +393,7 @@ mod tests {
         let response = HeartbeatResponse {
             leader_term: 1,
             generation: 1,
+            cluster: test_cluster(),
             assignments: vec![crate::model::TaskAssignment {
                 id: "task-1".into(),
                 cluster_id: "cluster-test".into(),
@@ -404,7 +422,7 @@ mod tests {
                 generation: 1,
                 spec_hash: "hash".into(),
             }],
-            node_role: NodeRole::Worker,
+            roles: agent_roles(),
             controllers: Vec::new(),
             remove_tasks: Vec::new(),
         };

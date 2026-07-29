@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::sync::RwLock;
 
 use crate::types::{
-    ApplicationState, CommandOutcome, CommandResponse, Entry, ManagerNode, NodeId, ReplicatedState,
-    TypeConfig,
+    ApplicationState, CommandOutcome, CommandResponse, ControllerNode, Entry, NodeId,
+    ReplicatedState, TypeConfig,
 };
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_meta");
@@ -38,13 +38,13 @@ type StorageResult<T> = Result<T, StorageError<NodeId>>;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct DurableStateMachine {
     last_applied_log: Option<LogId<NodeId>>,
-    last_membership: StoredMembership<NodeId, ManagerNode>,
+    last_membership: StoredMembership<NodeId, ControllerNode>,
     application: ApplicationState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredSnapshot {
-    meta: SnapshotMeta<NodeId, ManagerNode>,
+    meta: SnapshotMeta<NodeId, ControllerNode>,
     data: Vec<u8>,
 }
 
@@ -176,7 +176,10 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
 
     async fn applied_state(
         &mut self,
-    ) -> StorageResult<(Option<LogId<NodeId>>, StoredMembership<NodeId, ManagerNode>)> {
+    ) -> StorageResult<(
+        Option<LogId<NodeId>>,
+        StoredMembership<NodeId, ControllerNode>,
+    )> {
         let durable = self.inner.read().await;
         Ok((durable.last_applied_log, durable.last_membership.clone()))
     }
@@ -218,7 +221,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
 
     async fn install_snapshot(
         &mut self,
-        meta: &SnapshotMeta<NodeId, ManagerNode>,
+        meta: &SnapshotMeta<NodeId, ControllerNode>,
         snapshot: Box<<TypeConfig as openraft::RaftTypeConfig>::SnapshotData>,
     ) -> StorageResult<()> {
         let data = snapshot.into_inner();

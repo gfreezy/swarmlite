@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use axum::Router;
-use swarmlite_raft::{CommandOutcome, ManagerNode, NodeConfig, RaftNode};
+use swarmlite_raft::{CommandOutcome, ControllerNode, NodeConfig, RaftNode};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -61,14 +61,14 @@ async fn replicates_over_http_after_learners_are_promoted() {
     let mut nodes = Vec::new();
     for (index, directory) in directories.iter().enumerate() {
         let base_url = format!("http://{}", addresses[index]);
-        let manager = ManagerNode {
+        let controller = ControllerNode {
             raft_url: format!("{base_url}/internal/raft"),
             api_url: base_url,
         };
         nodes.push(
             RaftNode::open(NodeConfig::new(
                 index as u64 + 1,
-                manager,
+                controller,
                 directory.path(),
                 "three-node-test",
                 token,
@@ -87,7 +87,7 @@ async fn replicates_over_http_after_learners_are_promoted() {
     nodes[0]
         .raft()
         .wait(Some(Duration::from_secs(10)))
-        .current_leader(1, "first manager becomes leader")
+        .current_leader(1, "first controller becomes leader")
         .await
         .unwrap();
 

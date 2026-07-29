@@ -19,6 +19,6 @@ services:
         parallelism: 1
         order: start-first
       labels:
-        swarmlite.ingress.enable: "true"
-        swarmlite.ingress.host: example.com
-        swarmlite.ingress.port: "80"
+        swarmlite.gateway.enable: "true"
+        swarmlite.gateway.host: example.com
+        swarmlite.gateway.port: "80"

@@ -1,22 +1,24 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use serde::{Deserialize, Serialize};
-use swarmlite_raft::{CommandOutcome, ManagerNode, NodeId, RaftNode, ReplicatedState, SubmitError};
+use swarmlite_raft::{
+    CommandOutcome, ControllerNode, NodeId, RaftNode, ReplicatedState, SubmitError,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::model::{
-    ClusterSettings, ClusterState, ControllerRecord, DesiredTaskState, KvState, ObservedTaskState,
-    PortBinding, ServiceRecord, StackRecord, TaskRecord,
+    ClusterSettings, ClusterState, ControllerRecord, DesiredTaskState, KvState, NodeMember,
+    ObservedTaskState, PortBinding, ServiceRecord, StackRecord, TaskRecord,
 };
 
-const PERSISTED_SCHEMA_VERSION: u32 = 3;
+const PERSISTED_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("control-plane state was modified concurrently")]
     Conflict,
-    #[error("this manager is not the Raft leader")]
+    #[error("this controller is not the Raft leader")]
     NotLeader(Option<String>),
     #[error("Raft storage error: {0}")]
     Backend(String),
@@ -48,6 +50,7 @@ struct PersistedClusterState {
     stacks: BTreeMap<String, StackRecord>,
     services: BTreeMap<String, ServiceRecord>,
     tasks: BTreeMap<String, PersistedTaskRecord>,
+    members: BTreeMap<String, NodeMember>,
     controllers: BTreeMap<String, ControllerRecord>,
 }
 
@@ -101,7 +104,7 @@ impl StateRepository {
         self.raft.voter_ids().contains(&node_id)
     }
 
-    pub async fn ensure_voter(&self, node_id: NodeId, node: ManagerNode) -> StorageResult<()> {
+    pub async fn ensure_voter(&self, node_id: NodeId, node: ControllerNode) -> StorageResult<()> {
         if let Some(existing) = self.raft.member(node_id) {
             if self.is_voter(node_id) {
                 if existing != node {
@@ -274,7 +277,7 @@ fn same_cluster_identity(left: &ClusterSettings, right: &ClusterSettings) -> boo
     left.schema_version == right.schema_version
         && left.cluster_id == right.cluster_id
         && left.controller_port == right.controller_port
-        && left.caddy == right.caddy
+        && left.gateway == right.gateway
 }
 
 impl PersistedClusterState {
@@ -287,6 +290,7 @@ impl PersistedClusterState {
                 .iter()
                 .map(|(id, task)| (id.clone(), PersistedTaskRecord::from_runtime(task)))
                 .collect(),
+            members: state.members.clone(),
             controllers: state.controllers.clone(),
         }
     }
@@ -301,6 +305,7 @@ impl PersistedClusterState {
                 .into_iter()
                 .map(|(id, task)| (id, task.into_runtime()))
                 .collect(),
+            members: self.members,
             controllers: self.controllers,
             unclaimed_tasks: BTreeMap::new(),
         }
@@ -341,7 +346,7 @@ fn map_submit_error(error: SubmitError) -> StorageError {
     match error {
         SubmitError::EmptyRequestId => StorageError::Backend(error.to_string()),
         SubmitError::Raft(error) => {
-            if let Some(forward) = error.forward_to_leader::<ManagerNode>() {
+            if let Some(forward) = error.forward_to_leader::<ControllerNode>() {
                 StorageError::NotLeader(
                     forward
                         .leader_node
@@ -356,7 +361,7 @@ fn map_submit_error(error: SubmitError) -> StorageError {
 }
 
 fn map_raft_error(error: swarmlite_raft::ClientWriteRaftError) -> StorageError {
-    if let Some(forward) = error.forward_to_leader::<ManagerNode>() {
+    if let Some(forward) = error.forward_to_leader::<ControllerNode>() {
         StorageError::NotLeader(
             forward
                 .leader_node
@@ -369,7 +374,7 @@ fn map_raft_error(error: swarmlite_raft::ClientWriteRaftError) -> StorageError {
 }
 
 fn map_check_is_leader_error(error: swarmlite_raft::CheckIsLeaderRaftError) -> StorageError {
-    if let Some(forward) = error.forward_to_leader::<ManagerNode>() {
+    if let Some(forward) = error.forward_to_leader::<ControllerNode>() {
         StorageError::NotLeader(
             forward
                 .leader_node
@@ -385,9 +390,9 @@ fn map_check_is_leader_error(error: swarmlite_raft::CheckIsLeaderRaftError) -> S
 mod tests {
     use std::time::Duration;
 
-    use swarmlite_raft::{ManagerNode, NodeConfig};
+    use swarmlite_raft::{ControllerNode, NodeConfig};
 
-    use crate::model::{ClusterCaddyConfig, NodeRecord, ServiceRecord, ServiceSpec, TaskRecord};
+    use crate::model::{ClusterGatewayConfig, NodeRecord, ServiceRecord, ServiceSpec, TaskRecord};
 
     use super::*;
 
@@ -396,7 +401,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let raft = RaftNode::open(NodeConfig::new(
             1,
-            ManagerNode {
+            ControllerNode {
                 raft_url: "http://127.0.0.1:19090/internal/raft".into(),
                 api_url: "http://127.0.0.1:19090".into(),
             },
@@ -415,9 +420,9 @@ mod tests {
         let cluster = ClusterSettings {
             schema_version: 2,
             cluster_id: "storage-test".into(),
-            controllers: 1,
+            mode: crate::model::ClusterMode::Standalone,
             controller_port: 19090,
-            caddy: ClusterCaddyConfig::default(),
+            gateway: ClusterGatewayConfig::default(),
         };
         let repository = StateRepository::new(raft.clone(), cluster.clone());
         let first = repository.initialize_with_cluster(&cluster).await.unwrap();
@@ -432,10 +437,10 @@ mod tests {
                 memory_bytes: 1024,
                 port_range_start: 20_000,
                 port_range_end: 29_999,
-                controller_capable: false,
-                controller_url: None,
-                raft_id: None,
-                raft_url: None,
+                roles: crate::model::agent_roles(),
+                controller_url: String::new(),
+                raft_id: 1,
+                raft_url: String::new(),
             },
         );
         state.services.insert(

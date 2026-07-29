@@ -30,17 +30,17 @@ const MAX_KV_LOCK_LEASE_MS: u64 = 300_000;
 const MAX_HTTP_BODY_BYTES: usize = 6 * 1024 * 1024;
 
 use crate::{
-    caddy,
     config::ControllerConfig,
-    kv,
+    gateway, kv,
     model::{
-        BootstrapResponse, CaddyStatus, ClusterConfigResponse, ClusterConfigUpdate,
-        ClusterSettings, ClusterState, ControllerRecord, DesiredTaskState, HeartbeatResponse,
-        JoinRequest, JoinResponse, KvDeleteRequest, KvListResponse, KvLock, KvLockAcquireRequest,
-        KvLockAcquireResponse, KvLockMutationRequest, KvLockStatus, KvObjectResponse, KvPutRequest,
-        KvPutResponse, KvStatResponse, KvState, LeaderRecord, NodeHeartbeat, NodeRole,
+        BootstrapResponse, ClusterConfigResponse, ClusterConfigUpdate, ClusterMode,
+        ClusterSettings, ClusterState, ControllerRecord, DesiredTaskState, GatewayStatus,
+        HeartbeatResponse, JoinRequest, JoinResponse, KvDeleteRequest, KvListResponse, KvLock,
+        KvLockAcquireRequest, KvLockAcquireResponse, KvLockMutationRequest, KvLockStatus,
+        KvObjectResponse, KvPutRequest, KvPutResponse, KvStatResponse, KvState, LeaderRecord,
+        NodeHeartbeat, NodeMember, NodeRole, NodeRoles, NodeRolesResponse, NodeRolesUpdate,
         ObservedTaskState, RecoveryStatus, ServiceRecord, StackRecord, StatusResponse,
-        TaskAssignment, TaskRecord, UnclaimedTask, service_spec_hash, valid_controller_count,
+        TaskAssignment, TaskRecord, UnclaimedTask, agent_roles, service_spec_hash,
     },
     scheduler,
     stack::{ParsedStack, parse_stack},
@@ -74,7 +74,14 @@ where
         .route("/v1/stacks/{name}", put(apply_stack))
         .route("/v1/nodes/{node_id}/join", put(join_node))
         .route("/v1/nodes/{node_id}/heartbeat", post(heartbeat))
-        .route("/v1/caddy", get(caddy_config))
+        .route("/v1/gateway", get(gateway_config))
+        .route(
+            "/v1/nodes/{node_id}/roles",
+            get(get_node_roles)
+                .put(set_node_roles)
+                .patch(add_node_roles)
+                .delete(remove_node_roles),
+        )
         .route("/v1/kv", get(kv_object).put(put_kv).delete(delete_kv))
         .route("/v1/kv/keys", get(list_kv))
         .route("/v1/kv/stat", get(stat_kv))
@@ -90,15 +97,15 @@ where
         .with_context(|| format!("failed to listen on {}", config.listen))?;
     let background = controller.clone();
     let control_loop = tokio::spawn(async move { background.control_loop().await });
-    let caddy_background = controller.clone();
-    let caddy_loop = tokio::spawn(async move { caddy_background.caddy_sync_loop().await });
+    let gateway_background = controller.clone();
+    let gateway_loop = tokio::spawn(async move { gateway_background.gateway_sync_loop().await });
     info!(address = %config.listen, "controller API listening");
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await
         .map_err(anyhow::Error::from);
     control_loop.abort();
-    caddy_loop.abort();
+    gateway_loop.abort();
     let shutdown_result = raft.shutdown().await.map_err(anyhow::Error::msg);
     result.and(shutdown_result)
 }
@@ -117,15 +124,22 @@ pub struct Controller {
     token: String,
     repository: StateRepository,
     inner: Mutex<Inner>,
-    caddy_client: reqwest::Client,
-    caddy_notify: Notify,
-    caddy_sync: Mutex<CaddySyncState>,
+    gateway_client: reqwest::Client,
+    gateway_notify: Notify,
+    gateway_sync: Mutex<GatewaySyncState>,
 }
 
 #[derive(Debug, Default)]
-struct CaddySyncState {
+struct GatewaySyncState {
     applied_generation: Option<u64>,
     endpoint_errors: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoleOperation {
+    Set,
+    Add,
+    Remove,
 }
 
 #[derive(Debug)]
@@ -154,8 +168,8 @@ impl Controller {
         repository: StateRepository,
     ) -> Result<Self, StorageError> {
         let versioned = repository.initialize_with_cluster(&config.cluster).await?;
-        let caddy_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(config.caddy.request_timeout_seconds))
+        let gateway_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.gateway.request_timeout_seconds))
             .build()
             .map_err(|error| StorageError::Backend(error.to_string()))?;
         // Preserve existing assignments during the first node timeout after a takeover.
@@ -177,9 +191,9 @@ impl Controller {
                 is_leader: false,
                 live_nodes,
             }),
-            caddy_client,
-            caddy_notify: Notify::new(),
-            caddy_sync: Mutex::new(CaddySyncState::default()),
+            gateway_client,
+            gateway_notify: Notify::new(),
+            gateway_sync: Mutex::new(GatewaySyncState::default()),
         })
     }
 
@@ -221,7 +235,6 @@ impl Controller {
             let now_unix_ms = unix_ms();
             let voters = self.repository.voter_ids();
             let mut changed = prune_controllers(&mut inner.state, now_unix_ms, &voters);
-            changed |= self.reconcile_controller_count_locked(&mut inner).await?;
             changed |= scheduler::finish_drains(&mut inner.state, now_unix_ms);
             changed |= scheduler::reconcile(&mut inner.state, &live);
             if changed && let Err(error) = self.commit_locked(&mut inner).await {
@@ -279,12 +292,13 @@ impl Controller {
                 drains_reset = true;
             }
         }
+        let now = unix_ms();
         let self_record = ControllerRecord {
             node_id: self.config.controller_id.clone(),
             advertise_url: self.config.advertise_url.trim_end_matches('/').to_owned(),
             raft_id: self.repository.raft().node_id(),
             raft_url: self.repository.raft().local_node().raft_url.clone(),
-            reserved_at_unix_ms: unix_ms(),
+            reserved_at_unix_ms: now,
         };
         let controller_changed = inner
             .state
@@ -299,10 +313,47 @@ impl Controller {
             .state
             .controllers
             .insert(self.config.controller_id.clone(), self_record);
-        if drains_reset || controller_changed {
+        let address = reqwest::Url::parse(&self.config.advertise_url)
+            .ok()
+            .and_then(|url| url.host_str().map(ToOwned::to_owned))
+            .unwrap_or_default();
+        let (roles, automatic_roles, joined_at_unix_ms) = inner
+            .state
+            .members
+            .get(&self.config.controller_id)
+            .map(|member| {
+                (
+                    member.roles.clone(),
+                    member.automatic_roles,
+                    member.joined_at_unix_ms,
+                )
+            })
+            .unwrap_or_else(|| (self.config.roles.clone(), true, now));
+        let self_member = NodeMember {
+            id: self.config.controller_id.clone(),
+            address,
+            roles,
+            automatic_roles,
+            controller_url: self.config.advertise_url.trim_end_matches('/').to_owned(),
+            raft_id: self.repository.raft().node_id(),
+            raft_url: self.repository.raft().local_node().raft_url.clone(),
+            joined_at_unix_ms,
+        };
+        let member_changed = inner
+            .state
+            .members
+            .get(&self.config.controller_id)
+            .is_none_or(|member| member != &self_member);
+        if member_changed {
+            inner
+                .state
+                .members
+                .insert(self.config.controller_id.clone(), self_member);
+        }
+        if drains_reset || controller_changed || member_changed {
             self.commit_locked(inner).await?;
         } else {
-            self.caddy_notify.notify_one();
+            self.gateway_notify.notify_one();
         }
         Ok(())
     }
@@ -319,7 +370,7 @@ impl Controller {
         {
             Ok(generation) => {
                 inner.generation = generation;
-                self.caddy_notify.notify_one();
+                self.gateway_notify.notify_one();
                 Ok(())
             }
             Err(error) => {
@@ -372,47 +423,6 @@ impl Controller {
         Ok(inner.cluster.clone())
     }
 
-    async fn reconcile_controller_count_locked(
-        &self,
-        inner: &mut Inner,
-    ) -> Result<bool, StorageError> {
-        let target = usize::from(self.cluster_settings(inner)?.controllers);
-        if inner.state.controllers.len() <= target {
-            return Ok(false);
-        }
-
-        let voters = self.repository.voter_ids();
-        let candidate = inner
-            .state
-            .controllers
-            .values()
-            .filter(|record| record.node_id != self.config.controller_id)
-            .min_by(|left, right| {
-                voters
-                    .contains(&left.raft_id)
-                    .cmp(&voters.contains(&right.raft_id))
-                    .then_with(|| right.node_id.cmp(&left.node_id))
-            })
-            .cloned()
-            .ok_or_else(|| {
-                StorageError::InvalidData(
-                    "controller target cannot be reached without removing the active leader"
-                        .to_owned(),
-                )
-            })?;
-
-        if self.repository.is_voter(candidate.raft_id) {
-            self.repository.remove_voter(candidate.raft_id).await?;
-        }
-        inner.state.controllers.remove(&candidate.node_id);
-        info!(
-            node_id = %candidate.node_id,
-            controllers = target,
-            "demoted excess controller after cluster config update"
-        );
-        Ok(true)
-    }
-
     async fn get_cluster_config(&self) -> Result<ClusterConfigResponse, ControllerError> {
         let mut inner = self.inner.lock().await;
         self.expire_local_lease(&mut inner);
@@ -429,12 +439,6 @@ impl Controller {
         &self,
         update: ClusterConfigUpdate,
     ) -> Result<ClusterConfigResponse, ControllerError> {
-        if !valid_controller_count(update.controllers) {
-            return Err(ControllerError::Invalid(
-                "controllers must be 1 or an odd number greater than or equal to 3".to_owned(),
-            ));
-        }
-
         let mut inner = self.inner.lock().await;
         self.expire_local_lease(&mut inner);
         if !inner.is_leader {
@@ -442,14 +446,25 @@ impl Controller {
         }
 
         let mut cluster = self.cluster_settings(&inner)?;
-        if cluster.controllers != update.controllers {
-            cluster.controllers = update.controllers;
-            let previous = std::mem::replace(&mut inner.cluster, cluster.clone());
+        if cluster.mode == ClusterMode::Ha && update.mode == ClusterMode::Standalone {
+            return Err(ControllerError::Conflict(
+                "switching an HA cluster back to standalone is not supported".to_owned(),
+            ));
+        }
+        if cluster.mode != update.mode {
+            let previous_cluster = inner.cluster.clone();
+            let previous_state = inner.state.clone();
+            cluster.mode = update.mode;
+            inner.cluster = cluster.clone();
+            if update.mode == ClusterMode::Ha {
+                fill_automatic_ha_controllers(&mut inner.state);
+            }
             if let Err(error) = self.commit_locked(&mut inner).await {
-                inner.cluster = previous;
+                inner.cluster = previous_cluster;
+                inner.state = previous_state;
                 return Err(error.into());
             }
-            info!(controllers = update.controllers, "updated cluster config");
+            info!(mode = ?update.mode, "updated cluster mode");
         }
 
         Ok(ClusterConfigResponse {
@@ -494,64 +509,64 @@ impl Controller {
         let now = unix_ms();
         let voters = self.repository.voter_ids();
         let mut changed = prune_controllers(&mut inner.state, now, &voters);
-        let already_controller = inner.state.controllers.contains_key(node_id);
-        let has_capacity = inner.state.controllers.len() < usize::from(cluster.controllers);
-        let should_control = already_controller
-            || (request.controller_capable && cluster.controllers > 1 && has_capacity);
-        if should_control {
-            let url = request.controller_url.clone().ok_or_else(|| {
-                ControllerError::Invalid(
-                    "controller-capable nodes must provide controller_url".to_owned(),
-                )
-            })?;
-            let raft_id = request.raft_id.ok_or_else(|| {
-                ControllerError::Invalid("controller-capable nodes must provide raft_id".to_owned())
-            })?;
-            let raft_url = request.raft_url.clone().ok_or_else(|| {
-                ControllerError::Invalid(
-                    "controller-capable nodes must provide raft_url".to_owned(),
-                )
-            })?;
-            if inner
-                .state
-                .controllers
-                .get(node_id)
-                .is_some_and(|record| record.raft_id != raft_id)
-            {
+        let roles = if let Some(existing) = inner.state.members.get(node_id).cloned() {
+            if existing.raft_id != request.raft_id {
                 return Err(ControllerError::Invalid(
                     "a node cannot change its persisted raft_id".to_owned(),
                 ));
             }
-            let record = ControllerRecord {
-                node_id: node_id.to_owned(),
-                advertise_url: url,
-                raft_id,
-                raft_url,
-                reserved_at_unix_ms: inner
-                    .state
-                    .controllers
-                    .get(node_id)
-                    .map_or(now, |record| record.reserved_at_unix_ms),
+            if let Some(requested) = &request.requested_roles {
+                let requested = normalized_roles(requested.clone());
+                if requested != existing.roles {
+                    return Err(ControllerError::Conflict(
+                        "this node is already joined with different roles; use `swarmlite role set`"
+                            .to_owned(),
+                    ));
+                }
+            }
+            let member = inner.state.members.get_mut(node_id).expect("member exists");
+            if member.address != request.address
+                || member.controller_url != request.controller_url
+                || member.raft_url != request.raft_url
+            {
+                member.address.clone_from(&request.address);
+                member.controller_url.clone_from(&request.controller_url);
+                member.raft_url.clone_from(&request.raft_url);
+                changed = true;
+            }
+            existing.roles
+        } else {
+            let (roles, automatic_roles) = match request.requested_roles.clone() {
+                Some(roles) => (normalized_roles(roles), false),
+                None => (automatic_join_roles(&inner.state, cluster.mode), true),
             };
-            changed |= inner.state.controllers.get(node_id).is_none_or(|existing| {
-                existing.advertise_url != record.advertise_url
-                    || existing.raft_id != record.raft_id
-                    || existing.raft_url != record.raft_url
-            });
-            inner.state.controllers.insert(node_id.to_owned(), record);
+            validate_role_limits(&inner.state, node_id, &roles, cluster.mode)?;
+            inner.state.members.insert(
+                node_id.to_owned(),
+                NodeMember {
+                    id: node_id.to_owned(),
+                    address: request.address.clone(),
+                    roles: roles.clone(),
+                    automatic_roles,
+                    controller_url: request.controller_url.clone(),
+                    raft_id: request.raft_id,
+                    raft_url: request.raft_url.clone(),
+                    joined_at_unix_ms: now,
+                },
+            );
+            changed = true;
+            roles
+        };
+        if roles.contains(&NodeRole::Controller) {
+            changed |= ensure_controller_record(&mut inner.state, node_id, now)?;
         }
         if changed && let Err(error) = self.commit_locked(&mut inner).await {
             inner.state = previous;
             return Err(error.into());
         }
-        let role = if inner.state.controllers.contains_key(node_id) {
-            NodeRole::Controller
-        } else {
-            NodeRole::Worker
-        };
         Ok(JoinResponse {
             cluster,
-            role,
+            roles,
             controllers: controller_urls(
                 &inner.state,
                 Some(&self.config.advertise_url),
@@ -560,13 +575,153 @@ impl Controller {
         })
     }
 
+    async fn node_roles(&self, node_id: &str) -> Result<NodeRolesResponse, ControllerError> {
+        let mut inner = self.inner.lock().await;
+        self.expire_local_lease(&mut inner);
+        if !inner.is_leader {
+            return Err(self.leader_redirect(&format!("/v1/nodes/{node_id}/roles")));
+        }
+        let member =
+            inner.state.members.get(node_id).ok_or_else(|| {
+                ControllerError::NotFound(format!("node {node_id} is not joined"))
+            })?;
+        Ok(NodeRolesResponse {
+            node_id: node_id.to_owned(),
+            roles: member.roles.clone(),
+        })
+    }
+
+    async fn update_node_roles(
+        &self,
+        node_id: &str,
+        update: NodeRolesUpdate,
+        operation: RoleOperation,
+    ) -> Result<NodeRolesResponse, ControllerError> {
+        if update.roles.is_empty() && operation != RoleOperation::Set {
+            return Err(ControllerError::Invalid(
+                "at least one role must be supplied".to_owned(),
+            ));
+        }
+        if operation == RoleOperation::Remove && update.roles.contains(&NodeRole::Agent) {
+            return Err(ControllerError::Conflict(
+                "the mandatory agent role cannot be removed".to_owned(),
+            ));
+        }
+
+        let mut inner = self.inner.lock().await;
+        self.expire_local_lease(&mut inner);
+        if !inner.is_leader {
+            return Err(self.leader_redirect(&format!("/v1/nodes/{node_id}/roles")));
+        }
+        let current = inner
+            .state
+            .members
+            .get(node_id)
+            .ok_or_else(|| ControllerError::NotFound(format!("node {node_id} is not joined")))?
+            .roles
+            .clone();
+        let mut roles = match operation {
+            RoleOperation::Set => update.roles,
+            RoleOperation::Add => current.union(&update.roles).copied().collect(),
+            RoleOperation::Remove => current.difference(&update.roles).copied().collect(),
+        };
+        roles.insert(NodeRole::Agent);
+        if roles == current {
+            return Ok(NodeRolesResponse {
+                node_id: node_id.to_owned(),
+                roles,
+            });
+        }
+
+        validate_role_limits(&inner.state, node_id, &roles, inner.cluster.mode)?;
+        if current.contains(&NodeRole::Gateway) && !roles.contains(&NodeRole::Gateway) {
+            let gateway_count = inner
+                .state
+                .members
+                .values()
+                .filter(|member| member.roles.contains(&NodeRole::Gateway))
+                .count();
+            if gateway_count <= 1 {
+                return Err(ControllerError::Conflict(
+                    "cannot remove the cluster's last gateway role".to_owned(),
+                ));
+            }
+        }
+        if current.contains(&NodeRole::Controller) && !roles.contains(&NodeRole::Controller) {
+            let controller_count = inner
+                .state
+                .members
+                .values()
+                .filter(|member| member.roles.contains(&NodeRole::Controller))
+                .count();
+            if controller_count <= 1 {
+                return Err(ControllerError::Conflict(
+                    "cannot remove the cluster's last controller role".to_owned(),
+                ));
+            }
+        }
+
+        let previous = inner.state.clone();
+        let removed_voter = (current.contains(&NodeRole::Controller)
+            && !roles.contains(&NodeRole::Controller))
+        .then(|| {
+            inner
+                .state
+                .controllers
+                .get(node_id)
+                .map(|record| record.raft_id)
+        })
+        .flatten()
+        .filter(|raft_id| self.repository.is_voter(*raft_id));
+        let member = inner
+            .state
+            .members
+            .get_mut(node_id)
+            .expect("member was checked above");
+        member.roles.clone_from(&roles);
+        member.automatic_roles = false;
+        if roles.contains(&NodeRole::Controller) {
+            ensure_controller_record(&mut inner.state, node_id, unix_ms())?;
+        } else {
+            inner.state.controllers.remove(node_id);
+        }
+        if let Err(error) = self.commit_locked(&mut inner).await {
+            inner.state = previous;
+            return Err(error.into());
+        }
+        if let Some(raft_id) = removed_voter
+            && let Err(error) = self.repository.remove_voter(raft_id).await
+        {
+            inner.state = previous;
+            if let Err(rollback_error) = self.commit_locked(&mut inner).await {
+                error!(
+                    %rollback_error,
+                    node_id,
+                    "failed to roll back node roles after voter removal failed"
+                );
+            }
+            return Err(error.into());
+        }
+        info!(node_id, roles = ?roles, "updated node roles");
+        Ok(NodeRolesResponse {
+            node_id: node_id.to_owned(),
+            roles,
+        })
+    }
+
     async fn apply(&self, stack_name: &str, parsed: ParsedStack) -> Result<u64, ControllerError> {
         validate_stack_name(stack_name)?;
-        if self.config.caddy.admin_endpoints.is_empty()
-            && parsed.services.values().any(caddy::is_enabled)
-        {
+        let has_gateway = {
+            let inner = self.inner.lock().await;
+            inner
+                .state
+                .members
+                .values()
+                .any(|member| member.roles.contains(&NodeRole::Gateway))
+        };
+        if !has_gateway && parsed.services.values().any(gateway::is_enabled) {
             return Err(ControllerError::Invalid(
-                "ingress is enabled but caddy.admin_endpoints is empty".to_owned(),
+                "gateway routing is enabled but no node has the gateway role".to_owned(),
             ));
         }
         let mut inner = self.inner.lock().await;
@@ -646,77 +801,41 @@ impl Controller {
             return Err(self.leader_redirect(&format!("/v1/nodes/{node_id}/heartbeat")));
         }
 
-        let cluster = self.cluster_settings(&inner)?;
         let previous = inner.state.clone();
         let now = unix_ms();
         let voters = self.repository.voter_ids();
         let mut changed = prune_controllers(&mut inner.state, now, &voters);
         let mut soft_changed = false;
-        let already_controller = inner.state.controllers.contains_key(node_id);
-        let mut node_role = if already_controller {
-            NodeRole::Controller
-        } else {
-            NodeRole::Worker
+        let desired_roles = {
+            let member = inner.state.members.get_mut(node_id).ok_or_else(|| {
+                ControllerError::Invalid("node must join before sending heartbeats".to_owned())
+            })?;
+            if member.raft_id != heartbeat.node.raft_id {
+                return Err(ControllerError::Invalid(
+                    "heartbeat raft_id differs from the joined node identity".to_owned(),
+                ));
+            }
+            if member.address != heartbeat.node.address {
+                member.address.clone_from(&heartbeat.node.address);
+                changed = true;
+            }
+            member.roles.clone()
         };
-        if heartbeat.node.controller_capable {
-            let has_capacity = inner.state.controllers.len() < usize::from(cluster.controllers);
-            if node_role == NodeRole::Controller || (cluster.controllers > 1 && has_capacity) {
-                let controller_url = heartbeat.node.controller_url.clone().ok_or_else(|| {
-                    ControllerError::Invalid(
-                        "controller-capable nodes must provide controller_url".to_owned(),
-                    )
-                })?;
-                let raft_id = heartbeat.node.raft_id.ok_or_else(|| {
-                    ControllerError::Invalid(
-                        "controller-capable nodes must provide raft_id".to_owned(),
-                    )
-                })?;
-                let raft_url = heartbeat.node.raft_url.clone().ok_or_else(|| {
-                    ControllerError::Invalid(
-                        "controller-capable nodes must provide raft_url".to_owned(),
-                    )
-                })?;
-                let existing = inner.state.controllers.get(node_id);
-                if existing.is_some_and(|record| record.raft_id != raft_id) {
-                    return Err(ControllerError::Invalid(
-                        "a node cannot change its persisted raft_id".to_owned(),
-                    ));
-                }
-                let membership_needs_update = existing.is_some_and(|record| {
-                    !self.repository.is_voter(record.raft_id)
-                        || record.raft_id != raft_id
-                        || record.raft_url != raft_url
-                        || record.advertise_url != controller_url
-                });
-                if membership_needs_update {
+        if desired_roles.contains(&NodeRole::Controller) {
+            changed |= ensure_controller_record(&mut inner.state, node_id, now)?;
+            if heartbeat.node.roles.contains(&NodeRole::Controller) {
+                let record = inner.state.controllers[node_id].clone();
+                if !self.repository.is_voter(record.raft_id) {
                     self.repository
                         .ensure_voter(
-                            raft_id,
-                            swarmlite_raft::ManagerNode {
-                                raft_url: raft_url.clone(),
-                                api_url: controller_url.clone(),
+                            record.raft_id,
+                            swarmlite_raft::ControllerNode {
+                                raft_url: record.raft_url,
+                                api_url: record.advertise_url,
                             },
                         )
                         .await?;
                 }
-                let should_persist = existing.is_none_or(|record| {
-                    record.advertise_url != controller_url
-                        || record.raft_id != raft_id
-                        || record.raft_url != raft_url
-                });
-                let reserved_at_unix_ms = existing.map_or(now, |record| record.reserved_at_unix_ms);
-                inner.state.controllers.insert(
-                    node_id.to_owned(),
-                    ControllerRecord {
-                        node_id: node_id.to_owned(),
-                        advertise_url: controller_url,
-                        raft_id,
-                        raft_url,
-                        reserved_at_unix_ms,
-                    },
-                );
-                changed |= should_persist;
-                node_role = NodeRole::Controller;
             }
         }
         soft_changed |= inner.state.nodes.get(node_id).is_none_or(|existing| {
@@ -817,7 +936,7 @@ impl Controller {
             return Err(error.into());
         }
         if soft_changed && !changed {
-            self.caddy_notify.notify_one();
+            self.gateway_notify.notify_one();
         }
 
         let term = self.repository.current_term();
@@ -861,8 +980,9 @@ impl Controller {
         Ok(HeartbeatResponse {
             leader_term: term,
             generation,
+            cluster: inner.cluster.clone(),
             assignments,
-            node_role,
+            roles: desired_roles,
             controllers: controller_urls(
                 &inner.state,
                 Some(&self.config.advertise_url),
@@ -893,17 +1013,20 @@ impl Controller {
         let state = inner.state.clone();
         let recovery = recovery_status(&state);
         drop(inner);
-        let caddy_sync = self.caddy_sync.lock().await;
+        let gateway_sync = self.gateway_sync.lock().await;
         StatusResponse {
             cluster_id: self.config.cluster.cluster_id.clone(),
             generation,
             leader,
             is_leader,
-            caddy: CaddyStatus {
-                enabled: !self.config.caddy.admin_endpoints.is_empty(),
+            gateway: GatewayStatus {
+                enabled: state
+                    .members
+                    .values()
+                    .any(|member| member.roles.contains(&NodeRole::Gateway)),
                 desired_generation: generation,
-                applied_generation: caddy_sync.applied_generation,
-                endpoint_errors: caddy_sync.endpoint_errors.clone(),
+                applied_generation: gateway_sync.applied_generation,
+                endpoint_errors: gateway_sync.endpoint_errors.clone(),
             },
             recovery,
             state,
@@ -921,39 +1044,35 @@ impl Controller {
         }
     }
 
-    async fn caddy(&self) -> Result<caddy::HttpServer, ControllerError> {
+    async fn gateway(&self) -> Result<gateway::HttpServer, ControllerError> {
         let mut inner = self.inner.lock().await;
         self.expire_local_lease(&mut inner);
         if !inner.is_leader {
-            return Err(self.leader_redirect("/v1/caddy"));
+            return Err(self.leader_redirect("/v1/gateway"));
         }
-        Ok(caddy::generate(&inner.state, &self.config.caddy.listen))
+        Ok(gateway::generate(&inner.state, &self.config.gateway.listen))
     }
 
-    async fn caddy_sync_loop(self: Arc<Self>) {
-        if self.config.caddy.admin_endpoints.is_empty() {
-            info!("Caddy publishing is disabled because no admin endpoints are configured");
-            return;
-        }
+    async fn gateway_sync_loop(self: Arc<Self>) {
         let mut ticker = tokio::time::interval(Duration::from_secs(
-            self.config.caddy.resync_interval_seconds,
+            self.config.gateway.resync_interval_seconds,
         ));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = ticker.tick() => {}
-                _ = self.caddy_notify.notified() => {}
+                _ = self.gateway_notify.notified() => {}
             }
             loop {
-                match self.sync_caddy_once().await {
+                match self.sync_gateway_once().await {
                     Ok(()) => break,
                     Err(error) => {
-                        warn!(%error, "Caddy configuration sync failed");
+                        warn!(%error, "gateway configuration sync failed");
                         tokio::select! {
                             _ = tokio::time::sleep(Duration::from_secs(
-                                self.config.caddy.retry_interval_seconds,
+                                self.config.gateway.retry_interval_seconds,
                             )) => {}
-                            _ = self.caddy_notify.notified() => {}
+                            _ = self.gateway_notify.notified() => {}
                         }
                     }
                 }
@@ -961,8 +1080,8 @@ impl Controller {
         }
     }
 
-    async fn sync_caddy_once(&self) -> Result<(), String> {
-        let (generation, server) = {
+    async fn sync_gateway_once(&self) -> Result<(), String> {
+        let (generation, server, endpoints) = {
             let mut inner = self.inner.lock().await;
             self.expire_local_lease(&mut inner);
             if !inner.is_leader {
@@ -970,29 +1089,32 @@ impl Controller {
             }
             (
                 inner.generation,
-                caddy::generate(&inner.state, &self.config.caddy.listen),
+                gateway::generate(&inner.state, &self.config.gateway.listen),
+                gateway_endpoints(&inner.state, self.config.gateway.admin_port),
             )
         };
 
+        if endpoints.is_empty() {
+            let mut sync = self.gateway_sync.lock().await;
+            sync.applied_generation = None;
+            sync.endpoint_errors.clear();
+            return Ok(());
+        }
+
         let results = join_all(
-            self.config
-                .caddy
-                .admin_endpoints
+            endpoints
                 .iter()
-                .map(|endpoint| self.push_caddy_server(endpoint, &server)),
+                .map(|endpoint| self.push_gateway_server(endpoint, &server)),
         )
         .await;
-        let endpoint_errors = self
-            .config
-            .caddy
-            .admin_endpoints
+        let endpoint_errors = endpoints
             .iter()
             .cloned()
             .zip(results)
             .filter_map(|(endpoint, result)| result.err().map(|error| (endpoint, error)))
             .collect::<BTreeMap<_, _>>();
         {
-            let mut sync = self.caddy_sync.lock().await;
+            let mut sync = self.gateway_sync.lock().await;
             sync.endpoint_errors = endpoint_errors.clone();
             if endpoint_errors.is_empty() {
                 sync.applied_generation = Some(generation);
@@ -1006,14 +1128,14 @@ impl Controller {
                 .join("; "));
         }
 
-        info!(generation, "Caddy configuration applied");
+        info!(generation, "gateway configuration applied");
         let mut inner = self.inner.lock().await;
         self.expire_local_lease(&mut inner);
         if !inner.is_leader || inner.generation != generation {
-            self.caddy_notify.notify_one();
+            self.gateway_notify.notify_one();
             return Ok(());
         }
-        let deadline = unix_ms() + self.config.caddy.drain_timeout_seconds as i64 * 1000;
+        let deadline = unix_ms() + self.config.gateway.drain_timeout_seconds as i64 * 1000;
         let previous = inner.state.clone();
         let mut changed = false;
         for task in inner.state.tasks.values_mut() {
@@ -1029,18 +1151,18 @@ impl Controller {
         Ok(())
     }
 
-    async fn push_caddy_server(
+    async fn push_gateway_server(
         &self,
         endpoint: &str,
-        server: &caddy::HttpServer,
+        server: &gateway::HttpServer,
     ) -> Result<(), String> {
         let url = format!(
             "{}/config/apps/http/servers/{}",
             endpoint.trim_end_matches('/'),
-            self.config.caddy.server_name
+            self.config.gateway.server_name
         );
         let response = self
-            .caddy_client
+            .gateway_client
             .post(&url)
             .json(server)
             .send()
@@ -1319,6 +1441,54 @@ async fn join_node(
     controller.join_node(&node_id, body).await.map(Json)
 }
 
+async fn get_node_roles(
+    State(controller): State<Arc<Controller>>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<NodeRolesResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.node_roles(&node_id).await.map(Json)
+}
+
+async fn set_node_roles(
+    State(controller): State<Arc<Controller>>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<NodeRolesUpdate>,
+) -> Result<Json<NodeRolesResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller
+        .update_node_roles(&node_id, body, RoleOperation::Set)
+        .await
+        .map(Json)
+}
+
+async fn add_node_roles(
+    State(controller): State<Arc<Controller>>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<NodeRolesUpdate>,
+) -> Result<Json<NodeRolesResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller
+        .update_node_roles(&node_id, body, RoleOperation::Add)
+        .await
+        .map(Json)
+}
+
+async fn remove_node_roles(
+    State(controller): State<Arc<Controller>>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<NodeRolesUpdate>,
+) -> Result<Json<NodeRolesResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller
+        .update_node_roles(&node_id, body, RoleOperation::Remove)
+        .await
+        .map(Json)
+}
+
 async fn apply_stack(
     State(controller): State<Arc<Controller>>,
     Path(name): Path<String>,
@@ -1347,12 +1517,12 @@ async fn heartbeat(
     controller.heartbeat(&node_id, body).await.map(Json)
 }
 
-async fn caddy_config(
+async fn gateway_config(
     State(controller): State<Arc<Controller>>,
     headers: HeaderMap,
-) -> Result<Json<caddy::HttpServer>, ControllerError> {
+) -> Result<Json<gateway::HttpServer>, ControllerError> {
     require_auth(&controller, &headers)?;
-    controller.caddy().await.map(Json)
+    controller.gateway().await.map(Json)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1541,6 +1711,132 @@ fn current_live_nodes(inner: &Inner, timeout_seconds: u64) -> BTreeSet<String> {
         .collect()
 }
 
+fn normalized_roles(mut roles: NodeRoles) -> NodeRoles {
+    roles.insert(NodeRole::Agent);
+    roles
+}
+
+fn role_count(state: &ClusterState, role: NodeRole, except_node: Option<&str>) -> usize {
+    state
+        .members
+        .values()
+        .filter(|member| Some(member.id.as_str()) != except_node)
+        .filter(|member| member.roles.contains(&role))
+        .count()
+}
+
+fn validate_role_limits(
+    state: &ClusterState,
+    node_id: &str,
+    roles: &NodeRoles,
+    mode: ClusterMode,
+) -> Result<(), ControllerError> {
+    if !roles.contains(&NodeRole::Agent) {
+        return Err(ControllerError::Invalid(
+            "every node must have the agent role".to_owned(),
+        ));
+    }
+    let controller_count = role_count(state, NodeRole::Controller, Some(node_id))
+        + usize::from(roles.contains(&NodeRole::Controller));
+    if controller_count > mode.controller_limit() {
+        return Err(ControllerError::Conflict(format!(
+            "{mode:?} allows at most {} controller role(s)",
+            mode.controller_limit()
+        )));
+    }
+    Ok(())
+}
+
+fn automatic_join_roles(state: &ClusterState, mode: ClusterMode) -> NodeRoles {
+    let mut roles = agent_roles();
+    if mode == ClusterMode::Ha
+        && role_count(state, NodeRole::Controller, None) < mode.controller_limit()
+    {
+        roles.insert(NodeRole::Controller);
+    }
+    roles
+}
+
+fn fill_automatic_ha_controllers(state: &mut ClusterState) {
+    let mut controller_count = role_count(state, NodeRole::Controller, None);
+    let mut candidates = state
+        .members
+        .values()
+        .filter(|member| member.automatic_roles && member.roles.contains(&NodeRole::Agent))
+        .map(|member| (member.joined_at_unix_ms, member.id.clone()))
+        .collect::<Vec<_>>();
+    candidates.sort();
+    for (_, node_id) in candidates {
+        let member = state
+            .members
+            .get_mut(&node_id)
+            .expect("role candidate must still exist");
+        if controller_count < ClusterMode::Ha.controller_limit()
+            && !member.roles.contains(&NodeRole::Controller)
+        {
+            member.roles.insert(NodeRole::Controller);
+            controller_count += 1;
+        }
+        if controller_count == ClusterMode::Ha.controller_limit() {
+            break;
+        }
+    }
+}
+
+fn ensure_controller_record(
+    state: &mut ClusterState,
+    node_id: &str,
+    now_unix_ms: i64,
+) -> Result<bool, ControllerError> {
+    let member = state
+        .members
+        .get(node_id)
+        .ok_or_else(|| ControllerError::NotFound(format!("node {node_id} is not joined")))?;
+    if member.controller_url.trim().is_empty() || member.raft_id == 0 || member.raft_url.is_empty()
+    {
+        return Err(ControllerError::Invalid(format!(
+            "node {node_id} has an invalid controller identity"
+        )));
+    }
+    let changed = state.controllers.get(node_id).is_none_or(|record| {
+        record.advertise_url != member.controller_url
+            || record.raft_id != member.raft_id
+            || record.raft_url != member.raft_url
+    });
+    if changed {
+        state.controllers.insert(
+            node_id.to_owned(),
+            ControllerRecord {
+                node_id: node_id.to_owned(),
+                advertise_url: member.controller_url.trim_end_matches('/').to_owned(),
+                raft_id: member.raft_id,
+                raft_url: member.raft_url.clone(),
+                reserved_at_unix_ms: now_unix_ms,
+            },
+        );
+    }
+    Ok(changed)
+}
+
+fn gateway_endpoints(state: &ClusterState, admin_port: u16) -> Vec<String> {
+    state
+        .nodes
+        .values()
+        .filter(|node| node.roles.contains(&NodeRole::Gateway))
+        .map(|node| format!("http://{}:{admin_port}", format_host(&node.address)))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn format_host(host: &str) -> String {
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    }
+}
+
 fn prune_controllers(state: &mut ClusterState, now_unix_ms: i64, voters: &BTreeSet<u64>) -> bool {
     let previous_len = state.controllers.len();
     state.controllers.retain(|_, record| {
@@ -1708,14 +2004,14 @@ mod tests {
 
     use axum::routing::post;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use swarmlite_raft::{ManagerNode, NodeConfig, RaftNode};
+    use swarmlite_raft::{ControllerNode, NodeConfig, RaftNode};
 
     use crate::{
-        caddy::{ENABLE_LABEL, HOST_LABEL, PORT_LABEL},
-        config::CaddyConfig,
+        config::GatewayConfig,
+        gateway::{ENABLE_LABEL, HOST_LABEL, PORT_LABEL},
         model::{
-            ClusterCaddyConfig, KvVersion, NodeRecord, PortBinding, ServicePort, ServiceSpec,
-            TaskRecord, TaskReport,
+            ClusterGatewayConfig, KvVersion, NodeRecord, PortBinding, ServicePort, ServiceSpec,
+            TaskRecord, TaskReport, initial_roles,
         },
     };
 
@@ -1724,11 +2020,12 @@ mod tests {
     fn test_controller_config(cluster: &ClusterSettings) -> ControllerConfig {
         ControllerConfig {
             controller_id: "controller-a".into(),
+            roles: initial_roles(),
             listen: "127.0.0.1:0".parse().unwrap(),
             advertise_url: "http://10.0.0.10:8080".into(),
             node_timeout_seconds: 20,
             reconcile_interval_seconds: 1,
-            caddy: CaddyConfig::default(),
+            gateway: GatewayConfig::default(),
             cluster: cluster.clone(),
         }
     }
@@ -1738,9 +2035,9 @@ mod tests {
         let cluster = ClusterSettings {
             schema_version: 2,
             cluster_id: "kv-test".into(),
-            controllers: 1,
+            mode: ClusterMode::Standalone,
             controller_port: 8080,
-            caddy: ClusterCaddyConfig::default(),
+            gateway: ClusterGatewayConfig::default(),
         };
         let (repository, _raft, _directory) = test_repository(&cluster).await;
         let controller = Controller::new(
@@ -1840,13 +2137,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automatically_assigns_controllers_without_exceeding_target() {
+    async fn ha_automatically_fills_only_controller_roles() {
         let cluster = ClusterSettings {
             schema_version: 2,
             cluster_id: "controller-assignment-test".into(),
-            controllers: 3,
+            mode: ClusterMode::Ha,
             controller_port: 8080,
-            caddy: ClusterCaddyConfig::default(),
+            gateway: ClusterGatewayConfig::default(),
         };
         let (repository, _raft, _directory) = test_repository(&cluster).await;
         let config = test_controller_config(&cluster);
@@ -1856,100 +2153,131 @@ mod tests {
         controller.tick().await.unwrap();
 
         let first = controller
-            .join_node(
-                "node-b",
-                JoinRequest {
-                    node_id: "node-b".into(),
-                    address: "10.0.0.22".into(),
-                    controller_capable: true,
-                    controller_url: Some("http://10.0.0.22:8080".into()),
-                    raft_id: Some(2),
-                    raft_url: Some("http://10.0.0.22:8080/internal/raft".into()),
-                    labels: BTreeMap::new(),
-                },
-            )
+            .join_node("node-b", test_join_request("node-b", "10.0.0.22", 2))
             .await
             .unwrap();
-        assert_eq!(first.role, NodeRole::Controller);
+        assert_eq!(
+            first.roles,
+            BTreeSet::from([NodeRole::Controller, NodeRole::Agent])
+        );
 
         let second = controller
-            .join_node(
-                "node-c",
-                JoinRequest {
-                    node_id: "node-c".into(),
-                    address: "10.0.0.23".into(),
-                    controller_capable: true,
-                    controller_url: Some("http://10.0.0.23:8080".into()),
-                    raft_id: Some(3),
-                    raft_url: Some("http://10.0.0.23:8080/internal/raft".into()),
-                    labels: BTreeMap::new(),
-                },
-            )
+            .join_node("node-c", test_join_request("node-c", "10.0.0.23", 3))
             .await
             .unwrap();
-        assert_eq!(second.role, NodeRole::Controller);
+        assert_eq!(
+            second.roles,
+            BTreeSet::from([NodeRole::Controller, NodeRole::Agent])
+        );
 
         let third = controller
-            .join_node(
-                "node-d",
-                JoinRequest {
-                    node_id: "node-d".into(),
-                    address: "10.0.0.24".into(),
-                    controller_capable: true,
-                    controller_url: Some("http://10.0.0.24:8080".into()),
-                    raft_id: Some(4),
-                    raft_url: Some("http://10.0.0.24:8080/internal/raft".into()),
-                    labels: BTreeMap::new(),
-                },
-            )
+            .join_node("node-d", test_join_request("node-d", "10.0.0.24", 4))
             .await
             .unwrap();
-        assert_eq!(third.role, NodeRole::Worker);
+        assert_eq!(third.roles, agent_roles());
         assert_eq!(controller.inner.lock().await.state.controllers.len(), 3);
+        assert_eq!(
+            role_count(
+                &controller.inner.lock().await.state,
+                NodeRole::Gateway,
+                None
+            ),
+            1
+        );
 
+        let mut explicit = test_join_request("node-e", "10.0.0.25", 5);
+        explicit.requested_roles = Some(BTreeSet::from([NodeRole::Gateway]));
+        let joined = controller.join_node("node-e", explicit).await.unwrap();
+        assert_eq!(
+            joined.roles,
+            BTreeSet::from([NodeRole::Agent, NodeRole::Gateway])
+        );
         controller
-            .inner
-            .lock()
-            .await
-            .state
-            .controllers
-            .get_mut("node-b")
-            .unwrap()
-            .reserved_at_unix_ms = unix_ms() - CONTROLLER_TIMEOUT_MS - 1;
-        let promoted = controller
-            .heartbeat(
-                "node-d",
-                NodeHeartbeat {
-                    node: NodeRecord {
-                        id: "node-d".into(),
-                        address: "10.0.0.24".into(),
-                        labels: BTreeMap::new(),
-                        cpu_millis: 1000,
-                        memory_bytes: 1024,
-                        port_range_start: 20_000,
-                        port_range_end: 29_999,
-                        controller_capable: true,
-                        controller_url: Some("http://10.0.0.24:8080".into()),
-                        raft_id: Some(4),
-                        raft_url: Some("http://10.0.0.24:8080/internal/raft".into()),
-                    },
-                    tasks: Vec::new(),
+            .update_node_roles(
+                "controller-a",
+                NodeRolesUpdate {
+                    roles: BTreeSet::from([NodeRole::Gateway]),
                 },
+                RoleOperation::Remove,
             )
             .await
             .unwrap();
-        assert_eq!(promoted.node_role, NodeRole::Controller);
-        assert!(!controller.repository.is_voter(4));
+        assert!(matches!(
+            controller
+                .update_node_roles(
+                    "node-e",
+                    NodeRolesUpdate {
+                        roles: BTreeSet::from([NodeRole::Gateway]),
+                    },
+                    RoleOperation::Remove,
+                )
+                .await,
+            Err(ControllerError::Conflict(_))
+        ));
+
+        let mut conflicting = test_join_request("node-f", "10.0.0.26", 6);
+        conflicting.requested_roles = Some(BTreeSet::from([NodeRole::Controller]));
+        assert!(matches!(
+            controller.join_node("node-f", conflicting).await,
+            Err(ControllerError::Conflict(_))
+        ));
     }
 
     #[tokio::test]
-    async fn updates_controller_target_in_raft_and_reconciles_roles() {
+    async fn standalone_keeps_one_controller_and_allows_unlimited_gateways() {
+        let cluster = ClusterSettings {
+            schema_version: 2,
+            cluster_id: "standalone-role-test".into(),
+            mode: ClusterMode::Standalone,
+            controller_port: 8080,
+            gateway: ClusterGatewayConfig::default(),
+        };
+        let (repository, _raft, _directory) = test_repository(&cluster).await;
+        let controller = Controller::new(
+            test_controller_config(&cluster),
+            "secret".into(),
+            repository,
+        )
+        .await
+        .unwrap();
+        controller.tick().await.unwrap();
+
+        for (node_id, address, raft_id) in [
+            ("gateway-b", "10.0.0.22", 2),
+            ("gateway-c", "10.0.0.23", 3),
+            ("gateway-d", "10.0.0.24", 4),
+        ] {
+            let mut request = test_join_request(node_id, address, raft_id);
+            request.requested_roles = Some(BTreeSet::from([NodeRole::Gateway]));
+            let joined = controller.join_node(node_id, request).await.unwrap();
+            assert_eq!(
+                joined.roles,
+                BTreeSet::from([NodeRole::Agent, NodeRole::Gateway])
+            );
+        }
+
+        let joined = controller
+            .join_node("agent-e", test_join_request("agent-e", "10.0.0.25", 5))
+            .await
+            .unwrap();
+        assert_eq!(joined.roles, agent_roles());
+
+        let mut request = test_join_request("controller-f", "10.0.0.26", 6);
+        request.requested_roles = Some(BTreeSet::from([NodeRole::Controller]));
+        assert!(matches!(
+            controller.join_node("controller-f", request).await,
+            Err(ControllerError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn switches_standalone_to_ha_but_not_back() {
         let cluster = ClusterSettings {
             schema_version: 2,
             cluster_id: "config-update-test".into(),
-            controllers: 1,
+            mode: ClusterMode::Standalone,
             controller_port: 8080,
-            caddy: ClusterCaddyConfig::default(),
+            gateway: ClusterGatewayConfig::default(),
         };
         let (repository, _raft, _directory) = test_repository(&cluster).await;
         let observer = repository.clone();
@@ -1959,62 +2287,42 @@ mod tests {
             .unwrap();
         controller.tick().await.unwrap();
 
-        let error = controller
-            .update_cluster_config(ClusterConfigUpdate { controllers: 2 })
-            .await
-            .unwrap_err();
-        assert!(matches!(error, ControllerError::Invalid(_)));
-
         let updated = controller
-            .update_cluster_config(ClusterConfigUpdate { controllers: 3 })
+            .update_cluster_config(ClusterConfigUpdate {
+                mode: ClusterMode::Ha,
+            })
             .await
             .unwrap();
-        assert_eq!(updated.config.controllers, 3);
+        assert_eq!(updated.config.mode, ClusterMode::Ha);
         assert_eq!(
-            observer
-                .load_consistent()
-                .await
-                .unwrap()
-                .cluster
-                .controllers,
-            3
+            observer.load_consistent().await.unwrap().cluster.mode,
+            ClusterMode::Ha
         );
         assert_eq!(controller.get_cluster_config().await.unwrap(), updated);
 
         let joined = controller
-            .join_node(
-                "node-b",
-                JoinRequest {
-                    node_id: "node-b".into(),
-                    address: "10.0.0.22".into(),
-                    controller_capable: true,
-                    controller_url: Some("http://10.0.0.22:8080".into()),
-                    raft_id: Some(2),
-                    raft_url: Some("http://10.0.0.22:8080/internal/raft".into()),
-                    labels: BTreeMap::new(),
-                },
-            )
+            .join_node("node-b", test_join_request("node-b", "10.0.0.22", 2))
             .await
             .unwrap();
-        assert_eq!(joined.role, NodeRole::Controller);
+        assert!(joined.roles.contains(&NodeRole::Controller));
 
-        controller
-            .update_cluster_config(ClusterConfigUpdate { controllers: 1 })
+        let error = controller
+            .update_cluster_config(ClusterConfigUpdate {
+                mode: ClusterMode::Standalone,
+            })
             .await
-            .unwrap();
-        controller.tick().await.unwrap();
-        assert_eq!(controller.inner.lock().await.state.controllers.len(), 1);
-        assert_eq!(controller.bootstrap().await.unwrap().cluster.controllers, 1);
+            .unwrap_err();
+        assert!(matches!(error, ControllerError::Conflict(_)));
     }
 
     #[tokio::test]
-    async fn promotes_reserved_manager_through_raft() {
+    async fn promotes_reserved_controller_through_raft() {
         let cluster = ClusterSettings {
             schema_version: 2,
-            cluster_id: "manager-promotion-test".into(),
-            controllers: 3,
+            cluster_id: "controller-promotion-test".into(),
+            mode: ClusterMode::Ha,
             controller_port: 8080,
-            caddy: ClusterCaddyConfig::default(),
+            gateway: ClusterGatewayConfig::default(),
         };
         let (repository, leader_raft, _leader_directory) = test_repository(&cluster).await;
         let mut config = test_controller_config(&cluster);
@@ -2035,7 +2343,7 @@ mod tests {
         let follower_directory = tempfile::tempdir().unwrap();
         let follower_raft = RaftNode::open(NodeConfig::new(
             2,
-            ManagerNode {
+            ControllerNode {
                 raft_url: raft_url.clone(),
                 api_url: api_url.clone(),
             },
@@ -2054,16 +2362,16 @@ mod tests {
                 JoinRequest {
                     node_id: "controller-b".into(),
                     address: address.ip().to_string(),
-                    controller_capable: true,
-                    controller_url: Some(api_url.clone()),
-                    raft_id: Some(2),
-                    raft_url: Some(raft_url.clone()),
+                    requested_roles: None,
+                    controller_url: api_url.clone(),
+                    raft_id: 2,
+                    raft_url: raft_url.clone(),
                     labels: BTreeMap::new(),
                 },
             )
             .await
             .unwrap();
-        assert_eq!(joined.role, NodeRole::Controller);
+        assert!(joined.roles.contains(&NodeRole::Controller));
 
         let response = controller
             .heartbeat(
@@ -2077,10 +2385,10 @@ mod tests {
                         memory_bytes: 1024,
                         port_range_start: 20_000,
                         port_range_end: 29_999,
-                        controller_capable: true,
-                        controller_url: Some(api_url.clone()),
-                        raft_id: Some(2),
-                        raft_url: Some(raft_url),
+                        roles: joined.roles,
+                        controller_url: api_url.clone(),
+                        raft_id: 2,
+                        raft_url,
                     },
                     tasks: Vec::new(),
                 },
@@ -2088,7 +2396,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.node_role, NodeRole::Controller);
+        assert!(response.roles.contains(&NodeRole::Controller));
         assert!(response.controllers.contains(&api_url));
         assert!(leader_raft.voter_ids().contains(&2));
         assert!(
@@ -2112,7 +2420,7 @@ mod tests {
         let app = Router::new()
             .route(
                 "/config/apps/http/servers/swarmlite",
-                post(capture_caddy_config),
+                post(capture_gateway_config),
             )
             .with_state(received.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2122,15 +2430,15 @@ mod tests {
         let cluster = ClusterSettings {
             schema_version: 2,
             cluster_id: "caddy-publisher-test".into(),
-            controllers: 1,
+            mode: ClusterMode::Standalone,
             controller_port: 8080,
-            caddy: ClusterCaddyConfig::default(),
+            gateway: ClusterGatewayConfig::default(),
         };
         let mut config = test_controller_config(&cluster);
         config.controller_id = "controller-test".into();
-        config.caddy.admin_endpoints = vec![format!("http://{address}")];
-        config.caddy.listen = vec![":18089".into()];
-        config.caddy.drain_timeout_seconds = 3;
+        config.gateway.admin_port = address.port();
+        config.gateway.listen = vec![":18089".into()];
+        config.gateway.drain_timeout_seconds = 3;
         let (repository, _raft, _directory) = test_repository(&cluster).await;
         let controller = Controller::new(config, "test-token".into(), repository)
             .await
@@ -2138,7 +2446,9 @@ mod tests {
         {
             let mut inner = controller.inner.lock().await;
             controller.try_acquire_locked(&mut inner).await.unwrap();
-            inner.state.nodes.insert("node-a".into(), test_node());
+            let mut node = test_node();
+            node.roles.insert(NodeRole::Gateway);
+            inner.state.nodes.insert("node-a".into(), node);
             inner
                 .state
                 .services
@@ -2147,7 +2457,7 @@ mod tests {
             controller.commit_locked(&mut inner).await.unwrap();
         }
 
-        controller.sync_caddy_once().await.unwrap();
+        controller.sync_gateway_once().await.unwrap();
 
         let inner = controller.inner.lock().await;
         let task = &inner.state.tasks["old-task"];
@@ -2173,7 +2483,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let raft = RaftNode::open(NodeConfig::new(
             1,
-            ManagerNode {
+            ControllerNode {
                 raft_url: "http://127.0.0.1:19090/internal/raft".into(),
                 api_url: "http://127.0.0.1:19090".into(),
             },
@@ -2186,7 +2496,7 @@ mod tests {
         raft.initialize().await.unwrap();
         raft.raft()
             .wait(Some(Duration::from_secs(5)))
-            .current_leader(1, "test manager becomes leader")
+            .current_leader(1, "test controller becomes leader")
             .await
             .unwrap();
         (
@@ -2196,7 +2506,20 @@ mod tests {
         )
     }
 
-    async fn capture_caddy_config(
+    fn test_join_request(node_id: &str, address: &str, raft_id: u64) -> JoinRequest {
+        let controller_url = format!("http://{address}:8080");
+        JoinRequest {
+            node_id: node_id.to_owned(),
+            address: address.to_owned(),
+            requested_roles: None,
+            controller_url: controller_url.clone(),
+            raft_id,
+            raft_url: format!("{controller_url}/internal/raft"),
+            labels: BTreeMap::new(),
+        }
+    }
+
+    async fn capture_gateway_config(
         State(received): State<Arc<Mutex<Vec<serde_json::Value>>>>,
         Json(body): Json<serde_json::Value>,
     ) -> StatusCode {
@@ -2207,16 +2530,16 @@ mod tests {
     fn test_node() -> NodeRecord {
         NodeRecord {
             id: "node-a".into(),
-            address: "10.0.0.21".into(),
+            address: "127.0.0.1".into(),
             labels: BTreeMap::new(),
             cpu_millis: 1000,
             memory_bytes: 1024,
             port_range_start: 20_000,
             port_range_end: 29_999,
-            controller_capable: false,
-            controller_url: None,
-            raft_id: None,
-            raft_url: None,
+            roles: agent_roles(),
+            controller_url: "http://127.0.0.1:8080".into(),
+            raft_id: 2,
+            raft_url: "http://127.0.0.1:8080/internal/raft".into(),
         }
     }
 
@@ -2258,9 +2581,9 @@ mod tests {
         let cluster = ClusterSettings {
             schema_version: 2,
             cluster_id: "recovery-test".into(),
-            controllers: 1,
+            mode: ClusterMode::Standalone,
             controller_port: 8080,
-            caddy: ClusterCaddyConfig::default(),
+            gateway: ClusterGatewayConfig::default(),
         };
         let (repository, _raft, _directory) = test_repository(&cluster).await;
         let config = test_controller_config(&cluster);
@@ -2268,6 +2591,10 @@ mod tests {
             .await
             .unwrap();
         controller.tick().await.unwrap();
+        controller
+            .join_node("node-a", test_join_request("node-a", "127.0.0.1", 2))
+            .await
+            .unwrap();
 
         let mut service = test_service();
         service.spec.service_labels.clear();

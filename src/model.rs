@@ -1,12 +1,20 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ClusterCaddyConfig {
-    pub admin_endpoints: Vec<String>,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClusterGatewayConfig {
     pub listen: Vec<String>,
+}
+
+impl Default for ClusterGatewayConfig {
+    fn default() -> Self {
+        Self {
+            listen: vec![":80".to_owned()],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -123,13 +131,26 @@ pub struct KvLockMutationRequest {
 pub struct ClusterSettings {
     pub schema_version: u32,
     pub cluster_id: String,
-    pub controllers: u16,
+    pub mode: ClusterMode,
     pub controller_port: u16,
-    pub caddy: ClusterCaddyConfig,
+    pub gateway: ClusterGatewayConfig,
 }
 
-pub fn valid_controller_count(controllers: u16) -> bool {
-    controllers == 1 || (controllers >= 3 && !controllers.is_multiple_of(2))
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterMode {
+    #[default]
+    Standalone,
+    Ha,
+}
+
+impl ClusterMode {
+    pub const fn controller_limit(self) -> usize {
+        match self {
+            Self::Standalone => 1,
+            Self::Ha => 3,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -141,15 +162,37 @@ pub struct ClusterConfigResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClusterConfigUpdate {
-    pub controllers: u16,
+    pub mode: ClusterMode,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeRole {
     Controller,
-    #[default]
-    Worker,
+    Agent,
+    Gateway,
+}
+
+pub type NodeRoles = BTreeSet<NodeRole>;
+
+pub fn agent_roles() -> NodeRoles {
+    BTreeSet::from([NodeRole::Agent])
+}
+
+pub fn initial_roles() -> NodeRoles {
+    BTreeSet::from([NodeRole::Controller, NodeRole::Agent, NodeRole::Gateway])
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeMember {
+    pub id: String,
+    pub address: String,
+    pub roles: NodeRoles,
+    pub automatic_roles: bool,
+    pub controller_url: String,
+    pub raft_id: u64,
+    pub raft_url: String,
+    pub joined_at_unix_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,10 +270,10 @@ pub struct NodeRecord {
     pub memory_bytes: u64,
     pub port_range_start: u16,
     pub port_range_end: u16,
-    pub controller_capable: bool,
-    pub controller_url: Option<String>,
-    pub raft_id: Option<u64>,
-    pub raft_url: Option<String>,
+    pub roles: NodeRoles,
+    pub controller_url: String,
+    pub raft_id: u64,
+    pub raft_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -279,6 +322,7 @@ pub struct ClusterState {
     pub services: BTreeMap<String, ServiceRecord>,
     pub nodes: BTreeMap<String, NodeRecord>,
     pub tasks: BTreeMap<String, TaskRecord>,
+    pub members: BTreeMap<String, NodeMember>,
     pub controllers: BTreeMap<String, ControllerRecord>,
     pub unclaimed_tasks: BTreeMap<String, UnclaimedTask>,
 }
@@ -328,15 +372,17 @@ pub struct TaskReport {
 pub struct HeartbeatResponse {
     pub leader_term: u64,
     pub generation: u64,
+    pub cluster: ClusterSettings,
     pub assignments: Vec<TaskAssignment>,
-    pub node_role: NodeRole,
+    pub roles: NodeRoles,
     pub controllers: Vec<String>,
     pub remove_tasks: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NodeControl {
-    pub role: NodeRole,
+    pub cluster: ClusterSettings,
+    pub roles: NodeRoles,
     pub controllers: Vec<String>,
 }
 
@@ -350,18 +396,30 @@ pub struct BootstrapResponse {
 pub struct JoinRequest {
     pub node_id: String,
     pub address: String,
-    pub controller_capable: bool,
-    pub controller_url: Option<String>,
-    pub raft_id: Option<u64>,
-    pub raft_url: Option<String>,
+    pub requested_roles: Option<NodeRoles>,
+    pub controller_url: String,
+    pub raft_id: u64,
+    pub raft_url: String,
     pub labels: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinResponse {
     pub cluster: ClusterSettings,
-    pub role: NodeRole,
+    pub roles: NodeRoles,
     pub controllers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NodeRolesUpdate {
+    pub roles: NodeRoles,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeRolesResponse {
+    pub node_id: String,
+    pub roles: NodeRoles,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -386,7 +444,7 @@ pub struct StatusResponse {
     pub generation: u64,
     pub leader: Option<LeaderRecord>,
     pub is_leader: bool,
-    pub caddy: CaddyStatus,
+    pub gateway: GatewayStatus,
     pub recovery: RecoveryStatus,
     pub state: ClusterState,
 }
@@ -398,7 +456,7 @@ pub struct RecoveryStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CaddyStatus {
+pub struct GatewayStatus {
     pub enabled: bool,
     pub desired_generation: u64,
     pub applied_generation: Option<u64>,

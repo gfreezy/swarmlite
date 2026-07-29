@@ -4,22 +4,23 @@ use anyhow::{Result, bail};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
-use crate::model::ClusterSettings;
+use crate::model::{ClusterSettings, NodeRoles};
 
 #[derive(Debug, Clone)]
 pub struct ControllerConfig {
     pub controller_id: String,
+    pub roles: NodeRoles,
     pub listen: SocketAddr,
     pub advertise_url: String,
     pub node_timeout_seconds: u64,
     pub reconcile_interval_seconds: u64,
-    pub caddy: CaddyConfig,
+    pub gateway: GatewayConfig,
     pub cluster: ClusterSettings,
 }
 
 #[derive(Debug, Clone)]
-pub struct CaddyConfig {
-    pub admin_endpoints: Vec<String>,
+pub struct GatewayConfig {
+    pub admin_port: u16,
     pub server_name: String,
     pub listen: Vec<String>,
     pub request_timeout_seconds: u64,
@@ -28,16 +29,16 @@ pub struct CaddyConfig {
     pub drain_timeout_seconds: u64,
 }
 
-impl Default for CaddyConfig {
+impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
-            admin_endpoints: Vec::new(),
-            server_name: default_caddy_server_name(),
-            listen: default_caddy_listen(),
-            request_timeout_seconds: default_caddy_request_timeout(),
-            resync_interval_seconds: default_caddy_resync_interval(),
-            retry_interval_seconds: default_caddy_retry_interval(),
-            drain_timeout_seconds: default_caddy_drain_timeout(),
+            admin_port: 2019,
+            server_name: default_gateway_server_name(),
+            listen: default_gateway_listen(),
+            request_timeout_seconds: default_gateway_request_timeout(),
+            resync_interval_seconds: default_gateway_resync_interval(),
+            retry_interval_seconds: default_gateway_retry_interval(),
+            drain_timeout_seconds: default_gateway_drain_timeout(),
         }
     }
 }
@@ -52,10 +53,10 @@ pub struct AgentConfig {
     pub labels: BTreeMap<String, String>,
     pub heartbeat_interval_seconds: u64,
     pub port_range: PortRangeConfig,
-    pub controller_capable: bool,
-    pub controller_url: Option<String>,
-    pub raft_id: Option<u64>,
-    pub raft_url: Option<String>,
+    pub roles: NodeRoles,
+    pub controller_url: String,
+    pub raft_id: u64,
+    pub raft_url: String,
 }
 
 impl AgentConfig {
@@ -139,22 +140,22 @@ impl Default for PortRangeConfig {
     }
 }
 
-fn default_caddy_server_name() -> String {
+fn default_gateway_server_name() -> String {
     "swarmlite".to_owned()
 }
-fn default_caddy_listen() -> Vec<String> {
+fn default_gateway_listen() -> Vec<String> {
     vec![":80".to_owned()]
 }
-const fn default_caddy_request_timeout() -> u64 {
+const fn default_gateway_request_timeout() -> u64 {
     5
 }
-const fn default_caddy_resync_interval() -> u64 {
+const fn default_gateway_resync_interval() -> u64 {
     30
 }
-const fn default_caddy_retry_interval() -> u64 {
+const fn default_gateway_retry_interval() -> u64 {
     2
 }
-const fn default_caddy_drain_timeout() -> u64 {
+const fn default_gateway_drain_timeout() -> u64 {
     10
 }
 const fn default_port_start() -> u16 {

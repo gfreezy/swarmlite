@@ -4,7 +4,10 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use swarmlite::{
     config::RuntimeKind,
-    model::{ClusterCaddyConfig, ClusterConfigResponse, ClusterConfigUpdate, ClusterSettings},
+    model::{
+        ClusterConfigResponse, ClusterConfigUpdate, ClusterGatewayConfig, ClusterMode,
+        ClusterSettings, NodeRole, NodeRolesResponse, NodeRolesUpdate,
+    },
     node,
 };
 
@@ -52,6 +55,9 @@ enum Command {
         runtime_socket: Option<String>,
         #[arg(long = "label")]
         labels: Vec<String>,
+        /// Exact requested roles. Agent is always included. Omit for automatic assignment.
+        #[arg(long, value_enum, value_delimiter = ',')]
+        roles: Option<Vec<NodeRole>>,
     },
     /// Print a join command for this node's cluster.
     JoinToken,
@@ -59,6 +65,11 @@ enum Command {
     Config {
         #[command(subcommand)]
         action: ConfigCommand,
+    },
+    /// Read or change the roles assigned to a joined node.
+    Role {
+        #[command(subcommand)]
+        action: RoleCommand,
     },
     /// Deploy or update a Swarm-style stack file.
     Deploy {
@@ -98,9 +109,43 @@ enum ConfigCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum RoleCommand {
+    /// Print a node's assigned roles.
+    Get {
+        node_id: String,
+        #[command(flatten)]
+        connection: ConnectionArgs,
+    },
+    /// Replace a node's assigned roles. Agent is always included.
+    Set {
+        node_id: String,
+        #[arg(value_enum, value_delimiter = ',', required = true)]
+        roles: Vec<NodeRole>,
+        #[command(flatten)]
+        connection: ConnectionArgs,
+    },
+    /// Add roles to a node.
+    Add {
+        node_id: String,
+        #[arg(value_enum, value_delimiter = ',', required = true)]
+        roles: Vec<NodeRole>,
+        #[command(flatten)]
+        connection: ConnectionArgs,
+    },
+    /// Remove roles from a node. Agent cannot be removed.
+    Remove {
+        node_id: String,
+        #[arg(value_enum, value_delimiter = ',', required = true)]
+        roles: Vec<NodeRole>,
+        #[command(flatten)]
+        connection: ConnectionArgs,
+    },
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ConfigKey {
-    Controllers,
+    Mode,
 }
 
 #[derive(Debug, Args)]
@@ -117,9 +162,9 @@ struct InitArgs {
     token: Option<String>,
     #[arg(long, default_value_t = 8080)]
     controller_port: u16,
-    /// Desired number of Raft managers. Use 1 or an odd number such as 3 or 5.
-    #[arg(long, default_value_t = 1)]
-    controllers: u16,
+    /// Control-plane mode. HA has three controller slots.
+    #[arg(long, value_enum, default_value_t = ClusterMode::Standalone)]
+    mode: ClusterMode,
     /// Rebuild the control plane and collect containers from the previous cluster.
     #[arg(long)]
     recover: bool,
@@ -131,10 +176,8 @@ struct InitArgs {
     runtime_socket: Option<String>,
     #[arg(long = "label")]
     labels: Vec<String>,
-    #[arg(long = "caddy-admin")]
-    caddy_admin_endpoints: Vec<String>,
-    #[arg(long = "caddy-listen")]
-    caddy_listen: Vec<String>,
+    #[arg(long = "gateway-listen", default_value = ":80")]
+    gateway_listen: Vec<String>,
 }
 
 #[tokio::main]
@@ -151,13 +194,12 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Init { options } => {
             let cluster = ClusterSettings {
-                schema_version: 2,
+                schema_version: 3,
                 cluster_id: node::new_cluster_id(),
-                controllers: options.controllers,
+                mode: options.mode,
                 controller_port: options.controller_port,
-                caddy: ClusterCaddyConfig {
-                    admin_endpoints: options.caddy_admin_endpoints.clone(),
-                    listen: options.caddy_listen.clone(),
+                gateway: ClusterGatewayConfig {
+                    listen: options.gateway_listen.clone(),
                 },
             };
             let message = node::init(node::InitOptions {
@@ -196,6 +238,7 @@ async fn main() -> Result<()> {
             runtime,
             runtime_socket,
             labels,
+            roles,
         } => {
             let message = node::join(node::JoinOptions {
                 data_dir,
@@ -205,6 +248,7 @@ async fn main() -> Result<()> {
                 runtime,
                 runtime_socket,
                 labels: node::parse_labels(labels)?,
+                requested_roles: roles.map(IntoIterator::into_iter).map(Iterator::collect),
             })
             .await?;
             println!("{message}");
@@ -223,10 +267,9 @@ async fn main() -> Result<()> {
                     connection,
                 } => {
                     let update = match key {
-                        ConfigKey::Controllers => ClusterConfigUpdate {
-                            controllers: value.parse().map_err(|_| {
-                                anyhow::anyhow!("controllers must be an unsigned integer")
-                            })?,
+                        ConfigKey::Mode => ClusterConfigUpdate {
+                            mode: <ClusterMode as ValueEnum>::from_str(&value, true)
+                                .map_err(anyhow::Error::msg)?,
                         },
                     };
                     (connection, Some(update))
@@ -236,6 +279,35 @@ async fn main() -> Result<()> {
                 node::resolve_connection(&data_dir, connection.controller, connection.token)
                     .await?;
             let response = cluster_config(controller, token, update.as_ref()).await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+            Ok(())
+        }
+        Command::Role { action } => {
+            let (node_id, roles, method, connection) = match action {
+                RoleCommand::Get {
+                    node_id,
+                    connection,
+                } => (node_id, None, reqwest::Method::GET, connection),
+                RoleCommand::Set {
+                    node_id,
+                    roles,
+                    connection,
+                } => (node_id, Some(roles), reqwest::Method::PUT, connection),
+                RoleCommand::Add {
+                    node_id,
+                    roles,
+                    connection,
+                } => (node_id, Some(roles), reqwest::Method::PATCH, connection),
+                RoleCommand::Remove {
+                    node_id,
+                    roles,
+                    connection,
+                } => (node_id, Some(roles), reqwest::Method::DELETE, connection),
+            };
+            let (controller, token) =
+                node::resolve_connection(&data_dir, connection.controller, connection.token)
+                    .await?;
+            let response = node_roles(controller, token, &node_id, method, roles).await?;
             println!("{}", serde_json::to_string_pretty(&response)?);
             Ok(())
         }
@@ -255,6 +327,48 @@ async fn main() -> Result<()> {
             status(controller, token).await
         }
     }
+}
+
+async fn node_roles(
+    controller: String,
+    token: String,
+    node_id: &str,
+    method: reqwest::Method,
+    roles: Option<Vec<NodeRole>>,
+) -> Result<NodeRolesResponse> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let mut url = format!(
+        "{}/v1/nodes/{node_id}/roles",
+        controller.trim_end_matches('/')
+    );
+    let update = roles.map(|roles| NodeRolesUpdate {
+        roles: roles.into_iter().collect(),
+    });
+    for _ in 0..3 {
+        let mut request = client.request(method.clone(), &url).bearer_auth(&token);
+        if let Some(update) = &update {
+            request = request.json(update);
+        }
+        let response = request.send().await?;
+        if response.status() == reqwest::StatusCode::TEMPORARY_REDIRECT {
+            url = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| anyhow::anyhow!("controller redirect omitted Location"))?
+                .to_owned();
+            continue;
+        }
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            anyhow::bail!("controller returned {status}: {body}");
+        }
+        return serde_json::from_str(&body).map_err(Into::into);
+    }
+    anyhow::bail!("too many controller redirects")
 }
 
 async fn cluster_config(
@@ -370,6 +484,7 @@ mod tests {
         assert!(names.contains(&"join"));
         assert!(names.contains(&"serve"));
         assert!(names.contains(&"config"));
+        assert!(names.contains(&"role"));
         assert!(!names.contains(&"controller"));
         assert!(!names.contains(&"agent"));
     }
@@ -401,12 +516,12 @@ mod tests {
 
     #[test]
     fn config_set_accepts_key_value_arguments() {
-        assert!(Cli::try_parse_from(["swarmlite", "config", "set", "controllers", "3"]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "config", "set", "mode", "ha"]).is_ok());
         assert!(Cli::try_parse_from(["swarmlite", "config", "set", "unknown", "3"]).is_err());
     }
 
     #[test]
-    fn init_uses_only_a_manager_count() {
+    fn init_uses_a_cluster_mode() {
         let command = Cli::command();
         let init = command
             .get_subcommands()
@@ -417,9 +532,32 @@ mod tests {
             .get_arguments()
             .map(|argument| argument.get_id().as_str())
             .collect::<Vec<_>>();
-        assert!(arguments.contains(&"controllers"));
+        assert!(arguments.contains(&"mode"));
         assert!(arguments.contains(&"recover"));
         assert!(!arguments.iter().any(|argument| argument.contains("s3")));
+    }
+
+    #[test]
+    fn role_supports_get_set_add_and_remove() {
+        for action in ["get", "set", "add", "remove"] {
+            let mut args = vec!["swarmlite", "role", action, "node-a"];
+            if action != "get" {
+                args.push("gateway");
+            }
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+        assert!(
+            Cli::try_parse_from([
+                "swarmlite",
+                "join",
+                "http://127.0.0.1:8080",
+                "--token",
+                "0123456789abcdef",
+                "--roles",
+                "controller,gateway",
+            ])
+            .is_ok()
+        );
     }
 
     #[test]

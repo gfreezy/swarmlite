@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashSet};
 use uuid::Uuid;
 
 use crate::{
-    caddy,
+    gateway,
     model::{
         ClusterState, DesiredTaskState, NodeRecord, ObservedTaskState, PortBinding, ServicePort,
         ServiceRecord, ServiceSpec, TaskRecord,
@@ -175,7 +175,7 @@ fn retire_task(state: &mut ClusterState, task_id: &str, service: &ServiceRecord)
         return false;
     }
     task.desired =
-        if caddy::is_enabled(&service.spec) && task.observed == ObservedTaskState::Healthy {
+        if gateway::is_enabled(&service.spec) && task.observed == ObservedTaskState::Healthy {
             DesiredTaskState::Draining
         } else {
             DesiredTaskState::Stopped
@@ -293,7 +293,7 @@ fn allocate_ports(
     spec: &ServiceSpec,
 ) -> Option<Vec<PortBinding>> {
     let mut requested = spec.ports.clone();
-    if let Some(target) = caddy::target_port(spec)
+    if let Some(target) = gateway::target_port(spec)
         && !requested.iter().any(|port| port.target == target)
     {
         requested.push(ServicePort {
@@ -388,10 +388,10 @@ mod tests {
                     memory_bytes: 1024,
                     port_range_start: 20_000,
                     port_range_end: 20_010,
-                    controller_capable: false,
-                    controller_url: None,
-                    raft_id: None,
-                    raft_url: None,
+                    roles: crate::model::agent_roles(),
+                    controller_url: String::new(),
+                    raft_id: 1,
+                    raft_url: String::new(),
                 },
             );
         }
@@ -462,17 +462,17 @@ mod tests {
     }
 
     #[test]
-    fn ingress_rollout_drains_old_task_until_caddy_acknowledges_it() {
+    fn gateway_rollout_drains_old_task_until_caddy_acknowledges_it() {
         let (mut state, live) = state_with_nodes();
         let mut original = service(1, 1);
         original
             .spec
             .service_labels
-            .insert(caddy::ENABLE_LABEL.into(), "true".into());
+            .insert(gateway::ENABLE_LABEL.into(), "true".into());
         original
             .spec
             .service_labels
-            .insert(caddy::HOST_LABEL.into(), "example.com".into());
+            .insert(gateway::HOST_LABEL.into(), "example.com".into());
         state.services.insert(original.id.clone(), original.clone());
         reconcile(&mut state, &live);
         state.tasks.values_mut().for_each(|task| {
@@ -504,22 +504,22 @@ mod tests {
     }
 
     #[test]
-    fn ingress_port_label_allocates_a_host_port_without_compose_ports() {
+    fn gateway_port_label_allocates_a_host_port_without_compose_ports() {
         let (mut state, live) = state_with_nodes();
         let mut service = service(1, 1);
         service.spec.ports.clear();
         service
             .spec
             .service_labels
-            .insert(caddy::ENABLE_LABEL.into(), "true".into());
+            .insert(gateway::ENABLE_LABEL.into(), "true".into());
         service
             .spec
             .service_labels
-            .insert(caddy::HOST_LABEL.into(), "example.com".into());
+            .insert(gateway::HOST_LABEL.into(), "example.com".into());
         service
             .spec
             .service_labels
-            .insert(caddy::PORT_LABEL.into(), "8080".into());
+            .insert(gateway::PORT_LABEL.into(), "8080".into());
         state.services.insert(service.id.clone(), service);
 
         reconcile(&mut state, &live);

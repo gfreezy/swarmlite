@@ -2,10 +2,10 @@ use serde::Serialize;
 
 use crate::model::{ClusterState, DesiredTaskState, ObservedTaskState, ServiceRecord, ServiceSpec};
 
-pub const ENABLE_LABEL: &str = "swarmlite.ingress.enable";
-pub const HOST_LABEL: &str = "swarmlite.ingress.host";
-pub const PORT_LABEL: &str = "swarmlite.ingress.port";
-pub const SCHEME_LABEL: &str = "swarmlite.ingress.scheme";
+pub const ENABLE_LABEL: &str = "swarmlite.gateway.enable";
+pub const HOST_LABEL: &str = "swarmlite.gateway.host";
+pub const PORT_LABEL: &str = "swarmlite.gateway.port";
+pub const SCHEME_LABEL: &str = "swarmlite.gateway.scheme";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HttpServer {
@@ -51,7 +51,7 @@ pub struct HttpTransport {
 pub struct EmptyObject {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct IngressSpec {
+struct GatewaySpec {
     hosts: Vec<String>,
     target_port: u16,
     scheme: String,
@@ -95,13 +95,13 @@ pub fn validate_service(name: &str, spec: &ServiceSpec) -> Result<(), String> {
     if !is_enabled(spec) {
         return Ok(());
     }
-    parse_ingress(spec)
+    parse_gateway(spec)
         .map(|_| ())
         .map_err(|error| format!("service {name}: {error}"))
 }
 
 fn build_route(state: &ClusterState, service: &ServiceRecord) -> Option<Route> {
-    let ingress = parse_ingress(&service.spec).ok()?;
+    let gateway = parse_gateway(&service.spec).ok()?;
     let upstreams = state
         .tasks
         .values()
@@ -115,20 +115,20 @@ fn build_route(state: &ClusterState, service: &ServiceRecord) -> Option<Route> {
             let port = task
                 .ports
                 .iter()
-                .find(|port| port.target == ingress.target_port && port.protocol == "tcp")?;
+                .find(|port| port.target == gateway.target_port && port.protocol == "tcp")?;
             Some(Upstream {
                 dial: format!("{}:{}", format_host(&node.address), port.published),
             })
         })
         .collect();
-    let transport = (ingress.scheme == "https").then_some(HttpTransport {
+    let transport = (gateway.scheme == "https").then_some(HttpTransport {
         protocol: "http",
         tls: EmptyObject {},
     });
     Some(Route {
         id: format!("swarmlite-{}", sanitize_id(&service.id)),
         matchers: vec![RequestMatcher {
-            host: ingress.hosts,
+            host: gateway.hosts,
         }],
         handle: vec![ReverseProxyHandler {
             handler: "reverse_proxy",
@@ -139,7 +139,7 @@ fn build_route(state: &ClusterState, service: &ServiceRecord) -> Option<Route> {
     })
 }
 
-fn parse_ingress(spec: &ServiceSpec) -> Result<IngressSpec, String> {
+fn parse_gateway(spec: &ServiceSpec) -> Result<GatewaySpec, String> {
     let hosts = spec
         .service_labels
         .get(HOST_LABEL)
@@ -156,7 +156,9 @@ fn parse_ingress(spec: &ServiceSpec) -> Result<IngressSpec, String> {
             .find(|port| port.protocol == "tcp")
             .map(|port| port.target)
             .ok_or_else(|| {
-                format!("{PORT_LABEL} or a TCP service port is required when ingress is enabled")
+                format!(
+                    "{PORT_LABEL} or a TCP service port is required when gateway routing is enabled"
+                )
             })?,
     };
     let scheme = spec
@@ -167,7 +169,7 @@ fn parse_ingress(spec: &ServiceSpec) -> Result<IngressSpec, String> {
     if scheme != "http" && scheme != "https" {
         return Err(format!("{SCHEME_LABEL} must be either http or https"));
     }
-    Ok(IngressSpec {
+    Ok(GatewaySpec {
         hosts,
         target_port,
         scheme,
@@ -208,7 +210,7 @@ fn sanitize_id(value: &str) -> String {
 mod tests {
     use std::collections::BTreeMap;
 
-    use crate::model::{NodeRecord, PortBinding, ServicePort, TaskRecord};
+    use crate::model::{NodeRecord, PortBinding, ServicePort, TaskRecord, agent_roles};
 
     use super::*;
 
@@ -249,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_required_ingress_labels() {
+    fn validates_required_gateway_labels() {
         let mut service = service().spec;
         service.service_labels.remove(HOST_LABEL);
         let error = validate_service("web", &service).unwrap_err();
@@ -318,10 +320,10 @@ mod tests {
             memory_bytes: 1024,
             port_range_start: 20_000,
             port_range_end: 29_999,
-            controller_capable: false,
-            controller_url: None,
-            raft_id: None,
-            raft_url: None,
+            roles: agent_roles(),
+            controller_url: String::new(),
+            raft_id: 1,
+            raft_url: String::new(),
         }
     }
 
