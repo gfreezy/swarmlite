@@ -1,28 +1,29 @@
 # Swarmlite
 
 Swarmlite is a small Rust container orchestrator for one LAN or region. Every machine runs the
-same `swarmlite serve` command; a node's role set decides which components that process starts.
+same `swarmlite serve` command; a node's role set decides which components the node maintains.
 
 Roles are composable:
 
 - `agent` runs containers. It is mandatory on every node and cannot be removed.
 - `controller` runs the API and a Raft voter.
-- `gateway` runs the bundled Caddy build and publishes service routes.
+- `gateway` maintains an independent Caddy container and publishes service routes to it.
 
 This is an MVP, not a drop-in replacement for Docker Swarm or Kubernetes. It intentionally has
 no overlay network or routing mesh.
 
 ## Build
 
-Rust 1.97 or newer is required. A gateway node also needs the included Caddy build:
+Rust 1.97 or newer is required to build Swarmlite:
 
 ```bash
 cargo build --release --locked
-(cd caddy-storage && go build -o ../target/release/caddy ./cmd/caddy)
 ```
 
-Keep `swarmlite` and `caddy` on `PATH`, or set `SWARMLITE_GATEWAY_BINARY`. The project
-[Dockerfile](Dockerfile) builds both binaries into one image.
+The project [Dockerfile](Dockerfile) builds Swarmlite. Gateway nodes automatically pull the
+prebuilt `ghcr.io/swarmlite/swarmlite-caddy:latest` image, which contains Caddy plus the
+Swarmlite storage module. A Docker-compatible runtime is therefore required on deployed nodes;
+Go is needed only when developing or publishing the gateway image itself.
 
 ## Commands
 
@@ -155,13 +156,28 @@ in heartbeats and persisted locally, so agents do not need a hand-written contro
 
 ## Gateway and HTTPS
 
-A gateway role makes `serve` start the bundled Caddy binary. The first node is always a gateway;
-additional gateways are opt-in. The controller discovers active gateways and publishes routing
-configuration automatically. Use `--gateway-listen` during init to change the default `:80`:
+A gateway role makes `serve` create or start a separate `swarmlite-gateway` container. The
+container has `restart=unless-stopped`; stopping, crashing, or upgrading the Swarmlite process
+does not stop Caddy. The first node is always a gateway and additional gateways are opt-in. The
+controller discovers active gateways and publishes routing configuration automatically. Use
+`--gateway-listen` during init to change the default `:80`:
 
 ```bash
 swarmlite init --gateway-listen :80 --gateway-listen :443
 ```
+
+The default gateway image is `ghcr.io/swarmlite/swarmlite-caddy:latest`. Select another
+registry and tag during initialization, or roll the cluster to another image later:
+
+```bash
+swarmlite init --gateway-image registry.example.com/swarmlite-caddy:1.0.0
+swarmlite config set gateway-image registry.example.com/swarmlite-caddy:1.1.0
+```
+
+The image reference is replicated as cluster configuration and returned by
+`swarmlite config get`. Every gateway node pulls the new image and recreates its Caddy container
+after receiving the update. The pull completes before the existing container is removed, and
+the `/data` and `/config` volumes are retained.
 
 Supported service labels under `deploy.labels` are:
 
@@ -170,15 +186,32 @@ Supported service labels under `deploy.labels` are:
 - `swarmlite.gateway.port`, the container HTTP port
 - `swarmlite.gateway.scheme=http|https`, defaulting to `http`
 
-Caddy performs normal automatic HTTPS for routed hostnames. Its local certificate storage lives
-under the node data directory at `caddy/` and remains authoritative. The included generic
-Swarmlite storage adapter uses the controller KV and lock APIs only as a best-effort cross-gateway
-cache to reduce duplicate certificate requests. Loss of quorum or total loss of Swarmlite's KV
-state does not remove local certificates; a gateway can fall back to local locking and may issue a
-duplicate certificate. See [caddy-storage/README.md](caddy-storage/README.md).
+Caddy keeps certificates in a cluster-specific Docker volume mounted at `/data`, and the last
+accepted runtime configuration in another volume mounted at `/config`. It starts with `--resume`,
+so it can restore the last routes even when no controller is available. Loss of quorum or total
+loss of Swarmlite data does not remove either volume.
 
-The gateway admin API listens on port 2019 so the controller can publish routes. Restrict that
-port to trusted cluster nodes.
+The gateway image includes and automatically enables `caddy.storage.swarmlite`. Local
+`FileStorage` remains authoritative, while certificate objects are copied to the generic KV API
+and certificate issuance uses its distributed locks. This normally lets additional gateway nodes
+reuse an existing certificate instead of applying for another one. The leader keeps the module's
+controller list current through Caddy's admin API; the cluster token is supplied only through the
+container environment and only its SHA-256 fingerprint is stored in a recovery label.
+
+If Swarmlite, its KV state, or Raft quorum is unavailable, Caddy immediately falls back to its
+local certificate data and local lock. Existing HTTPS traffic continues; gateways may apply for
+duplicate certificates until coordination returns.
+
+The gateway admin API listens inside the container on `0.0.0.0:2019`, but host port 2019 is
+published only on this node's detected or explicitly configured `advertise-address`. Controllers
+push routes to `http://<advertise-address>:2019`; restrict that port to controller nodes on the
+trusted cluster network. Gateway traffic ports are published on all host interfaces.
+
+Removing the gateway role intentionally stops the container and deletes both its container and
+persistent volumes. Adding the role again therefore starts with empty Caddy data. Container
+replacement caused by an image, listener, or advertise-address change retains the volumes. Any
+configured image must contain `caddy.storage.swarmlite`. See
+[caddy-storage/README.md](caddy-storage/README.md).
 
 During rolling updates, old healthy tasks remain routable until replacements are healthy and all
 active gateways acknowledge the new routing configuration.
@@ -203,9 +236,24 @@ Raft persists cluster settings, member roles, stacks, service specifications, de
 assignments, ports, drain deadlines, controller identities, KV state, and Raft metadata.
 Heartbeat liveness, resources, and observed container state are rebuilt from agent heartbeats.
 
-Every managed container carries the minimal labels needed to collect it after total control-plane
-loss: cluster, task, stack, service, slot, revision, normalized spec hash, and published ports.
-The labels do not contain the full stack. Keep the original stack file separately.
+Every managed workload container carries the minimal labels needed to collect it after total
+control-plane loss: cluster, task, stack, service, slot, revision, normalized spec hash, and
+published ports. The labels do not contain the full stack. Keep the original stack file
+separately.
+
+The independent Caddy container is also recoverable, but is deliberately not labeled as a task.
+It carries these labels:
+
+- `io.swarmlite.managed=true`
+- the stable `io.swarmlite.cluster_id`
+- `io.swarmlite.system=true` and `io.swarmlite.component=gateway`
+- `io.swarmlite.advertise_address` and `io.swarmlite.gateway_bind_address`
+- `io.swarmlite.gateway_image`, `io.swarmlite.gateway_listen`, and
+  `io.swarmlite.gateway_schema`
+- `io.swarmlite.gateway_token_sha256`, never the token itself
+
+They let recovery identify the cluster, restore the gateway role and listener settings, and keep
+using the existing Caddy image without mistaking the container for a stack service.
 
 Stop every old `swarmlite serve`, then rebuild the control plane on a machine that still has local
 cluster state or managed containers:
@@ -215,10 +263,12 @@ swarmlite init --recover
 swarmlite serve
 ```
 
-Recovery detects the old cluster ID, archives stale `local.redb` and Raft data under
-`recovery-backup/`, creates a fresh standalone control plane, and rotates the join token. It never
-deletes or changes a container. Rejoin and serve other nodes using the new token, then deploy the
-same stack name and file:
+Recovery detects the old cluster ID, including when Caddy is the only remaining managed
+container, archives stale `local.redb` and Raft data under `recovery-backup/`, creates a fresh
+standalone control plane, and rotates the join token. It never deletes or changes a container.
+On another recovered node, a join without explicit `--roles` detects the labeled local Caddy
+container and restores its gateway role automatically. Rejoin and serve other nodes using the new
+token, then deploy the same stack name and file:
 
 ```bash
 swarmlite deploy --name demo --file stack.yaml

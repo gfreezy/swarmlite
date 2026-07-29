@@ -347,13 +347,11 @@ mod tests {
 
     fn test_cluster() -> ClusterSettings {
         ClusterSettings {
-            schema_version: 3,
+            schema_version: crate::model::CLUSTER_SCHEMA_VERSION,
             cluster_id: "cluster-test".into(),
             mode: ClusterMode::Standalone,
             controller_port: 8080,
-            gateway: ClusterGatewayConfig {
-                listen: vec![":80".into()],
-            },
+            gateway: ClusterGatewayConfig::default(),
         }
     }
 

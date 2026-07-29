@@ -41,6 +41,7 @@ use crate::{
         NodeHeartbeat, NodeMember, NodeRole, NodeRoles, NodeRolesResponse, NodeRolesUpdate,
         ObservedTaskState, RecoveryStatus, ServiceRecord, StackRecord, StatusResponse,
         TaskAssignment, TaskRecord, UnclaimedTask, agent_roles, service_spec_hash,
+        valid_gateway_image,
     },
     scheduler,
     stack::{ParsedStack, parse_stack},
@@ -445,26 +446,60 @@ impl Controller {
             return Err(self.leader_redirect("/v1/config"));
         }
 
-        let mut cluster = self.cluster_settings(&inner)?;
-        if cluster.mode == ClusterMode::Ha && update.mode == ClusterMode::Standalone {
-            return Err(ControllerError::Conflict(
-                "switching an HA cluster back to standalone is not supported".to_owned(),
+        let ClusterConfigUpdate {
+            mode,
+            gateway_image,
+        } = update;
+        if mode.is_none() && gateway_image.is_none() {
+            return Err(ControllerError::Invalid(
+                "cluster configuration update must contain a key".to_owned(),
             ));
         }
-        if cluster.mode != update.mode {
-            let previous_cluster = inner.cluster.clone();
-            let previous_state = inner.state.clone();
-            cluster.mode = update.mode;
-            inner.cluster = cluster.clone();
-            if update.mode == ClusterMode::Ha {
-                fill_automatic_ha_controllers(&mut inner.state);
+        if gateway_image
+            .as_deref()
+            .is_some_and(|image| !valid_gateway_image(image))
+        {
+            return Err(ControllerError::Invalid(
+                "gateway-image must be a non-empty OCI image reference without whitespace"
+                    .to_owned(),
+            ));
+        }
+
+        let mut cluster = self.cluster_settings(&inner)?;
+        let previous_cluster = inner.cluster.clone();
+        let previous_state = inner.state.clone();
+        let mut changed = false;
+
+        if let Some(mode) = mode {
+            if cluster.mode == ClusterMode::Ha && mode == ClusterMode::Standalone {
+                return Err(ControllerError::Conflict(
+                    "switching an HA cluster back to standalone is not supported".to_owned(),
+                ));
             }
+            if cluster.mode != mode {
+                cluster.mode = mode;
+                if mode == ClusterMode::Ha {
+                    fill_automatic_ha_controllers(&mut inner.state);
+                }
+                changed = true;
+            }
+        }
+
+        if let Some(image) = gateway_image
+            && cluster.gateway.image != image
+        {
+            cluster.gateway.image = image;
+            changed = true;
+        }
+
+        if changed {
+            inner.cluster = cluster.clone();
             if let Err(error) = self.commit_locked(&mut inner).await {
                 inner.cluster = previous_cluster;
                 inner.state = previous_state;
                 return Err(error.into());
             }
-            info!(mode = ?update.mode, "updated cluster mode");
+            info!(mode = ?cluster.mode, gateway_image = %cluster.gateway.image, "updated cluster configuration");
         }
 
         Ok(ClusterConfigResponse {
@@ -538,7 +573,11 @@ impl Controller {
         } else {
             let (roles, automatic_roles) = match request.requested_roles.clone() {
                 Some(roles) => (normalized_roles(roles), false),
-                None => (automatic_join_roles(&inner.state, cluster.mode), true),
+                None => {
+                    let mut roles = automatic_join_roles(&inner.state, cluster.mode);
+                    roles.extend(request.recovered_roles);
+                    (normalized_roles(roles), true)
+                }
             };
             validate_role_limits(&inner.state, node_id, &roles, cluster.mode)?;
             inner.state.members.insert(
@@ -1081,7 +1120,8 @@ impl Controller {
     }
 
     async fn sync_gateway_once(&self) -> Result<(), String> {
-        let (generation, server, endpoints) = {
+        let voters = self.repository.voter_ids();
+        let (generation, server, storage, endpoints) = {
             let mut inner = self.inner.lock().await;
             self.expire_local_lease(&mut inner);
             if !inner.is_leader {
@@ -1090,6 +1130,11 @@ impl Controller {
             (
                 inner.generation,
                 gateway::generate(&inner.state, &self.config.gateway.listen),
+                gateway::storage(controller_urls(
+                    &inner.state,
+                    Some(&self.config.advertise_url),
+                    &voters,
+                )),
                 gateway_endpoints(&inner.state, self.config.gateway.admin_port),
             )
         };
@@ -1101,11 +1146,10 @@ impl Controller {
             return Ok(());
         }
 
-        let results = join_all(
-            endpoints
-                .iter()
-                .map(|endpoint| self.push_gateway_server(endpoint, &server)),
-        )
+        let results = join_all(endpoints.iter().map(|endpoint| async {
+            self.push_gateway_storage(endpoint, &storage).await?;
+            self.push_gateway_server(endpoint, &server).await
+        }))
         .await;
         let endpoint_errors = endpoints
             .iter()
@@ -1165,6 +1209,28 @@ impl Controller {
             .gateway_client
             .post(&url)
             .json(server)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let body = body.chars().take(512).collect::<String>();
+        Err(format!("{status} {body}"))
+    }
+
+    async fn push_gateway_storage(
+        &self,
+        endpoint: &str,
+        storage: &gateway::StorageConfig,
+    ) -> Result<(), String> {
+        let url = format!("{}/config/storage", endpoint.trim_end_matches('/'));
+        let response = self
+            .gateway_client
+            .post(&url)
+            .json(storage)
             .send()
             .await
             .map_err(|error| error.to_string())?;
@@ -2010,8 +2076,8 @@ mod tests {
         config::GatewayConfig,
         gateway::{ENABLE_LABEL, HOST_LABEL, PORT_LABEL},
         model::{
-            ClusterGatewayConfig, KvVersion, NodeRecord, PortBinding, ServicePort, ServiceSpec,
-            TaskRecord, TaskReport, initial_roles,
+            CLUSTER_SCHEMA_VERSION, ClusterGatewayConfig, KvVersion, NodeRecord, PortBinding,
+            ServicePort, ServiceSpec, TaskRecord, TaskReport, initial_roles,
         },
     };
 
@@ -2033,7 +2099,7 @@ mod tests {
     #[tokio::test]
     async fn kv_is_lww_and_locks_are_fenced() {
         let cluster = ClusterSettings {
-            schema_version: 2,
+            schema_version: CLUSTER_SCHEMA_VERSION,
             cluster_id: "kv-test".into(),
             mode: ClusterMode::Standalone,
             controller_port: 8080,
@@ -2139,7 +2205,7 @@ mod tests {
     #[tokio::test]
     async fn ha_automatically_fills_only_controller_roles() {
         let cluster = ClusterSettings {
-            schema_version: 2,
+            schema_version: CLUSTER_SCHEMA_VERSION,
             cluster_id: "controller-assignment-test".into(),
             mode: ClusterMode::Ha,
             controller_port: 8080,
@@ -2226,7 +2292,7 @@ mod tests {
     #[tokio::test]
     async fn standalone_keeps_one_controller_and_allows_unlimited_gateways() {
         let cluster = ClusterSettings {
-            schema_version: 2,
+            schema_version: CLUSTER_SCHEMA_VERSION,
             cluster_id: "standalone-role-test".into(),
             mode: ClusterMode::Standalone,
             controller_port: 8080,
@@ -2248,7 +2314,11 @@ mod tests {
             ("gateway-d", "10.0.0.24", 4),
         ] {
             let mut request = test_join_request(node_id, address, raft_id);
-            request.requested_roles = Some(BTreeSet::from([NodeRole::Gateway]));
+            if node_id == "gateway-b" {
+                request.recovered_roles = BTreeSet::from([NodeRole::Gateway]);
+            } else {
+                request.requested_roles = Some(BTreeSet::from([NodeRole::Gateway]));
+            }
             let joined = controller.join_node(node_id, request).await.unwrap();
             assert_eq!(
                 joined.roles,
@@ -2273,7 +2343,7 @@ mod tests {
     #[tokio::test]
     async fn switches_standalone_to_ha_but_not_back() {
         let cluster = ClusterSettings {
-            schema_version: 2,
+            schema_version: CLUSTER_SCHEMA_VERSION,
             cluster_id: "config-update-test".into(),
             mode: ClusterMode::Standalone,
             controller_port: 8080,
@@ -2289,7 +2359,8 @@ mod tests {
 
         let updated = controller
             .update_cluster_config(ClusterConfigUpdate {
-                mode: ClusterMode::Ha,
+                mode: Some(ClusterMode::Ha),
+                gateway_image: None,
             })
             .await
             .unwrap();
@@ -2306,9 +2377,48 @@ mod tests {
             .unwrap();
         assert!(joined.roles.contains(&NodeRole::Controller));
 
+        let image = "ghcr.io/example/swarmlite-caddy:v2";
+        let updated = controller
+            .update_cluster_config(ClusterConfigUpdate {
+                mode: None,
+                gateway_image: Some(image.to_owned()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(updated.config.gateway.image, image);
+        assert_eq!(
+            observer
+                .load_consistent()
+                .await
+                .unwrap()
+                .cluster
+                .gateway
+                .image,
+            image
+        );
         let error = controller
             .update_cluster_config(ClusterConfigUpdate {
-                mode: ClusterMode::Standalone,
+                mode: None,
+                gateway_image: Some("bad image".to_owned()),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ControllerError::Invalid(_)));
+        assert_eq!(
+            controller
+                .get_cluster_config()
+                .await
+                .unwrap()
+                .config
+                .gateway
+                .image,
+            image
+        );
+
+        let error = controller
+            .update_cluster_config(ClusterConfigUpdate {
+                mode: Some(ClusterMode::Standalone),
+                gateway_image: None,
             })
             .await
             .unwrap_err();
@@ -2318,7 +2428,7 @@ mod tests {
     #[tokio::test]
     async fn promotes_reserved_controller_through_raft() {
         let cluster = ClusterSettings {
-            schema_version: 2,
+            schema_version: CLUSTER_SCHEMA_VERSION,
             cluster_id: "controller-promotion-test".into(),
             mode: ClusterMode::Ha,
             controller_port: 8080,
@@ -2363,6 +2473,7 @@ mod tests {
                     node_id: "controller-b".into(),
                     address: address.ip().to_string(),
                     requested_roles: None,
+                    recovered_roles: NodeRoles::new(),
                     controller_url: api_url.clone(),
                     raft_id: 2,
                     raft_url: raft_url.clone(),
@@ -2418,6 +2529,7 @@ mod tests {
     async fn caddy_acknowledgement_starts_drain_deadline() {
         let received = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
         let app = Router::new()
+            .route("/config/storage", post(capture_gateway_config))
             .route(
                 "/config/apps/http/servers/swarmlite",
                 post(capture_gateway_config),
@@ -2428,7 +2540,7 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let cluster = ClusterSettings {
-            schema_version: 2,
+            schema_version: CLUSTER_SCHEMA_VERSION,
             cluster_id: "caddy-publisher-test".into(),
             mode: ClusterMode::Standalone,
             controller_port: 8080,
@@ -2468,10 +2580,13 @@ mod tests {
         );
         drop(inner);
         let requests = received.lock().await;
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0]["listen"][0], ":18089");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["module"], "swarmlite");
+        assert_eq!(requests[0]["token_env"], "SWARMLITE_TOKEN");
+        assert!(!requests[0]["controllers"].as_array().unwrap().is_empty());
+        assert_eq!(requests[1]["listen"][0], ":18089");
         assert_eq!(
-            requests[0]["routes"][0]["handle"][0]["upstreams"],
+            requests[1]["routes"][0]["handle"][0]["upstreams"],
             json!([])
         );
         server.abort();
@@ -2512,6 +2627,7 @@ mod tests {
             node_id: node_id.to_owned(),
             address: address.to_owned(),
             requested_roles: None,
+            recovered_roles: NodeRoles::new(),
             controller_url: controller_url.clone(),
             raft_id,
             raft_url: format!("{controller_url}/internal/raft"),
@@ -2579,7 +2695,7 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_then_deploy_adopts_the_existing_container() {
         let cluster = ClusterSettings {
-            schema_version: 2,
+            schema_version: CLUSTER_SCHEMA_VERSION,
             cluster_id: "recovery-test".into(),
             mode: ClusterMode::Standalone,
             controller_port: 8080,

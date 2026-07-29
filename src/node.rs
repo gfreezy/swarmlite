@@ -1,20 +1,15 @@
 use std::{
     collections::BTreeMap,
     env,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket},
     path::{Path, PathBuf},
-    process::Stdio,
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use swarmlite_raft::{ControllerNode, NodeConfig, RaftNode};
-use tokio::{
-    io::AsyncWriteExt,
-    process::Command,
-    sync::{mpsc, oneshot, watch},
-};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{info, warn};
 use url::Url;
 use uuid::Uuid;
@@ -27,10 +22,13 @@ use crate::{
     controller,
     local_state::{AgentFence, FENCE_KEY, LOCAL_STATE_FILE, LocalState, NODE_KEY},
     model::{
-        BootstrapResponse, ClusterGatewayConfig, ClusterMode, ClusterSettings, JoinRequest,
-        JoinResponse, NodeControl, NodeRole, NodeRoles, initial_roles,
+        BootstrapResponse, CLUSTER_SCHEMA_VERSION, ClusterGatewayConfig, ClusterMode,
+        ClusterSettings, JoinRequest, JoinResponse, NodeControl, NodeRole, NodeRoles,
+        initial_roles, valid_gateway_image,
     },
-    runtime::{ContainerRuntime, DockerCompatibleRuntime, ManagedClusterInventory},
+    runtime::{
+        ContainerRuntime, DockerCompatibleRuntime, GatewayContainerSpec, ManagedClusterInventory,
+    },
     storage::StateRepository,
 };
 
@@ -46,6 +44,7 @@ pub struct InitOptions {
     pub runtime_socket: Option<String>,
     pub labels: BTreeMap<String, String>,
     pub recovery: bool,
+    pub gateway_image_explicit: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -118,7 +117,6 @@ impl LocalClusterSettings {
 enum NodeEvent {
     Agent(Result<()>),
     Controller(Result<()>),
-    Gateway(Result<()>),
 }
 
 pub fn resolve_data_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
@@ -150,6 +148,11 @@ pub async fn init(mut options: InitOptions) -> Result<String> {
     let local_state = if options.recovery {
         let local_cluster_id = recovery_local_cluster_id(&options.data_dir, &inventory).await?;
         options.cluster.cluster_id = recovery_cluster_id(&inventory, local_cluster_id.as_deref())?;
+        recover_gateway_config(
+            &mut options.cluster,
+            &inventory,
+            options.gateway_image_explicit,
+        );
         validate_managed_inventory(&inventory, &options.cluster.cluster_id, true)?;
         archive_control_plane_state(&options.data_dir).await?;
         ensure_raft_data_is_absent(&options.data_dir).await?;
@@ -232,6 +235,13 @@ pub async fn run(options: ServeOptions) -> Result<()> {
         options.runtime_socket.as_deref(),
         settings.runtime.as_ref(),
     );
+    let gateway_runtime = DockerCompatibleRuntime::connect(&runtime.resolve()?)?;
+    gateway_runtime
+        .reconcile_gateway(
+            &gateway_container_spec(&settings, &advertise_address, &public_controller)?,
+            settings.roles.contains(&NodeRole::Gateway),
+        )
+        .await?;
     let mut agent_controllers = settings.controller_urls.clone();
     if settings.roles.contains(&NodeRole::Controller) {
         agent_controllers.insert(0, local_controller.clone());
@@ -287,6 +297,8 @@ pub async fn run(options: ServeOptions) -> Result<()> {
         events_tx,
         events_rx,
         agent_handle,
+        gateway_runtime,
+        advertise_address,
     )
     .await
 }
@@ -301,6 +313,8 @@ async fn supervise(
     events_tx: mpsc::UnboundedSender<NodeEvent>,
     mut events_rx: mpsc::UnboundedReceiver<NodeEvent>,
     agent_handle: tokio::task::JoinHandle<()>,
+    gateway_runtime: DockerCompatibleRuntime,
+    advertise_address: String,
 ) -> Result<()> {
     let mut desired_roles = settings.roles.clone();
     let mut controller_running = false;
@@ -317,13 +331,8 @@ async fn supervise(
             info!("completed one-time Raft bootstrap and sealed local node state");
         }
     }
-    let mut gateway_running = false;
-    let mut gateway_stopping = false;
-    let mut gateway_shutdown = None;
     if desired_roles.contains(&NodeRole::Gateway) {
-        gateway_shutdown =
-            Some(start_gateway(data_dir, &settings, &public_controller, events_tx.clone()).await?);
-        gateway_running = true;
+        info!("gateway role assigned; independent Caddy container is running");
     }
 
     loop {
@@ -335,9 +344,6 @@ async fn supervise(
                 if let Some(shutdown) = controller_shutdown.take() {
                     let _ = shutdown.send(());
                 }
-                if let Some(shutdown) = gateway_shutdown.take() {
-                    let _ = shutdown.send(());
-                }
                 agent_handle.abort();
                 return Ok(());
             }
@@ -346,6 +352,7 @@ async fn supervise(
                     bail!("node agent stopped publishing control updates");
                 }
                 let control = control_rx.borrow_and_update().clone();
+                let had_gateway = settings.roles.contains(&NodeRole::Gateway);
                 desired_roles = control.roles;
                 settings.roles.clone_from(&desired_roles);
                 settings.cluster = LocalClusterSettings::from_cluster(&control.cluster);
@@ -370,32 +377,39 @@ async fn supervise(
                     }
                     _ => {}
                 }
-                match (desired_roles.contains(&NodeRole::Gateway), gateway_running) {
-                    (true, false) => {
-                        gateway_shutdown = Some(
-                            start_gateway(data_dir, &settings, &public_controller, events_tx.clone()).await?
-                        );
-                        gateway_running = true;
-                        gateway_stopping = false;
-                        info!("gateway role added; started Caddy");
+                let has_gateway = desired_roles.contains(&NodeRole::Gateway);
+                if has_gateway {
+                    gateway_runtime
+                        .reconcile_gateway(
+                            &gateway_container_spec(
+                                &settings,
+                                &advertise_address,
+                                &public_controller,
+                            )?,
+                            true,
+                        )
+                        .await?;
+                    if !had_gateway {
+                        info!("gateway role added; started independent Caddy container");
                     }
-                    (false, true) => {
-                        if let Some(shutdown) = gateway_shutdown.take() {
-                            let _ = shutdown.send(());
-                        }
-                        gateway_stopping = true;
-                        info!("gateway role removed; stopping Caddy");
-                    }
-                    _ => {}
+                } else if had_gateway && !has_gateway {
+                    gateway_runtime
+                        .reconcile_gateway(
+                            &gateway_container_spec(
+                                &settings,
+                                &advertise_address,
+                                &public_controller,
+                            )?,
+                            false,
+                        )
+                        .await?;
+                    info!("gateway role removed; removed independent Caddy container");
                 }
             }
             event = events_rx.recv() => {
                 match event.context("node task event channel closed")? {
                     NodeEvent::Agent(result) => {
                         if let Some(shutdown) = controller_shutdown.take() {
-                            let _ = shutdown.send(());
-                        }
-                        if let Some(shutdown) = gateway_shutdown.take() {
                             let _ = shutdown.send(());
                         }
                         agent_handle.abort();
@@ -421,112 +435,47 @@ async fn supervise(
                             warn!(%error, "demoted controller stopped with an error");
                         }
                     }
-                    NodeEvent::Gateway(result) => {
-                        gateway_running = false;
-                        gateway_shutdown = None;
-                        if desired_roles.contains(&NodeRole::Gateway) {
-                            if gateway_stopping && result.is_ok() {
-                                gateway_shutdown = Some(
-                                    start_gateway(data_dir, &settings, &public_controller, events_tx.clone()).await?
-                                );
-                                gateway_running = true;
-                                gateway_stopping = false;
-                                continue;
-                            }
-                            result.context("assigned gateway stopped")?;
-                            bail!("assigned gateway stopped unexpectedly");
-                        }
-                        gateway_stopping = false;
-                        if let Err(error) = result {
-                            warn!(%error, "removed gateway stopped with an error");
-                        }
-                    }
                 }
             }
         }
     }
 }
 
-async fn start_gateway(
-    data_dir: &Path,
+fn gateway_container_spec(
     settings: &NodeSettings,
+    advertise_address: &str,
     public_controller: &str,
-    events: mpsc::UnboundedSender<NodeEvent>,
-) -> Result<oneshot::Sender<()>> {
+) -> Result<GatewayContainerSpec> {
     let mut controllers = settings.controller_urls.clone();
     if settings.roles.contains(&NodeRole::Controller) {
         controllers.push(public_controller.to_owned());
     }
     normalize_controller_list(&mut controllers);
-    let persist = false;
-    let config = serde_json::json!({
-        "admin": {
-            "listen": "0.0.0.0:2019",
-            "config": { "persist": persist }
-        },
-        "storage": {
-            "module": "swarmlite",
-            "root": data_dir.join("caddy").to_string_lossy(),
-            "controllers": controllers,
-            "token_env": "SWARMLITE_TOKEN",
-            "timeout": "500ms",
-            "lock_lease": "30s"
-        },
-        "apps": {
-            "http": {
-                "servers": {
-                    "swarmlite": {
-                        "listen": settings.cluster.gateway.listen,
-                        "routes": []
-                    }
-                }
-            }
-        }
-    });
-    let binary = nonempty_env("SWARMLITE_GATEWAY_BINARY").unwrap_or_else(|| "caddy".to_owned());
-    let mut child = Command::new(&binary)
-        .arg("run")
-        .arg("--config")
-        .arg("-")
-        .env("SWARMLITE_TOKEN", &settings.token)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to start gateway binary {binary:?}; install the bundled Caddy build or set SWARMLITE_GATEWAY_BINARY"
-            )
-        })?;
-    let encoded = serde_json::to_vec(&config)?;
-    let mut stdin = child.stdin.take().context("failed to open Caddy stdin")?;
-    stdin.write_all(&encoded).await?;
-    stdin.shutdown().await?;
+    Ok(GatewayContainerSpec {
+        cluster_id: settings.cluster.cluster_id.clone(),
+        advertise_address: advertise_address.to_owned(),
+        admin_bind_address: resolve_gateway_bind_address(advertise_address)?,
+        listen: settings.cluster.gateway.listen.clone(),
+        controllers,
+        token: settings.token.clone(),
+        image: settings.cluster.gateway.image.clone(),
+    })
+}
 
-    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
-    tokio::spawn(async move {
-        let result: Result<()> = async {
-            tokio::select! {
-                status = child.wait() => {
-                    let status = status.context("failed to wait for Caddy")?;
-                    if status.success() {
-                        Ok(())
-                    } else {
-                        bail!("Caddy exited with {status}")
-                    }
-                }
-                _ = &mut shutdown_rx => {
-                    child.start_kill().context("failed to stop Caddy")?;
-                    let _ = child.wait().await;
-                    Ok(())
-                }
-            }
-        }
-        .await;
-        let _ = events.send(NodeEvent::Gateway(result));
-    });
-    Ok(shutdown_tx)
+fn resolve_gateway_bind_address(advertise_address: &str) -> Result<String> {
+    if let Ok(address) = advertise_address.parse::<IpAddr>() {
+        return Ok(address.to_string());
+    }
+    (advertise_address, 0)
+        .to_socket_addrs()
+        .with_context(|| {
+            format!("failed to resolve advertise address {advertise_address:?} for Caddy")
+        })?
+        .next()
+        .map(|address| address.ip().to_string())
+        .with_context(|| {
+            format!("advertise address {advertise_address:?} resolved to no IP addresses")
+        })
 }
 
 async fn start_controller(
@@ -642,11 +591,24 @@ pub async fn join(options: JoinOptions) -> Result<String> {
     let node_id =
         preserve_identity.map_or_else(default_node_id, |settings| settings.node_id.clone());
     let raft_id = preserve_identity.map_or_else(new_raft_id, |settings| settings.raft_id);
+    let runtime = requested_runtime(options.runtime, options.runtime_socket.as_deref())
+        .or_else(|| preserve_identity.and_then(|settings| settings.runtime.clone()));
+    let recovered_roles = if options.requested_roles.is_none() {
+        let detection_runtime = resolve_runtime(
+            options.runtime,
+            options.runtime_socket.as_deref(),
+            runtime.as_ref(),
+        );
+        detect_recovered_system_roles(&detection_runtime, &bootstrap.cluster.cluster_id).await
+    } else {
+        NodeRoles::new()
+    };
     let public_controller = controller_url(&advertise_address, bootstrap.cluster.controller_port);
     let request = JoinRequest {
         node_id: node_id.clone(),
         address: advertise_address.clone(),
         requested_roles: options.requested_roles.clone(),
+        recovered_roles,
         controller_url: public_controller.clone(),
         raft_id,
         raft_url: raft_url(&public_controller),
@@ -668,8 +630,6 @@ pub async fn join(options: JoinOptions) -> Result<String> {
         .map(|settings| settings.labels.clone())
         .unwrap_or_default();
     labels.extend(options.labels);
-    let runtime = requested_runtime(options.runtime, options.runtime_socket.as_deref())
-        .or_else(|| preserve_identity.and_then(|settings| settings.runtime.clone()));
     let settings = NodeSettings {
         schema_version: 6,
         roles: response.roles,
@@ -698,6 +658,39 @@ pub async fn join(options: JoinOptions) -> Result<String> {
         settings.cluster.cluster_id,
         role_names(&settings.roles)
     ))
+}
+
+async fn detect_recovered_system_roles(runtime: &RuntimeConfig, cluster_id: &str) -> NodeRoles {
+    let resolved = match runtime.resolve() {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            warn!(%error, "could not inspect system containers while joining");
+            return NodeRoles::new();
+        }
+    };
+    if !Path::new(&resolved.socket).exists() {
+        return NodeRoles::new();
+    }
+    let runtime = match DockerCompatibleRuntime::connect(&resolved) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            warn!(%error, "could not connect to the runtime while collecting system containers");
+            return NodeRoles::new();
+        }
+    };
+    let inventory = match runtime.managed_cluster_inventory().await {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            warn!(%error, "could not inspect system containers while joining");
+            return NodeRoles::new();
+        }
+    };
+    if inventory.gateway_cluster_ids.contains(cluster_id) {
+        info!(cluster_id, "collected an existing gateway system container");
+        NodeRoles::from([NodeRole::Gateway])
+    } else {
+        NodeRoles::new()
+    }
 }
 
 pub async fn join_command(data_dir: &Path) -> Result<String> {
@@ -844,7 +837,7 @@ where
 }
 
 fn validate_cluster(cluster: &ClusterSettings) -> Result<()> {
-    if cluster.schema_version != 3 || !valid_cluster_id(&cluster.cluster_id) {
+    if cluster.schema_version != CLUSTER_SCHEMA_VERSION || !valid_cluster_id(&cluster.cluster_id) {
         bail!("invalid cluster identity or schema version");
     }
     if cluster.controller_port == 0 {
@@ -858,6 +851,9 @@ fn validate_cluster(cluster: &ClusterSettings) -> Result<()> {
             .any(|listen| listen.trim().is_empty())
     {
         bail!("gateway.listen must contain at least one non-empty address");
+    }
+    if !valid_gateway_image(&cluster.gateway.image) {
+        bail!("gateway.image must be a non-empty OCI image reference without whitespace");
     }
     Ok(())
 }
@@ -990,6 +986,19 @@ fn recovery_cluster_id(
         )
 }
 
+fn recover_gateway_config(
+    cluster: &mut ClusterSettings,
+    inventory: &ManagedClusterInventory,
+    image_explicit: bool,
+) {
+    if let Some(listen) = inventory.gateway_listen.get(&cluster.cluster_id) {
+        cluster.gateway.listen.clone_from(listen);
+    }
+    if !image_explicit && let Some(image) = inventory.gateway_images.get(&cluster.cluster_id) {
+        cluster.gateway.image.clone_from(image);
+    }
+}
+
 async fn existing_local_cluster_id(data_dir: &Path) -> Result<Option<String>> {
     if let Some(local_state) = LocalState::open_existing(data_dir)?
         && let Some(settings) = local_state.get::<NodeSettings>(NODE_KEY)?
@@ -1065,9 +1074,10 @@ fn validate_node_settings(settings: &NodeSettings) -> Result<()> {
     {
         bail!("unsupported or invalid node settings; run init/join with a fresh data directory");
     }
-    if settings.cluster.schema_version != 3
+    if settings.cluster.schema_version != CLUSTER_SCHEMA_VERSION
         || settings.cluster.cluster_id.trim().is_empty()
         || settings.cluster.controller_port == 0
+        || !valid_gateway_image(&settings.cluster.gateway.image)
     {
         bail!("invalid local cluster identity");
     }
@@ -1381,7 +1391,7 @@ mod tests {
     #[test]
     fn validates_cluster_modes() {
         let standalone = ClusterSettings {
-            schema_version: 3,
+            schema_version: CLUSTER_SCHEMA_VERSION,
             cluster_id: "test".into(),
             mode: ClusterMode::Standalone,
             controller_port: 8080,
@@ -1400,13 +1410,14 @@ mod tests {
         let inventory = ManagedClusterInventory {
             cluster_ids: ["cluster-old".to_owned()].into_iter().collect(),
             unlabeled: 0,
+            ..Default::default()
         };
         assert!(validate_managed_inventory(&inventory, "cluster-new", false).is_err());
         assert!(validate_managed_inventory(&inventory, "cluster-old", true).is_ok());
         assert!(validate_managed_inventory(&inventory, "cluster-new", true).is_err());
         let unlabeled = ManagedClusterInventory {
-            cluster_ids: Default::default(),
             unlabeled: 1,
+            ..Default::default()
         };
         assert!(validate_managed_inventory(&unlabeled, "cluster-old", true).is_err());
     }
@@ -1416,6 +1427,7 @@ mod tests {
         let inventory = ManagedClusterInventory {
             cluster_ids: ["cluster-old".to_owned()].into_iter().collect(),
             unlabeled: 0,
+            ..Default::default()
         };
         assert_eq!(
             recovery_cluster_id(&inventory, None).unwrap(),
@@ -1432,6 +1444,36 @@ mod tests {
         assert!(recovery_cluster_id(&ManagedClusterInventory::default(), None).is_err());
     }
 
+    #[test]
+    fn recovery_keeps_the_gateway_image_from_the_existing_container() {
+        let mut cluster = ClusterSettings {
+            schema_version: CLUSTER_SCHEMA_VERSION,
+            cluster_id: "cluster-old".into(),
+            mode: ClusterMode::Standalone,
+            controller_port: 8080,
+            gateway: Default::default(),
+        };
+        let inventory = ManagedClusterInventory {
+            gateway_listen: BTreeMap::from([(
+                "cluster-old".into(),
+                vec![":80".into(), ":443".into()],
+            )]),
+            gateway_images: BTreeMap::from([(
+                "cluster-old".into(),
+                "registry.example.com/caddy:old".into(),
+            )]),
+            ..Default::default()
+        };
+
+        recover_gateway_config(&mut cluster, &inventory, false);
+        assert_eq!(cluster.gateway.listen, [":80", ":443"]);
+        assert_eq!(cluster.gateway.image, "registry.example.com/caddy:old");
+
+        cluster.gateway.image = "registry.example.com/caddy:new".into();
+        recover_gateway_config(&mut cluster, &inventory, true);
+        assert_eq!(cluster.gateway.image, "registry.example.com/caddy:new");
+    }
+
     #[tokio::test]
     async fn recovery_can_use_container_identity_when_local_redb_is_corrupt() {
         let directory = tempfile::tempdir().unwrap();
@@ -1444,6 +1486,7 @@ mod tests {
         let inventory = ManagedClusterInventory {
             cluster_ids: ["cluster-from-containers".to_owned()].into_iter().collect(),
             unlabeled: 0,
+            ..Default::default()
         };
 
         let local_cluster_id = recovery_local_cluster_id(directory.path(), &inventory)
@@ -1465,7 +1508,7 @@ mod tests {
     async fn init_persists_all_local_state_in_redb() {
         let directory = tempfile::tempdir().unwrap();
         let cluster = ClusterSettings {
-            schema_version: 3,
+            schema_version: CLUSTER_SCHEMA_VERSION,
             cluster_id: "test".into(),
             mode: ClusterMode::Standalone,
             controller_port: 18080,
@@ -1480,6 +1523,7 @@ mod tests {
             runtime_socket: None,
             labels: BTreeMap::new(),
             recovery: false,
+            gateway_image_explicit: false,
         })
         .await
         .unwrap();
@@ -1503,7 +1547,7 @@ mod tests {
         let duplicate = init(InitOptions {
             data_dir: directory.path().to_owned(),
             cluster: ClusterSettings {
-                schema_version: 3,
+                schema_version: CLUSTER_SCHEMA_VERSION,
                 cluster_id: "other".into(),
                 mode: ClusterMode::Standalone,
                 controller_port: 18080,
@@ -1515,6 +1559,7 @@ mod tests {
             runtime_socket: None,
             labels: BTreeMap::new(),
             recovery: false,
+            gateway_image_explicit: false,
         })
         .await
         .unwrap_err();
@@ -1536,7 +1581,7 @@ mod tests {
     async fn recovery_init_archives_local_control_plane_and_keeps_cluster_identity() {
         let directory = tempfile::tempdir().unwrap();
         let cluster = ClusterSettings {
-            schema_version: 3,
+            schema_version: CLUSTER_SCHEMA_VERSION,
             cluster_id: "recover-test".into(),
             mode: ClusterMode::Standalone,
             controller_port: 18081,
@@ -1551,6 +1596,7 @@ mod tests {
             runtime_socket: None,
             labels: BTreeMap::new(),
             recovery: false,
+            gateway_image_explicit: false,
         })
         .await
         .unwrap();
@@ -1572,6 +1618,7 @@ mod tests {
             runtime_socket: None,
             labels: BTreeMap::new(),
             recovery: true,
+            gateway_image_explicit: false,
         })
         .await
         .unwrap();
@@ -1593,7 +1640,7 @@ mod tests {
     #[tokio::test]
     async fn join_pulls_cluster_settings_and_persists_agent_role() {
         let cluster = ClusterSettings {
-            schema_version: 3,
+            schema_version: CLUSTER_SCHEMA_VERSION,
             cluster_id: "joined-test".into(),
             mode: ClusterMode::Standalone,
             controller_port: 18080,
@@ -1640,7 +1687,7 @@ mod tests {
     #[tokio::test]
     async fn join_rebinds_same_cluster_when_recovery_rotates_the_token() {
         let cluster = ClusterSettings {
-            schema_version: 3,
+            schema_version: CLUSTER_SCHEMA_VERSION,
             cluster_id: "rejoined-test".into(),
             mode: ClusterMode::Standalone,
             controller_port: 18082,
@@ -1728,7 +1775,7 @@ mod tests {
                     schema_version: 4,
                     roles: initial_roles(),
                     cluster: LocalClusterSettings {
-                        schema_version: 3,
+                        schema_version: CLUSTER_SCHEMA_VERSION,
                         cluster_id: "unsupported-test".into(),
                         mode: ClusterMode::Standalone,
                         controller_port: 8080,

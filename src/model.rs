@@ -4,15 +4,20 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub const CLUSTER_SCHEMA_VERSION: u32 = 4;
+pub const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/swarmlite/swarmlite-caddy:latest";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClusterGatewayConfig {
     pub listen: Vec<String>,
+    pub image: String,
 }
 
 impl Default for ClusterGatewayConfig {
     fn default() -> Self {
         Self {
             listen: vec![":80".to_owned()],
+            image: DEFAULT_GATEWAY_IMAGE.to_owned(),
         }
     }
 }
@@ -162,7 +167,17 @@ pub struct ClusterConfigResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClusterConfigUpdate {
-    pub mode: ClusterMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ClusterMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_image: Option<String>,
+}
+
+pub fn valid_gateway_image(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 512
+        && value.trim() == value
+        && !value.chars().any(char::is_whitespace)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -397,6 +412,7 @@ pub struct JoinRequest {
     pub node_id: String,
     pub address: String,
     pub requested_roles: Option<NodeRoles>,
+    pub recovered_roles: NodeRoles,
     pub controller_url: String,
     pub raft_id: u64,
     pub raft_url: String,

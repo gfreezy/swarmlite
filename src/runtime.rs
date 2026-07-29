@@ -1,21 +1,22 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use bollard::{
     API_DEFAULT_VERSION, Docker,
     models::{
-        ContainerCreateBody, HealthConfig, HealthStatusEnum, HostConfig,
+        ContainerCreateBody, ContainerSummaryStateEnum, HealthConfig, HealthStatusEnum, HostConfig,
         PortBinding as DockerPortBinding, RestartPolicy, RestartPolicyNameEnum,
     },
     query_parameters::{
         CreateContainerOptionsBuilder, CreateImageOptionsBuilder, ListContainersOptionsBuilder,
-        RemoveContainerOptionsBuilder, StopContainerOptionsBuilder,
+        RemoveContainerOptionsBuilder, RemoveVolumeOptionsBuilder, StopContainerOptionsBuilder,
     },
 };
 use futures_util::StreamExt;
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use crate::{
@@ -23,8 +24,22 @@ use crate::{
     model::{ObservedTaskState, PortBinding, TaskAssignment},
 };
 
+#[cfg(test)]
+use crate::model::DEFAULT_GATEWAY_IMAGE;
+
 pub(crate) const MANAGED_LABEL: &str = "io.swarmlite.managed";
 pub(crate) const CLUSTER_LABEL: &str = "io.swarmlite.cluster_id";
+pub(crate) const SYSTEM_LABEL: &str = "io.swarmlite.system";
+pub(crate) const COMPONENT_LABEL: &str = "io.swarmlite.component";
+pub(crate) const GATEWAY_COMPONENT: &str = "gateway";
+pub(crate) const GATEWAY_ADDRESS_LABEL: &str = "io.swarmlite.advertise_address";
+const GATEWAY_BIND_ADDRESS_LABEL: &str = "io.swarmlite.gateway_bind_address";
+const GATEWAY_SCHEMA_LABEL: &str = "io.swarmlite.gateway_schema";
+const GATEWAY_IMAGE_LABEL: &str = "io.swarmlite.gateway_image";
+const GATEWAY_LISTEN_LABEL: &str = "io.swarmlite.gateway_listen";
+const GATEWAY_TOKEN_HASH_LABEL: &str = "io.swarmlite.gateway_token_sha256";
+const GATEWAY_SCHEMA: &str = "2";
+const GATEWAY_CONTAINER_NAME: &str = "swarmlite-gateway";
 const TASK_LABEL: &str = "io.swarmlite.task_id";
 const SERVICE_LABEL: &str = "io.swarmlite.service_id";
 const STACK_LABEL: &str = "io.swarmlite.stack";
@@ -60,7 +75,34 @@ pub struct ManagedContainer {
 #[derive(Debug, Default)]
 pub(crate) struct ManagedClusterInventory {
     pub cluster_ids: BTreeSet<String>,
+    pub gateway_cluster_ids: BTreeSet<String>,
+    pub gateway_listen: BTreeMap<String, Vec<String>>,
+    pub gateway_images: BTreeMap<String, String>,
     pub unlabeled: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GatewayContainerSpec {
+    pub cluster_id: String,
+    pub advertise_address: String,
+    pub admin_bind_address: String,
+    pub listen: Vec<String>,
+    pub controllers: Vec<String>,
+    pub token: String,
+    pub image: String,
+}
+
+#[derive(Debug)]
+struct ExistingGatewayContainer {
+    id: String,
+    cluster_id: Option<String>,
+    advertise_address: Option<String>,
+    admin_bind_address: Option<String>,
+    image: Option<String>,
+    listen: Option<String>,
+    token_hash: Option<String>,
+    schema: Option<String>,
+    running: bool,
 }
 
 pub trait ContainerRuntime: Send + Sync + 'static {
@@ -115,6 +157,45 @@ impl DockerCompatibleRuntime {
             match labels.get(CLUSTER_LABEL).filter(|value| !value.is_empty()) {
                 Some(cluster_id) => {
                     inventory.cluster_ids.insert(cluster_id.clone());
+                    if is_gateway_system_container(&labels) {
+                        inventory.gateway_cluster_ids.insert(cluster_id.clone());
+                        if let Some(listen) = labels
+                            .get(GATEWAY_LISTEN_LABEL)
+                            .map(|value| {
+                                value
+                                    .split(',')
+                                    .map(str::trim)
+                                    .filter(|value| !value.is_empty())
+                                    .map(ToOwned::to_owned)
+                                    .collect::<Vec<_>>()
+                            })
+                            .filter(|listen| !listen.is_empty())
+                        {
+                            match inventory
+                                .gateway_listen
+                                .insert(cluster_id.clone(), listen.clone())
+                            {
+                                Some(existing) if existing != listen => bail!(
+                                    "managed gateway containers for cluster {cluster_id} have conflicting listener labels"
+                                ),
+                                _ => {}
+                            }
+                        }
+                        if let Some(image) = labels
+                            .get(GATEWAY_IMAGE_LABEL)
+                            .filter(|value| !value.is_empty())
+                        {
+                            match inventory
+                                .gateway_images
+                                .insert(cluster_id.clone(), image.clone())
+                            {
+                                Some(existing) if existing != *image => bail!(
+                                    "managed gateway containers for cluster {cluster_id} have conflicting image labels"
+                                ),
+                                _ => {}
+                            }
+                        }
+                    }
                 }
                 None => inventory.unlabeled += 1,
             }
@@ -133,6 +214,324 @@ impl DockerCompatibleRuntime {
             .await
             .map_err(Into::into)
     }
+
+    pub(crate) async fn reconcile_gateway(
+        &self,
+        spec: &GatewayContainerSpec,
+        enabled: bool,
+    ) -> Result<()> {
+        if enabled {
+            gateway_ports(&spec.listen)?;
+        }
+        let gateways = self.gateway_containers().await?;
+        if gateways.len() > 1 {
+            bail!(
+                "found multiple managed gateway containers; keep exactly one on this node before serving"
+            );
+        }
+        let existing = gateways.into_iter().next();
+        if let Some(existing) = &existing
+            && existing.cluster_id.as_deref() != Some(&spec.cluster_id)
+        {
+            bail!(
+                "managed gateway container belongs to cluster {:?}, not {}; recover the old cluster or remove that container",
+                existing.cluster_id,
+                spec.cluster_id
+            );
+        }
+
+        if !enabled {
+            if let Some(existing) = existing {
+                self.remove_gateway(&existing).await?;
+            }
+            self.remove_gateway_volumes(&spec.cluster_id).await?;
+            return Ok(());
+        }
+
+        if let Some(existing) = existing {
+            if gateway_matches_spec(&existing, spec) {
+                if !existing.running {
+                    self.client
+                        .start_container(&existing.id, None)
+                        .await
+                        .context("failed to start the managed gateway container")?;
+                    info!(runtime = %self.kind, "started existing gateway container");
+                }
+                return Ok(());
+            }
+            self.ensure_image(&spec.image).await?;
+            info!(
+                previous_address = ?existing.advertise_address,
+                address = %spec.advertise_address,
+                "recreating gateway container for the current gateway settings"
+            );
+            self.remove_gateway(&existing).await?;
+            return self.create_gateway(spec).await;
+        }
+
+        self.create_gateway(spec).await
+    }
+
+    async fn gateway_containers(&self) -> Result<Vec<ExistingGatewayContainer>> {
+        let summaries = self.list_managed_summaries().await?;
+        Ok(summaries
+            .into_iter()
+            .filter_map(|summary| {
+                let labels = summary.labels.unwrap_or_default();
+                if !is_gateway_system_container(&labels) {
+                    return None;
+                }
+                Some(ExistingGatewayContainer {
+                    id: summary.id?,
+                    cluster_id: labels.get(CLUSTER_LABEL).cloned(),
+                    advertise_address: labels.get(GATEWAY_ADDRESS_LABEL).cloned(),
+                    admin_bind_address: labels.get(GATEWAY_BIND_ADDRESS_LABEL).cloned(),
+                    image: labels.get(GATEWAY_IMAGE_LABEL).cloned(),
+                    listen: labels.get(GATEWAY_LISTEN_LABEL).cloned(),
+                    token_hash: labels.get(GATEWAY_TOKEN_HASH_LABEL).cloned(),
+                    schema: labels.get(GATEWAY_SCHEMA_LABEL).cloned(),
+                    running: summary.state == Some(ContainerSummaryStateEnum::RUNNING),
+                })
+            })
+            .collect())
+    }
+
+    async fn create_gateway(&self, spec: &GatewayContainerSpec) -> Result<()> {
+        self.ensure_image(&spec.image).await?;
+        let bootstrap = gateway_bootstrap(spec)?;
+        let ports = gateway_ports(&spec.listen)?;
+        let mut port_bindings = HashMap::new();
+        let mut exposed_ports = Vec::new();
+        for port in ports {
+            let key = format!("{port}/tcp");
+            exposed_ports.push(key.clone());
+            port_bindings.insert(
+                key,
+                Some(vec![DockerPortBinding {
+                    host_ip: Some("0.0.0.0".to_owned()),
+                    host_port: Some(port.to_string()),
+                }]),
+            );
+            if port == 443 {
+                let key = "443/udp".to_owned();
+                exposed_ports.push(key.clone());
+                port_bindings.insert(
+                    key,
+                    Some(vec![DockerPortBinding {
+                        host_ip: Some("0.0.0.0".to_owned()),
+                        host_port: Some("443".to_owned()),
+                    }]),
+                );
+            }
+        }
+        let admin = "2019/tcp".to_owned();
+        exposed_ports.push(admin.clone());
+        port_bindings.insert(
+            admin,
+            Some(vec![DockerPortBinding {
+                host_ip: Some(spec.admin_bind_address.clone()),
+                host_port: Some("2019".to_owned()),
+            }]),
+        );
+
+        let [data_volume, config_volume] = gateway_volume_names(&spec.cluster_id);
+        let host_config = HostConfig {
+            binds: Some(vec![
+                format!("{data_volume}:/data"),
+                format!("{config_volume}:/config"),
+            ]),
+            port_bindings: Some(port_bindings),
+            restart_policy: Some(RestartPolicy {
+                name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
+                maximum_retry_count: None,
+            }),
+            ..Default::default()
+        };
+        let labels = gateway_labels(spec);
+        let body = ContainerCreateBody {
+            image: Some(spec.image.clone()),
+            entrypoint: Some(vec!["/bin/sh".to_owned(), "-ec".to_owned()]),
+            cmd: Some(vec![
+                "printf '%s' \"$SWARMLITE_CADDY_BOOTSTRAP\" > /config/bootstrap.json; exec caddy run --resume --config /config/bootstrap.json"
+                    .to_owned(),
+            ]),
+            env: Some(vec![
+                "XDG_CONFIG_HOME=/config".to_owned(),
+                "XDG_DATA_HOME=/data".to_owned(),
+                format!("SWARMLITE_TOKEN={}", spec.token),
+                format!("SWARMLITE_CADDY_BOOTSTRAP={bootstrap}"),
+            ]),
+            exposed_ports: Some(exposed_ports),
+            labels: Some(labels),
+            stop_timeout: Some(10),
+            host_config: Some(host_config),
+            ..Default::default()
+        };
+        let options = CreateContainerOptionsBuilder::default()
+            .name(GATEWAY_CONTAINER_NAME)
+            .build();
+        let created = self
+            .client
+            .create_container(Some(options), body)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to create gateway container {GATEWAY_CONTAINER_NAME}; remove any unrelated container using that name"
+                )
+            })?;
+        self.client
+            .start_container(&created.id, None)
+            .await
+            .context("failed to start the gateway container")?;
+        info!(
+            image = %spec.image,
+            address = %spec.advertise_address,
+            runtime = %self.kind,
+            "started independent gateway container"
+        );
+        Ok(())
+    }
+
+    async fn remove_gateway(&self, container: &ExistingGatewayContainer) -> Result<()> {
+        if container.running {
+            let stop = StopContainerOptionsBuilder::default().t(10).build();
+            if let Err(error) = self.client.stop_container(&container.id, Some(stop)).await {
+                warn!(%error, "graceful gateway stop failed; forcing removal");
+            }
+        }
+        let remove = RemoveContainerOptionsBuilder::default().force(true).build();
+        self.client
+            .remove_container(&container.id, Some(remove))
+            .await
+            .context("failed to remove the managed gateway container")?;
+        info!(runtime = %self.kind, "removed gateway container");
+        Ok(())
+    }
+
+    async fn remove_gateway_volumes(&self, cluster_id: &str) -> Result<()> {
+        for volume in gateway_volume_names(cluster_id) {
+            let options = RemoveVolumeOptionsBuilder::default().force(true).build();
+            match self.client.remove_volume(&volume, Some(options)).await {
+                Ok(())
+                | Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to remove gateway volume {volume}"));
+                }
+            }
+        }
+        info!(runtime = %self.kind, "removed gateway persistent volumes");
+        Ok(())
+    }
+
+    async fn ensure_image(&self, image: &str) -> Result<()> {
+        if self.client.inspect_image(image).await.is_ok() {
+            return Ok(());
+        }
+        let options = CreateImageOptionsBuilder::default()
+            .from_image(image)
+            .build();
+        let mut pull = self.client.create_image(Some(options), None, None);
+        while let Some(item) = pull.next().await {
+            item.with_context(|| format!("failed to pull {image}"))?;
+        }
+        Ok(())
+    }
+}
+
+fn gateway_labels(spec: &GatewayContainerSpec) -> HashMap<String, String> {
+    HashMap::from([
+        (MANAGED_LABEL.to_owned(), "true".to_owned()),
+        (CLUSTER_LABEL.to_owned(), spec.cluster_id.clone()),
+        (SYSTEM_LABEL.to_owned(), "true".to_owned()),
+        (COMPONENT_LABEL.to_owned(), GATEWAY_COMPONENT.to_owned()),
+        (
+            GATEWAY_ADDRESS_LABEL.to_owned(),
+            spec.advertise_address.clone(),
+        ),
+        (
+            GATEWAY_BIND_ADDRESS_LABEL.to_owned(),
+            spec.admin_bind_address.clone(),
+        ),
+        (GATEWAY_SCHEMA_LABEL.to_owned(), GATEWAY_SCHEMA.to_owned()),
+        (GATEWAY_IMAGE_LABEL.to_owned(), spec.image.clone()),
+        (GATEWAY_LISTEN_LABEL.to_owned(), spec.listen.join(",")),
+        (
+            GATEWAY_TOKEN_HASH_LABEL.to_owned(),
+            gateway_token_hash(&spec.token),
+        ),
+    ])
+}
+
+fn gateway_token_hash(token: &str) -> String {
+    format!("{:x}", Sha256::digest(token.as_bytes()))
+}
+
+fn gateway_volume_names(cluster_id: &str) -> [String; 2] {
+    let prefix = format!("swarmlite-gateway-{cluster_id}");
+    [format!("{prefix}-data"), format!("{prefix}-config")]
+}
+
+fn gateway_matches_spec(container: &ExistingGatewayContainer, spec: &GatewayContainerSpec) -> bool {
+    container.advertise_address.as_deref() == Some(&spec.advertise_address)
+        && container.admin_bind_address.as_deref() == Some(&spec.admin_bind_address)
+        && container.image.as_deref() == Some(&spec.image)
+        && container.listen.as_deref() == Some(&spec.listen.join(","))
+        && container.token_hash.as_deref() == Some(&gateway_token_hash(&spec.token))
+        && container.schema.as_deref() == Some(GATEWAY_SCHEMA)
+}
+
+fn gateway_ports(listen: &[String]) -> Result<BTreeSet<u16>> {
+    listen
+        .iter()
+        .map(|address| {
+            let port = address
+                .rsplit_once(':')
+                .map(|(_, port)| port)
+                .unwrap_or_default()
+                .parse::<u16>()
+                .with_context(|| {
+                    format!("gateway listen address {address:?} must end in a numeric TCP port")
+                })?;
+            if port == 2019 {
+                bail!("gateway listen port 2019 is reserved for the Caddy admin API");
+            }
+            Ok(port)
+        })
+        .collect()
+}
+
+fn gateway_bootstrap(spec: &GatewayContainerSpec) -> Result<String> {
+    Ok(serde_json::to_string(&serde_json::json!({
+        "admin": {
+            "listen": "0.0.0.0:2019",
+            "config": { "persist": true }
+        },
+        "storage": {
+            "module": "swarmlite",
+            "controllers": &spec.controllers,
+            "token_env": "SWARMLITE_TOKEN",
+            "timeout": "500ms",
+            "lock_lease": "30s"
+        },
+        "apps": {
+            "http": {
+                "servers": {
+                    "swarmlite": {
+                        "listen": &spec.listen,
+                        "routes": []
+                    }
+                }
+            }
+        }
+    }))?)
+}
+
+fn is_gateway_system_container(labels: &HashMap<String, String>) -> bool {
+    labels.get(SYSTEM_LABEL).map(String::as_str) == Some("true")
+        && labels.get(COMPONENT_LABEL).map(String::as_str) == Some(GATEWAY_COMPONENT)
 }
 
 impl ContainerRuntime for DockerCompatibleRuntime {
@@ -224,20 +623,7 @@ impl ContainerRuntime for DockerCompatibleRuntime {
             runtime = %self.kind,
             "creating task container"
         );
-        if self
-            .client
-            .inspect_image(&assignment.spec.image)
-            .await
-            .is_err()
-        {
-            let options = CreateImageOptionsBuilder::default()
-                .from_image(&assignment.spec.image)
-                .build();
-            let mut pull = self.client.create_image(Some(options), None, None);
-            while let Some(item) = pull.next().await {
-                item.with_context(|| format!("failed to pull {}", assignment.spec.image))?;
-            }
-        }
+        self.ensure_image(&assignment.spec.image).await?;
 
         let mut port_bindings = HashMap::new();
         let exposed_ports = assignment
@@ -410,6 +796,128 @@ mod tests {
     #[test]
     fn sanitizes_runtime_container_names() {
         assert_eq!(sanitize_name("demo/web:v1"), "demo-web-v1");
+    }
+
+    #[test]
+    fn recognizes_gateway_system_container_labels() {
+        let labels = HashMap::from([
+            (MANAGED_LABEL.to_owned(), "true".to_owned()),
+            (CLUSTER_LABEL.to_owned(), "cluster-old".to_owned()),
+            (SYSTEM_LABEL.to_owned(), "true".to_owned()),
+            (COMPONENT_LABEL.to_owned(), GATEWAY_COMPONENT.to_owned()),
+        ]);
+        assert!(is_gateway_system_container(&labels));
+
+        let workload = HashMap::from([
+            (MANAGED_LABEL.to_owned(), "true".to_owned()),
+            (CLUSTER_LABEL.to_owned(), "cluster-old".to_owned()),
+        ]);
+        assert!(!is_gateway_system_container(&workload));
+    }
+
+    #[test]
+    fn builds_gateway_recovery_labels() {
+        let spec = GatewayContainerSpec {
+            cluster_id: "cluster-old".into(),
+            advertise_address: "10.0.0.21".into(),
+            admin_bind_address: "10.0.0.21".into(),
+            listen: vec![":80".into()],
+            controllers: vec!["http://10.0.0.21:8080".into()],
+            token: "0123456789abcdef".into(),
+            image: DEFAULT_GATEWAY_IMAGE.into(),
+        };
+        let labels = gateway_labels(&spec);
+        assert_eq!(labels[MANAGED_LABEL], "true");
+        assert_eq!(labels[CLUSTER_LABEL], "cluster-old");
+        assert_eq!(labels[SYSTEM_LABEL], "true");
+        assert_eq!(labels[COMPONENT_LABEL], GATEWAY_COMPONENT);
+        assert_eq!(labels[GATEWAY_ADDRESS_LABEL], "10.0.0.21");
+        assert_eq!(labels[GATEWAY_BIND_ADDRESS_LABEL], "10.0.0.21");
+        assert_eq!(labels[GATEWAY_SCHEMA_LABEL], GATEWAY_SCHEMA);
+        assert_eq!(labels[GATEWAY_IMAGE_LABEL], DEFAULT_GATEWAY_IMAGE);
+        assert_eq!(labels[GATEWAY_LISTEN_LABEL], ":80");
+        assert_eq!(
+            labels[GATEWAY_TOKEN_HASH_LABEL],
+            gateway_token_hash("0123456789abcdef")
+        );
+        assert!(!labels.values().any(|value| value == "0123456789abcdef"));
+        assert!(!labels.contains_key(TASK_LABEL));
+    }
+
+    #[test]
+    fn replaces_a_gateway_when_the_cluster_image_changes() {
+        let container = ExistingGatewayContainer {
+            id: "gateway".into(),
+            cluster_id: Some("cluster-old".into()),
+            advertise_address: Some("10.0.0.21".into()),
+            admin_bind_address: Some("10.0.0.21".into()),
+            image: Some("custom-caddy:v1".into()),
+            listen: Some(":80".into()),
+            token_hash: Some(gateway_token_hash("0123456789abcdef")),
+            schema: Some(GATEWAY_SCHEMA.into()),
+            running: true,
+        };
+        let mut spec = GatewayContainerSpec {
+            cluster_id: "cluster-old".into(),
+            advertise_address: "10.0.0.21".into(),
+            admin_bind_address: "10.0.0.21".into(),
+            listen: vec![":80".into()],
+            controllers: vec!["http://10.0.0.21:8080".into()],
+            token: "0123456789abcdef".into(),
+            image: DEFAULT_GATEWAY_IMAGE.into(),
+        };
+        assert!(!gateway_matches_spec(&container, &spec));
+        spec.image = "custom-caddy:v1".into();
+        assert!(gateway_matches_spec(&container, &spec));
+    }
+
+    #[test]
+    fn maps_gateway_listeners_to_published_ports() {
+        assert_eq!(
+            gateway_ports(&[":80".into(), "0.0.0.0:443".into()]).unwrap(),
+            BTreeSet::from([80, 443])
+        );
+        assert!(gateway_ports(&[":2019".into()]).is_err());
+        assert!(gateway_ports(&["unix/socket".into()]).is_err());
+    }
+
+    #[test]
+    fn scopes_gateway_volumes_to_the_cluster() {
+        assert_eq!(
+            gateway_volume_names("cluster-old"),
+            [
+                "swarmlite-gateway-cluster-old-data".to_owned(),
+                "swarmlite-gateway-cluster-old-config".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn gateway_bootstrap_persists_admin_updates() {
+        let spec = GatewayContainerSpec {
+            cluster_id: "cluster-old".into(),
+            advertise_address: "10.0.0.21".into(),
+            admin_bind_address: "10.0.0.21".into(),
+            listen: vec![":80".into()],
+            controllers: vec![
+                "http://10.0.0.21:8080".into(),
+                "http://10.0.0.22:8080".into(),
+            ],
+            token: "do-not-persist-this-token".into(),
+            image: DEFAULT_GATEWAY_IMAGE.into(),
+        };
+        let encoded = gateway_bootstrap(&spec).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(value["admin"]["listen"], "0.0.0.0:2019");
+        assert_eq!(value["admin"]["config"]["persist"], true);
+        assert_eq!(value["storage"]["module"], "swarmlite");
+        assert_eq!(value["storage"]["controllers"][1], "http://10.0.0.22:8080");
+        assert_eq!(value["storage"]["token_env"], "SWARMLITE_TOKEN");
+        assert!(!encoded.contains("do-not-persist-this-token"));
+        assert_eq!(
+            value["apps"]["http"]["servers"]["swarmlite"]["listen"][0],
+            ":80"
+        );
     }
 
     #[test]

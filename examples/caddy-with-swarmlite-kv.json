@@ -1,6 +1,9 @@
 {
   "admin": {
-    "listen": "10.0.0.20:2019"
+    "listen": "0.0.0.0:2019",
+    "config": {
+      "persist": true
+    }
   },
   "storage": {
     "module": "swarmlite",
@@ -13,7 +16,12 @@
   },
   "apps": {
     "http": {
-      "servers": {}
+      "servers": {
+        "swarmlite": {
+          "listen": [":80"],
+          "routes": []
+        }
+      }
     }
   }
 }

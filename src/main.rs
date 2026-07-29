@@ -5,8 +5,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use swarmlite::{
     config::RuntimeKind,
     model::{
-        ClusterConfigResponse, ClusterConfigUpdate, ClusterGatewayConfig, ClusterMode,
-        ClusterSettings, NodeRole, NodeRolesResponse, NodeRolesUpdate,
+        CLUSTER_SCHEMA_VERSION, ClusterConfigResponse, ClusterConfigUpdate, ClusterGatewayConfig,
+        ClusterMode, ClusterSettings, DEFAULT_GATEWAY_IMAGE, NodeRole, NodeRolesResponse,
+        NodeRolesUpdate,
     },
     node,
 };
@@ -146,6 +147,7 @@ enum RoleCommand {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ConfigKey {
     Mode,
+    GatewayImage,
 }
 
 #[derive(Debug, Args)]
@@ -178,6 +180,10 @@ struct InitArgs {
     labels: Vec<String>,
     #[arg(long = "gateway-listen", default_value = ":80")]
     gateway_listen: Vec<String>,
+    /// OCI image containing Caddy and caddy.storage.swarmlite.
+    /// Defaults to ghcr.io/swarmlite/swarmlite-caddy:latest.
+    #[arg(long = "gateway-image")]
+    gateway_image: Option<String>,
 }
 
 #[tokio::main]
@@ -193,13 +199,17 @@ async fn main() -> Result<()> {
     let data_dir = node::resolve_data_dir(cli.data_dir)?;
     match cli.command {
         Command::Init { options } => {
+            let gateway_image_explicit = options.gateway_image.is_some();
             let cluster = ClusterSettings {
-                schema_version: 3,
+                schema_version: CLUSTER_SCHEMA_VERSION,
                 cluster_id: node::new_cluster_id(),
                 mode: options.mode,
                 controller_port: options.controller_port,
                 gateway: ClusterGatewayConfig {
                     listen: options.gateway_listen.clone(),
+                    image: options
+                        .gateway_image
+                        .unwrap_or_else(|| DEFAULT_GATEWAY_IMAGE.to_owned()),
                 },
             };
             let message = node::init(node::InitOptions {
@@ -211,6 +221,7 @@ async fn main() -> Result<()> {
                 runtime_socket: options.runtime_socket,
                 labels: node::parse_labels(options.labels)?,
                 recovery: options.recover,
+                gateway_image_explicit,
             })
             .await?;
             println!("{message}");
@@ -268,8 +279,15 @@ async fn main() -> Result<()> {
                 } => {
                     let update = match key {
                         ConfigKey::Mode => ClusterConfigUpdate {
-                            mode: <ClusterMode as ValueEnum>::from_str(&value, true)
-                                .map_err(anyhow::Error::msg)?,
+                            mode: Some(
+                                <ClusterMode as ValueEnum>::from_str(&value, true)
+                                    .map_err(anyhow::Error::msg)?,
+                            ),
+                            gateway_image: None,
+                        },
+                        ConfigKey::GatewayImage => ClusterConfigUpdate {
+                            mode: None,
+                            gateway_image: Some(value),
                         },
                     };
                     (connection, Some(update))
@@ -517,6 +535,16 @@ mod tests {
     #[test]
     fn config_set_accepts_key_value_arguments() {
         assert!(Cli::try_parse_from(["swarmlite", "config", "set", "mode", "ha"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "swarmlite",
+                "config",
+                "set",
+                "gateway-image",
+                "ghcr.io/example/caddy:v1",
+            ])
+            .is_ok()
+        );
         assert!(Cli::try_parse_from(["swarmlite", "config", "set", "unknown", "3"]).is_err());
     }
 
@@ -534,6 +562,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(arguments.contains(&"mode"));
         assert!(arguments.contains(&"recover"));
+        assert!(arguments.contains(&"gateway_image"));
         assert!(!arguments.iter().any(|argument| argument.contains("s3")));
     }
 

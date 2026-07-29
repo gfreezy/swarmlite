@@ -277,7 +277,6 @@ fn same_cluster_identity(left: &ClusterSettings, right: &ClusterSettings) -> boo
     left.schema_version == right.schema_version
         && left.cluster_id == right.cluster_id
         && left.controller_port == right.controller_port
-        && left.gateway == right.gateway
 }
 
 impl PersistedClusterState {
@@ -418,7 +417,7 @@ mod tests {
             .await
             .unwrap();
         let cluster = ClusterSettings {
-            schema_version: 2,
+            schema_version: crate::model::CLUSTER_SCHEMA_VERSION,
             cluster_id: "storage-test".into(),
             mode: crate::model::ClusterMode::Standalone,
             controller_port: 19090,

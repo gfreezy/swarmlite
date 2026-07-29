@@ -14,6 +14,15 @@ pub struct HttpServer {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct StorageConfig {
+    pub module: &'static str,
+    pub controllers: Vec<String>,
+    pub token_env: &'static str,
+    pub timeout: &'static str,
+    pub lock_lease: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct Route {
     #[serde(rename = "@id")]
     pub id: String,
@@ -67,6 +76,16 @@ pub fn generate(state: &ClusterState, listen: &[String]) -> HttpServer {
     HttpServer {
         listen: listen.to_vec(),
         routes,
+    }
+}
+
+pub fn storage(controllers: Vec<String>) -> StorageConfig {
+    StorageConfig {
+        module: "swarmlite",
+        controllers,
+        token_env: "SWARMLITE_TOKEN",
+        timeout: "500ms",
+        lock_lease: "30s",
     }
 }
 
