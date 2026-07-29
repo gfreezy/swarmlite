@@ -2146,17 +2146,14 @@ dependencies = [
  "bollard",
  "clap",
  "futures-util",
- "humantime",
  "pretty_assertions",
  "redb",
  "reqwest",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2",
- "shell-words",
- "swarmlite-gateway",
  "swarmlite-raft",
+ "swarmlite-stack",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
@@ -2165,16 +2162,6 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
-]
-
-[[package]]
-name = "swarmlite-gateway"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "regex",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -2191,6 +2178,20 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "swarmlite-stack"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "humantime",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "shell-words",
 ]
 
 [[package]]

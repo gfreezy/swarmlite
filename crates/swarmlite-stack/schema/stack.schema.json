@@ -1,0 +1,426 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://swarmlite.dev/schema/stack.schema.json",
+  "title": "Swarmlite Stack",
+  "type": "object",
+  "required": ["services"],
+  "properties": {
+    "services": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "$ref": "#/$defs/service" }
+    },
+    "x-swarmlite": { "$ref": "#/$defs/swarmlite" }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "service": {
+      "type": "object",
+      "required": ["image"],
+      "properties": {
+        "image": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Container image reference. Image builds are not supported."
+        },
+        "command": {
+          "$ref": "#/$defs/stringOrList",
+          "description": "Container command. String form is parsed with shell-style word splitting; list form is passed verbatim."
+        },
+        "entrypoint": {
+          "$ref": "#/$defs/stringOrList",
+          "description": "Container entrypoint. String form is parsed with shell-style word splitting; list form is passed verbatim."
+        },
+        "environment": {
+          "$ref": "#/$defs/stringMapOrList",
+          "description": "Environment as a scalar map or KEY=value list. A null map value emits only KEY."
+        },
+        "labels": {
+          "$ref": "#/$defs/stringMapOrList",
+          "description": "Labels attached to each task container. deploy.labels are service metadata instead."
+        },
+        "ports": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/servicePort" },
+          "default": [],
+          "description": "Host-published ports. Omit published to let Swarmlite allocate a node port. Port ranges, host-IP prefixes, and mode are not supported."
+        },
+        "volumes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/serviceVolume" },
+          "default": [],
+          "description": "Node-local named volumes, bind mounts, or anonymous volumes."
+        },
+        "healthcheck": {
+          "$ref": "#/$defs/healthcheck"
+        },
+        "stop_grace_period": {
+          "$ref": "#/$defs/duration",
+          "default": "10s",
+          "description": "Time allowed for a task to stop before it is killed."
+        },
+        "deploy": {
+          "$ref": "#/$defs/deploy",
+          "default": {}
+        }
+      },
+      "additionalProperties": false
+    },
+    "stringOrList": {
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      ]
+    },
+    "scalar": {
+      "type": ["string", "number", "boolean", "null"]
+    },
+    "stringMapOrList": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/scalar" }
+        },
+        {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      ]
+    },
+    "servicePort": {
+      "oneOf": [
+        {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Container target port; the host port is allocated automatically."
+        },
+        {
+          "type": "string",
+          "pattern": "^(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?(?:/(?:tcp|udp))?$",
+          "description": "Short syntax: target[/protocol] or published:target[/protocol]. Each port must be 1-65535."
+        },
+        {
+          "$ref": "#/$defs/servicePortLong"
+        }
+      ]
+    },
+    "servicePortLong": {
+      "type": "object",
+      "required": ["target"],
+      "properties": {
+        "target": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "published": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Omit to allocate a free node port automatically."
+        },
+        "protocol": {
+          "type": "string",
+          "enum": ["tcp", "udp"],
+          "default": "tcp"
+        }
+      },
+      "additionalProperties": false
+    },
+    "serviceVolume": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "description": "Docker bind syntax such as data:/data, /host:/container:ro, or /container."
+        },
+        {
+          "$ref": "#/$defs/serviceVolumeLong"
+        }
+      ]
+    },
+    "serviceVolumeLong": {
+      "type": "object",
+      "required": ["target"],
+      "properties": {
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Named volume or absolute host path. Omit for an anonymous volume."
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1
+        },
+        "read_only": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "healthcheck": {
+      "type": "object",
+      "properties": {
+        "test": {
+          "oneOf": [
+            {
+              "type": "string",
+              "description": "Run through CMD-SHELL."
+            },
+            {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Docker healthcheck test vector, normally beginning with CMD, CMD-SHELL, or NONE."
+            }
+          ]
+        },
+        "disable": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, test is normalized to [NONE]."
+        },
+        "interval": { "$ref": "#/$defs/duration" },
+        "timeout": { "$ref": "#/$defs/duration" },
+        "retries": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "start_period": { "$ref": "#/$defs/duration" },
+        "start_interval": { "$ref": "#/$defs/duration" }
+      },
+      "additionalProperties": false
+    },
+    "duration": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable duration accepted by humantime, for example 500ms, 10s, 2m, or 1h."
+    },
+    "deploy": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "const": "replicated",
+          "default": "replicated"
+        },
+        "replicas": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 1
+        },
+        "labels": {
+          "$ref": "#/$defs/stringMapOrList",
+          "description": "Service metadata stored in cluster state; these labels are not attached to containers."
+        },
+        "placement": {
+          "$ref": "#/$defs/placement",
+          "default": {}
+        },
+        "update_config": {
+          "$ref": "#/$defs/updateConfig",
+          "default": {}
+        }
+      },
+      "additionalProperties": false
+    },
+    "placement": {
+      "type": "object",
+      "properties": {
+        "constraints": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "default": [],
+          "description": "Hard constraints such as node.labels.region == cn-east or node.id != node-a."
+        }
+      },
+      "additionalProperties": false
+    },
+    "updateConfig": {
+      "type": "object",
+      "properties": {
+        "parallelism": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "For start-first updates, controls temporary surge tasks; zero is normalized to one."
+        },
+        "order": {
+          "type": "string",
+          "enum": ["start-first", "stop-first"],
+          "default": "start-first"
+        }
+      },
+      "additionalProperties": false
+    },
+    "swarmlite": {
+      "type": "object",
+      "properties": {
+        "tls": {
+          "$ref": "#/$defs/tlsMode",
+          "default": "serve"
+        },
+        "http": {
+          "$ref": "#/$defs/httpMode",
+          "default": "redirect"
+        },
+        "http_routes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/httpRoute" },
+          "default": []
+        }
+      },
+      "additionalProperties": false
+    },
+    "tlsMode": {
+      "type": "string",
+      "enum": ["serve", "disabled"]
+    },
+    "httpMode": {
+      "type": "string",
+      "enum": ["redirect", "serve", "disabled"]
+    },
+    "httpRoute": {
+      "type": "object",
+      "required": ["hostnames", "rules"],
+      "properties": {
+        "hostnames": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "tls": { "$ref": "#/$defs/tlsMode" },
+        "http": { "$ref": "#/$defs/httpMode" },
+        "rules": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/rule" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "rule": {
+      "type": "object",
+      "required": ["backend"],
+      "properties": {
+        "matches": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/pathMatch" },
+          "default": []
+        },
+        "rewrite": { "$ref": "#/$defs/rewrite" },
+        "backend": { "$ref": "#/$defs/backend" }
+      },
+      "additionalProperties": false
+    },
+    "pathMatch": {
+      "type": "object",
+      "required": ["path"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "type": {
+          "type": "string",
+          "enum": ["exact", "prefix", "regex"],
+          "default": "prefix"
+        },
+        "ignore_case": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "rewrite": {
+      "type": "object",
+      "properties": {
+        "strip_prefix": { "const": true },
+        "replace_prefix": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "replace_path": {
+          "type": "string",
+          "pattern": "^/"
+        }
+      },
+      "oneOf": [
+        {
+          "required": ["strip_prefix"],
+          "not": {
+            "anyOf": [
+              { "required": ["replace_prefix"] },
+              { "required": ["replace_path"] }
+            ]
+          }
+        },
+        {
+          "required": ["replace_prefix"],
+          "not": {
+            "anyOf": [
+              { "required": ["strip_prefix"] },
+              { "required": ["replace_path"] }
+            ]
+          }
+        },
+        {
+          "required": ["replace_path"],
+          "not": {
+            "anyOf": [
+              { "required": ["strip_prefix"] },
+              { "required": ["replace_prefix"] }
+            ]
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "backend": {
+      "type": "object",
+      "required": ["port"],
+      "properties": {
+        "service": {
+          "type": "string",
+          "minLength": 1
+        },
+        "host": {
+          "type": "string",
+          "minLength": 1
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "protocol": {
+          "type": "string",
+          "enum": ["http", "https", "h2c"],
+          "default": "http"
+        },
+        "preserve_host": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "oneOf": [
+        {
+          "required": ["service"],
+          "not": { "required": ["host"] }
+        },
+        {
+          "required": ["host"],
+          "not": { "required": ["service"] }
+        }
+      ],
+      "additionalProperties": false
+    }
+  }
+}

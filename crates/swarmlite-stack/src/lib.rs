@@ -1,8 +1,57 @@
-use std::{cmp::Reverse, collections::BTreeSet, net::IpAddr};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet},
+    net::IpAddr,
+};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+mod compose;
+
+pub use compose::{ParsedStack, parse_stack};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceSpec {
+    pub image: String,
+    pub command: Vec<String>,
+    pub entrypoint: Vec<String>,
+    pub environment: Vec<String>,
+    pub ports: Vec<ServicePort>,
+    pub volumes: Vec<String>,
+    pub container_labels: BTreeMap<String, String>,
+    pub service_labels: BTreeMap<String, String>,
+    pub healthcheck: Option<HealthcheckSpec>,
+    pub replicas: u32,
+    pub constraints: Vec<String>,
+    pub max_surge: u32,
+    pub stop_grace_period_seconds: u64,
+}
+
+pub fn service_spec_hash(spec: &ServiceSpec) -> String {
+    let encoded = serde_json::to_vec(spec).expect("ServiceSpec serialization cannot fail");
+    let digest = Sha256::digest(encoded);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HealthcheckSpec {
+    pub test: Vec<String>,
+    pub interval_nanos: Option<i64>,
+    pub timeout_nanos: Option<i64>,
+    pub retries: Option<i64>,
+    pub start_period_nanos: Option<i64>,
+    pub start_interval_nanos: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServicePort {
+    pub target: u16,
+    pub published: Option<u16>,
+    pub protocol: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

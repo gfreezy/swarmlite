@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_yaml::Value;
 
-use crate::model::{HealthcheckSpec, ServicePort, ServiceSpec, StackGatewaySpec};
+use crate::{HealthcheckSpec, ServicePort, ServiceSpec, StackGatewaySpec};
 
 #[derive(Debug, Clone)]
 pub struct ParsedStack {
@@ -23,6 +23,7 @@ struct RawStack {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawService {
     image: Option<String>,
     command: Option<StringOrList>,
@@ -42,6 +43,7 @@ struct RawService {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawDeploy {
     mode: Option<String>,
     replicas: Option<u32>,
@@ -54,18 +56,21 @@ struct RawDeploy {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawPlacement {
     #[serde(default)]
     constraints: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawUpdateConfig {
     parallelism: Option<u32>,
     order: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawHealthcheck {
     test: Option<StringOrList>,
     #[serde(default)]
@@ -145,12 +150,11 @@ enum PortValue {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LongPort {
     target: u16,
     published: Option<u16>,
     protocol: Option<String>,
-    #[allow(dead_code)]
-    mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,13 +165,12 @@ enum VolumeValue {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LongVolume {
     source: Option<String>,
     target: String,
     #[serde(default)]
     read_only: bool,
-    #[allow(dead_code)]
-    r#type: Option<String>,
 }
 
 pub fn parse_stack(yaml: &str) -> Result<ParsedStack> {
@@ -181,7 +184,7 @@ pub fn parse_stack(yaml: &str) -> Result<ParsedStack> {
         .into_iter()
         .map(|(name, service)| normalize_service(&name, service).map(|spec| (name, spec)))
         .collect::<Result<_>>()?;
-    swarmlite_gateway::validate_and_normalize(
+    crate::validate_and_normalize(
         &mut raw.gateway,
         &services.keys().cloned().collect::<BTreeSet<_>>(),
     )
@@ -273,6 +276,9 @@ fn normalize_service(name: &str, raw: RawService) -> Result<ServiceSpec> {
 }
 
 fn normalize_healthcheck(name: &str, raw: RawHealthcheck) -> Result<HealthcheckSpec> {
+    if raw.retries.is_some_and(|retries| retries < 0) {
+        bail!("service {name}: healthcheck.retries must be non-negative");
+    }
     let test = if raw.disable {
         vec!["NONE".to_owned()]
     } else {
@@ -313,16 +319,29 @@ fn parse_optional_duration(name: &str, field: &str, value: Option<String>) -> Re
 
 fn normalize_port(value: PortValue) -> Result<ServicePort> {
     match value {
-        PortValue::Number(target) => Ok(ServicePort {
-            target,
-            published: None,
-            protocol: "tcp".to_owned(),
-        }),
-        PortValue::Long(port) => Ok(ServicePort {
-            target: port.target,
-            published: port.published,
-            protocol: port.protocol.unwrap_or_else(|| "tcp".to_owned()),
-        }),
+        PortValue::Number(target) => {
+            ensure_nonzero_port(target, &target.to_string())?;
+            Ok(ServicePort {
+                target,
+                published: None,
+                protocol: "tcp".to_owned(),
+            })
+        }
+        PortValue::Long(port) => {
+            ensure_nonzero_port(port.target, "long port target")?;
+            if let Some(published) = port.published {
+                ensure_nonzero_port(published, "long port published")?;
+            }
+            let protocol = port.protocol.unwrap_or_else(|| "tcp".to_owned());
+            if protocol != "tcp" && protocol != "udp" {
+                bail!("unsupported long port protocol {protocol}");
+            }
+            Ok(ServicePort {
+                target: port.target,
+                published: port.published,
+                protocol,
+            })
+        }
         PortValue::Short(value) => parse_short_port(&value),
     }
 }
@@ -337,7 +356,7 @@ fn parse_short_port(value: &str) -> Result<ServicePort> {
     let parts: Vec<&str> = address.rsplit(':').collect();
     let (target, published) = match parts.as_slice() {
         [target] => (parse_port_number(target, value)?, None),
-        [target, published, ..] => (
+        [target, published] => (
             parse_port_number(target, value)?,
             Some(parse_port_number(published, value)?),
         ),
@@ -354,15 +373,35 @@ fn parse_port_number(value: &str, original: &str) -> Result<u16> {
     if value.contains('-') {
         bail!("port ranges are not supported yet: {original}");
     }
-    value
+    let port = value
         .parse()
-        .with_context(|| format!("invalid port mapping {original}"))
+        .with_context(|| format!("invalid port mapping {original}"))?;
+    ensure_nonzero_port(port, original)?;
+    Ok(port)
+}
+
+fn ensure_nonzero_port(port: u16, original: &str) -> Result<()> {
+    if port == 0 {
+        bail!("port must be between 1 and 65535: {original}");
+    }
+    Ok(())
 }
 
 fn normalize_volume(value: VolumeValue) -> Result<String> {
     match value {
-        VolumeValue::Short(value) => Ok(value),
+        VolumeValue::Short(value) => {
+            if value.is_empty() {
+                bail!("volume short syntax cannot be empty");
+            }
+            Ok(value)
+        }
         VolumeValue::Long(volume) => {
+            if volume.target.is_empty() {
+                bail!("volume target cannot be empty");
+            }
+            if volume.source.as_deref().is_some_and(str::is_empty) {
+                bail!("volume source cannot be empty");
+            }
             let mut result = match volume.source {
                 Some(source) => format!("{source}:{}", volume.target),
                 None => volume.target,
@@ -392,9 +431,10 @@ mod tests {
     #[test]
     fn parses_all_checked_in_stack_examples_without_a_version_field() {
         for yaml in [
-            include_str!("../examples/stack.yaml"),
-            include_str!("../examples/stack-standalone.yaml"),
-            include_str!("../examples/routing-all.yaml"),
+            include_str!("../../../examples/stack.yaml"),
+            include_str!("../../../examples/stack-standalone.yaml"),
+            include_str!("../../../examples/routing-all.yaml"),
+            include_str!("../../../examples/services-all.yaml"),
         ] {
             assert!(!yaml.lines().any(|line| line.starts_with("version:")));
             parse_stack(yaml).unwrap();
@@ -474,6 +514,37 @@ services:
         )
         .unwrap_err();
         assert!(error.to_string().contains("only deploy.mode=replicated"));
+    }
+
+    #[test]
+    fn rejects_unknown_service_fields_including_compose_compatibility_fields() {
+        for yaml in [
+            r#"
+services:
+  web:
+    image: nginx
+    restart: always
+"#,
+            r#"
+services:
+  web:
+    image: nginx
+    ports:
+      - target: 80
+        mode: host
+"#,
+            r#"
+services:
+  web:
+    image: nginx
+    volumes:
+      - type: bind
+        source: /srv/web
+        target: /run
+"#,
+        ] {
+            assert!(parse_stack(yaml).is_err(), "expected rejection for {yaml}");
+        }
     }
 
     #[test]

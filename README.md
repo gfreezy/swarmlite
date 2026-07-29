@@ -278,16 +278,18 @@ top-level defaults. `http: redirect` requires `tls: serve`. See the complete exa
 [examples/routing-all.yaml](examples/routing-all.yaml).
 
 VS Code/YAML Language Server completion is available from
-[crates/swarmlite-gateway/schema/stack.schema.json](crates/swarmlite-gateway/schema/stack.schema.json).
+[crates/swarmlite-stack/schema/stack.schema.json](crates/swarmlite-stack/schema/stack.schema.json).
+The Schema enumerates every supported `services` field and rejects unsupported keys; see
+[examples/services-all.yaml](examples/services-all.yaml) for all accepted service forms.
 Add this first line to a Stack file if it is not already associated in editor settings:
 
 ```yaml
-# yaml-language-server: $schema=./crates/swarmlite-gateway/schema/stack.schema.json
+# yaml-language-server: $schema=./crates/swarmlite-stack/schema/stack.schema.json
 ```
 
-The routing model, validation, precedence, and Caddy JSON renderer live in the independent
-`swarmlite-gateway` crate. The main orchestrator only resolves internal service references to
-healthy task addresses.
+The complete Stack parser, service model, routing validation, precedence, and Caddy JSON renderer
+live in the independent `swarmlite-stack` crate. The main orchestrator only persists normalized
+service specs and resolves internal service references to healthy task addresses.
 
 Caddy keeps certificates in a cluster-specific Docker volume mounted at `/data`, and the last
 accepted runtime configuration in another volume mounted at `/config`. It starts with `--resume`,

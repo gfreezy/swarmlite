@@ -1,0 +1,66 @@
+# yaml-language-server: $schema=../crates/swarmlite-stack/schema/stack.schema.json
+services:
+  api:
+    image: example/api:1.0
+    entrypoint: ["/usr/bin/env"]
+    command: ["/app/api", "--listen=:8080"]
+    environment:
+      APP_ENV: production
+      DEBUG: false
+      WORKERS: 4
+      INHERIT_FROM_HOST:
+    labels:
+      com.example.component: api
+      com.example.public: true
+    ports:
+      - 8080
+      - "18081:8081/tcp"
+      - target: 5353
+        published: 15353
+        protocol: udp
+    volumes:
+      - api-data:/var/lib/api
+      - source: /srv/example/api-config
+        target: /etc/api
+        read_only: true
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 2s
+      retries: 3
+      start_period: 20s
+      start_interval: 1s
+    stop_grace_period: 30s
+    deploy:
+      mode: replicated
+      replicas: 3
+      labels:
+        com.example.owner: platform
+      placement:
+        constraints:
+          - node.labels.region == cn-east
+          - node.labels.disk != hdd
+      update_config:
+        parallelism: 2
+        order: start-first
+
+  worker:
+    image: example/worker:1.0
+    entrypoint: "/usr/bin/tini --"
+    command: "/app/worker --queue default"
+    environment:
+      - QUEUE=default
+      - LOG_LEVEL=info
+    labels:
+      - com.example.component=worker
+    ports:
+      - "9000/udp"
+    volumes:
+      - target: /cache
+    healthcheck:
+      disable: true
+    deploy:
+      labels:
+        - com.example.owner=platform
+      update_config:
+        order: stop-first

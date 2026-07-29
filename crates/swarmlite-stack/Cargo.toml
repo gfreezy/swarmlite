@@ -1,13 +1,16 @@
 [package]
-name = "swarmlite-gateway"
+name = "swarmlite-stack"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "Swarmlite HTTP routing schema, validation, and Caddy JSON renderer"
+description = "Swarmlite Stack parser, routing validation, and Caddy JSON renderer"
 
 [dependencies]
 anyhow = "1.0"
+humantime = "2.3"
 regex = "1.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-
+serde_yaml = "0.9"
+sha2 = "0.10"
+shell-words = "1.1"

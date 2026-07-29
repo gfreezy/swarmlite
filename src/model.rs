@@ -2,10 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-pub use swarmlite_gateway::{
-    GatewayHttpMode, GatewayTlsMode, HttpBackend, HttpBackendProtocol, HttpPathMatch,
-    HttpPathMatchType, HttpPathRewrite, HttpRouteRule, HttpRouteSpec, StackGatewaySpec,
+pub use swarmlite_stack::{
+    GatewayHttpMode, GatewayTlsMode, HealthcheckSpec, HttpBackend, HttpBackendProtocol,
+    HttpPathMatch, HttpPathMatchType, HttpPathRewrite, HttpRouteRule, HttpRouteSpec, ServicePort,
+    ServiceSpec, StackGatewaySpec, service_spec_hash,
 };
 
 pub const CLUSTER_SCHEMA_VERSION: u32 = 5;
@@ -222,46 +222,6 @@ pub struct ControllerRecord {
     pub raft_id: u64,
     pub raft_url: String,
     pub reserved_at_unix_ms: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ServiceSpec {
-    pub image: String,
-    pub command: Vec<String>,
-    pub entrypoint: Vec<String>,
-    pub environment: Vec<String>,
-    pub ports: Vec<ServicePort>,
-    pub volumes: Vec<String>,
-    pub container_labels: BTreeMap<String, String>,
-    pub service_labels: BTreeMap<String, String>,
-    pub healthcheck: Option<HealthcheckSpec>,
-    pub replicas: u32,
-    pub constraints: Vec<String>,
-    pub max_surge: u32,
-    pub stop_grace_period_seconds: u64,
-}
-
-pub fn service_spec_hash(spec: &ServiceSpec) -> String {
-    let encoded = serde_json::to_vec(spec).expect("ServiceSpec serialization cannot fail");
-    let digest = Sha256::digest(encoded);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct HealthcheckSpec {
-    pub test: Vec<String>,
-    pub interval_nanos: Option<i64>,
-    pub timeout_nanos: Option<i64>,
-    pub retries: Option<i64>,
-    pub start_period_nanos: Option<i64>,
-    pub start_interval_nanos: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ServicePort {
-    pub target: u16,
-    pub published: Option<u16>,
-    pub protocol: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -2,10 +2,10 @@ use std::collections::BTreeSet;
 
 use crate::model::{ClusterState, DesiredTaskState, ObservedTaskState, ServiceRecord};
 
-pub use swarmlite_gateway::{HttpServer, StorageConfig, routed_service_ports, storage};
+pub use swarmlite_stack::{HttpServer, StorageConfig, routed_service_ports, storage};
 
 pub fn generate(state: &ClusterState, listen: &[String]) -> HttpServer {
-    swarmlite_gateway::generate(
+    swarmlite_stack::generate(
         state
             .stacks
             .values()
@@ -58,12 +58,10 @@ fn format_host(host: &str) -> String {
 mod tests {
     use std::collections::BTreeMap;
 
-    use crate::{
-        model::{
-            NodeRecord, PortBinding, ServicePort, ServiceSpec, StackRecord, TaskRecord, agent_roles,
-        },
-        stack::parse_stack,
+    use crate::model::{
+        NodeRecord, PortBinding, ServicePort, ServiceSpec, StackRecord, TaskRecord, agent_roles,
     };
+    use swarmlite_stack::parse_stack;
 
     use super::*;
 
