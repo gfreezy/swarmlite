@@ -65,17 +65,18 @@ runtime from `/etc/swarmlite/runtime.env`.
 
 ### macOS ARM64 CLI
 
-macOS does not install systemd or a container runtime. Docker Desktop must already be installed and
-running; otherwise the installer exits without installing Swarmlite. Run the installer without
-`sudo` so it can verify the current user's Docker Desktop socket:
+macOS does not install systemd or a container runtime. Any accessible Docker-compatible Unix socket
+is sufficient. If no socket exists, the installer exits and recommends installing OrbStack. Run
+the installer without `sudo` so it can access the current user's runtime socket:
 
 ```bash
 curl -fsSL https://github.com/gfreezy/swarmlite/releases/latest/download/install.sh | sh
 ```
 
 The installer supports Apple silicon, verifies the CLI archive, and asks for `sudo` only if writing
-to `/usr/local/bin` requires it. It accepts either `/var/run/docker.sock` or Docker Desktop's
-per-user `$HOME/.docker/run/docker.sock`.
+to `/usr/local/bin` requires it. It probes `$HOME/.orbstack/run/docker.sock`,
+`/var/run/docker.sock`, and `$HOME/.docker/run/docker.sock`. Install OrbStack from
+[orbstack.dev/download](https://orbstack.dev/download) when no compatible runtime is available.
 
 ## Build
 
@@ -459,7 +460,7 @@ remain unclaimed. `swarmlite status` reports `recovery.awaiting_adoption` and
 
 ## Runtime and networking
 
-Detected runtime sockets include Docker, Docker Desktop, Podman, and rootless Podman. Override
+Detected runtime sockets include Docker, OrbStack, Podman, and rootless Podman. Override
 detection when necessary:
 
 ```bash

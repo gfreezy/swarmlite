@@ -31,7 +31,8 @@ Defaults:
   --version latest  Install assets from the latest GitHub Release.
 
 Linux installs a container runtime when necessary and configures systemd. macOS requires an
-already installed and running Docker Desktop, and installs only the CLI.
+accessible Docker-compatible Unix socket, recommends OrbStack when none exists, and installs only
+the CLI.
 EOF
 }
 
@@ -81,23 +82,28 @@ case "$host_os" in
         esac
         ;;
     Darwin)
-        [ "$(id -u)" -ne 0 ] || fail "run the macOS installer without sudo so it can access your Docker Desktop socket"
+        [ "$(id -u)" -ne 0 ] || fail "run the macOS installer without sudo so it can access your container runtime socket"
         case "$requested_runtime" in
             auto|docker) ;;
-            podman) fail "the macOS installer supports Docker Desktop only" ;;
+            podman) fail "the macOS installer expects a Docker-compatible socket" ;;
         esac
         case "$(uname -m)" in
             arm64|aarch64) archive="swarmlite-macos-arm64.tar.gz" ;;
             *) fail "the macOS installer currently supports Apple silicon only" ;;
         esac
-        command -v docker >/dev/null 2>&1 || fail "Docker Desktop is required but the docker command was not found"
-        docker info >/dev/null 2>&1 || fail "Docker Desktop is installed but not running or not accessible"
-        if [ -S /var/run/docker.sock ]; then
-            macos_docker_socket="/var/run/docker.sock"
-        elif [ -n "${HOME:-}" ] && [ -S "$HOME/.docker/run/docker.sock" ]; then
-            macos_docker_socket="$HOME/.docker/run/docker.sock"
+        probe_macos_socket() {
+            [ -S "$1" ] && curl --fail --silent --unix-socket "$1" \
+                http://localhost/_ping >/dev/null 2>&1 && macos_docker_socket="$1"
+        }
+        macos_docker_socket=""
+        if [ -n "${HOME:-}" ] && probe_macos_socket "$HOME/.orbstack/run/docker.sock"; then
+            :
+        elif probe_macos_socket /var/run/docker.sock; then
+            :
+        elif [ -n "${HOME:-}" ] && probe_macos_socket "$HOME/.docker/run/docker.sock"; then
+            :
         else
-            fail "Docker is running, but no supported local socket was found; enable Docker Desktop's default socket"
+            fail "no accessible Docker-compatible socket was found; install and start OrbStack: https://orbstack.dev/download"
         fi
         ;;
     *)
@@ -149,7 +155,7 @@ if [ "$host_os" = "Darwin" ]; then
         sudo install -d -m 0755 "$install_dir"
         sudo install -m 0755 "$install_tmp/swarmlite" "$install_dir/swarmlite"
     fi
-    log "installation complete; Docker Desktop was detected"
+    log "installation complete; container runtime socket detected at $macos_docker_socket"
     "$install_dir/swarmlite" --help >/dev/null
     exit 0
 fi

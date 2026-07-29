@@ -1162,6 +1162,10 @@ fn runtime_candidates() -> Vec<(RuntimeKind, PathBuf)> {
     if let Some(home) = nonempty_env("HOME") {
         candidates.push((
             RuntimeKind::Docker,
+            PathBuf::from(&home).join(".orbstack/run/docker.sock"),
+        ));
+        candidates.push((
+            RuntimeKind::Docker,
             PathBuf::from(home).join(".docker/run/docker.sock"),
         ));
     }
