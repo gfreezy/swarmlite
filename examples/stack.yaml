@@ -1,5 +1,4 @@
-version: "3.8"
-
+# yaml-language-server: $schema=../crates/swarmlite-gateway/schema/stack.schema.json
 services:
   web:
     image: nginx:1.29-alpine
@@ -18,7 +17,16 @@ services:
       update_config:
         parallelism: 1
         order: start-first
-      labels:
-        swarmlite.gateway.enable: "true"
-        swarmlite.gateway.host: example.com
-        swarmlite.gateway.port: "80"
+
+x-swarmlite:
+  tls: serve
+  http: redirect
+  http_routes:
+    - hostnames:
+        - example.com
+      rules:
+        - backend:
+            service: web
+            port: 80
+            protocol: http
+            preserve_host: true

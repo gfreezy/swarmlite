@@ -1,0 +1,895 @@
+use std::{cmp::Reverse, collections::BTreeSet, net::IpAddr};
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StackGatewaySpec {
+    #[serde(default)]
+    pub tls: GatewayTlsMode,
+    #[serde(default)]
+    pub http: GatewayHttpMode,
+    #[serde(default)]
+    pub http_routes: Vec<HttpRouteSpec>,
+}
+
+impl Default for StackGatewaySpec {
+    fn default() -> Self {
+        Self {
+            tls: GatewayTlsMode::Serve,
+            http: GatewayHttpMode::Redirect,
+            http_routes: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayTlsMode {
+    #[default]
+    Serve,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayHttpMode {
+    #[default]
+    Redirect,
+    Serve,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpRouteSpec {
+    pub hostnames: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<GatewayTlsMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<GatewayHttpMode>,
+    pub rules: Vec<HttpRouteRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpRouteRule {
+    #[serde(default)]
+    pub matches: Vec<HttpPathMatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewrite: Option<HttpPathRewrite>,
+    pub backend: HttpBackend,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpPathMatch {
+    pub path: String,
+    #[serde(rename = "type", default)]
+    pub kind: HttpPathMatchType,
+    #[serde(default)]
+    pub ignore_case: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpPathMatchType {
+    Exact,
+    #[default]
+    Prefix,
+    Regex,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpPathRewrite {
+    #[serde(default)]
+    pub strip_prefix: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpBackend {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub port: u16,
+    #[serde(default)]
+    pub protocol: HttpBackendProtocol,
+    #[serde(default = "default_true")]
+    pub preserve_host: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpBackendProtocol {
+    #[default]
+    Http,
+    Https,
+    H2c,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HttpServer {
+    pub listen: Vec<String>,
+    pub routes: Vec<Route>,
+    pub automatic_https: AutomaticHttps,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AutomaticHttps {
+    pub disable_redirects: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skip: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageConfig {
+    pub module: &'static str,
+    pub controllers: Vec<String>,
+    pub controller_set_generation: u64,
+    pub token_env: &'static str,
+    pub timeout: &'static str,
+    pub lock_lease: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Route {
+    #[serde(rename = "@id")]
+    pub id: String,
+    #[serde(rename = "match", skip_serializing_if = "Vec::is_empty")]
+    pub matchers: Vec<RequestMatcher>,
+    pub handle: Vec<Value>,
+    pub terminal: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RequestMatcher {
+    pub host: Vec<String>,
+    pub protocol: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_regexp: Option<PathRegexpMatcher>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PathRegexpMatcher {
+    pub pattern: String,
+}
+
+pub fn validate_and_normalize(
+    gateway: &mut StackGatewaySpec,
+    services: &BTreeSet<String>,
+) -> Result<()> {
+    let mut seen_hostnames = BTreeSet::new();
+    for (route_index, route) in gateway.http_routes.iter_mut().enumerate() {
+        if route.hostnames.is_empty() {
+            bail!("http_routes[{route_index}].hostnames must not be empty");
+        }
+        for hostname in &mut route.hostnames {
+            *hostname = normalize_hostname(hostname, true).with_context(|| {
+                format!("http_routes[{route_index}].hostnames contains an invalid host")
+            })?;
+            if !seen_hostnames.insert(hostname.clone()) {
+                bail!("hostname {hostname:?} appears in more than one route");
+            }
+        }
+        route.hostnames.sort();
+        route.hostnames.dedup();
+
+        let tls = route.tls.unwrap_or(gateway.tls);
+        let http = route.http.unwrap_or(gateway.http);
+        if tls == GatewayTlsMode::Disabled && http == GatewayHttpMode::Disabled {
+            bail!("http_routes[{route_index}] disables both TLS and HTTP");
+        }
+        if http == GatewayHttpMode::Redirect && tls != GatewayTlsMode::Serve {
+            bail!("http_routes[{route_index}].http=redirect requires tls=serve");
+        }
+        if route.rules.is_empty() {
+            bail!("http_routes[{route_index}].rules must not be empty");
+        }
+
+        let mut fallback_seen = false;
+        for (rule_index, rule) in route.rules.iter_mut().enumerate() {
+            if rule.matches.is_empty() {
+                if fallback_seen {
+                    bail!("http_routes[{route_index}] contains more than one fallback rule");
+                }
+                fallback_seen = true;
+            }
+            for path_match in &mut rule.matches {
+                normalize_path_match(path_match).with_context(|| {
+                    format!("invalid http_routes[{route_index}].rules[{rule_index}] match")
+                })?;
+            }
+            validate_rewrite(rule.rewrite.as_ref(), &rule.matches).with_context(|| {
+                format!("invalid http_routes[{route_index}].rules[{rule_index}].rewrite")
+            })?;
+            normalize_backend(&mut rule.backend, services).with_context(|| {
+                format!("invalid http_routes[{route_index}].rules[{rule_index}].backend")
+            })?;
+        }
+    }
+    Ok(())
+}
+
+pub fn generate<'a>(
+    stacks: impl IntoIterator<Item = (&'a str, &'a StackGatewaySpec)>,
+    listen: &[String],
+    mut resolve_service: impl FnMut(&str, &str, u16) -> Vec<String>,
+) -> HttpServer {
+    let mut routes = Vec::new();
+    let mut skip_certificates = BTreeSet::new();
+
+    for (stack_name, gateway) in stacks {
+        for (route_index, route) in gateway.http_routes.iter().enumerate() {
+            let tls = route.tls.unwrap_or(gateway.tls);
+            let http = route.http.unwrap_or(gateway.http);
+            if tls == GatewayTlsMode::Disabled {
+                skip_certificates.extend(route.hostnames.iter().cloned());
+            }
+            if http == GatewayHttpMode::Redirect {
+                routes.push(redirect_route(stack_name, route_index, &route.hostnames));
+            }
+            if tls == GatewayTlsMode::Serve {
+                build_proxy_routes(
+                    stack_name,
+                    route_index,
+                    &route.hostnames,
+                    &route.rules,
+                    "https",
+                    &mut resolve_service,
+                    &mut routes,
+                );
+            }
+            if http == GatewayHttpMode::Serve {
+                build_proxy_routes(
+                    stack_name,
+                    route_index,
+                    &route.hostnames,
+                    &route.rules,
+                    "http",
+                    &mut resolve_service,
+                    &mut routes,
+                );
+            }
+        }
+    }
+
+    routes.push(Route {
+        id: "swarmlite-unmatched".to_owned(),
+        matchers: Vec::new(),
+        handle: vec![static_response(404)],
+        terminal: true,
+    });
+    HttpServer {
+        listen: listen.to_vec(),
+        routes,
+        automatic_https: AutomaticHttps {
+            disable_redirects: true,
+            skip: skip_certificates.into_iter().collect(),
+        },
+    }
+}
+
+pub fn storage(controllers: Vec<String>, controller_set_generation: u64) -> StorageConfig {
+    StorageConfig {
+        module: "swarmlite",
+        controllers,
+        controller_set_generation,
+        token_env: "SWARMLITE_TOKEN",
+        timeout: "500ms",
+        lock_lease: "30s",
+    }
+}
+
+pub fn routed_service_ports(gateway: &StackGatewaySpec, service_name: &str) -> BTreeSet<u16> {
+    gateway
+        .http_routes
+        .iter()
+        .flat_map(|route| &route.rules)
+        .filter_map(|rule| {
+            (rule.backend.service.as_deref() == Some(service_name)).then_some(rule.backend.port)
+        })
+        .collect()
+}
+
+fn normalize_hostname(value: &str, allow_wildcard: bool) -> Result<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() || value.len() > 253 {
+        bail!("hostname must contain between 1 and 253 characters");
+    }
+    if value.parse::<IpAddr>().is_ok() {
+        return Ok(value);
+    }
+    if !allow_wildcard && value.starts_with("*.") {
+        bail!("backend host must not contain a wildcard");
+    }
+    let name = if allow_wildcard {
+        value.strip_prefix("*.").unwrap_or(&value)
+    } else {
+        &value
+    };
+    if name.is_empty()
+        || name.ends_with('.')
+        || name.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        bail!("invalid DNS hostname {value:?}");
+    }
+    Ok(value)
+}
+
+fn normalize_path_match(path_match: &mut HttpPathMatch) -> Result<()> {
+    if path_match.path.is_empty() || path_match.path.len() > 2048 {
+        bail!("path must contain between 1 and 2048 characters");
+    }
+    if path_match.path.chars().any(char::is_control) {
+        bail!("path must not contain control characters");
+    }
+    match path_match.kind {
+        HttpPathMatchType::Exact | HttpPathMatchType::Prefix => {
+            validate_rewrite_path(&path_match.path)?;
+            if path_match.kind == HttpPathMatchType::Prefix && path_match.path.len() > 1 {
+                let length = path_match.path.trim_end_matches('/').len();
+                path_match.path.truncate(length);
+            }
+        }
+        HttpPathMatchType::Regex => {
+            regex::Regex::new(&path_match.path).with_context(|| {
+                format!("invalid RE2-compatible path regex {:?}", path_match.path)
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_rewrite(rewrite: Option<&HttpPathRewrite>, matches: &[HttpPathMatch]) -> Result<()> {
+    let Some(rewrite) = rewrite else {
+        return Ok(());
+    };
+    let operation_count = usize::from(rewrite.strip_prefix)
+        + usize::from(rewrite.replace_prefix.is_some())
+        + usize::from(rewrite.replace_path.is_some());
+    if operation_count != 1 {
+        bail!("exactly one of strip_prefix, replace_prefix, or replace_path must be set");
+    }
+    if rewrite.strip_prefix || rewrite.replace_prefix.is_some() {
+        if matches.is_empty() {
+            bail!("prefix rewrites require at least one path match");
+        }
+        if matches
+            .iter()
+            .any(|path_match| path_match.kind != HttpPathMatchType::Prefix)
+        {
+            bail!("strip_prefix and replace_prefix require type=prefix");
+        }
+    }
+    if let Some(path) = rewrite.replace_prefix.as_deref() {
+        validate_rewrite_path(path)?;
+    }
+    if let Some(path) = rewrite.replace_path.as_deref() {
+        validate_rewrite_path(path)?;
+    }
+    Ok(())
+}
+
+fn validate_rewrite_path(path: &str) -> Result<()> {
+    if !path.starts_with('/') {
+        bail!("path must start with /");
+    }
+    if path.contains('?') || path.contains('#') || path.chars().any(char::is_control) {
+        bail!("path must not contain a query, fragment, or control character");
+    }
+    Ok(())
+}
+
+fn normalize_backend(backend: &mut HttpBackend, services: &BTreeSet<String>) -> Result<()> {
+    if backend.port == 0 {
+        bail!("port must be between 1 and 65535");
+    }
+    match (&mut backend.service, &mut backend.host) {
+        (Some(service), None) => {
+            *service = service.trim().to_owned();
+            if !services.contains(service) {
+                bail!("service {service:?} does not exist in this stack");
+            }
+        }
+        (None, Some(host)) => *host = normalize_hostname(host, false)?,
+        (Some(_), Some(_)) => bail!("service and host are mutually exclusive"),
+        (None, None) => bail!("one of service or host is required"),
+    }
+    Ok(())
+}
+
+fn build_proxy_routes(
+    stack_name: &str,
+    route_index: usize,
+    hostnames: &[String],
+    rules: &[HttpRouteRule],
+    request_protocol: &'static str,
+    resolve_service: &mut impl FnMut(&str, &str, u16) -> Vec<String>,
+    routes: &mut Vec<Route>,
+) {
+    let mut expanded = rules
+        .iter()
+        .enumerate()
+        .flat_map(|(rule_index, rule)| {
+            if rule.matches.is_empty() {
+                vec![(rule_index, None, rule)]
+            } else {
+                rule.matches
+                    .iter()
+                    .enumerate()
+                    .map(|(match_index, path_match)| {
+                        (rule_index, Some((match_index, path_match)), rule)
+                    })
+                    .collect()
+            }
+        })
+        .collect::<Vec<_>>();
+    expanded.sort_by_key(|(rule_index, path_match, _)| {
+        let (priority, prefix_length, match_index) = match path_match {
+            Some((index, path_match)) => match path_match.kind {
+                HttpPathMatchType::Exact => (0, Reverse(0), *index),
+                HttpPathMatchType::Prefix => (1, Reverse(path_match.path.len()), *index),
+                HttpPathMatchType::Regex => (2, Reverse(0), *index),
+            },
+            None => (3, Reverse(0), 0),
+        };
+        (priority, prefix_length, *rule_index, match_index)
+    });
+
+    for (rule_index, path_match, rule) in expanded {
+        let match_index = path_match.map_or(0, |(index, _)| index);
+        let path_match = path_match.map(|(_, path_match)| path_match);
+        let mut handle = rewrite_handlers(rule.rewrite.as_ref(), path_match);
+        handle.extend(backend_handlers(stack_name, &rule.backend, resolve_service));
+        routes.push(Route {
+            id: format!(
+                "swarmlite-{}-route-{}-rule-{}-match-{}-{}",
+                sanitize_id(stack_name),
+                route_index + 1,
+                rule_index + 1,
+                match_index + 1,
+                request_protocol
+            ),
+            matchers: vec![RequestMatcher {
+                host: hostnames.to_vec(),
+                protocol: request_protocol,
+                path_regexp: path_match.map(|path_match| PathRegexpMatcher {
+                    pattern: path_pattern(path_match),
+                }),
+            }],
+            handle,
+            terminal: true,
+        });
+    }
+}
+
+fn redirect_route(stack_name: &str, route_index: usize, hostnames: &[String]) -> Route {
+    Route {
+        id: format!(
+            "swarmlite-{}-route-{}-redirect",
+            sanitize_id(stack_name),
+            route_index + 1
+        ),
+        matchers: vec![RequestMatcher {
+            host: hostnames.to_vec(),
+            protocol: "http",
+            path_regexp: None,
+        }],
+        handle: vec![json!({
+            "handler": "static_response",
+            "status_code": 308,
+            "headers": {
+                "Location": ["https://{http.request.host}{http.request.uri}"]
+            }
+        })],
+        terminal: true,
+    }
+}
+
+fn rewrite_handlers(
+    rewrite: Option<&HttpPathRewrite>,
+    path_match: Option<&HttpPathMatch>,
+) -> Vec<Value> {
+    let Some(rewrite) = rewrite else {
+        return Vec::new();
+    };
+    if let Some(path) = rewrite.replace_path.as_deref() {
+        return vec![json!({ "handler": "rewrite", "uri": path })];
+    }
+    let Some(path_match) = path_match else {
+        return Vec::new();
+    };
+    if rewrite.strip_prefix {
+        return vec![json!({
+            "handler": "rewrite",
+            "strip_path_prefix": path_match.path
+        })];
+    }
+    if let Some(replacement) = rewrite.replace_prefix.as_deref() {
+        let replacement = if replacement == "/" {
+            ""
+        } else {
+            replacement.trim_end_matches('/')
+        };
+        let case_flag = if path_match.ignore_case { "(?i)" } else { "" };
+        return vec![json!({
+            "handler": "rewrite",
+            "path_regexp": [{
+                "find": format!("{case_flag}^{}", regex::escape(&path_match.path)),
+                "replace": replacement
+            }]
+        })];
+    }
+    Vec::new()
+}
+
+fn backend_handlers(
+    stack_name: &str,
+    backend: &HttpBackend,
+    resolve_service: &mut impl FnMut(&str, &str, u16) -> Vec<String>,
+) -> Vec<Value> {
+    let (upstreams, upstream_name) = match (&backend.service, &backend.host) {
+        (Some(service_name), None) => (
+            resolve_service(stack_name, service_name, backend.port)
+                .into_iter()
+                .map(|dial| json!({ "dial": dial }))
+                .collect::<Vec<_>>(),
+            service_name.as_str(),
+        ),
+        (None, Some(host)) => (
+            vec![json!({
+                "dial": format!("{}:{}", format_host(host), backend.port)
+            })],
+            host.as_str(),
+        ),
+        _ => return vec![static_response(503)],
+    };
+    if upstreams.is_empty() {
+        return vec![static_response(503)];
+    }
+
+    let transport = match backend.protocol {
+        HttpBackendProtocol::Http => None,
+        HttpBackendProtocol::Https => Some(json!({
+            "protocol": "http",
+            "tls": { "server_name": upstream_name }
+        })),
+        HttpBackendProtocol::H2c => Some(json!({
+            "protocol": "http",
+            "versions": ["h2c"]
+        })),
+    };
+    let host_header = if backend.preserve_host {
+        (backend.protocol == HttpBackendProtocol::Https).then_some("{http.request.host}")
+    } else {
+        Some(upstream_name)
+    };
+
+    let mut handler = serde_json::Map::from_iter([
+        ("handler".to_owned(), json!("reverse_proxy")),
+        ("upstreams".to_owned(), json!(upstreams)),
+    ]);
+    if let Some(transport) = transport {
+        handler.insert("transport".to_owned(), transport);
+    }
+    if let Some(host_header) = host_header {
+        handler.insert(
+            "headers".to_owned(),
+            json!({ "request": { "set": { "Host": [host_header] } } }),
+        );
+    }
+    vec![Value::Object(handler)]
+}
+
+fn static_response(status_code: u16) -> Value {
+    json!({
+        "handler": "static_response",
+        "status_code": status_code
+    })
+}
+
+fn path_pattern(path_match: &HttpPathMatch) -> String {
+    let case_flag = if path_match.ignore_case { "(?i)" } else { "" };
+    match path_match.kind {
+        HttpPathMatchType::Exact => {
+            format!("{case_flag}^{}$", regex::escape(&path_match.path))
+        }
+        HttpPathMatchType::Prefix if path_match.path == "/" => format!("{case_flag}^/.*$"),
+        HttpPathMatchType::Prefix => {
+            format!("{case_flag}^{}(?:/.*)?$", regex::escape(&path_match.path))
+        }
+        HttpPathMatchType::Regex => format!("{case_flag}{}", path_match.path),
+    }
+}
+
+fn format_host(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    }
+}
+
+fn sanitize_id(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    #[test]
+    fn validates_normalizes_and_collects_service_ports() {
+        let mut spec = StackGatewaySpec {
+            http_routes: vec![HttpRouteSpec {
+                hostnames: vec!["EXAMPLE.COM".into()],
+                tls: None,
+                http: None,
+                rules: vec![HttpRouteRule {
+                    matches: vec![HttpPathMatch {
+                        path: "/api/".into(),
+                        kind: HttpPathMatchType::Prefix,
+                        ignore_case: true,
+                    }],
+                    rewrite: Some(HttpPathRewrite {
+                        strip_prefix: true,
+                        ..Default::default()
+                    }),
+                    backend: HttpBackend {
+                        service: Some("api".into()),
+                        host: None,
+                        port: 8080,
+                        protocol: HttpBackendProtocol::Http,
+                        preserve_host: true,
+                    },
+                }],
+            }],
+            ..Default::default()
+        };
+        validate_and_normalize(&mut spec, &BTreeSet::from(["api".into()])).unwrap();
+        assert_eq!(spec.http_routes[0].hostnames, ["example.com"]);
+        assert_eq!(spec.http_routes[0].rules[0].matches[0].path, "/api");
+        assert_eq!(routed_service_ports(&spec, "api"), BTreeSet::from([8080]));
+    }
+
+    #[test]
+    fn rejects_missing_service_and_invalid_rewrite_combination() {
+        let mut spec = StackGatewaySpec {
+            http_routes: vec![HttpRouteSpec {
+                hostnames: vec!["example.com".into()],
+                tls: None,
+                http: None,
+                rules: vec![HttpRouteRule {
+                    matches: vec![HttpPathMatch {
+                        path: "/health".into(),
+                        kind: HttpPathMatchType::Exact,
+                        ignore_case: false,
+                    }],
+                    rewrite: Some(HttpPathRewrite {
+                        strip_prefix: true,
+                        ..Default::default()
+                    }),
+                    backend: HttpBackend {
+                        service: Some("missing".into()),
+                        host: None,
+                        port: 8080,
+                        protocol: HttpBackendProtocol::Http,
+                        preserve_host: true,
+                    },
+                }],
+            }],
+            ..Default::default()
+        };
+        let error = validate_and_normalize(&mut spec, &BTreeSet::new()).unwrap_err();
+        assert!(error.to_string().contains("rewrite"));
+    }
+
+    #[test]
+    fn renders_internal_and_external_caddy_routes() {
+        let gateway: StackGatewaySpec = serde_json::from_value(json!({
+            "tls": "serve",
+            "http": "redirect",
+            "http_routes": [{
+                "hostnames": ["example.com"],
+                "rules": [
+                    {
+                        "matches": [{"path": "/api", "ignore_case": true}],
+                        "rewrite": {"strip_prefix": true},
+                        "backend": {"service": "api", "port": 8080}
+                    },
+                    {
+                        "matches": [{"path": "/openai"}],
+                        "rewrite": {"replace_prefix": "/"},
+                        "backend": {
+                            "host": "api.openai.com",
+                            "port": 443,
+                            "protocol": "https",
+                            "preserve_host": false
+                        }
+                    }
+                ]
+            }]
+        }))
+        .unwrap();
+        let server = generate(
+            [("demo", &gateway)],
+            &[":80".into(), ":443".into()],
+            |_, service, port| vec![format!("10.0.0.21:{port}-{service}")],
+        );
+        let value = serde_json::to_value(server).unwrap();
+        assert_eq!(value["routes"][0]["handle"][0]["status_code"], 308);
+        let routes = value["routes"].as_array().unwrap();
+        let external = routes
+            .iter()
+            .find(|route| {
+                route["handle"].as_array().is_some_and(|handlers| {
+                    handlers.last().is_some_and(|handler| {
+                        handler["upstreams"][0]["dial"] == "api.openai.com:443"
+                    })
+                })
+            })
+            .unwrap();
+        let handler = external["handle"].as_array().unwrap().last().unwrap();
+        assert_eq!(handler["transport"]["tls"]["server_name"], "api.openai.com");
+        assert_eq!(
+            handler["headers"]["request"]["set"]["Host"][0],
+            "api.openai.com"
+        );
+    }
+
+    #[test]
+    fn orders_every_match_type_and_renders_every_rewrite_type() {
+        let mut gateway: StackGatewaySpec = serde_json::from_value(json!({
+            "tls": "disabled",
+            "http": "serve",
+            "http_routes": [{
+                "hostnames": ["routes.example.com"],
+                "rules": [
+                    {
+                        "backend": {"host": "upstream.example.com", "port": 80}
+                    },
+                    {
+                        "matches": [{"path": "^/items/[0-9]+$", "type": "regex"}],
+                        "backend": {"host": "upstream.example.com", "port": 80}
+                    },
+                    {
+                        "matches": [{"path": "/api"}],
+                        "rewrite": {"strip_prefix": true},
+                        "backend": {"host": "upstream.example.com", "port": 80}
+                    },
+                    {
+                        "matches": [{"path": "/api/admin"}],
+                        "rewrite": {"replace_prefix": "/internal"},
+                        "backend": {"host": "upstream.example.com", "port": 80}
+                    },
+                    {
+                        "matches": [{"path": "/api/admin", "type": "exact"}],
+                        "rewrite": {"replace_path": "/health"},
+                        "backend": {"host": "upstream.example.com", "port": 80}
+                    }
+                ]
+            }]
+        }))
+        .unwrap();
+        validate_and_normalize(&mut gateway, &BTreeSet::new()).unwrap();
+
+        let value = serde_json::to_value(generate(
+            [("demo", &gateway)],
+            &[":80".into()],
+            |_, _, _| Vec::new(),
+        ))
+        .unwrap();
+        let routes = value["routes"].as_array().unwrap();
+        let patterns = routes[..5]
+            .iter()
+            .map(|route| {
+                route["match"][0]["path_regexp"]["pattern"]
+                    .as_str()
+                    .map(ToOwned::to_owned)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            patterns,
+            [
+                Some("^/api/admin$".into()),
+                Some("^/api/admin(?:/.*)?$".into()),
+                Some("^/api(?:/.*)?$".into()),
+                Some("^/items/[0-9]+$".into()),
+                None,
+            ]
+        );
+        assert_eq!(routes[0]["handle"][0]["uri"], "/health");
+        assert_eq!(
+            routes[1]["handle"][0]["path_regexp"][0]["replace"],
+            "/internal"
+        );
+        assert_eq!(routes[2]["handle"][0]["strip_path_prefix"], "/api");
+        assert_eq!(
+            value["automatic_https"]["skip"],
+            json!(["routes.example.com"])
+        );
+    }
+
+    #[test]
+    fn supports_preserve_host_for_https_services_and_h2c_for_external_hosts() {
+        let mut gateway: StackGatewaySpec = serde_json::from_value(json!({
+            "tls": "disabled",
+            "http": "serve",
+            "http_routes": [{
+                "hostnames": ["protocols.example.com"],
+                "rules": [
+                    {
+                        "matches": [{"path": "/secure"}],
+                        "backend": {
+                            "service": "secure_api",
+                            "port": 8443,
+                            "protocol": "https",
+                            "preserve_host": true
+                        }
+                    },
+                    {
+                        "backend": {
+                            "host": "h2c.example.net",
+                            "port": 8080,
+                            "protocol": "h2c",
+                            "preserve_host": false
+                        }
+                    }
+                ]
+            }]
+        }))
+        .unwrap();
+        validate_and_normalize(&mut gateway, &BTreeSet::from(["secure_api".into()])).unwrap();
+        let value = serde_json::to_value(generate(
+            [("demo", &gateway)],
+            &[":80".into()],
+            |_, _, _| vec!["10.0.0.21:28443".into()],
+        ))
+        .unwrap();
+        let routes = value["routes"].as_array().unwrap();
+        let secure = &routes[0]["handle"][0];
+        assert_eq!(secure["transport"]["tls"]["server_name"], "secure_api");
+        assert_eq!(
+            secure["headers"]["request"]["set"]["Host"][0],
+            "{http.request.host}"
+        );
+        let h2c = &routes[1]["handle"][0];
+        assert_eq!(h2c["transport"]["versions"], json!(["h2c"]));
+        assert_eq!(
+            h2c["headers"]["request"]["set"]["Host"][0],
+            "h2c.example.net"
+        );
+    }
+}

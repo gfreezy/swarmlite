@@ -1,0 +1,187 @@
+# yaml-language-server: $schema=../crates/swarmlite-gateway/schema/stack.schema.json
+services:
+  web:
+    image: example/web:latest
+    deploy:
+      replicas: 3
+
+  api:
+    image: example/api:latest
+    deploy:
+      replicas: 3
+
+  legacy_api:
+    image: example/legacy-api:latest
+
+  health:
+    image: example/health:latest
+
+  h2c_api:
+    image: example/h2c-api:latest
+    deploy:
+      replicas: 2
+
+x-swarmlite:
+  # Defaults inherited by routes which do not override these fields.
+  tls: serve
+  http: redirect
+
+  http_routes:
+    # HTTPS plus HTTP -> HTTPS redirect.
+    - hostnames:
+        - example.com
+        - www.example.com
+      rules:
+        # exact
+        - matches:
+            - path: /health
+              type: exact
+          backend:
+            service: health
+            port: 8080
+            protocol: http
+            preserve_host: true
+
+        # exact + ignore_case + replace_path
+        - matches:
+            - path: /READY
+              type: exact
+              ignore_case: true
+          rewrite:
+            replace_path: /internal/ready
+          backend:
+            service: health
+            port: 8080
+
+        # prefix is the default type
+        - matches:
+            - path: /api
+          rewrite:
+            strip_prefix: true
+          backend:
+            service: api
+            port: 8080
+
+        # prefix + ignore_case + replace_prefix
+        - matches:
+            - path: /legacy
+              type: prefix
+              ignore_case: true
+          rewrite:
+            replace_prefix: /v1
+          backend:
+            service: legacy_api
+            port: 8080
+            preserve_host: false
+
+        # regex
+        - matches:
+            - path: ^/users/[0-9]+/avatar$
+              type: regex
+              ignore_case: true
+          backend:
+            service: api
+            port: 8080
+
+        # Multiple matches in one rule are OR.
+        - matches:
+            - path: /login
+              type: exact
+            - path: /signin
+              type: exact
+          backend:
+            service: web
+            port: 3000
+
+        # No matches is the fallback rule.
+        - backend:
+            service: web
+            port: 3000
+
+    # External HTTPS proxy; Host is changed to api.revenuecat.com.
+    - hostnames:
+        - revenuecat.example.com
+      rules:
+        - matches:
+            - path: /revenuecat
+          rewrite:
+            strip_prefix: true
+          backend:
+            host: api.revenuecat.com
+            port: 443
+            protocol: https
+            preserve_host: false
+
+        - matches:
+            - path: /status
+              type: exact
+          rewrite:
+            replace_path: /health
+          backend:
+            host: api.revenuecat.com
+            port: 443
+            protocol: https
+            preserve_host: false
+
+    # External HTTPS proxy which preserves the incoming HTTP Host header.
+    - hostnames:
+        - legacy-proxy.example.com
+      rules:
+        - backend:
+            host: legacy-upstream.example.net
+            port: 443
+            protocol: https
+            preserve_host: true
+
+    # External plain HTTP proxy.
+    - hostnames:
+        - http-upstream.example.com
+      rules:
+        - backend:
+            host: upstream.example.net
+            port: 8080
+            protocol: http
+            preserve_host: false
+
+    # Internal h2c backend.
+    - hostnames:
+        - h2c.example.com
+      rules:
+        - matches:
+            - path: /rpc
+          rewrite:
+            strip_prefix: true
+          backend:
+            service: h2c_api
+            port: 8080
+            protocol: h2c
+
+    # HTTP only.
+    - hostnames:
+        - insecure.example.com
+      tls: disabled
+      http: serve
+      rules:
+        - backend:
+            service: web
+            port: 3000
+
+    # HTTP and HTTPS without a redirect.
+    - hostnames:
+        - mixed.example.com
+      tls: serve
+      http: serve
+      rules:
+        - backend:
+            service: web
+            port: 3000
+
+    # HTTPS only.
+    - hostnames:
+        - secure-only.example.com
+      tls: serve
+      http: disabled
+      rules:
+        - backend:
+            service: web
+            port: 3000

@@ -15,6 +15,19 @@ import (
 	"github.com/caddyserver/certmagic"
 )
 
+func TestModuleAcceptsControllerSetGeneration(t *testing.T) {
+	var module Module
+	if err := json.Unmarshal([]byte(`{
+		"controllers":["http://10.0.0.2:8080"],
+		"controller_set_generation":42
+	}`), &module); err != nil {
+		t.Fatal(err)
+	}
+	if module.ControllerSetGeneration != 42 {
+		t.Fatalf("unexpected controller set generation %d", module.ControllerSetGeneration)
+	}
+}
+
 func TestLocalStorageSurvivesCoordinatorFailure(t *testing.T) {
 	storage := newStorage(
 		t.TempDir(),

@@ -20,12 +20,13 @@ func init() {
 // errors only reduce cross-instance certificate reuse; they never make local
 // storage unavailable.
 type Module struct {
-	Root        string         `json:"root,omitempty"`
-	Controllers []string       `json:"controllers,omitempty"`
-	Token       string         `json:"token,omitempty"`
-	TokenEnv    string         `json:"token_env,omitempty"`
-	Timeout     caddy.Duration `json:"timeout,omitempty"`
-	LockLease   caddy.Duration `json:"lock_lease,omitempty"`
+	Root                    string         `json:"root,omitempty"`
+	Controllers             []string       `json:"controllers,omitempty"`
+	ControllerSetGeneration uint64         `json:"controller_set_generation,omitempty"`
+	Token                   string         `json:"token,omitempty"`
+	TokenEnv                string         `json:"token_env,omitempty"`
+	Timeout                 caddy.Duration `json:"timeout,omitempty"`
+	LockLease               caddy.Duration `json:"lock_lease,omitempty"`
 }
 
 func (Module) CaddyModule() caddy.ModuleInfo {

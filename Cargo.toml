@@ -21,6 +21,7 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 shell-words = "1.1"
 swarmlite-raft = { path = "crates/swarmlite-raft" }
+swarmlite-gateway = { path = "crates/swarmlite-gateway" }
 thiserror = "2.0"
 tokio = { version = "1.49", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace"] }
@@ -38,5 +39,5 @@ lto = "thin"
 strip = true
 
 [workspace]
-members = [".", "crates/swarmlite-raft"]
+members = [".", "crates/swarmlite-gateway", "crates/swarmlite-raft"]
 resolver = "3"

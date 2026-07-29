@@ -1,0 +1,214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://swarmlite.dev/schema/stack.schema.json",
+  "title": "Swarmlite Stack",
+  "type": "object",
+  "required": ["services"],
+  "properties": {
+    "services": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "$ref": "#/$defs/service" }
+    },
+    "x-swarmlite": { "$ref": "#/$defs/swarmlite" }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "service": {
+      "type": "object",
+      "required": ["image"],
+      "properties": {
+        "image": { "type": "string", "minLength": 1 },
+        "command": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        },
+        "entrypoint": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        },
+        "environment": {
+          "oneOf": [
+            { "type": "object" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        },
+        "ports": { "type": "array" },
+        "volumes": { "type": "array" },
+        "healthcheck": { "type": "object" },
+        "stop_grace_period": { "type": "string" },
+        "deploy": { "type": "object" }
+      },
+      "additionalProperties": true
+    },
+    "swarmlite": {
+      "type": "object",
+      "properties": {
+        "tls": {
+          "$ref": "#/$defs/tlsMode",
+          "default": "serve"
+        },
+        "http": {
+          "$ref": "#/$defs/httpMode",
+          "default": "redirect"
+        },
+        "http_routes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/httpRoute" },
+          "default": []
+        }
+      },
+      "additionalProperties": false
+    },
+    "tlsMode": {
+      "type": "string",
+      "enum": ["serve", "disabled"]
+    },
+    "httpMode": {
+      "type": "string",
+      "enum": ["redirect", "serve", "disabled"]
+    },
+    "httpRoute": {
+      "type": "object",
+      "required": ["hostnames", "rules"],
+      "properties": {
+        "hostnames": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "tls": { "$ref": "#/$defs/tlsMode" },
+        "http": { "$ref": "#/$defs/httpMode" },
+        "rules": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/rule" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "rule": {
+      "type": "object",
+      "required": ["backend"],
+      "properties": {
+        "matches": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/pathMatch" },
+          "default": []
+        },
+        "rewrite": { "$ref": "#/$defs/rewrite" },
+        "backend": { "$ref": "#/$defs/backend" }
+      },
+      "additionalProperties": false
+    },
+    "pathMatch": {
+      "type": "object",
+      "required": ["path"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "type": {
+          "type": "string",
+          "enum": ["exact", "prefix", "regex"],
+          "default": "prefix"
+        },
+        "ignore_case": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "rewrite": {
+      "type": "object",
+      "properties": {
+        "strip_prefix": { "const": true },
+        "replace_prefix": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "replace_path": {
+          "type": "string",
+          "pattern": "^/"
+        }
+      },
+      "oneOf": [
+        {
+          "required": ["strip_prefix"],
+          "not": {
+            "anyOf": [
+              { "required": ["replace_prefix"] },
+              { "required": ["replace_path"] }
+            ]
+          }
+        },
+        {
+          "required": ["replace_prefix"],
+          "not": {
+            "anyOf": [
+              { "required": ["strip_prefix"] },
+              { "required": ["replace_path"] }
+            ]
+          }
+        },
+        {
+          "required": ["replace_path"],
+          "not": {
+            "anyOf": [
+              { "required": ["strip_prefix"] },
+              { "required": ["replace_prefix"] }
+            ]
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "backend": {
+      "type": "object",
+      "required": ["port"],
+      "properties": {
+        "service": {
+          "type": "string",
+          "minLength": 1
+        },
+        "host": {
+          "type": "string",
+          "minLength": 1
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "protocol": {
+          "type": "string",
+          "enum": ["http", "https", "h2c"],
+          "default": "http"
+        },
+        "preserve_host": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "oneOf": [
+        {
+          "required": ["service"],
+          "not": { "required": ["host"] }
+        },
+        {
+          "required": ["host"],
+          "not": { "required": ["service"] }
+        }
+      ],
+      "additionalProperties": false
+    }
+  }
+}

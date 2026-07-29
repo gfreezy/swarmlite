@@ -196,16 +196,16 @@ fn stop_all_service_tasks(state: &mut ClusterState, service: &ServiceRecord) -> 
 }
 
 fn retire_task(state: &mut ClusterState, task_id: &str, service: &ServiceRecord) -> bool {
+    let routed = gateway::is_service_routed(state, service);
     let task = state.tasks.get_mut(task_id).unwrap();
     if task.desired != DesiredTaskState::Running {
         return false;
     }
-    task.desired =
-        if gateway::is_enabled(&service.spec) && task.observed == ObservedTaskState::Healthy {
-            DesiredTaskState::Draining
-        } else {
-            DesiredTaskState::Stopped
-        };
+    task.desired = if routed && task.observed == ObservedTaskState::Healthy {
+        DesiredTaskState::Draining
+    } else {
+        DesiredTaskState::Stopped
+    };
     task.drain_until_unix_ms = None;
     true
 }
@@ -255,7 +255,7 @@ fn schedule_task(
         (same_service, total, node.id.as_str())
     });
     let node = candidates.first()?;
-    let ports = allocate_ports(state, node, &service.spec)?;
+    let ports = allocate_ports(state, node, service)?;
     let used_slots: HashSet<u32> = state
         .tasks
         .values()
@@ -316,17 +316,20 @@ fn explicit_ports_available(state: &ClusterState, node: &NodeRecord, spec: &Serv
 fn allocate_ports(
     state: &ClusterState,
     node: &NodeRecord,
-    spec: &ServiceSpec,
+    service: &ServiceRecord,
 ) -> Option<Vec<PortBinding>> {
-    let mut requested = spec.ports.clone();
-    if let Some(target) = gateway::target_port(spec)
-        && !requested.iter().any(|port| port.target == target)
-    {
-        requested.push(ServicePort {
-            target,
-            published: None,
-            protocol: "tcp".to_owned(),
-        });
+    let mut requested = service.spec.ports.clone();
+    for target in gateway::service_ports(state, service) {
+        if !requested
+            .iter()
+            .any(|port| port.target == target && port.protocol == "tcp")
+        {
+            requested.push(ServicePort {
+                target,
+                published: None,
+                protocol: "tcp".to_owned(),
+            });
+        }
     }
 
     let mut used = used_ports(state, &node.id);
@@ -369,6 +372,11 @@ fn used_ports(state: &ClusterState, node_id: &str) -> BTreeSet<u16> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+
+    use crate::model::{
+        HttpBackend, HttpBackendProtocol, HttpRouteRule, HttpRouteSpec, StackGatewaySpec,
+        StackRecord,
+    };
 
     use super::*;
 
@@ -601,15 +609,8 @@ mod tests {
     #[test]
     fn gateway_rollout_drains_old_task_until_caddy_acknowledges_it() {
         let (mut state, live) = state_with_nodes();
-        let mut original = service(1, 1);
-        original
-            .spec
-            .service_labels
-            .insert(gateway::ENABLE_LABEL.into(), "true".into());
-        original
-            .spec
-            .service_labels
-            .insert(gateway::HOST_LABEL.into(), "example.com".into());
+        route_service(&mut state, "web", 80);
+        let original = service(1, 1);
         state.services.insert(original.id.clone(), original.clone());
         reconcile(&mut state, &live);
         state.tasks.values_mut().for_each(|task| {
@@ -641,22 +642,11 @@ mod tests {
     }
 
     #[test]
-    fn gateway_port_label_allocates_a_host_port_without_compose_ports() {
+    fn gateway_backend_allocates_a_host_port_without_compose_ports() {
         let (mut state, live) = state_with_nodes();
         let mut service = service(1, 1);
         service.spec.ports.clear();
-        service
-            .spec
-            .service_labels
-            .insert(gateway::ENABLE_LABEL.into(), "true".into());
-        service
-            .spec
-            .service_labels
-            .insert(gateway::HOST_LABEL.into(), "example.com".into());
-        service
-            .spec
-            .service_labels
-            .insert(gateway::PORT_LABEL.into(), "8080".into());
+        route_service(&mut state, "web", 8080);
         state.services.insert(service.id.clone(), service);
 
         reconcile(&mut state, &live);
@@ -664,6 +654,36 @@ mod tests {
         let binding = &state.tasks.values().next().unwrap().ports[0];
         assert_eq!(binding.target, 8080);
         assert!((20_000..=20_010).contains(&binding.published));
+    }
+
+    fn route_service(state: &mut ClusterState, service: &str, port: u16) {
+        state.stacks.insert(
+            "demo".into(),
+            StackRecord {
+                name: "demo".into(),
+                applied_at_unix_ms: 1,
+                services: vec![format!("demo.{service}")],
+                gateway: StackGatewaySpec {
+                    http_routes: vec![HttpRouteSpec {
+                        hostnames: vec!["example.com".into()],
+                        tls: None,
+                        http: None,
+                        rules: vec![HttpRouteRule {
+                            matches: Vec::new(),
+                            rewrite: None,
+                            backend: HttpBackend {
+                                service: Some(service.into()),
+                                host: None,
+                                port,
+                                protocol: HttpBackendProtocol::Http,
+                                preserve_host: true,
+                            },
+                        }],
+                    }],
+                    ..Default::default()
+                },
+            },
+        );
     }
 
     #[test]

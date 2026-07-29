@@ -40,8 +40,8 @@ use crate::{
         KvObjectResponse, KvPutRequest, KvPutResponse, KvStatResponse, KvState, LeaderRecord,
         NodeHeartbeat, NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, NodeMember,
         NodeRole, NodeRoles, NodeRolesResponse, NodeRolesUpdate, ObservedTaskState, RecoveryStatus,
-        ServiceRecord, StackRecord, StatusResponse, TaskAssignment, TaskRecord, UnclaimedTask,
-        agent_roles, service_spec_hash, valid_gateway_image,
+        ServiceRecord, StackGatewaySpec, StackRecord, StatusResponse, TaskAssignment, TaskRecord,
+        UnclaimedTask, agent_roles, service_spec_hash, valid_gateway_image,
     },
     scheduler,
     stack::{ParsedStack, parse_stack},
@@ -140,6 +140,7 @@ pub struct Controller {
 #[derive(Debug, Default)]
 struct GatewaySyncState {
     applied_generation: Option<u64>,
+    applied_controller_set_generations: BTreeMap<String, u64>,
     endpoint_errors: BTreeMap<String, String>,
 }
 
@@ -767,6 +768,22 @@ impl Controller {
                     pending.into_iter().collect::<Vec<_>>().join(", ")
                 )));
             }
+            let pending_gateways = {
+                let sync = self.gateway_sync.lock().await;
+                pending_gateway_controller_set_acknowledgements(
+                    &inner,
+                    &sync,
+                    self.config.node_timeout_seconds,
+                    self.config.gateway.admin_port,
+                    controller_set_generation,
+                )
+            };
+            if !pending_gateways.is_empty() {
+                return Err(ControllerError::Conflict(format!(
+                    "cannot remove controller until active Caddy gateways apply controller set generation {controller_set_generation}; waiting for {}",
+                    pending_gateways.into_iter().collect::<Vec<_>>().join(", ")
+                )));
+            }
         }
 
         let previous = inner.state.clone();
@@ -902,6 +919,10 @@ impl Controller {
 
     async fn apply(&self, stack_name: &str, parsed: ParsedStack) -> Result<u64, ControllerError> {
         validate_stack_name(stack_name)?;
+        let ParsedStack {
+            services,
+            gateway: stack_gateway,
+        } = parsed;
         let has_gateway = {
             let inner = self.inner.lock().await;
             inner
@@ -910,7 +931,7 @@ impl Controller {
                 .values()
                 .any(|member| member.roles.contains(&NodeRole::Gateway))
         };
-        if !has_gateway && parsed.services.values().any(gateway::is_enabled) {
+        if !has_gateway && !stack_gateway.http_routes.is_empty() {
             return Err(ControllerError::Invalid(
                 "gateway routing is enabled but no node has the gateway role".to_owned(),
             ));
@@ -920,9 +941,15 @@ impl Controller {
         if !inner.is_leader {
             return Err(self.leader_redirect(&format!("/v1/stacks/{stack_name}")));
         }
+        validate_gateway_hostname_ownership(&inner.state, stack_name, &stack_gateway)?;
         let previous = inner.state.clone();
-        let desired_ids: BTreeSet<String> = parsed
-            .services
+        let previous_gateway = inner
+            .state
+            .stacks
+            .get(stack_name)
+            .map(|stack| stack.gateway.clone())
+            .unwrap_or_default();
+        let desired_ids: BTreeSet<String> = services
             .keys()
             .map(|name| service_id(stack_name, name))
             .collect();
@@ -934,10 +961,13 @@ impl Controller {
         {
             service.deleted = !desired_ids.contains(&service.id);
         }
-        for (name, spec) in parsed.services {
+        for (name, spec) in services {
             let id = service_id(stack_name, &name);
+            let routing_ports_changed = gateway::routed_service_ports(&previous_gateway, &name)
+                != gateway::routed_service_ports(&stack_gateway, &name);
             match inner.state.services.get_mut(&id) {
-                Some(existing) if existing.spec == spec && !existing.deleted => {}
+                Some(existing)
+                    if existing.spec == spec && !existing.deleted && !routing_ports_changed => {}
                 Some(existing) => {
                     existing.revision += 1;
                     existing.spec = spec;
@@ -964,6 +994,7 @@ impl Controller {
                 name: stack_name.to_owned(),
                 applied_at_unix_ms: unix_ms(),
                 services: desired_ids.into_iter().collect(),
+                gateway: stack_gateway,
             },
         );
         adopt_unclaimed_tasks(&mut inner.state, stack_name);
@@ -1027,6 +1058,7 @@ impl Controller {
                             },
                         )
                         .await?;
+                    self.gateway_notify.notify_one();
                 }
             }
         }
@@ -1219,6 +1251,10 @@ impl Controller {
                     .any(|member| member.roles.contains(&NodeRole::Gateway)),
                 desired_generation: generation,
                 applied_generation: gateway_sync.applied_generation,
+                desired_controller_set_generation: controller_set_generation,
+                applied_controller_set_generations: gateway_sync
+                    .applied_controller_set_generations
+                    .clone(),
                 endpoint_errors: gateway_sync.endpoint_errors.clone(),
             },
             recovery,
@@ -1274,21 +1310,21 @@ impl Controller {
     }
 
     async fn sync_gateway_once(&self) -> Result<(), String> {
-        let voters = self.repository.voter_ids();
-        let (generation, server, storage, endpoints) = {
+        let (generation, controller_set_generation, server, storage, endpoints) = {
             let mut inner = self.inner.lock().await;
             self.expire_local_lease(&mut inner);
             if !inner.is_leader {
                 return Ok(());
             }
+            let (controller_set_generation, voters) = self.repository.controller_set();
             (
                 inner.generation,
+                controller_set_generation,
                 gateway::generate(&inner.state, &self.config.gateway.listen),
-                gateway::storage(controller_urls(
-                    &inner.state,
-                    Some(&self.config.advertise_url),
-                    &voters,
-                )),
+                gateway::storage(
+                    controller_urls(&inner.state, Some(&self.config.advertise_url), &voters),
+                    controller_set_generation,
+                ),
                 gateway_endpoints(&inner.state, self.config.gateway.admin_port),
             )
         };
@@ -1296,24 +1332,37 @@ impl Controller {
         if endpoints.is_empty() {
             let mut sync = self.gateway_sync.lock().await;
             sync.applied_generation = None;
+            sync.applied_controller_set_generations.clear();
             sync.endpoint_errors.clear();
             return Ok(());
         }
 
         let results = join_all(endpoints.iter().map(|endpoint| async {
-            self.push_gateway_storage(endpoint, &storage).await?;
-            self.push_gateway_server(endpoint, &server).await
+            match self.push_gateway_storage(endpoint, &storage).await {
+                Ok(()) => (true, self.push_gateway_server(endpoint, &server).await),
+                Err(error) => (false, Err(error)),
+            }
         }))
         .await;
-        let endpoint_errors = endpoints
-            .iter()
-            .cloned()
-            .zip(results)
-            .filter_map(|(endpoint, result)| result.err().map(|error| (endpoint, error)))
-            .collect::<BTreeMap<_, _>>();
+        let mut endpoint_errors = BTreeMap::new();
+        let mut storage_applied = Vec::new();
+        for (endpoint, (storage_succeeded, result)) in endpoints.iter().cloned().zip(results) {
+            if storage_succeeded {
+                storage_applied.push(endpoint.clone());
+            }
+            if let Err(error) = result {
+                endpoint_errors.insert(endpoint, error);
+            }
+        }
         {
             let mut sync = self.gateway_sync.lock().await;
             sync.endpoint_errors = endpoint_errors.clone();
+            sync.applied_controller_set_generations
+                .retain(|endpoint, _| endpoints.contains(endpoint));
+            for endpoint in storage_applied {
+                sync.applied_controller_set_generations
+                    .insert(endpoint, controller_set_generation);
+            }
             if endpoint_errors.is_empty() {
                 sync.applied_generation = Some(generation);
             }
@@ -1326,7 +1375,10 @@ impl Controller {
                 .join("; "));
         }
 
-        info!(generation, "gateway configuration applied");
+        info!(
+            generation,
+            controller_set_generation, "gateway configuration applied"
+        );
         let mut inner = self.inner.lock().await;
         self.expire_local_lease(&mut inner);
         if !inner.is_leader || inner.generation != generation {
@@ -1988,6 +2040,26 @@ fn pending_controller_set_acknowledgements(
         .collect()
 }
 
+fn pending_gateway_controller_set_acknowledgements(
+    inner: &Inner,
+    sync: &GatewaySyncState,
+    timeout_seconds: u64,
+    admin_port: u16,
+    controller_set_generation: u64,
+) -> BTreeSet<String> {
+    current_live_nodes(inner, timeout_seconds)
+        .into_iter()
+        .filter_map(|node_id| inner.state.nodes.get(&node_id))
+        .filter(|node| node.roles.contains(&NodeRole::Gateway))
+        .map(|node| format!("http://{}:{admin_port}", format_host(&node.address)))
+        .filter(|endpoint| {
+            sync.applied_controller_set_generations
+                .get(endpoint)
+                .is_none_or(|generation| *generation < controller_set_generation)
+        })
+        .collect()
+}
+
 fn normalized_roles(mut roles: NodeRoles) -> NodeRoles {
     roles.insert(NodeRole::Agent);
     roles
@@ -2178,6 +2250,7 @@ fn adopt_unclaimed_tasks(state: &mut ClusterState, stack_name: &str) {
     let mut adopted = 0_usize;
     for service in services {
         let spec_hash = service_spec_hash(&service.spec);
+        let routed_ports = gateway::service_ports(state, &service);
         let mut occupied_slots = state
             .tasks
             .values()
@@ -2194,6 +2267,11 @@ fn adopt_unclaimed_tasks(state: &mut ClusterState, stack_name: &str) {
                     && task.service == service.name
                     && task.spec_hash == spec_hash
                     && task.slot < service.spec.replicas
+                    && routed_ports.iter().all(|target| {
+                        task.ports
+                            .iter()
+                            .any(|port| port.target == *target && port.protocol == "tcp")
+                    })
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -2267,6 +2345,37 @@ fn service_id(stack: &str, service: &str) -> String {
     format!("{stack}.{service}")
 }
 
+fn validate_gateway_hostname_ownership(
+    state: &ClusterState,
+    stack_name: &str,
+    gateway: &StackGatewaySpec,
+) -> Result<(), ControllerError> {
+    let requested = gateway
+        .http_routes
+        .iter()
+        .flat_map(|route| route.hostnames.iter())
+        .collect::<BTreeSet<_>>();
+    for stack in state
+        .stacks
+        .values()
+        .filter(|stack| stack.name != stack_name)
+    {
+        if let Some(hostname) = stack
+            .gateway
+            .http_routes
+            .iter()
+            .flat_map(|route| route.hostnames.iter())
+            .find(|hostname| requested.contains(hostname))
+        {
+            return Err(ControllerError::Conflict(format!(
+                "gateway hostname {hostname:?} is already owned by stack {:?}",
+                stack.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_stack_name(name: &str) -> Result<(), ControllerError> {
     if name.is_empty()
         || !name
@@ -2311,10 +2420,9 @@ mod tests {
 
     use crate::{
         config::GatewayConfig,
-        gateway::{ENABLE_LABEL, HOST_LABEL, PORT_LABEL},
         model::{
             CLUSTER_SCHEMA_VERSION, ClusterGatewayConfig, KvVersion, NodeRecord, PortBinding,
-            ServicePort, ServiceSpec, TaskRecord, TaskReport, initial_roles,
+            ServicePort, ServiceSpec, StackGatewaySpec, TaskRecord, TaskReport, initial_roles,
         },
     };
 
@@ -2332,6 +2440,42 @@ mod tests {
             gateway: GatewayConfig::default(),
             cluster: cluster.clone(),
         }
+    }
+
+    #[test]
+    fn rejects_a_gateway_hostname_owned_by_another_stack() {
+        let gateway = parse_stack(
+            r#"
+services:
+  web:
+    image: nginx
+x-swarmlite:
+  http_routes:
+    - hostnames: [EXAMPLE.com]
+      rules:
+        - backend: { service: web, port: 80 }
+"#,
+        )
+        .unwrap()
+        .gateway;
+        let mut state = ClusterState::default();
+        state.stacks.insert(
+            "first".into(),
+            StackRecord {
+                name: "first".into(),
+                applied_at_unix_ms: 1,
+                services: vec!["first.web".into()],
+                gateway: gateway.clone(),
+            },
+        );
+
+        let error = validate_gateway_hostname_ownership(&state, "second", &gateway).unwrap_err();
+        assert!(matches!(
+            error,
+            ControllerError::Conflict(message)
+                if message.contains("example.com") && message.contains("first")
+        ));
+        validate_gateway_hostname_ownership(&state, "first", &gateway).unwrap();
     }
 
     #[tokio::test]
@@ -2778,6 +2922,19 @@ mod tests {
 
     #[tokio::test]
     async fn promotes_reserved_controller_through_raft() {
+        let caddy_received = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let caddy_app = Router::new()
+            .route("/config/storage", post(capture_gateway_config))
+            .route(
+                "/config/apps/http/servers/swarmlite",
+                post(capture_gateway_config),
+            )
+            .with_state(caddy_received.clone());
+        let caddy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let caddy_address = caddy_listener.local_addr().unwrap();
+        let caddy_server =
+            tokio::spawn(async move { axum::serve(caddy_listener, caddy_app).await.unwrap() });
+
         let cluster = ClusterSettings {
             schema_version: CLUSTER_SCHEMA_VERSION,
             cluster_id: "controller-promotion-test".into(),
@@ -2788,6 +2945,7 @@ mod tests {
         let (repository, leader_raft, _leader_directory) = test_repository(&cluster).await;
         let mut config = test_controller_config(&cluster);
         config.advertise_url = "http://127.0.0.1:19090".into();
+        config.gateway.admin_port = caddy_address.port();
         let controller = Controller::new(
             config,
             "0123456789abcdef0123456789abcdef".into(),
@@ -2892,11 +3050,11 @@ mod tests {
 
         let current_controller_set_generation = response.controller_set_generation;
         let mut agent_request = test_join_request("node-c", "127.0.0.2", 3);
-        agent_request.requested_roles = Some(agent_roles());
+        agent_request.requested_roles = Some(BTreeSet::from([NodeRole::Agent, NodeRole::Gateway]));
         let joined_agent = controller.join_node("node-c", agent_request).await.unwrap();
         let mut agent_node = test_node();
         agent_node.id = "node-c".into();
-        agent_node.address = "127.0.0.2".into();
+        agent_node.address = caddy_address.ip().to_string();
         agent_node.roles = joined_agent.roles;
         agent_node.raft_id = 3;
         agent_node.controller_set_generation = current_controller_set_generation - 1;
@@ -2937,6 +3095,32 @@ mod tests {
             )
             .await
             .unwrap();
+        let error = controller
+            .update_node_roles(
+                "controller-b",
+                NodeRolesUpdate {
+                    roles: BTreeSet::from([NodeRole::Controller]),
+                },
+                RoleOperation::Remove,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ControllerError::Conflict(message)
+                if message.contains("Caddy gateways")
+                    && message.contains(&caddy_address.to_string())
+        ));
+
+        controller.sync_gateway_once().await.unwrap();
+        assert_eq!(
+            controller
+                .gateway_sync
+                .lock()
+                .await
+                .applied_controller_set_generations[&format!("http://{caddy_address}")],
+            current_controller_set_generation
+        );
         controller
             .update_node_roles(
                 "controller-b",
@@ -2952,6 +3136,7 @@ mod tests {
         leader_raft.shutdown().await.unwrap();
         follower_raft.shutdown().await.unwrap();
         server.abort();
+        caddy_server.abort();
     }
 
     #[tokio::test]
@@ -2994,10 +3179,33 @@ mod tests {
                 .state
                 .services
                 .insert("demo.web".into(), test_service());
+            inner.state.stacks.insert(
+                "demo".into(),
+                StackRecord {
+                    name: "demo".into(),
+                    applied_at_unix_ms: unix_ms(),
+                    services: vec!["demo.web".into()],
+                    gateway: parse_stack(
+                        r#"
+services:
+  web:
+    image: nginx:1.29-alpine
+x-swarmlite:
+  http_routes:
+    - hostnames: [example.com]
+      rules:
+        - backend: { service: web, port: 80 }
+"#,
+                    )
+                    .unwrap()
+                    .gateway,
+                },
+            );
             inner.state.tasks.insert("old-task".into(), draining_task());
             controller.commit_locked(&mut inner).await.unwrap();
         }
 
+        let controller_set_generation = controller.repository.controller_set().0;
         controller.sync_gateway_once().await.unwrap();
 
         let inner = controller.inner.lock().await;
@@ -3012,11 +3220,22 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0]["module"], "swarmlite");
         assert_eq!(requests[0]["token_env"], "SWARMLITE_TOKEN");
+        assert_eq!(
+            requests[0]["controller_set_generation"],
+            controller_set_generation
+        );
         assert!(!requests[0]["controllers"].as_array().unwrap().is_empty());
         assert_eq!(requests[1]["listen"][0], ":18089");
-        assert_eq!(
-            requests[1]["routes"][0]["handle"][0]["upstreams"],
-            json!([])
+        assert!(
+            requests[1]["routes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|route| {
+                    route["handle"].as_array().is_some_and(|handlers| {
+                        handlers.iter().any(|handler| handler["status_code"] == 503)
+                    })
+                })
         );
         server.abort();
     }
@@ -3107,11 +3326,7 @@ mod tests {
                 }],
                 volumes: Vec::new(),
                 container_labels: BTreeMap::new(),
-                service_labels: BTreeMap::from([
-                    (ENABLE_LABEL.into(), "true".into()),
-                    (HOST_LABEL.into(), "example.com".into()),
-                    (PORT_LABEL.into(), "80".into()),
-                ]),
+                service_labels: BTreeMap::new(),
                 healthcheck: None,
                 replicas: 1,
                 constraints: Vec::new(),
@@ -3185,6 +3400,7 @@ mod tests {
                 "demo",
                 ParsedStack {
                     services: BTreeMap::from([("web".into(), service.spec)]),
+                    gateway: StackGatewaySpec::default(),
                 },
             )
             .await

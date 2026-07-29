@@ -1,24 +1,25 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_yaml::Value;
 
-use crate::{
-    gateway,
-    model::{HealthcheckSpec, ServicePort, ServiceSpec},
-};
+use crate::model::{HealthcheckSpec, ServicePort, ServiceSpec, StackGatewaySpec};
 
 #[derive(Debug, Clone)]
 pub struct ParsedStack {
     pub services: BTreeMap<String, ServiceSpec>,
+    pub gateway: StackGatewaySpec,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawStack {
-    #[allow(dead_code)]
-    version: Option<Value>,
     services: BTreeMap<String, RawService>,
+    #[serde(rename = "x-swarmlite", default)]
+    gateway: StackGatewaySpec,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,17 +171,25 @@ struct LongVolume {
 }
 
 pub fn parse_stack(yaml: &str) -> Result<ParsedStack> {
-    let raw: RawStack = serde_yaml::from_str(yaml).context("invalid stack YAML")?;
+    let mut raw: RawStack = serde_yaml::from_str(yaml).context("invalid stack YAML")?;
     if raw.services.is_empty() {
         bail!("stack must contain at least one service");
     }
 
-    let services = raw
+    let services: BTreeMap<String, ServiceSpec> = raw
         .services
         .into_iter()
         .map(|(name, service)| normalize_service(&name, service).map(|spec| (name, spec)))
         .collect::<Result<_>>()?;
-    Ok(ParsedStack { services })
+    swarmlite_gateway::validate_and_normalize(
+        &mut raw.gateway,
+        &services.keys().cloned().collect::<BTreeSet<_>>(),
+    )
+    .context("invalid x-swarmlite configuration")?;
+    Ok(ParsedStack {
+        services,
+        gateway: raw.gateway,
+    })
 }
 
 fn normalize_service(name: &str, raw: RawService) -> Result<ServiceSpec> {
@@ -260,7 +269,6 @@ fn normalize_service(name: &str, raw: RawService) -> Result<ServiceSpec> {
         max_surge,
         stop_grace_period_seconds,
     };
-    gateway::validate_service(name, &spec).map_err(anyhow::Error::msg)?;
     Ok(spec)
 }
 
@@ -382,10 +390,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_all_checked_in_stack_examples_without_a_version_field() {
+        for yaml in [
+            include_str!("../examples/stack.yaml"),
+            include_str!("../examples/stack-standalone.yaml"),
+            include_str!("../examples/routing-all.yaml"),
+        ] {
+            assert!(!yaml.lines().any(|line| line.starts_with("version:")));
+            parse_stack(yaml).unwrap();
+        }
+    }
+
+    #[test]
     fn parses_swarm_style_stack() {
         let stack = parse_stack(
             r#"
-version: "3.8"
 services:
   web:
     image: nginx:1.29-alpine
@@ -411,10 +430,18 @@ services:
       update_config:
         parallelism: 2
         order: start-first
-      labels:
-        swarmlite.gateway.enable: "true"
-        swarmlite.gateway.host: example.com
-        swarmlite.gateway.port: "80"
+x-swarmlite:
+  http_routes:
+    - hostnames: [example.com]
+      rules:
+        - matches:
+            - path: /api
+              ignore_case: true
+          rewrite:
+            strip_prefix: true
+          backend:
+            service: web
+            port: 80
 "#,
         )
         .unwrap();
@@ -429,7 +456,9 @@ services:
         );
         assert_eq!(web.ports[0].published, Some(8080));
         assert_eq!(web.environment, ["DEBUG=false", "MODE=production"]);
-        assert_eq!(web.service_labels[gateway::HOST_LABEL], "example.com");
+        let rule = &stack.gateway.http_routes[0].rules[0];
+        assert_eq!(rule.backend.service.as_deref(), Some("web"));
+        assert_eq!(rule.matches[0].path, "/api");
     }
 
     #[test]
@@ -448,19 +477,22 @@ services:
     }
 
     #[test]
-    fn rejects_incomplete_gateway_configuration() {
+    fn rejects_unknown_gateway_service() {
         let error = parse_stack(
             r#"
 services:
   web:
     image: nginx
-    ports: [80]
-    deploy:
-      labels:
-        swarmlite.gateway.enable: "true"
+x-swarmlite:
+  http_routes:
+    - hostnames: [example.com]
+      rules:
+        - backend:
+            service: missing
+            port: 80
 "#,
         )
         .unwrap_err();
-        assert!(error.to_string().contains(gateway::HOST_LABEL));
+        assert!(format!("{error:#}").contains("service \"missing\" does not exist"));
     }
 }

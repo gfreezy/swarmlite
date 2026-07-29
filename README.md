@@ -202,20 +202,18 @@ advertised Controller set carries a `controller_set_generation` derived from the
 membership log. Agents persist that generation with the addresses and report the applied generation
 in their next heartbeat; `swarmlite status` exposes both the current generation and each live node's
 reported generation. Removing a Controller voter returns `409 Conflict` until every active Agent has
-reported the current generation. Agents beyond the node heartbeat timeout do not block removal; if
-they only know the removed Controller, they must be given a reachable join address when they return.
+reported the current generation and every active Gateway's Caddy Admin API has accepted the matching
+storage configuration. Agents beyond the node heartbeat timeout do not block removal; if they only
+know the removed Controller, they must be given a reachable join address when they return.
 
 ## Gateway and HTTPS
 
 A gateway role makes `serve` create or start a separate `swarmlite-gateway` container. The
 container has `restart=unless-stopped`; stopping, crashing, or upgrading the Swarmlite process
 does not stop Caddy. The first node is always a gateway and additional gateways are opt-in. The
-controller discovers active gateways and publishes routing configuration automatically. Use
-`--gateway-listen` during init to change the default `:80`:
-
-```bash
-swarmlite init --gateway-listen :80 --gateway-listen :443
-```
+controller discovers active gateways and publishes routing configuration automatically. Gateways
+listen on `:80` and `:443` by default, so normal public HTTPS needs no listener configuration.
+Advanced deployments can override the listeners with repeated `--gateway-listen` options at init.
 
 The default gateway image is `ghcr.io/swarmlite/swarmlite-caddy:latest`. Select another
 registry and tag during initialization, or roll the cluster to another image later:
@@ -230,12 +228,66 @@ The image reference is replicated as cluster configuration and returned by
 after receiving the update. The pull completes before the existing container is removed, and
 the `/data` and `/config` volumes are retained.
 
-Supported service labels under `deploy.labels` are:
+Keep `services` compatible with Docker Compose/Swarm and put routing under `x-swarmlite`. Stack
+files do not need a top-level `version`:
 
-- `swarmlite.gateway.enable=true`
-- `swarmlite.gateway.host`, containing one host or a comma-separated host list
-- `swarmlite.gateway.port`, the container HTTP port
-- `swarmlite.gateway.scheme=http|https`, defaulting to `http`
+```yaml
+services:
+  api:
+    image: example/api:latest
+
+x-swarmlite:
+  tls: serve
+  http: redirect
+  http_routes:
+    - hostnames: [example.com]
+      rules:
+        - matches:
+            - path: /api
+          rewrite:
+            strip_prefix: true
+          backend:
+            service: api
+            port: 8080
+
+        - matches:
+            - path: /openai
+              type: prefix
+              ignore_case: true
+          rewrite:
+            replace_prefix: /
+          backend:
+            host: api.openai.com
+            port: 443
+            protocol: https
+            preserve_host: false
+```
+
+`backend.service` references a service in the same Stack and is checked locally during deployment,
+without an external validation service or network request. Swarmlite allocates the required task
+port automatically. `backend.host` targets an external DNS name or IP. Both variants support
+`preserve_host`, and `protocol` is `http`, `https`, or `h2c`.
+
+Path matches support `exact`, `prefix` (the default), and RE2-compatible `regex`; `ignore_case`
+defaults to `false`. Rewrites support exactly one of `strip_prefix`, `replace_prefix`, or
+`replace_path`. Multiple match entries in one rule are OR, while a rule without `matches` is the
+hostname fallback. Matching precedence is exact, longest prefix, regex, then fallback.
+
+`tls` is `serve|disabled`; `http` is `redirect|serve|disabled`. Each route may override the
+top-level defaults. `http: redirect` requires `tls: serve`. See the complete example at
+[examples/routing-all.yaml](examples/routing-all.yaml).
+
+VS Code/YAML Language Server completion is available from
+[crates/swarmlite-gateway/schema/stack.schema.json](crates/swarmlite-gateway/schema/stack.schema.json).
+Add this first line to a Stack file if it is not already associated in editor settings:
+
+```yaml
+# yaml-language-server: $schema=./crates/swarmlite-gateway/schema/stack.schema.json
+```
+
+The routing model, validation, precedence, and Caddy JSON renderer live in the independent
+`swarmlite-gateway` crate. The main orchestrator only resolves internal service references to
+healthy task addresses.
 
 Caddy keeps certificates in a cluster-specific Docker volume mounted at `/data`, and the last
 accepted runtime configuration in another volume mounted at `/config`. It starts with `--resume`,
@@ -350,7 +402,8 @@ host ports and gateways connect to `node-advertise-address:allocated-host-port`.
 - Only replicated services are supported; `deploy.mode: global` is rejected.
 - No Compose `build`, `configs`, `secrets`, resource reservations, or autoscaling.
 - Named volumes and bind mounts remain node-local.
-- Gateway routing supports host matching and HTTP/HTTPS upstreams, not arbitrary Caddy handlers.
+- Gateway routing intentionally supports the documented host/path/rewrite/backend model, not
+  arbitrary Caddy handlers.
 - The controller API is HTTP; use a trusted private network or terminate TLS in front of it.
 - Controller membership changes require a live Raft quorum.
 

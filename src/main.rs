@@ -214,7 +214,7 @@ struct InitArgs {
     runtime_socket: Option<String>,
     #[arg(long = "label")]
     labels: Vec<String>,
-    #[arg(long = "gateway-listen", default_value = ":80")]
+    #[arg(long = "gateway-listen", default_values = [":80", ":443"])]
     gateway_listen: Vec<String>,
     /// OCI image containing Caddy and caddy.storage.swarmlite.
     /// Defaults to ghcr.io/swarmlite/swarmlite-caddy:latest.

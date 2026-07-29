@@ -35,7 +35,9 @@ existing container, and keep the existing `/data` and `/config` volumes.
 
 Swarmlite generates the storage block automatically, injects the cluster token through
 `SWARMLITE_TOKEN`, and refreshes the active controller URLs through Caddy's admin API. The token
-is not written into Caddy's JSON configuration or container labels.
+is not written into Caddy's JSON configuration or container labels. Generated storage updates also
+carry `controller_set_generation`; Swarmlite records a successful Caddy Admin API update as that
+Gateway's acknowledgement before allowing a Controller voter to be removed.
 
 For manual testing, build the included binary and run the example:
 

@@ -1,5 +1,4 @@
-version: "3.8"
-
+# yaml-language-server: $schema=../crates/swarmlite-gateway/schema/stack.schema.json
 services:
   web:
     image: nginx:1.29-alpine

@@ -146,7 +146,7 @@ fn default_gateway_server_name() -> String {
     "swarmlite".to_owned()
 }
 fn default_gateway_listen() -> Vec<String> {
-    vec![":80".to_owned()]
+    vec![":80".to_owned(), ":443".to_owned()]
 }
 const fn default_gateway_request_timeout() -> u64 {
     5

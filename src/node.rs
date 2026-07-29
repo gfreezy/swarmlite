@@ -531,7 +531,7 @@ async fn start_controller(
         .map_err(anyhow::Error::msg)?;
     let gateway = GatewayConfig {
         listen: if settings.cluster.gateway.listen.is_empty() {
-            vec![":80".to_owned()]
+            vec![":80".to_owned(), ":443".to_owned()]
         } else {
             settings.cluster.gateway.listen.clone()
         },

@@ -3,6 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+pub use swarmlite_gateway::{
+    GatewayHttpMode, GatewayTlsMode, HttpBackend, HttpBackendProtocol, HttpPathMatch,
+    HttpPathMatchType, HttpPathRewrite, HttpRouteRule, HttpRouteSpec, StackGatewaySpec,
+};
 
 pub const CLUSTER_SCHEMA_VERSION: u32 = 5;
 pub const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/swarmlite/swarmlite-caddy:latest";
@@ -16,7 +20,7 @@ pub struct ClusterGatewayConfig {
 impl Default for ClusterGatewayConfig {
     fn default() -> Self {
         Self {
-            listen: vec![":80".to_owned()],
+            listen: vec![":80".to_owned(), ":443".to_owned()],
             image: DEFAULT_GATEWAY_IMAGE.to_owned(),
         }
     }
@@ -275,6 +279,8 @@ pub struct StackRecord {
     pub name: String,
     pub applied_at_unix_ms: i64,
     pub services: Vec<String>,
+    #[serde(default)]
+    pub gateway: StackGatewaySpec,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -510,5 +516,9 @@ pub struct GatewayStatus {
     pub enabled: bool,
     pub desired_generation: u64,
     pub applied_generation: Option<u64>,
+    #[serde(default)]
+    pub desired_controller_set_generation: u64,
+    #[serde(default)]
+    pub applied_controller_set_generations: BTreeMap<String, u64>,
     pub endpoint_errors: BTreeMap<String, String>,
 }
