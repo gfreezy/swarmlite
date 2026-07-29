@@ -4,7 +4,7 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const CLUSTER_SCHEMA_VERSION: u32 = 4;
+pub const CLUSTER_SCHEMA_VERSION: u32 = 5;
 pub const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/swarmlite/swarmlite-caddy:latest";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -203,6 +203,7 @@ pub struct NodeMember {
     pub id: String,
     pub address: String,
     pub roles: NodeRoles,
+    pub labels: BTreeMap<String, String>,
     pub automatic_roles: bool,
     pub controller_url: String,
     pub raft_id: u64,
@@ -395,6 +396,7 @@ pub struct HeartbeatResponse {
     pub cluster: ClusterSettings,
     pub assignments: Vec<TaskAssignment>,
     pub roles: NodeRoles,
+    pub labels: BTreeMap<String, String>,
     pub controllers: Vec<String>,
     pub remove_tasks: Vec<String>,
 }
@@ -403,6 +405,7 @@ pub struct HeartbeatResponse {
 pub struct NodeControl {
     pub cluster: ClusterSettings,
     pub roles: NodeRoles,
+    pub labels: BTreeMap<String, String>,
     pub controllers: Vec<String>,
 }
 
@@ -430,6 +433,7 @@ pub struct JoinRequest {
 pub struct JoinResponse {
     pub cluster: ClusterSettings,
     pub roles: NodeRoles,
+    pub labels: BTreeMap<String, String>,
     pub controllers: Vec<String>,
     #[serde(default)]
     pub controller_set_generation: u64,
@@ -445,6 +449,25 @@ pub struct NodeRolesUpdate {
 pub struct NodeRolesResponse {
     pub node_id: String,
     pub roles: NodeRoles,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeLabelsResponse {
+    pub node_id: String,
+    pub labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NodeLabelSetRequest {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NodeLabelRemoveRequest {
+    pub key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

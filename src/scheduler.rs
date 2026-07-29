@@ -56,6 +56,32 @@ fn reconcile_service(
         .map(|task| task.id.clone())
         .collect();
 
+    // Constraints are hard requirements. A task from the active revision must
+    // leave a node as soon as a current heartbeat shows that the node no longer
+    // matches (for example after a node-label update). Missing soft node state
+    // is not a mismatch: after controller failover it is empty until the next
+    // heartbeat. Retire before counting rollout capacity so a stopped or
+    // draining container occupies its slot until the agent acknowledges its
+    // removal.
+    for id in &task_ids {
+        let task = &state.tasks[id];
+        if task.revision != service.revision
+            || !matches!(
+                task.desired,
+                DesiredTaskState::Running | DesiredTaskState::Draining
+            )
+        {
+            continue;
+        }
+        let node_violates_constraints = state
+            .nodes
+            .get(&task.node_id)
+            .is_some_and(|node| !matches_constraints(node, &service.spec.constraints));
+        if node_violates_constraints {
+            changed |= retire_task(state, id, service);
+        }
+    }
+
     let mut current_running = task_ids
         .iter()
         .filter(|id| {
@@ -460,6 +486,116 @@ mod tests {
         state.services.insert(constrained.id.clone(), constrained);
         reconcile(&mut state, &live);
         assert_eq!(state.tasks.values().next().unwrap().node_id, "node-b");
+    }
+
+    #[test]
+    fn label_change_retires_noncompliant_task_and_replaces_it_on_matching_node() {
+        let (mut state, live) = state_with_nodes();
+        state
+            .nodes
+            .get_mut("node-a")
+            .unwrap()
+            .labels
+            .insert("disk".into(), "ssd".into());
+        state
+            .nodes
+            .get_mut("node-b")
+            .unwrap()
+            .labels
+            .insert("disk".into(), "hdd".into());
+        let mut constrained = service(1, 1);
+        constrained.spec.constraints = vec!["node.labels.disk==ssd".into()];
+        state.services.insert(constrained.id.clone(), constrained);
+        reconcile(&mut state, &live);
+        assert_eq!(state.tasks.values().next().unwrap().node_id, "node-a");
+
+        state
+            .nodes
+            .get_mut("node-a")
+            .unwrap()
+            .labels
+            .insert("disk".into(), "hdd".into());
+        state
+            .nodes
+            .get_mut("node-b")
+            .unwrap()
+            .labels
+            .insert("disk".into(), "ssd".into());
+
+        assert!(reconcile(&mut state, &live));
+        assert_eq!(
+            state.tasks.values().next().unwrap().desired,
+            DesiredTaskState::Stopped
+        );
+        assert_eq!(state.tasks.len(), 1, "wait for the stop acknowledgement");
+
+        state
+            .tasks
+            .retain(|_, task| task.desired != DesiredTaskState::Stopped);
+        assert!(reconcile(&mut state, &live));
+        let replacement = state.tasks.values().next().unwrap();
+        assert_eq!(replacement.node_id, "node-b");
+        assert_eq!(replacement.desired, DesiredTaskState::Running);
+    }
+
+    #[test]
+    fn label_change_without_matching_node_does_not_schedule_replacement() {
+        let (mut state, live) = state_with_nodes();
+        state
+            .nodes
+            .get_mut("node-a")
+            .unwrap()
+            .labels
+            .insert("disk".into(), "ssd".into());
+        state
+            .nodes
+            .get_mut("node-b")
+            .unwrap()
+            .labels
+            .insert("disk".into(), "hdd".into());
+        let mut constrained = service(1, 1);
+        constrained.spec.constraints = vec!["node.labels.disk==ssd".into()];
+        state.services.insert(constrained.id.clone(), constrained);
+        reconcile(&mut state, &live);
+
+        state
+            .nodes
+            .get_mut("node-a")
+            .unwrap()
+            .labels
+            .insert("disk".into(), "hdd".into());
+        assert!(reconcile(&mut state, &live));
+        assert!(
+            state
+                .tasks
+                .values()
+                .all(|task| task.desired == DesiredTaskState::Stopped)
+        );
+
+        state.tasks.clear();
+        assert!(!reconcile(&mut state, &live));
+        assert!(state.tasks.is_empty());
+    }
+
+    #[test]
+    fn missing_soft_node_state_after_failover_does_not_violate_constraints() {
+        let (mut state, live) = state_with_nodes();
+        state
+            .nodes
+            .get_mut("node-a")
+            .unwrap()
+            .labels
+            .insert("disk".into(), "ssd".into());
+        let mut constrained = service(1, 1);
+        constrained.spec.constraints = vec!["node.labels.disk==ssd".into()];
+        state.services.insert(constrained.id.clone(), constrained);
+        reconcile(&mut state, &live);
+        let task_id = state.tasks.keys().next().unwrap().clone();
+        let node_id = state.tasks[&task_id].node_id.clone();
+
+        state.nodes.remove(&node_id);
+        assert!(!reconcile(&mut state, &live));
+        assert_eq!(state.tasks[&task_id].desired, DesiredTaskState::Running);
     }
 
     #[test]

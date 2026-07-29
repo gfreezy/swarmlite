@@ -6,8 +6,8 @@ use swarmlite::{
     config::RuntimeKind,
     model::{
         CLUSTER_SCHEMA_VERSION, ClusterConfigResponse, ClusterConfigUpdate, ClusterGatewayConfig,
-        ClusterMode, ClusterSettings, DEFAULT_GATEWAY_IMAGE, NodeRole, NodeRolesResponse,
-        NodeRolesUpdate,
+        ClusterMode, ClusterSettings, DEFAULT_GATEWAY_IMAGE, NodeLabelRemoveRequest,
+        NodeLabelSetRequest, NodeLabelsResponse, NodeRole, NodeRolesResponse, NodeRolesUpdate,
     },
     node,
 };
@@ -39,9 +39,6 @@ enum Command {
         runtime: Option<RuntimeKind>,
         #[arg(long)]
         runtime_socket: Option<String>,
-        /// Persistent node label in KEY=VALUE form.
-        #[arg(long = "label")]
-        labels: Vec<String>,
     },
     /// Pull cluster settings and configure this machine to join an existing cluster.
     Join {
@@ -71,6 +68,11 @@ enum Command {
     Role {
         #[command(subcommand)]
         action: RoleCommand,
+    },
+    /// Read or change metadata assigned to joined nodes.
+    Node {
+        #[command(subcommand)]
+        action: NodeCommand,
     },
     /// Deploy or update a Swarm-style stack file.
     Deploy {
@@ -139,6 +141,40 @@ enum RoleCommand {
         node_id: String,
         #[arg(value_enum, value_delimiter = ',', required = true)]
         roles: Vec<NodeRole>,
+        #[command(flatten)]
+        connection: ConnectionArgs,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum NodeCommand {
+    /// Read or change a node's authoritative placement labels.
+    Label {
+        #[command(subcommand)]
+        action: NodeLabelCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum NodeLabelCommand {
+    /// Print all labels assigned to a node.
+    Get {
+        node_id: String,
+        #[command(flatten)]
+        connection: ConnectionArgs,
+    },
+    /// Set or replace one label.
+    Set {
+        node_id: String,
+        key: String,
+        value: String,
+        #[command(flatten)]
+        connection: ConnectionArgs,
+    },
+    /// Remove one label.
+    Remove {
+        node_id: String,
+        key: String,
         #[command(flatten)]
         connection: ConnectionArgs,
     },
@@ -231,14 +267,12 @@ async fn main() -> Result<()> {
             advertise_address,
             runtime,
             runtime_socket,
-            labels,
         } => {
             node::run(node::ServeOptions {
                 data_dir,
                 advertise_address,
                 runtime,
                 runtime_socket,
-                labels: node::parse_labels(labels)?,
             })
             .await
         }
@@ -329,6 +363,44 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&response)?);
             Ok(())
         }
+        Command::Node { action } => match action {
+            NodeCommand::Label { action } => {
+                let (node_id, method, body, connection) = match action {
+                    NodeLabelCommand::Get {
+                        node_id,
+                        connection,
+                    } => (node_id, reqwest::Method::GET, None, connection),
+                    NodeLabelCommand::Set {
+                        node_id,
+                        key,
+                        value,
+                        connection,
+                    } => (
+                        node_id,
+                        reqwest::Method::PUT,
+                        Some(serde_json::to_value(NodeLabelSetRequest { key, value })?),
+                        connection,
+                    ),
+                    NodeLabelCommand::Remove {
+                        node_id,
+                        key,
+                        connection,
+                    } => (
+                        node_id,
+                        reqwest::Method::DELETE,
+                        Some(serde_json::to_value(NodeLabelRemoveRequest { key })?),
+                        connection,
+                    ),
+                };
+                let (controller, token) =
+                    node::resolve_connection(&data_dir, connection.controller, connection.token)
+                        .await?;
+                let response =
+                    node_labels(controller, token, &node_id, method, body.as_ref()).await?;
+                println!("{}", serde_json::to_string_pretty(&response)?);
+                Ok(())
+            }
+        },
         Command::Deploy {
             controller,
             name,
@@ -345,6 +417,45 @@ async fn main() -> Result<()> {
             status(controller, token).await
         }
     }
+}
+
+async fn node_labels(
+    controller: String,
+    token: String,
+    node_id: &str,
+    method: reqwest::Method,
+    body: Option<&serde_json::Value>,
+) -> Result<NodeLabelsResponse> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let mut url = format!(
+        "{}/v1/nodes/{node_id}/labels",
+        controller.trim_end_matches('/')
+    );
+    for _ in 0..3 {
+        let mut request = client.request(method.clone(), &url).bearer_auth(&token);
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let response = request.send().await?;
+        if response.status() == reqwest::StatusCode::TEMPORARY_REDIRECT {
+            url = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| anyhow::anyhow!("controller redirect omitted Location"))?
+                .to_owned();
+            continue;
+        }
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            anyhow::bail!("controller returned {status}: {body}");
+        }
+        return serde_json::from_str(&body).map_err(Into::into);
+    }
+    anyhow::bail!("too many controller redirects")
 }
 
 async fn node_roles(
@@ -503,6 +614,7 @@ mod tests {
         assert!(names.contains(&"serve"));
         assert!(names.contains(&"config"));
         assert!(names.contains(&"role"));
+        assert!(names.contains(&"node"));
         assert!(!names.contains(&"controller"));
         assert!(!names.contains(&"agent"));
     }
@@ -587,6 +699,45 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn node_labels_support_get_set_and_remove() {
+        assert!(Cli::try_parse_from(["swarmlite", "node", "label", "get", "node-a"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "swarmlite",
+                "node",
+                "label",
+                "set",
+                "node-a",
+                "region",
+                "cn-east",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["swarmlite", "node", "label", "remove", "node-a", "region",])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn labels_are_initial_only_on_init_and_join() {
+        assert!(Cli::try_parse_from(["swarmlite", "init", "--label", "region=cn-east"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "swarmlite",
+                "join",
+                "http://127.0.0.1:8080",
+                "--token",
+                "0123456789abcdef",
+                "--label",
+                "region=cn-east",
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["swarmlite", "serve", "--label", "region=cn-east"]).is_err());
     }
 
     #[test]

@@ -166,9 +166,11 @@ async fn run_with_runtime<R: ContainerRuntime>(
         let next_control = NodeControl {
             cluster: response.cluster.clone(),
             roles: response.roles.clone(),
+            labels: response.labels.clone(),
             controllers: controllers.clone(),
         };
         node.roles.clone_from(&response.roles);
+        node.labels.clone_from(&response.labels);
         updates.send_if_modified(|current| {
             if *current == next_control {
                 false
@@ -398,6 +400,7 @@ mod tests {
             cluster: test_cluster(),
             assignments: Vec::new(),
             roles: agent_roles(),
+            labels: Default::default(),
             controllers: Vec::new(),
             remove_tasks: Vec::new(),
         };
@@ -455,6 +458,7 @@ mod tests {
                 spec_hash: "hash".into(),
             }],
             roles: agent_roles(),
+            labels: Default::default(),
             controllers: Vec::new(),
             remove_tasks: Vec::new(),
         };

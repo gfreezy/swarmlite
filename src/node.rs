@@ -56,7 +56,6 @@ pub struct ServeOptions {
     pub advertise_address: Option<String>,
     pub runtime: Option<RuntimeKind>,
     pub runtime_socket: Option<String>,
-    pub labels: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -238,10 +237,6 @@ pub async fn run(options: ServeOptions) -> Result<()> {
         settings.runtime = Some(runtime);
         changed = true;
     }
-    if !options.labels.is_empty() {
-        settings.labels.extend(options.labels);
-        changed = true;
-    }
     if changed {
         local_state.put(NODE_KEY, &settings)?;
     }
@@ -289,6 +284,7 @@ pub async fn run(options: ServeOptions) -> Result<()> {
     let initial_control = NodeControl {
         cluster: settings.cluster.raft_seed(),
         roles: settings.roles.clone(),
+        labels: settings.labels.clone(),
         controllers: settings.controller_urls.clone(),
     };
     let (control_tx, control_rx) = watch::channel(initial_control);
@@ -376,6 +372,7 @@ async fn supervise(
                 let had_gateway = settings.roles.contains(&NodeRole::Gateway);
                 desired_roles = control.roles;
                 settings.roles.clone_from(&desired_roles);
+                settings.labels = control.labels;
                 settings.cluster = LocalClusterSettings::from_cluster(&control.cluster);
                 settings.controller_urls = control.controllers;
                 normalize_controller_list(&mut settings.controller_urls);
@@ -543,6 +540,7 @@ async fn start_controller(
     let config = ControllerConfig {
         controller_id: settings.node_id.clone(),
         roles: settings.roles.clone(),
+        labels: settings.labels.clone(),
         listen: SocketAddr::new(
             IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             settings.cluster.controller_port,
@@ -651,10 +649,6 @@ pub async fn join(options: JoinOptions) -> Result<String> {
         generation: controller_set_generation,
         controllers: controllers.clone(),
     };
-    let mut labels = preserve_identity
-        .map(|settings| settings.labels.clone())
-        .unwrap_or_default();
-    labels.extend(options.labels);
     let settings = NodeSettings {
         schema_version: 6,
         roles: response.roles,
@@ -666,7 +660,7 @@ pub async fn join(options: JoinOptions) -> Result<String> {
         controller_urls: controllers.clone(),
         advertise_address: Some(advertise_address),
         runtime,
-        labels,
+        labels: response.labels,
     };
     if recovery_rebind || existing.is_none() {
         local_state.put_triple(
@@ -773,10 +767,19 @@ pub fn parse_labels(values: Vec<String>) -> Result<BTreeMap<String, String>> {
             let (key, value) = value
                 .split_once('=')
                 .with_context(|| format!("label must use KEY=VALUE syntax: {value}"))?;
-            if key.trim().is_empty() {
-                bail!("label key must not be empty");
+            if key.is_empty()
+                || key.len() > 256
+                || key.trim() != key
+                || key.chars().any(char::is_control)
+            {
+                bail!(
+                    "label key must contain 1 to 256 bytes without control characters or surrounding whitespace"
+                );
             }
-            Ok((key.trim().to_owned(), value.trim().to_owned()))
+            if value.len() > 4_096 || value.chars().any(char::is_control) {
+                bail!("label value must contain at most 4096 bytes without control characters");
+            }
+            Ok((key.to_owned(), value.to_owned()))
         })
         .collect()
 }
@@ -1418,6 +1421,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_initial_node_labels_without_silently_rewriting_them() {
+        assert_eq!(
+            parse_labels(vec!["region=cn-east".into(), "disk=nvme".into()]).unwrap(),
+            BTreeMap::from([
+                ("disk".to_owned(), "nvme".to_owned()),
+                ("region".to_owned(), "cn-east".to_owned()),
+            ])
+        );
+        assert!(parse_labels(vec!["region".into()]).is_err());
+        assert!(parse_labels(vec![" region=cn-east".into()]).is_err());
+        assert!(parse_labels(vec!["region=cn\neast".into()]).is_err());
+    }
+
+    #[test]
     fn validates_cluster_modes() {
         let standalone = ClusterSettings {
             schema_version: CLUSTER_SCHEMA_VERSION,
@@ -1696,7 +1713,7 @@ mod tests {
             advertise_address: Some("10.0.0.22".into()),
             runtime: None,
             runtime_socket: None,
-            labels: BTreeMap::new(),
+            labels: BTreeMap::from([("region".into(), "cn-east".into())]),
             requested_roles: None,
         })
         .await
@@ -1708,6 +1725,10 @@ mod tests {
             LocalClusterSettings::from_cluster(&cluster)
         );
         assert_eq!(settings.roles, crate::model::agent_roles());
+        assert_eq!(
+            settings.labels,
+            BTreeMap::from([("region".into(), "cn-east".into())])
+        );
         let controller_set = LocalState::open(directory.path())
             .unwrap()
             .get::<AgentControllerSet>(CONTROLLER_SET_KEY)
@@ -1842,11 +1863,12 @@ mod tests {
 
     async fn mock_join(
         State(state): State<MockJoinState>,
-        Json(_request): Json<JoinRequest>,
+        Json(request): Json<JoinRequest>,
     ) -> Json<JoinResponse> {
         Json(JoinResponse {
             cluster: state.cluster,
             roles: crate::model::agent_roles(),
+            labels: request.labels,
             controllers: vec![state.controller],
             controller_set_generation: 1,
         })

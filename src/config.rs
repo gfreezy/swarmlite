@@ -10,6 +10,7 @@ use crate::model::{ClusterSettings, NodeRoles};
 pub struct ControllerConfig {
     pub controller_id: String,
     pub roles: NodeRoles,
+    pub labels: BTreeMap<String, String>,
     pub listen: SocketAddr,
     pub advertise_url: String,
     pub node_timeout_seconds: u64,

@@ -38,10 +38,10 @@ use crate::{
         HeartbeatResponse, JoinRequest, JoinResponse, KvDeleteRequest, KvListResponse, KvLock,
         KvLockAcquireRequest, KvLockAcquireResponse, KvLockMutationRequest, KvLockStatus,
         KvObjectResponse, KvPutRequest, KvPutResponse, KvStatResponse, KvState, LeaderRecord,
-        NodeHeartbeat, NodeMember, NodeRole, NodeRoles, NodeRolesResponse, NodeRolesUpdate,
-        ObservedTaskState, RecoveryStatus, ServiceRecord, StackRecord, StatusResponse,
-        TaskAssignment, TaskRecord, UnclaimedTask, agent_roles, service_spec_hash,
-        valid_gateway_image,
+        NodeHeartbeat, NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, NodeMember,
+        NodeRole, NodeRoles, NodeRolesResponse, NodeRolesUpdate, ObservedTaskState, RecoveryStatus,
+        ServiceRecord, StackRecord, StatusResponse, TaskAssignment, TaskRecord, UnclaimedTask,
+        agent_roles, service_spec_hash, valid_gateway_image,
     },
     scheduler,
     stack::{ParsedStack, parse_stack},
@@ -82,6 +82,12 @@ where
                 .put(set_node_roles)
                 .patch(add_node_roles)
                 .delete(remove_node_roles),
+        )
+        .route(
+            "/v1/nodes/{node_id}/labels",
+            get(get_node_labels)
+                .put(set_node_label)
+                .delete(remove_node_label),
         )
         .route("/v1/kv", get(kv_object).put(put_kv).delete(delete_kv))
         .route("/v1/kv/keys", get(list_kv))
@@ -326,22 +332,31 @@ impl Controller {
             .ok()
             .and_then(|url| url.host_str().map(ToOwned::to_owned))
             .unwrap_or_default();
-        let (roles, automatic_roles, joined_at_unix_ms) = inner
+        let (roles, labels, automatic_roles, joined_at_unix_ms) = inner
             .state
             .members
             .get(&self.config.controller_id)
             .map(|member| {
                 (
                     member.roles.clone(),
+                    member.labels.clone(),
                     member.automatic_roles,
                     member.joined_at_unix_ms,
                 )
             })
-            .unwrap_or_else(|| (self.config.roles.clone(), true, now));
+            .unwrap_or_else(|| {
+                (
+                    self.config.roles.clone(),
+                    self.config.labels.clone(),
+                    true,
+                    now,
+                )
+            });
         let self_member = NodeMember {
             id: self.config.controller_id.clone(),
             address,
             roles,
+            labels,
             automatic_roles,
             controller_url: self.config.advertise_url.trim_end_matches('/').to_owned(),
             raft_id: self.repository.raft().node_id(),
@@ -532,6 +547,9 @@ impl Controller {
         node_id: &str,
         request: JoinRequest,
     ) -> Result<JoinResponse, ControllerError> {
+        for (key, value) in &request.labels {
+            validate_node_label(key, value)?;
+        }
         if node_id != request.node_id {
             return Err(ControllerError::Invalid(
                 "node ID in path and request body differ".to_owned(),
@@ -568,6 +586,12 @@ impl Controller {
                     ));
                 }
             }
+            if !request.labels.is_empty() && request.labels != existing.labels {
+                return Err(ControllerError::Conflict(
+                    "this node is already joined with different labels; use `swarmlite node label set` or `remove`"
+                        .to_owned(),
+                ));
+            }
             let member = inner.state.members.get_mut(node_id).expect("member exists");
             if member.address != request.address
                 || member.controller_url != request.controller_url
@@ -595,6 +619,7 @@ impl Controller {
                     id: node_id.to_owned(),
                     address: request.address.clone(),
                     roles: roles.clone(),
+                    labels: request.labels.clone(),
                     automatic_roles,
                     controller_url: request.controller_url.clone(),
                     raft_id: request.raft_id,
@@ -616,9 +641,11 @@ impl Controller {
             .controller_ack_candidates
             .insert(node_id.to_owned(), Instant::now());
         let (controller_set_generation, voters) = self.repository.controller_set();
+        let labels = inner.state.members[node_id].labels.clone();
         Ok(JoinResponse {
             cluster,
             roles,
+            labels,
             controllers: controller_urls(&inner.state, Some(&self.config.advertise_url), &voters),
             controller_set_generation,
         })
@@ -779,6 +806,100 @@ impl Controller {
         })
     }
 
+    async fn node_labels(&self, node_id: &str) -> Result<NodeLabelsResponse, ControllerError> {
+        let mut inner = self.inner.lock().await;
+        self.expire_local_lease(&mut inner);
+        if !inner.is_leader {
+            return Err(self.leader_redirect(&format!("/v1/nodes/{node_id}/labels")));
+        }
+        let member =
+            inner.state.members.get(node_id).ok_or_else(|| {
+                ControllerError::NotFound(format!("node {node_id} is not joined"))
+            })?;
+        Ok(NodeLabelsResponse {
+            node_id: node_id.to_owned(),
+            labels: member.labels.clone(),
+        })
+    }
+
+    async fn set_node_label(
+        &self,
+        node_id: &str,
+        request: NodeLabelSetRequest,
+    ) -> Result<NodeLabelsResponse, ControllerError> {
+        validate_node_label(&request.key, &request.value)?;
+        self.update_node_label(node_id, request.key, Some(request.value))
+            .await
+    }
+
+    async fn remove_node_label(
+        &self,
+        node_id: &str,
+        request: NodeLabelRemoveRequest,
+    ) -> Result<NodeLabelsResponse, ControllerError> {
+        validate_node_label_key(&request.key)?;
+        self.update_node_label(node_id, request.key, None).await
+    }
+
+    async fn update_node_label(
+        &self,
+        node_id: &str,
+        key: String,
+        value: Option<String>,
+    ) -> Result<NodeLabelsResponse, ControllerError> {
+        let mut inner = self.inner.lock().await;
+        self.expire_local_lease(&mut inner);
+        if !inner.is_leader {
+            return Err(self.leader_redirect(&format!("/v1/nodes/{node_id}/labels")));
+        }
+        let current = inner
+            .state
+            .members
+            .get(node_id)
+            .ok_or_else(|| ControllerError::NotFound(format!("node {node_id} is not joined")))?
+            .labels
+            .clone();
+        let mut labels = current.clone();
+        let removed = value.is_none();
+        match value {
+            Some(value) => {
+                labels.insert(key.clone(), value);
+            }
+            None => {
+                labels.remove(&key);
+            }
+        }
+        if labels == current {
+            return Ok(NodeLabelsResponse {
+                node_id: node_id.to_owned(),
+                labels,
+            });
+        }
+
+        let previous = inner.state.clone();
+        inner
+            .state
+            .members
+            .get_mut(node_id)
+            .expect("member was checked above")
+            .labels
+            .clone_from(&labels);
+        if let Some(node) = inner.state.nodes.get_mut(node_id) {
+            node.labels.clone_from(&labels);
+        }
+        let live = current_live_nodes(&inner, self.config.node_timeout_seconds);
+        scheduler::reconcile(&mut inner.state, &live);
+        if let Err(error) = self.commit_locked(&mut inner).await {
+            inner.state = previous;
+            return Err(error.into());
+        }
+        info!(node_id, label = %key, removed, "updated node label");
+        Ok(NodeLabelsResponse {
+            node_id: node_id.to_owned(),
+            labels,
+        })
+    }
+
     async fn apply(&self, stack_name: &str, parsed: ParsedStack) -> Result<u64, ControllerError> {
         validate_stack_name(stack_name)?;
         let has_gateway = {
@@ -860,7 +981,8 @@ impl Controller {
         node_id: &str,
         heartbeat: NodeHeartbeat,
     ) -> Result<HeartbeatResponse, ControllerError> {
-        if node_id != heartbeat.node.id {
+        let NodeHeartbeat { mut node, tasks } = heartbeat;
+        if node_id != node.id {
             return Err(ControllerError::Invalid(
                 "node ID in path and request body differ".to_owned(),
             ));
@@ -876,24 +998,24 @@ impl Controller {
         let voters = self.repository.voter_ids();
         let mut changed = prune_controllers(&mut inner.state, now, &voters);
         let mut soft_changed = false;
-        let desired_roles = {
+        let (desired_roles, desired_labels) = {
             let member = inner.state.members.get_mut(node_id).ok_or_else(|| {
                 ControllerError::Invalid("node must join before sending heartbeats".to_owned())
             })?;
-            if member.raft_id != heartbeat.node.raft_id {
+            if member.raft_id != node.raft_id {
                 return Err(ControllerError::Invalid(
                     "heartbeat raft_id differs from the joined node identity".to_owned(),
                 ));
             }
-            if member.address != heartbeat.node.address {
-                member.address.clone_from(&heartbeat.node.address);
+            if member.address != node.address {
+                member.address.clone_from(&node.address);
                 changed = true;
             }
-            member.roles.clone()
+            (member.roles.clone(), member.labels.clone())
         };
         if desired_roles.contains(&NodeRole::Controller) {
             changed |= ensure_controller_record(&mut inner.state, node_id, now)?;
-            if heartbeat.node.roles.contains(&NodeRole::Controller) {
+            if node.roles.contains(&NodeRole::Controller) {
                 let record = inner.state.controllers[node_id].clone();
                 if !self.repository.is_voter(record.raft_id) {
                     self.repository
@@ -908,14 +1030,14 @@ impl Controller {
                 }
             }
         }
+        node.labels.clone_from(&desired_labels);
         soft_changed |= inner.state.nodes.get(node_id).is_none_or(|existing| {
-            serde_json::to_value(existing).ok() != serde_json::to_value(&heartbeat.node).ok()
+            serde_json::to_value(existing).ok() != serde_json::to_value(&node).ok()
         });
         inner.live_nodes.insert(node_id.to_owned(), Instant::now());
-        inner.state.nodes.insert(node_id.to_owned(), heartbeat.node);
+        inner.state.nodes.insert(node_id.to_owned(), node);
 
-        let reports: HashMap<_, _> = heartbeat
-            .tasks
+        let reports: HashMap<_, _> = tasks
             .into_iter()
             .map(|report| (report.id.clone(), report))
             .collect();
@@ -1055,6 +1177,7 @@ impl Controller {
             cluster: inner.cluster.clone(),
             assignments,
             roles: desired_roles,
+            labels: desired_labels,
             controllers: controller_urls(&inner.state, Some(&self.config.advertise_url), &voters),
             remove_tasks,
         })
@@ -1587,6 +1710,35 @@ async fn remove_node_roles(
         .map(Json)
 }
 
+async fn get_node_labels(
+    State(controller): State<Arc<Controller>>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<NodeLabelsResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.node_labels(&node_id).await.map(Json)
+}
+
+async fn set_node_label(
+    State(controller): State<Arc<Controller>>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<NodeLabelSetRequest>,
+) -> Result<Json<NodeLabelsResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.set_node_label(&node_id, body).await.map(Json)
+}
+
+async fn remove_node_label(
+    State(controller): State<Arc<Controller>>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<NodeLabelRemoveRequest>,
+) -> Result<Json<NodeLabelsResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.remove_node_label(&node_id, body).await.map(Json)
+}
+
 async fn apply_stack(
     State(controller): State<Arc<Controller>>,
     Path(name): Path<String>,
@@ -1839,6 +1991,32 @@ fn pending_controller_set_acknowledgements(
 fn normalized_roles(mut roles: NodeRoles) -> NodeRoles {
     roles.insert(NodeRole::Agent);
     roles
+}
+
+fn validate_node_label_key(key: &str) -> Result<(), ControllerError> {
+    if key.is_empty()
+        || key.len() > 256
+        || key.trim() != key
+        || key.contains('=')
+        || key.chars().any(char::is_control)
+    {
+        return Err(ControllerError::Invalid(
+            "node label key must contain 1 to 256 bytes without control characters, '=' or surrounding whitespace"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_node_label(key: &str, value: &str) -> Result<(), ControllerError> {
+    validate_node_label_key(key)?;
+    if value.len() > 4_096 || value.chars().any(char::is_control) {
+        return Err(ControllerError::Invalid(
+            "node label value must contain at most 4096 bytes without control characters"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn role_count(state: &ClusterState, role: NodeRole, except_node: Option<&str>) -> usize {
@@ -2146,6 +2324,7 @@ mod tests {
         ControllerConfig {
             controller_id: "controller-a".into(),
             roles: initial_roles(),
+            labels: BTreeMap::new(),
             listen: "127.0.0.1:0".parse().unwrap(),
             advertise_url: "http://10.0.0.10:8080".into(),
             node_timeout_seconds: 20,
@@ -2496,6 +2675,105 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, ControllerError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn node_labels_are_authoritative_and_persisted() {
+        let cluster = ClusterSettings {
+            schema_version: CLUSTER_SCHEMA_VERSION,
+            cluster_id: "node-label-test".into(),
+            mode: ClusterMode::Standalone,
+            controller_port: 8080,
+            gateway: ClusterGatewayConfig::default(),
+        };
+        let (repository, _raft, _directory) = test_repository(&cluster).await;
+        let observer = repository.clone();
+        let mut config = test_controller_config(&cluster);
+        config.labels = BTreeMap::from([("region".into(), "cn-east".into())]);
+        let controller = Controller::new(config, "secret".into(), repository)
+            .await
+            .unwrap();
+        controller.tick().await.unwrap();
+        assert_eq!(
+            observer.load_consistent().await.unwrap().state.members["controller-a"].labels,
+            BTreeMap::from([("region".into(), "cn-east".into())])
+        );
+
+        let mut request = test_join_request("node-a", "127.0.0.1", 2);
+        request.labels = BTreeMap::from([("disk".into(), "ssd".into())]);
+        let joined = controller.join_node("node-a", request).await.unwrap();
+        assert_eq!(
+            joined.labels,
+            BTreeMap::from([("disk".into(), "ssd".into())])
+        );
+
+        let mut conflicting = test_join_request("node-a", "127.0.0.1", 2);
+        conflicting.labels = BTreeMap::from([("disk".into(), "hdd".into())]);
+        assert!(matches!(
+            controller.join_node("node-a", conflicting).await,
+            Err(ControllerError::Conflict(_))
+        ));
+
+        let mut reported = test_node();
+        reported.labels = BTreeMap::from([
+            ("disk".into(), "hdd".into()),
+            ("untrusted".into(), "value".into()),
+        ]);
+        let response = controller
+            .heartbeat(
+                "node-a",
+                NodeHeartbeat {
+                    node: reported,
+                    tasks: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.labels,
+            BTreeMap::from([("disk".into(), "ssd".into())])
+        );
+        assert_eq!(
+            controller.inner.lock().await.state.nodes["node-a"].labels,
+            response.labels
+        );
+
+        let labels = controller
+            .set_node_label(
+                "node-a",
+                NodeLabelSetRequest {
+                    key: "region".into(),
+                    value: "cn-north".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(labels.labels["region"], "cn-north");
+        assert_eq!(
+            observer.load_consistent().await.unwrap().state.members["node-a"].labels,
+            labels.labels
+        );
+
+        let labels = controller
+            .remove_node_label("node-a", NodeLabelRemoveRequest { key: "disk".into() })
+            .await
+            .unwrap();
+        assert_eq!(
+            labels.labels,
+            BTreeMap::from([("region".into(), "cn-north".into())])
+        );
+        assert!(matches!(
+            controller
+                .set_node_label(
+                    "node-a",
+                    NodeLabelSetRequest {
+                        key: " bad".into(),
+                        value: "value".into(),
+                    },
+                )
+                .await,
+            Err(ControllerError::Invalid(_))
+        ));
     }
 
     #[tokio::test]

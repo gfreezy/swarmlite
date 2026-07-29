@@ -12,7 +12,7 @@ use crate::model::{
     ObservedTaskState, PortBinding, ServiceRecord, StackRecord, TaskRecord,
 };
 
-const PERSISTED_SCHEMA_VERSION: u32 = 4;
+const PERSISTED_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Error)]
 pub enum StorageError {

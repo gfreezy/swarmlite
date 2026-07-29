@@ -34,6 +34,8 @@ serve                run this node's assigned components
 config get|set       read or update cluster-wide settings
 role get|set|add|remove
                      read or update one node's role set
+node label get|set|remove
+                     read or update one node's placement labels
 deploy               deploy or update a stack
 status               inspect cluster state
 ```
@@ -123,6 +125,49 @@ listed roles. Swarmlite refuses to remove the final controller or final gateway.
 controller, remove it from the old node before adding it to the new one. Removing the current
 leader first commits the new role set, removes that voter, and lets the remaining voters elect a
 new leader. To move a gateway, add the new gateway first, then remove the old one.
+
+## Node labels and placement
+
+Set initial labels while creating or joining a node:
+
+```bash
+swarmlite init --mode standalone --label region=cn-east --label disk=nvme
+swarmlite join http://10.0.0.21:8080 \
+  --token '<generated-token>' \
+  --label region=cn-east
+```
+
+After a node has joined, its labels belong to cluster state. Read or change them through the
+controller:
+
+```bash
+swarmlite node label get node-a
+swarmlite node label set node-a region cn-north
+swarmlite node label remove node-a disk
+```
+
+`serve` does not accept labels. A heartbeat cannot add or overwrite labels; it receives the
+authoritative label set from the controller and caches that set in the node's local redb state.
+Label changes are replicated by Raft.
+
+Use the labels with Swarm-style hard placement constraints:
+
+```yaml
+services:
+  api:
+    image: example/api:latest
+    deploy:
+      replicas: 2
+      placement:
+        constraints:
+          - node.labels.region == cn-north
+          - node.labels.disk == nvme
+```
+
+When a label change makes a running task violate a hard constraint, Swarmlite stops that task
+through the normal drain/remove flow and schedules its replacement on an eligible live node. If
+no node matches, the service remains under-replicated until one does; constraints are never
+silently ignored.
 
 ## HA
 
@@ -238,8 +283,8 @@ Request and response bodies are documented in [docs/kv-api.md](docs/kv-api.md).
 
 ## Persistence and extreme recovery
 
-Raft persists cluster settings, member roles, stacks, service specifications, desired task
-assignments, ports, drain deadlines, controller identities, KV state, and Raft metadata.
+Raft persists cluster settings, member roles and labels, stacks, service specifications, desired
+task assignments, ports, drain deadlines, controller identities, KV state, and Raft metadata.
 Heartbeat liveness, resources, and observed container state are rebuilt from agent heartbeats.
 
 Every managed workload container carries the minimal labels needed to collect it after total
