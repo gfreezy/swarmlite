@@ -9,6 +9,116 @@ pub struct ClusterCaddyConfig {
     pub listen: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KvState {
+    pub objects: BTreeMap<String, KvObject>,
+    pub prefix_tombstones: BTreeMap<String, KvVersion>,
+    pub locks: BTreeMap<String, KvLock>,
+    pub next_fencing_token: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KvObject {
+    pub value_base64: String,
+    pub version: KvVersion,
+    pub modified_at_unix_ms: i64,
+    pub tombstone: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct KvVersion {
+    pub physical_unix_ms: i64,
+    pub logical: u64,
+    pub replica_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KvLock {
+    pub owner_id: String,
+    pub fencing_token: u64,
+    pub lease_until_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KvPutRequest {
+    pub key: String,
+    pub value_base64: String,
+    pub version: KvVersion,
+    pub modified_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KvDeleteRequest {
+    pub key: String,
+    pub version: KvVersion,
+    pub modified_at_unix_ms: i64,
+    /// Deletes the key and all keys below it when true.
+    #[serde(default)]
+    pub recursive: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KvPutResponse {
+    pub applied: bool,
+    pub version: KvVersion,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KvObjectResponse {
+    pub key: String,
+    pub value_base64: String,
+    pub version: KvVersion,
+    pub modified_at_unix_ms: i64,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KvListResponse {
+    pub keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KvStatResponse {
+    pub key: String,
+    pub modified_at_unix_ms: i64,
+    pub size: u64,
+    pub is_value: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KvLockAcquireRequest {
+    pub name: String,
+    pub owner_id: String,
+    pub lease_millis: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KvLockStatus {
+    Acquired,
+    Busy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KvLockAcquireResponse {
+    pub status: KvLockStatus,
+    pub fencing_token: Option<u64>,
+    pub lease_until_unix_ms: Option<i64>,
+    pub retry_after_millis: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KvLockMutationRequest {
+    pub name: String,
+    pub owner_id: String,
+    pub fencing_token: u64,
+    pub lease_millis: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClusterSettings {
     pub schema_version: u32,

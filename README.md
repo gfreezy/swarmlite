@@ -74,9 +74,29 @@ Raft stores only state needed to reconstruct the desired cluster:
 - cluster settings, stacks, and service specifications;
 - desired task assignments, allocated ports, and drain deadlines;
 - manager identities and pending manager reservations;
+- the optional generic KV namespace and its short-lived lock leases;
 - Raft's own log, membership, term, vote, and snapshot metadata.
 
 Heartbeat-derived state is intentionally disposable. Node liveness and resources, task observed state and container IDs, the current leader record, and request-deduplication history stay in memory. After a leader change, nodes rebuild that state through heartbeats; existing task assignments receive one node-timeout grace period before failover decisions are made.
+
+## Generic KV service
+
+The controller exposes a small authenticated KV API. It has no Caddy, certificate, or TLS
+semantics; integrations decide what their keys and values mean. Values are opaque base64 data,
+keys are slash-separated strings, and each mutation carries a client-generated hybrid-clock
+version. Conflicts use last-write-wins ordering by
+`(physical_unix_ms, logical, replica_id)`.
+
+- `GET`, `PUT`, and `DELETE /v1/kv` read, write, or tombstone a key.
+- `GET /v1/kv/keys` lists a prefix, directly or recursively.
+- `GET /v1/kv/stat` reads value or prefix metadata.
+- `POST /v1/kv/locks/{acquire,renew,release}` provides generic expiring locks with fencing tokens.
+
+All endpoints use the cluster bearer token and redirect followers to the Raft leader. A key is
+limited to 1024 bytes, a value to 4 MiB, and a lock lease to 1 second through 5 minutes. Writes
+need a Raft quorum. Consumers that use this service as an optional cache should continue locally
+when it is unavailable. Extreme control-plane recovery does not attempt to reconstruct KV data.
+Request and response bodies are documented in [docs/kv-api.md](docs/kv-api.md).
 
 ## Recover a lost control plane
 
@@ -219,6 +239,12 @@ Supported service labels under `deploy.labels`:
 - `swarmlite.ingress.scheme=http|https`, defaulting to `http`
 
 Only the leader publishes Caddy configuration. During rolling updates, old healthy tasks remain routable until replacements are healthy and every Caddy endpoint acknowledges the new routing configuration.
+
+Swarmlite's KV API can optionally reduce duplicate certificate issuance across Caddy instances.
+This is implemented by the independent [Caddy storage adapter](caddy-storage/README.md), not by
+the Rust control plane. Caddy's normal local filesystem remains authoritative: loss of quorum,
+loss of all Swarmlite state, or removing the adapter does not remove local certificates or stop
+Caddy. In those cases, different machines may request the same certificate again.
 
 ## Runtime and networking
 

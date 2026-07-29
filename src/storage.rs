@@ -6,11 +6,11 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::model::{
-    ClusterSettings, ClusterState, ControllerRecord, DesiredTaskState, ObservedTaskState,
+    ClusterSettings, ClusterState, ControllerRecord, DesiredTaskState, KvState, ObservedTaskState,
     PortBinding, ServiceRecord, StackRecord, TaskRecord,
 };
 
-const PERSISTED_SCHEMA_VERSION: u32 = 2;
+const PERSISTED_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -31,6 +31,7 @@ pub struct VersionedState {
     pub generation: u64,
     pub cluster: ClusterSettings,
     pub state: ClusterState,
+    pub kv: KvState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +40,7 @@ struct PersistedControlPlane {
     cluster_id: String,
     cluster: ClusterSettings,
     state: PersistedClusterState,
+    kv: KvState,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -147,6 +149,7 @@ impl StateRepository {
                 generation: replica.generation,
                 cluster: value.cluster,
                 state: value.state.into_runtime(),
+                kv: value.kv,
             });
         }
 
@@ -156,13 +159,18 @@ impl StateRepository {
                 generation: replica.generation,
                 cluster: cluster.clone(),
                 state,
+                kv: KvState::default(),
             });
         }
-        match self.replace(replica.generation, cluster, &state).await {
+        match self
+            .replace(replica.generation, cluster, &state, &KvState::default())
+            .await
+        {
             Ok(generation) => Ok(VersionedState {
                 generation,
                 cluster: cluster.clone(),
                 state,
+                kv: KvState::default(),
             }),
             Err(StorageError::Conflict) => self.load_local().await,
             Err(error) => Err(error),
@@ -188,6 +196,7 @@ impl StateRepository {
         expected_generation: u64,
         cluster: &ClusterSettings,
         state: &ClusterState,
+        kv: &KvState,
     ) -> StorageResult<u64> {
         if !same_cluster_identity(cluster, &self.cluster) {
             return Err(StorageError::InvalidData(
@@ -199,6 +208,7 @@ impl StateRepository {
             cluster_id: cluster.cluster_id.clone(),
             cluster: cluster.clone(),
             state: PersistedClusterState::from_runtime(state),
+            kv: kv.clone(),
         };
         let body = serde_json::to_vec(&value)
             .map_err(|error| StorageError::InvalidData(error.to_string()))?;
@@ -221,14 +231,21 @@ impl StateRepository {
     }
 
     fn versioned_state(&self, replica: ReplicatedState) -> StorageResult<VersionedState> {
-        let (cluster, state) = self.decode_replica(&replica)?.map_or_else(
-            || (self.cluster.clone(), ClusterState::default()),
-            |value| (value.cluster, value.state.into_runtime()),
+        let (cluster, state, kv) = self.decode_replica(&replica)?.map_or_else(
+            || {
+                (
+                    self.cluster.clone(),
+                    ClusterState::default(),
+                    KvState::default(),
+                )
+            },
+            |value| (value.cluster, value.state.into_runtime(), value.kv),
         );
         Ok(VersionedState {
             generation: replica.generation,
             cluster,
             state,
+            kv,
         })
     }
 
@@ -463,7 +480,7 @@ mod tests {
         );
 
         repository
-            .replace(first.generation, &cluster, &state)
+            .replace(first.generation, &cluster, &state, &KvState::default())
             .await
             .unwrap();
         let raw = raft.local_state().await;

@@ -2,6 +2,7 @@ mod agent;
 pub mod caddy;
 pub mod config;
 mod controller;
+mod kv;
 mod local_state;
 pub mod model;
 pub mod node;

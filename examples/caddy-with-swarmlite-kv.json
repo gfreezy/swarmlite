@@ -1,0 +1,19 @@
+{
+  "admin": {
+    "listen": "10.0.0.20:2019"
+  },
+  "storage": {
+    "module": "swarmlite",
+    "controllers": [
+      "http://10.0.0.21:8080"
+    ],
+    "token_env": "SWARMLITE_TOKEN",
+    "timeout": "500ms",
+    "lock_lease": "30s"
+  },
+  "apps": {
+    "http": {
+      "servers": {}
+    }
+  }
+}

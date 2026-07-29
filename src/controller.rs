@@ -9,12 +9,13 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
 use futures_util::future::join_all;
+use serde::Deserialize;
 use serde_json::json;
 use tokio::{
     net::TcpListener,
@@ -24,16 +25,22 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
 const CONTROLLER_TIMEOUT_MS: i64 = 60_000;
+const MIN_KV_LOCK_LEASE_MS: u64 = 1_000;
+const MAX_KV_LOCK_LEASE_MS: u64 = 300_000;
+const MAX_HTTP_BODY_BYTES: usize = 6 * 1024 * 1024;
 
 use crate::{
     caddy,
     config::ControllerConfig,
+    kv,
     model::{
         BootstrapResponse, CaddyStatus, ClusterConfigResponse, ClusterConfigUpdate,
         ClusterSettings, ClusterState, ControllerRecord, DesiredTaskState, HeartbeatResponse,
-        JoinRequest, JoinResponse, LeaderRecord, NodeHeartbeat, NodeRole, ObservedTaskState,
-        RecoveryStatus, ServiceRecord, StackRecord, StatusResponse, TaskAssignment, TaskRecord,
-        UnclaimedTask, service_spec_hash, valid_controller_count,
+        JoinRequest, JoinResponse, KvDeleteRequest, KvListResponse, KvLock, KvLockAcquireRequest,
+        KvLockAcquireResponse, KvLockMutationRequest, KvLockStatus, KvObjectResponse, KvPutRequest,
+        KvPutResponse, KvStatResponse, KvState, LeaderRecord, NodeHeartbeat, NodeRole,
+        ObservedTaskState, RecoveryStatus, ServiceRecord, StackRecord, StatusResponse,
+        TaskAssignment, TaskRecord, UnclaimedTask, service_spec_hash, valid_controller_count,
     },
     scheduler,
     stack::{ParsedStack, parse_stack},
@@ -68,8 +75,15 @@ where
         .route("/v1/nodes/{node_id}/join", put(join_node))
         .route("/v1/nodes/{node_id}/heartbeat", post(heartbeat))
         .route("/v1/caddy", get(caddy_config))
+        .route("/v1/kv", get(kv_object).put(put_kv).delete(delete_kv))
+        .route("/v1/kv/keys", get(list_kv))
+        .route("/v1/kv/stat", get(stat_kv))
+        .route("/v1/kv/locks/acquire", post(acquire_kv_lock))
+        .route("/v1/kv/locks/renew", post(renew_kv_lock))
+        .route("/v1/kv/locks/release", post(release_kv_lock))
         .with_state(controller.clone())
         .nest("/internal/raft", raft_router)
+        .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .layer(TraceLayer::new_for_http());
     let listener = TcpListener::bind(config.listen)
         .await
@@ -93,6 +107,7 @@ struct Inner {
     generation: u64,
     cluster: ClusterSettings,
     state: ClusterState,
+    kv: KvState,
     is_leader: bool,
     live_nodes: HashMap<String, Instant>,
 }
@@ -117,6 +132,8 @@ struct CaddySyncState {
 enum ControllerError {
     Unauthorized,
     Invalid(String),
+    NotFound(String),
+    Conflict(String),
     NotLeader(Option<String>),
     Storage(StorageError),
 }
@@ -156,6 +173,7 @@ impl Controller {
                 generation: versioned.generation,
                 cluster: versioned.cluster,
                 state: versioned.state,
+                kv: versioned.kv,
                 is_leader: false,
                 live_nodes,
             }),
@@ -232,6 +250,7 @@ impl Controller {
             inner.generation = latest.generation;
             inner.cluster = latest.cluster;
             inner.state = latest.state;
+            inner.kv = latest.kv;
         }
         Ok(())
     }
@@ -295,7 +314,7 @@ impl Controller {
         }
         match self
             .repository
-            .replace(inner.generation, &inner.cluster, &inner.state)
+            .replace(inner.generation, &inner.cluster, &inner.state, &inner.kv)
             .await
         {
             Ok(generation) => {
@@ -310,11 +329,42 @@ impl Controller {
         }
     }
 
+    async fn commit_kv_locked(&self, inner: &mut Inner) -> Result<(), StorageError> {
+        self.expire_local_lease(inner);
+        if !inner.is_leader {
+            return Err(StorageError::Conflict);
+        }
+        match self
+            .repository
+            .replace(inner.generation, &inner.cluster, &inner.state, &inner.kv)
+            .await
+        {
+            Ok(generation) => {
+                inner.generation = generation;
+                Ok(())
+            }
+            Err(error) => {
+                inner.is_leader = false;
+                Err(error)
+            }
+        }
+    }
+
     fn leader_redirect(&self, path: &str) -> ControllerError {
         let location = self
             .repository
             .leader_url()
             .map(|leader| format!("{}{}", leader.trim_end_matches('/'), path));
+        ControllerError::NotLeader(location)
+    }
+
+    fn leader_redirect_with_query(&self, path: &str, query: &[(&str, String)]) -> ControllerError {
+        let location = self.repository.leader_url().and_then(|leader| {
+            let target = format!("{}{}", leader.trim_end_matches('/'), path);
+            let mut target = reqwest::Url::parse(&target).ok()?;
+            target.query_pairs_mut().extend_pairs(query.iter().cloned());
+            Some(target.into())
+        });
         ControllerError::NotLeader(location)
     }
 
@@ -1005,6 +1055,207 @@ impl Controller {
         Err(format!("{status} {body}"))
     }
 
+    async fn put_kv(&self, request: KvPutRequest) -> Result<KvPutResponse, ControllerError> {
+        let mut inner = self.inner.lock().await;
+        self.expire_local_lease(&mut inner);
+        if !inner.is_leader {
+            return Err(self.leader_redirect("/v1/kv"));
+        }
+        let previous = inner.kv.clone();
+        let response = kv::apply_put(&mut inner.kv, request).map_err(ControllerError::Invalid)?;
+        if response.applied
+            && let Err(error) = self.commit_kv_locked(&mut inner).await
+        {
+            inner.kv = previous;
+            return Err(error.into());
+        }
+        Ok(response)
+    }
+
+    async fn delete_kv(&self, request: KvDeleteRequest) -> Result<KvPutResponse, ControllerError> {
+        let mut inner = self.inner.lock().await;
+        self.expire_local_lease(&mut inner);
+        if !inner.is_leader {
+            return Err(self.leader_redirect("/v1/kv"));
+        }
+        let previous = inner.kv.clone();
+        let response =
+            kv::apply_delete(&mut inner.kv, request).map_err(ControllerError::Invalid)?;
+        if response.applied
+            && let Err(error) = self.commit_kv_locked(&mut inner).await
+        {
+            inner.kv = previous;
+            return Err(error.into());
+        }
+        Ok(response)
+    }
+
+    async fn kv_object(&self, key: &str) -> Result<KvObjectResponse, ControllerError> {
+        let mut inner = self.inner.lock().await;
+        self.expire_local_lease(&mut inner);
+        if !inner.is_leader {
+            return Err(self.leader_redirect_with_query("/v1/kv", &[("key", key.to_owned())]));
+        }
+        kv::get(&inner.kv, key)
+            .map_err(ControllerError::Invalid)?
+            .ok_or_else(|| ControllerError::NotFound(format!("KV key {key} was not found")))
+    }
+
+    async fn list_kv(
+        &self,
+        path: &str,
+        recursive: bool,
+    ) -> Result<KvListResponse, ControllerError> {
+        let mut inner = self.inner.lock().await;
+        self.expire_local_lease(&mut inner);
+        if !inner.is_leader {
+            return Err(self.leader_redirect_with_query(
+                "/v1/kv/keys",
+                &[
+                    ("prefix", path.to_owned()),
+                    ("recursive", recursive.to_string()),
+                ],
+            ));
+        }
+        kv::list(&inner.kv, path, recursive)
+            .map_err(ControllerError::Invalid)?
+            .ok_or_else(|| ControllerError::NotFound(format!("KV path {path} was not found")))
+    }
+
+    async fn stat_kv(&self, key: &str) -> Result<KvStatResponse, ControllerError> {
+        let mut inner = self.inner.lock().await;
+        self.expire_local_lease(&mut inner);
+        if !inner.is_leader {
+            return Err(self.leader_redirect_with_query("/v1/kv/stat", &[("key", key.to_owned())]));
+        }
+        kv::stat(&inner.kv, key)
+            .map_err(ControllerError::Invalid)?
+            .ok_or_else(|| ControllerError::NotFound(format!("KV key {key} was not found")))
+    }
+
+    async fn acquire_kv_lock(
+        &self,
+        request: KvLockAcquireRequest,
+    ) -> Result<KvLockAcquireResponse, ControllerError> {
+        validate_kv_lock_identity(&request.name, &request.owner_id)?;
+        validate_kv_lock_lease(request.lease_millis)?;
+        let mut inner = self.inner.lock().await;
+        self.expire_local_lease(&mut inner);
+        if !inner.is_leader {
+            return Err(self.leader_redirect("/v1/kv/locks/acquire"));
+        }
+
+        let now = unix_ms();
+        if let Some(lock) = inner.kv.locks.get(&request.name)
+            && lock.lease_until_unix_ms > now
+            && lock.owner_id != request.owner_id
+        {
+            return Ok(KvLockAcquireResponse {
+                status: KvLockStatus::Busy,
+                fencing_token: None,
+                lease_until_unix_ms: Some(lock.lease_until_unix_ms),
+                retry_after_millis: Some(
+                    u64::try_from(lock.lease_until_unix_ms - now)
+                        .unwrap_or(1_000)
+                        .clamp(100, 1_000),
+                ),
+            });
+        }
+
+        let previous = inner.kv.clone();
+        let lease_until_unix_ms = lease_deadline(now, request.lease_millis)?;
+        let fencing_token = if let Some(lock) = inner.kv.locks.get_mut(&request.name)
+            && lock.lease_until_unix_ms > now
+            && lock.owner_id == request.owner_id
+        {
+            lock.lease_until_unix_ms = lease_until_unix_ms;
+            lock.fencing_token
+        } else {
+            inner.kv.next_fencing_token = inner
+                .kv
+                .next_fencing_token
+                .checked_add(1)
+                .ok_or_else(|| ControllerError::Invalid("KV lock token overflow".to_owned()))?;
+            let token = inner.kv.next_fencing_token;
+            inner.kv.locks.insert(
+                request.name,
+                KvLock {
+                    owner_id: request.owner_id,
+                    fencing_token: token,
+                    lease_until_unix_ms,
+                },
+            );
+            token
+        };
+        if let Err(error) = self.commit_kv_locked(&mut inner).await {
+            inner.kv = previous;
+            return Err(error.into());
+        }
+        Ok(KvLockAcquireResponse {
+            status: KvLockStatus::Acquired,
+            fencing_token: Some(fencing_token),
+            lease_until_unix_ms: Some(lease_until_unix_ms),
+            retry_after_millis: None,
+        })
+    }
+
+    async fn renew_kv_lock(&self, request: KvLockMutationRequest) -> Result<(), ControllerError> {
+        validate_kv_lock_identity(&request.name, &request.owner_id)?;
+        let lease_millis = request
+            .lease_millis
+            .ok_or_else(|| ControllerError::Invalid("lease_millis is required".to_owned()))?;
+        validate_kv_lock_lease(lease_millis)?;
+        let mut inner = self.inner.lock().await;
+        self.expire_local_lease(&mut inner);
+        if !inner.is_leader {
+            return Err(self.leader_redirect("/v1/kv/locks/renew"));
+        }
+        let now = unix_ms();
+        let previous = inner.kv.clone();
+        let lock = inner
+            .kv
+            .locks
+            .get_mut(&request.name)
+            .filter(|lock| {
+                lock.owner_id == request.owner_id
+                    && lock.fencing_token == request.fencing_token
+                    && lock.lease_until_unix_ms > now
+            })
+            .ok_or_else(|| {
+                ControllerError::Conflict("the KV lock is no longer owned".to_owned())
+            })?;
+        lock.lease_until_unix_ms = lease_deadline(now, lease_millis)?;
+        if let Err(error) = self.commit_kv_locked(&mut inner).await {
+            inner.kv = previous;
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    async fn release_kv_lock(&self, request: KvLockMutationRequest) -> Result<(), ControllerError> {
+        validate_kv_lock_identity(&request.name, &request.owner_id)?;
+        let mut inner = self.inner.lock().await;
+        self.expire_local_lease(&mut inner);
+        if !inner.is_leader {
+            return Err(self.leader_redirect("/v1/kv/locks/release"));
+        }
+        let Some(lock) = inner.kv.locks.get(&request.name) else {
+            return Ok(());
+        };
+        if lock.owner_id != request.owner_id || lock.fencing_token != request.fencing_token {
+            return Err(ControllerError::Conflict(
+                "the KV lock is owned by another writer".to_owned(),
+            ));
+        }
+        let previous = inner.kv.clone();
+        inner.kv.locks.remove(&request.name);
+        if let Err(error) = self.commit_kv_locked(&mut inner).await {
+            inner.kv = previous;
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
     fn authorized(&self, headers: &HeaderMap) -> bool {
         headers
             .get(header::AUTHORIZATION)
@@ -1104,6 +1355,98 @@ async fn caddy_config(
     controller.caddy().await.map(Json)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KvKeyQuery {
+    key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KvListQuery {
+    #[serde(default)]
+    prefix: String,
+    #[serde(default)]
+    recursive: bool,
+}
+
+async fn put_kv(
+    State(controller): State<Arc<Controller>>,
+    headers: HeaderMap,
+    Json(body): Json<KvPutRequest>,
+) -> Result<Json<KvPutResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.put_kv(body).await.map(Json)
+}
+
+async fn delete_kv(
+    State(controller): State<Arc<Controller>>,
+    headers: HeaderMap,
+    Json(body): Json<KvDeleteRequest>,
+) -> Result<Json<KvPutResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.delete_kv(body).await.map(Json)
+}
+
+async fn kv_object(
+    State(controller): State<Arc<Controller>>,
+    headers: HeaderMap,
+    Query(query): Query<KvKeyQuery>,
+) -> Result<Json<KvObjectResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.kv_object(&query.key).await.map(Json)
+}
+
+async fn list_kv(
+    State(controller): State<Arc<Controller>>,
+    headers: HeaderMap,
+    Query(query): Query<KvListQuery>,
+) -> Result<Json<KvListResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller
+        .list_kv(&query.prefix, query.recursive)
+        .await
+        .map(Json)
+}
+
+async fn stat_kv(
+    State(controller): State<Arc<Controller>>,
+    headers: HeaderMap,
+    Query(query): Query<KvKeyQuery>,
+) -> Result<Json<KvStatResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.stat_kv(&query.key).await.map(Json)
+}
+
+async fn acquire_kv_lock(
+    State(controller): State<Arc<Controller>>,
+    headers: HeaderMap,
+    Json(body): Json<KvLockAcquireRequest>,
+) -> Result<Json<KvLockAcquireResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.acquire_kv_lock(body).await.map(Json)
+}
+
+async fn renew_kv_lock(
+    State(controller): State<Arc<Controller>>,
+    headers: HeaderMap,
+    Json(body): Json<KvLockMutationRequest>,
+) -> Result<StatusCode, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.renew_kv_lock(body).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn release_kv_lock(
+    State(controller): State<Arc<Controller>>,
+    headers: HeaderMap,
+    Json(body): Json<KvLockMutationRequest>,
+) -> Result<StatusCode, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.release_kv_lock(body).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 fn require_auth(controller: &Controller, headers: &HeaderMap) -> Result<(), ControllerError> {
     if controller.authorized(headers) {
         Ok(())
@@ -1122,6 +1465,12 @@ impl IntoResponse for ControllerError {
                 .into_response(),
             Self::Invalid(message) => {
                 (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response()
+            }
+            Self::NotFound(message) => {
+                (StatusCode::NOT_FOUND, Json(json!({"error": message}))).into_response()
+            }
+            Self::Conflict(message) => {
+                (StatusCode::CONFLICT, Json(json!({"error": message}))).into_response()
             }
             Self::NotLeader(Some(location)) => {
                 let mut response = (
@@ -1149,6 +1498,36 @@ impl IntoResponse for ControllerError {
             }
         }
     }
+}
+
+fn validate_kv_lock_identity(name: &str, owner_id: &str) -> Result<(), ControllerError> {
+    if name.trim().is_empty() || name.len() > 1_024 {
+        return Err(ControllerError::Invalid(
+            "KV lock name must contain 1 to 1024 bytes".to_owned(),
+        ));
+    }
+    if owner_id.trim().is_empty() || owner_id.len() > 512 {
+        return Err(ControllerError::Invalid(
+            "KV lock owner_id must contain 1 to 512 bytes".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_kv_lock_lease(lease_millis: u64) -> Result<(), ControllerError> {
+    if !(MIN_KV_LOCK_LEASE_MS..=MAX_KV_LOCK_LEASE_MS).contains(&lease_millis) {
+        return Err(ControllerError::Invalid(format!(
+            "KV lock lease_millis must be between {MIN_KV_LOCK_LEASE_MS} and {MAX_KV_LOCK_LEASE_MS}"
+        )));
+    }
+    Ok(())
+}
+
+fn lease_deadline(now: i64, lease_millis: u64) -> Result<i64, ControllerError> {
+    let lease_millis = i64::try_from(lease_millis)
+        .map_err(|_| ControllerError::Invalid("KV lock lease is too large".to_owned()))?;
+    now.checked_add(lease_millis)
+        .ok_or_else(|| ControllerError::Invalid("KV lock lease overflow".to_owned()))
 }
 
 fn current_live_nodes(inner: &Inner, timeout_seconds: u64) -> BTreeSet<String> {
@@ -1328,14 +1707,15 @@ mod tests {
     use std::time::Duration;
 
     use axum::routing::post;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use swarmlite_raft::{ManagerNode, NodeConfig, RaftNode};
 
     use crate::{
         caddy::{ENABLE_LABEL, HOST_LABEL, PORT_LABEL},
         config::CaddyConfig,
         model::{
-            ClusterCaddyConfig, NodeRecord, PortBinding, ServicePort, ServiceSpec, TaskRecord,
-            TaskReport,
+            ClusterCaddyConfig, KvVersion, NodeRecord, PortBinding, ServicePort, ServiceSpec,
+            TaskRecord, TaskReport,
         },
     };
 
@@ -1351,6 +1731,112 @@ mod tests {
             caddy: CaddyConfig::default(),
             cluster: cluster.clone(),
         }
+    }
+
+    #[tokio::test]
+    async fn kv_is_lww_and_locks_are_fenced() {
+        let cluster = ClusterSettings {
+            schema_version: 2,
+            cluster_id: "kv-test".into(),
+            controllers: 1,
+            controller_port: 8080,
+            caddy: ClusterCaddyConfig::default(),
+        };
+        let (repository, _raft, _directory) = test_repository(&cluster).await;
+        let controller = Controller::new(
+            test_controller_config(&cluster),
+            "secret".into(),
+            repository.clone(),
+        )
+        .await
+        .unwrap();
+        controller.tick().await.unwrap();
+
+        let new_version = KvVersion {
+            physical_unix_ms: 20,
+            logical: 0,
+            replica_id: "writer-a".into(),
+        };
+        assert!(
+            controller
+                .put_kv(KvPutRequest {
+                    key: "apps/demo/config".into(),
+                    value_base64: STANDARD.encode("new"),
+                    version: new_version.clone(),
+                    modified_at_unix_ms: 20,
+                })
+                .await
+                .unwrap()
+                .applied
+        );
+        assert!(
+            !controller
+                .put_kv(KvPutRequest {
+                    key: "apps/demo/config".into(),
+                    value_base64: STANDARD.encode("old"),
+                    version: KvVersion {
+                        physical_unix_ms: 10,
+                        logical: 0,
+                        replica_id: "writer-b".into(),
+                    },
+                    modified_at_unix_ms: 10,
+                })
+                .await
+                .unwrap()
+                .applied
+        );
+        assert_eq!(
+            controller
+                .kv_object("apps/demo/config")
+                .await
+                .unwrap()
+                .value_base64,
+            STANDARD.encode("new")
+        );
+        assert_eq!(
+            repository.load_consistent().await.unwrap().kv.objects["apps/demo/config"].version,
+            new_version
+        );
+
+        let acquired = controller
+            .acquire_kv_lock(KvLockAcquireRequest {
+                name: "jobs/demo".into(),
+                owner_id: "writer-a".into(),
+                lease_millis: 30_000,
+            })
+            .await
+            .unwrap();
+        assert_eq!(acquired.status, KvLockStatus::Acquired);
+        let token = acquired.fencing_token.unwrap();
+        let busy = controller
+            .acquire_kv_lock(KvLockAcquireRequest {
+                name: "jobs/demo".into(),
+                owner_id: "writer-b".into(),
+                lease_millis: 30_000,
+            })
+            .await
+            .unwrap();
+        assert_eq!(busy.status, KvLockStatus::Busy);
+        assert!(
+            controller
+                .release_kv_lock(KvLockMutationRequest {
+                    name: "jobs/demo".into(),
+                    owner_id: "writer-b".into(),
+                    fencing_token: token,
+                    lease_millis: None,
+                })
+                .await
+                .is_err()
+        );
+        controller
+            .release_kv_lock(KvLockMutationRequest {
+                name: "jobs/demo".into(),
+                owner_id: "writer-a".into(),
+                fencing_token: token,
+                lease_millis: None,
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
