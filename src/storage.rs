@@ -100,6 +100,10 @@ impl StateRepository {
         self.raft.voter_ids()
     }
 
+    pub fn controller_set(&self) -> (u64, std::collections::BTreeSet<NodeId>) {
+        self.raft.controller_set()
+    }
+
     pub fn is_voter(&self, node_id: NodeId) -> bool {
         self.raft.voter_ids().contains(&node_id)
     }
@@ -440,6 +444,7 @@ mod tests {
                 controller_url: String::new(),
                 raft_id: 1,
                 raft_url: String::new(),
+                controller_set_generation: 0,
             },
         );
         state.services.insert(

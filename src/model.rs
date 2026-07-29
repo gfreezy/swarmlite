@@ -289,6 +289,9 @@ pub struct NodeRecord {
     pub controller_url: String,
     pub raft_id: u64,
     pub raft_url: String,
+    /// Raft membership generation of the Controller URL set applied by this node.
+    #[serde(default)]
+    pub controller_set_generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -387,6 +390,8 @@ pub struct TaskReport {
 pub struct HeartbeatResponse {
     pub leader_term: u64,
     pub generation: u64,
+    #[serde(default)]
+    pub controller_set_generation: u64,
     pub cluster: ClusterSettings,
     pub assignments: Vec<TaskAssignment>,
     pub roles: NodeRoles,
@@ -405,6 +410,8 @@ pub struct NodeControl {
 pub struct BootstrapResponse {
     pub cluster: ClusterSettings,
     pub controllers: Vec<String>,
+    #[serde(default)]
+    pub controller_set_generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -424,6 +431,8 @@ pub struct JoinResponse {
     pub cluster: ClusterSettings,
     pub roles: NodeRoles,
     pub controllers: Vec<String>,
+    #[serde(default)]
+    pub controller_set_generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -458,6 +467,8 @@ pub struct TaskAssignment {
 pub struct StatusResponse {
     pub cluster_id: String,
     pub generation: u64,
+    #[serde(default)]
+    pub controller_set_generation: u64,
     pub leader: Option<LeaderRecord>,
     pub is_leader: bool,
     pub gateway: GatewayStatus,

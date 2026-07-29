@@ -118,6 +118,7 @@ struct Inner {
     kv: KvState,
     is_leader: bool,
     live_nodes: HashMap<String, Instant>,
+    controller_ack_candidates: HashMap<String, Instant>,
 }
 
 pub struct Controller {
@@ -191,6 +192,7 @@ impl Controller {
                 kv: versioned.kv,
                 is_leader: false,
                 live_nodes,
+                controller_ack_candidates: HashMap::new(),
             }),
             gateway_client,
             gateway_notify: Notify::new(),
@@ -280,8 +282,14 @@ impl Controller {
         info!(term, "acquired controller leadership");
         inner.is_leader = true;
         inner.live_nodes.clear();
+        inner.controller_ack_candidates.clear();
         inner.state.nodes.clear();
         let takeover_time = Instant::now();
+        for node_id in inner.state.members.keys() {
+            inner
+                .controller_ack_candidates
+                .insert(node_id.clone(), takeover_time);
+        }
         for node_id in inner.state.tasks.values().map(|task| task.node_id.clone()) {
             inner.live_nodes.insert(node_id, takeover_time);
         }
@@ -511,10 +519,11 @@ impl Controller {
     async fn bootstrap(&self) -> Result<BootstrapResponse, ControllerError> {
         let inner = self.inner.lock().await;
         let cluster = self.cluster_settings(&inner)?;
-        let voters = self.repository.voter_ids();
+        let (controller_set_generation, voters) = self.repository.controller_set();
         Ok(BootstrapResponse {
             cluster,
             controllers: controller_urls(&inner.state, Some(&self.config.advertise_url), &voters),
+            controller_set_generation,
         })
     }
 
@@ -603,14 +612,15 @@ impl Controller {
             inner.state = previous;
             return Err(error.into());
         }
+        inner
+            .controller_ack_candidates
+            .insert(node_id.to_owned(), Instant::now());
+        let (controller_set_generation, voters) = self.repository.controller_set();
         Ok(JoinResponse {
             cluster,
             roles,
-            controllers: controller_urls(
-                &inner.state,
-                Some(&self.config.advertise_url),
-                &self.repository.voter_ids(),
-            ),
+            controllers: controller_urls(&inner.state, Some(&self.config.advertise_url), &voters),
+            controller_set_generation,
         })
     }
 
@@ -700,7 +710,7 @@ impl Controller {
             }
         }
 
-        let previous = inner.state.clone();
+        let (controller_set_generation, voters) = self.repository.controller_set();
         let removed_voter = (current.contains(&NodeRole::Controller)
             && !roles.contains(&NodeRole::Controller))
         .then(|| {
@@ -711,7 +721,28 @@ impl Controller {
                 .map(|record| record.raft_id)
         })
         .flatten()
-        .filter(|raft_id| self.repository.is_voter(*raft_id));
+        .filter(|raft_id| voters.contains(raft_id));
+        if removed_voter.is_some() {
+            if voters.len() <= 1 {
+                return Err(ControllerError::Conflict(
+                    "cannot remove the last active controller voter; wait for another controller to be promoted"
+                        .to_owned(),
+                ));
+            }
+            let pending = pending_controller_set_acknowledgements(
+                &inner,
+                self.config.node_timeout_seconds,
+                controller_set_generation,
+            );
+            if !pending.is_empty() {
+                return Err(ControllerError::Conflict(format!(
+                    "cannot remove controller until active agents apply controller set generation {controller_set_generation}; waiting for {}",
+                    pending.into_iter().collect::<Vec<_>>().join(", ")
+                )));
+            }
+        }
+
+        let previous = inner.state.clone();
         let member = inner
             .state
             .members
@@ -1016,17 +1047,15 @@ impl Controller {
             .filter(|task| task.node_id == node_id && task.desired == DesiredTaskState::Stopped)
             .map(|task| task.id.clone())
             .collect();
+        let (controller_set_generation, voters) = self.repository.controller_set();
         Ok(HeartbeatResponse {
             leader_term: term,
             generation,
+            controller_set_generation,
             cluster: inner.cluster.clone(),
             assignments,
             roles: desired_roles,
-            controllers: controller_urls(
-                &inner.state,
-                Some(&self.config.advertise_url),
-                &self.repository.voter_ids(),
-            ),
+            controllers: controller_urls(&inner.state, Some(&self.config.advertise_url), &voters),
             remove_tasks,
         })
     }
@@ -1035,6 +1064,7 @@ impl Controller {
         let mut inner = self.inner.lock().await;
         self.expire_local_lease(&mut inner);
         let generation = inner.generation;
+        let (controller_set_generation, _) = self.repository.controller_set();
         let leader = self.repository.raft().leader().map(|(raft_id, node)| {
             let id = inner
                 .state
@@ -1056,6 +1086,7 @@ impl Controller {
         StatusResponse {
             cluster_id: self.config.cluster.cluster_id.clone(),
             generation,
+            controller_set_generation,
             leader,
             is_leader,
             gateway: GatewayStatus {
@@ -1461,6 +1492,7 @@ async fn health(State(controller): State<Arc<Controller>>) -> Json<serde_json::V
         "is_leader": status.is_leader,
         "leader": status.leader,
         "generation": status.generation,
+        "controller_set_generation": status.controller_set_generation,
     }))
 }
 
@@ -1774,6 +1806,33 @@ fn current_live_nodes(inner: &Inner, timeout_seconds: u64) -> BTreeSet<String> {
         .iter()
         .filter(|(_, seen)| now.duration_since(**seen) <= timeout)
         .map(|(id, _)| id.clone())
+        .collect()
+}
+
+fn pending_controller_set_acknowledgements(
+    inner: &Inner,
+    timeout_seconds: u64,
+    controller_set_generation: u64,
+) -> BTreeSet<String> {
+    let now = Instant::now();
+    let timeout = Duration::from_secs(timeout_seconds);
+    let mut candidates = current_live_nodes(inner, timeout_seconds);
+    candidates.extend(
+        inner
+            .controller_ack_candidates
+            .iter()
+            .filter(|(_, seen)| now.duration_since(**seen) <= timeout)
+            .map(|(id, _)| id.clone()),
+    );
+    candidates
+        .into_iter()
+        .filter(|node_id| {
+            inner
+                .state
+                .nodes
+                .get(node_id)
+                .is_none_or(|node| node.controller_set_generation < controller_set_generation)
+        })
         .collect()
 }
 
@@ -2258,6 +2317,20 @@ mod tests {
             joined.roles,
             BTreeSet::from([NodeRole::Agent, NodeRole::Gateway])
         );
+        let error = controller
+            .update_node_roles(
+                "controller-a",
+                NodeRolesUpdate {
+                    roles: BTreeSet::from([NodeRole::Controller]),
+                },
+                RoleOperation::Remove,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ControllerError::Conflict(message) if message.contains("last active controller voter")
+        ));
         controller
             .update_node_roles(
                 "controller-a",
@@ -2484,23 +2557,26 @@ mod tests {
             .unwrap();
         assert!(joined.roles.contains(&NodeRole::Controller));
 
+        let joined_controller_set_generation = joined.controller_set_generation;
+        let mut heartbeat_node = NodeRecord {
+            id: "controller-b".into(),
+            address: address.ip().to_string(),
+            labels: BTreeMap::new(),
+            cpu_millis: 1000,
+            memory_bytes: 1024,
+            port_range_start: 20_000,
+            port_range_end: 29_999,
+            roles: joined.roles,
+            controller_url: api_url.clone(),
+            raft_id: 2,
+            raft_url,
+            controller_set_generation: joined_controller_set_generation,
+        };
         let response = controller
             .heartbeat(
                 "controller-b",
                 NodeHeartbeat {
-                    node: NodeRecord {
-                        id: "controller-b".into(),
-                        address: address.ip().to_string(),
-                        labels: BTreeMap::new(),
-                        cpu_millis: 1000,
-                        memory_bytes: 1024,
-                        port_range_start: 20_000,
-                        port_range_end: 29_999,
-                        roles: joined.roles,
-                        controller_url: api_url.clone(),
-                        raft_id: 2,
-                        raft_url,
-                    },
+                    node: heartbeat_node.clone(),
                     tasks: Vec::new(),
                 },
             )
@@ -2509,7 +2585,19 @@ mod tests {
 
         assert!(response.roles.contains(&NodeRole::Controller));
         assert!(response.controllers.contains(&api_url));
+        assert!(response.controller_set_generation > joined_controller_set_generation);
         assert!(leader_raft.voter_ids().contains(&2));
+        heartbeat_node.controller_set_generation = response.controller_set_generation;
+        controller
+            .heartbeat(
+                "controller-b",
+                NodeHeartbeat {
+                    node: heartbeat_node,
+                    tasks: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
         assert!(
             controller
                 .inner
@@ -2519,6 +2607,69 @@ mod tests {
                 .controllers
                 .contains_key("controller-b")
         );
+        assert_eq!(
+            controller.inner.lock().await.state.nodes["controller-b"].controller_set_generation,
+            response.controller_set_generation
+        );
+
+        let current_controller_set_generation = response.controller_set_generation;
+        let mut agent_request = test_join_request("node-c", "127.0.0.2", 3);
+        agent_request.requested_roles = Some(agent_roles());
+        let joined_agent = controller.join_node("node-c", agent_request).await.unwrap();
+        let mut agent_node = test_node();
+        agent_node.id = "node-c".into();
+        agent_node.address = "127.0.0.2".into();
+        agent_node.roles = joined_agent.roles;
+        agent_node.raft_id = 3;
+        agent_node.controller_set_generation = current_controller_set_generation - 1;
+        let agent_response = controller
+            .heartbeat(
+                "node-c",
+                NodeHeartbeat {
+                    node: agent_node.clone(),
+                    tasks: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let error = controller
+            .update_node_roles(
+                "controller-b",
+                NodeRolesUpdate {
+                    roles: BTreeSet::from([NodeRole::Controller]),
+                },
+                RoleOperation::Remove,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ControllerError::Conflict(message)
+                if message.contains("generation") && message.contains("node-c")
+        ));
+
+        agent_node.controller_set_generation = agent_response.controller_set_generation;
+        controller
+            .heartbeat(
+                "node-c",
+                NodeHeartbeat {
+                    node: agent_node,
+                    tasks: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        controller
+            .update_node_roles(
+                "controller-b",
+                NodeRolesUpdate {
+                    roles: BTreeSet::from([NodeRole::Controller]),
+                },
+                RoleOperation::Remove,
+            )
+            .await
+            .unwrap();
+        assert!(!leader_raft.voter_ids().contains(&2));
 
         leader_raft.shutdown().await.unwrap();
         follower_raft.shutdown().await.unwrap();
@@ -2656,6 +2807,7 @@ mod tests {
             controller_url: "http://127.0.0.1:8080".into(),
             raft_id: 2,
             raft_url: "http://127.0.0.1:8080/internal/raft".into(),
+            controller_set_generation: 0,
         }
     }
 

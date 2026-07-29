@@ -255,12 +255,22 @@ impl RaftNode {
     }
 
     pub fn voter_ids(&self) -> BTreeSet<NodeId> {
-        self.raft
-            .metrics()
-            .borrow()
+        self.controller_set().1
+    }
+
+    /// Returns a stable generation and voter snapshot from one Raft metrics read.
+    ///
+    /// The generation is the log index of the effective membership configuration,
+    /// so it advances only after a membership change has been committed.
+    pub fn controller_set(&self) -> (u64, BTreeSet<NodeId>) {
+        let metrics = self.raft.metrics();
+        let metrics = metrics.borrow();
+        let generation = metrics
             .membership_config
-            .voter_ids()
-            .collect()
+            .log_id()
+            .map_or(0, |log_id| log_id.index);
+        let voters = metrics.membership_config.voter_ids().collect();
+        (generation, voters)
     }
 
     pub fn member_ids(&self) -> BTreeSet<NodeId> {

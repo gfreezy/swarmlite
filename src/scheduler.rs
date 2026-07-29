@@ -392,6 +392,7 @@ mod tests {
                     controller_url: String::new(),
                     raft_id: 1,
                     raft_url: String::new(),
+                    controller_set_generation: 0,
                 },
             );
         }

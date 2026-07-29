@@ -152,7 +152,13 @@ swarmlite config get
 ```
 
 Cluster configuration and node roles are replicated through Raft. Controller addresses are sent
-in heartbeats and persisted locally, so agents do not need a hand-written controller list.
+in heartbeats and persisted locally, so agents do not need a hand-written controller list. Every
+advertised Controller set carries a `controller_set_generation` derived from the committed Raft
+membership log. Agents persist that generation with the addresses and report the applied generation
+in their next heartbeat; `swarmlite status` exposes both the current generation and each live node's
+reported generation. Removing a Controller voter returns `409 Conflict` until every active Agent has
+reported the current generation. Agents beyond the node heartbeat timeout do not block removal; if
+they only know the removed Controller, they must be given a reachable join address when they return.
 
 ## Gateway and HTTPS
 

@@ -5,7 +5,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     config::AgentConfig,
-    local_state::{AgentFence, FENCE_KEY, LocalState},
+    local_state::{AgentControllerSet, AgentFence, CONTROLLER_SET_KEY, FENCE_KEY, LocalState},
     model::{
         HeartbeatResponse, NodeControl, NodeHeartbeat, NodeRecord, ObservedTaskState, TaskReport,
     },
@@ -32,6 +32,20 @@ async fn run_with_runtime<R: ContainerRuntime>(
 ) -> Result<()> {
     runtime.ping().await?;
     let system = runtime.system_info().await?;
+    let mut fence = local_state
+        .get::<AgentFence>(FENCE_KEY)?
+        .unwrap_or_default();
+    let configured_controller_set = AgentControllerSet {
+        generation: config.controller_set_generation,
+        controllers: config.controllers.clone(),
+    };
+    let controller_set = local_state
+        .get::<AgentControllerSet>(CONTROLLER_SET_KEY)?
+        .filter(|persisted| {
+            !persisted.controllers.is_empty()
+                && persisted.generation > configured_controller_set.generation
+        })
+        .unwrap_or(configured_controller_set);
     let mut node = NodeRecord {
         id: config.node_id.clone(),
         address: config.advertise_address.clone(),
@@ -44,14 +58,12 @@ async fn run_with_runtime<R: ContainerRuntime>(
         controller_url: config.controller_url.clone(),
         raft_id: config.raft_id,
         raft_url: config.raft_url.clone(),
+        controller_set_generation: controller_set.generation,
     };
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
-    let mut fence = local_state
-        .get::<AgentFence>(FENCE_KEY)?
-        .unwrap_or_default();
-    let mut controllers = config.controllers.clone();
+    let mut controllers = controller_set.controllers;
     let (assignments_tx, assignments_rx) = tokio::sync::watch::channel(None);
     let runtime = Arc::new(runtime);
     let reconcile_runtime = Arc::clone(&runtime);
@@ -124,12 +136,32 @@ async fn run_with_runtime<R: ContainerRuntime>(
         }
         fence.term = response.leader_term;
         fence.generation = response.generation;
-        if let Err(error) = local_state.put(FENCE_KEY, &fence) {
+        let next_controller_set = (response.controller_set_generation
+            >= node.controller_set_generation
+            && !response.controllers.is_empty())
+        .then(|| AgentControllerSet {
+            generation: response.controller_set_generation,
+            controllers: response.controllers.clone(),
+        });
+        let persist_result = match &next_controller_set {
+            Some(controller_set) => {
+                local_state.put_pair((FENCE_KEY, &fence), (CONTROLLER_SET_KEY, controller_set))
+            }
+            None => local_state.put(FENCE_KEY, &fence),
+        };
+        if let Err(error) = persist_result {
             error!(%error, "failed to persist fencing state; refusing to change containers");
             continue;
         }
-        if !response.controllers.is_empty() {
-            controllers.clone_from(&response.controllers);
+        if let Some(controller_set) = next_controller_set {
+            controllers = controller_set.controllers;
+            node.controller_set_generation = controller_set.generation;
+        } else if response.controller_set_generation < node.controller_set_generation {
+            warn!(
+                received_controller_set_generation = response.controller_set_generation,
+                applied_controller_set_generation = node.controller_set_generation,
+                "rejected stale controller set"
+            );
         }
         let next_control = NodeControl {
             cluster: response.cluster.clone(),
@@ -362,6 +394,7 @@ mod tests {
         let mut response = HeartbeatResponse {
             leader_term: 1,
             generation: 1,
+            controller_set_generation: 1,
             cluster: test_cluster(),
             assignments: Vec::new(),
             roles: agent_roles(),
@@ -391,6 +424,7 @@ mod tests {
         let response = HeartbeatResponse {
             leader_term: 1,
             generation: 1,
+            controller_set_generation: 1,
             cluster: test_cluster(),
             assignments: vec![crate::model::TaskAssignment {
                 id: "task-1".into(),

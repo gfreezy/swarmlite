@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 pub(crate) const LOCAL_STATE_FILE: &str = "local.redb";
 pub(crate) const NODE_KEY: &str = "node";
 pub(crate) const FENCE_KEY: &str = "agent_fence";
+pub(crate) const CONTROLLER_SET_KEY: &str = "controller_set";
 
 const STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("local_state");
 const OPEN_RETRIES: usize = 100;
@@ -23,6 +24,12 @@ static LOCAL_DATABASE_ACCESS: OnceLock<Mutex<()>> = OnceLock::new();
 pub(crate) struct AgentFence {
     pub term: u64,
     pub generation: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct AgentControllerSet {
+    pub generation: u64,
+    pub controllers: Vec<String>,
 }
 
 /// A cheap path handle. Every operation opens redb for one short transaction and closes it
@@ -98,6 +105,22 @@ impl LocalState {
         self.put_encoded([
             (first.0, first_value.as_slice()),
             (second.0, second_value.as_slice()),
+        ])
+    }
+
+    pub(crate) fn put_triple<A: Serialize, B: Serialize, C: Serialize>(
+        &self,
+        first: (&str, &A),
+        second: (&str, &B),
+        third: (&str, &C),
+    ) -> Result<()> {
+        let first_value = serde_json::to_vec(first.1)?;
+        let second_value = serde_json::to_vec(second.1)?;
+        let third_value = serde_json::to_vec(third.1)?;
+        self.put_encoded([
+            (first.0, first_value.as_slice()),
+            (second.0, second_value.as_slice()),
+            (third.0, third_value.as_slice()),
         ])
     }
 
@@ -181,14 +204,21 @@ mod tests {
     fn stores_node_values_and_fence_in_one_database() {
         let directory = tempfile::tempdir().unwrap();
         let state = LocalState::open(directory.path()).unwrap();
-        state.put(NODE_KEY, &"node-a").unwrap();
+        let controller_set = AgentControllerSet {
+            generation: 11,
+            controllers: vec!["http://10.0.0.2:8080".into()],
+        };
         state
-            .put(
-                FENCE_KEY,
-                &AgentFence {
-                    term: 3,
-                    generation: 7,
-                },
+            .put_triple(
+                (NODE_KEY, &"node-a"),
+                (
+                    FENCE_KEY,
+                    &AgentFence {
+                        term: 3,
+                        generation: 7,
+                    },
+                ),
+                (CONTROLLER_SET_KEY, &controller_set),
             )
             .unwrap();
 
@@ -205,6 +235,13 @@ mod tests {
                 term: 3,
                 generation: 7
             }
+        );
+        assert_eq!(
+            second_handle
+                .get::<AgentControllerSet>(CONTROLLER_SET_KEY)
+                .unwrap()
+                .unwrap(),
+            controller_set
         );
     }
 }

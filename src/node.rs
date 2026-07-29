@@ -20,7 +20,10 @@ use crate::{
         AgentConfig, ControllerConfig, GatewayConfig, PortRangeConfig, RuntimeConfig, RuntimeKind,
     },
     controller,
-    local_state::{AgentFence, FENCE_KEY, LOCAL_STATE_FILE, LocalState, NODE_KEY},
+    local_state::{
+        AgentControllerSet, AgentFence, CONTROLLER_SET_KEY, FENCE_KEY, LOCAL_STATE_FILE,
+        LocalState, NODE_KEY,
+    },
     model::{
         BootstrapResponse, CLUSTER_SCHEMA_VERSION, ClusterGatewayConfig, ClusterMode,
         ClusterSettings, JoinRequest, JoinResponse, NodeControl, NodeRole, NodeRoles,
@@ -191,7 +194,11 @@ pub async fn init(mut options: InitOptions) -> Result<String> {
         runtime: requested_runtime(options.runtime, options.runtime_socket.as_deref()),
         labels: options.labels,
     };
-    local_state.put_pair((NODE_KEY, &settings), (FENCE_KEY, &AgentFence::default()))?;
+    local_state.put_triple(
+        (NODE_KEY, &settings),
+        (FENCE_KEY, &AgentFence::default()),
+        (CONTROLLER_SET_KEY, &AgentControllerSet::default()),
+    )?;
     Ok(format!(
         "initialized {}{} cluster {} as {} with roles {}; run `swarmlite serve` (join token: {token})",
         if options.recovery { "recovered " } else { "" },
@@ -209,6 +216,19 @@ pub async fn run(options: ServeOptions) -> Result<()> {
     let mut settings = load_node_settings_from(&local_state)?;
 
     let mut changed = false;
+    let controller_set = local_state
+        .get::<AgentControllerSet>(CONTROLLER_SET_KEY)?
+        .filter(|controller_set| !controller_set.controllers.is_empty())
+        .unwrap_or_else(|| AgentControllerSet {
+            generation: 0,
+            controllers: settings.controller_urls.clone(),
+        });
+    if settings.controller_urls != controller_set.controllers {
+        settings
+            .controller_urls
+            .clone_from(&controller_set.controllers);
+        changed = true;
+    }
     if let Some(address) = &options.advertise_address {
         resolve_advertise_address(Some(address))?;
         settings.advertise_address = Some(address.clone());
@@ -256,6 +276,7 @@ pub async fn run(options: ServeOptions) -> Result<()> {
         node_id: settings.node_id.clone(),
         advertise_address: advertise_address.clone(),
         controllers: agent_controllers.clone(),
+        controller_set_generation: controller_set.generation,
         runtime: Some(runtime),
         labels: settings.labels.clone(),
         heartbeat_interval_seconds: 2,
@@ -618,14 +639,18 @@ pub async fn join(options: JoinOptions) -> Result<String> {
     if response.cluster != bootstrap.cluster {
         bail!("cluster settings changed during join; retry the command");
     }
-    let mut controllers = response.controllers;
-    if controllers.is_empty() {
-        controllers = bootstrap.controllers;
-    }
-    if controllers.is_empty() {
-        controllers.push(seed.clone());
-    }
+    let (mut controllers, controller_set_generation) = if !response.controllers.is_empty() {
+        (response.controllers, response.controller_set_generation)
+    } else if !bootstrap.controllers.is_empty() {
+        (bootstrap.controllers, bootstrap.controller_set_generation)
+    } else {
+        (vec![seed.clone()], 0)
+    };
     normalize_controller_list(&mut controllers);
+    let controller_set = AgentControllerSet {
+        generation: controller_set_generation,
+        controllers: controllers.clone(),
+    };
     let mut labels = preserve_identity
         .map(|settings| settings.labels.clone())
         .unwrap_or_default();
@@ -644,9 +669,13 @@ pub async fn join(options: JoinOptions) -> Result<String> {
         labels,
     };
     if recovery_rebind || existing.is_none() {
-        local_state.put_pair((NODE_KEY, &settings), (FENCE_KEY, &AgentFence::default()))?;
+        local_state.put_triple(
+            (NODE_KEY, &settings),
+            (FENCE_KEY, &AgentFence::default()),
+            (CONTROLLER_SET_KEY, &controller_set),
+        )?;
     } else {
-        local_state.put(NODE_KEY, &settings)?;
+        local_state.put_pair((NODE_KEY, &settings), (CONTROLLER_SET_KEY, &controller_set))?;
     }
     Ok(format!(
         "{} cluster {} as {node_id} with roles {}; run `swarmlite serve`",
@@ -1679,6 +1708,13 @@ mod tests {
             LocalClusterSettings::from_cluster(&cluster)
         );
         assert_eq!(settings.roles, crate::model::agent_roles());
+        let controller_set = LocalState::open(directory.path())
+            .unwrap()
+            .get::<AgentControllerSet>(CONTROLLER_SET_KEY)
+            .unwrap()
+            .unwrap();
+        assert_eq!(controller_set.generation, 1);
+        assert_eq!(controller_set.controllers, settings.controller_urls);
         assert!(directory.path().join(LOCAL_STATE_FILE).exists());
         assert_no_json_state(directory.path());
         server.abort();
@@ -1800,6 +1836,7 @@ mod tests {
         Json(BootstrapResponse {
             cluster: state.cluster,
             controllers: vec![state.controller],
+            controller_set_generation: 1,
         })
     }
 
@@ -1811,6 +1848,7 @@ mod tests {
             cluster: state.cluster,
             roles: crate::model::agent_roles(),
             controllers: vec![state.controller],
+            controller_set_generation: 1,
         })
     }
 }

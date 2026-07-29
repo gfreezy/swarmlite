@@ -49,6 +49,7 @@ pub struct AgentConfig {
     pub node_id: String,
     pub advertise_address: String,
     pub controllers: Vec<String>,
+    pub controller_set_generation: u64,
     pub runtime: Option<RuntimeConfig>,
     pub labels: BTreeMap<String, String>,
     pub heartbeat_interval_seconds: u64,
