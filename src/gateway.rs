@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 
+use serde_json::{Value, json};
+
 use crate::model::{ClusterState, DesiredTaskState, ObservedTaskState, ServiceRecord};
 
 pub use swarmlite_stack::{HttpServer, StorageConfig, routed_service_ports, storage};
@@ -32,6 +34,25 @@ pub fn generate(state: &ClusterState, listen: &[String]) -> HttpServer {
                 .collect()
         },
     )
+}
+
+pub fn config(state: &ClusterState, listen: &[String], controller: String) -> Value {
+    let server = generate(state, listen);
+    let storage = storage(controller);
+    json!({
+        "admin": {
+            "listen": "0.0.0.0:2019",
+            "config": { "persist": true }
+        },
+        "storage": storage,
+        "apps": {
+            "http": {
+                "servers": {
+                    "swarmlite": server
+                }
+            }
+        }
+    })
 }
 
 pub fn service_ports(state: &ClusterState, service: &ServiceRecord) -> BTreeSet<u16> {

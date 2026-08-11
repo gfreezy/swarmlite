@@ -279,8 +279,7 @@ pub struct GatewayReport {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GatewayAssignment {
     pub generation: u64,
-    pub server: serde_json::Value,
-    pub storage: serde_json::Value,
+    pub config: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -12,15 +12,12 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::error;
 
-use crate::{
-    gateway,
-    model::{
-        BootstrapResponse, ClusterConfigResponse, ClusterConfigUpdate, HeartbeatResponse,
-        JoinRequest, JoinResponse, KvDeleteRequest, KvListResponse, KvLockAcquireRequest,
-        KvLockAcquireResponse, KvLockMutationRequest, KvObjectResponse, KvPutRequest,
-        KvStatResponse, NodeGatewayResponse, NodeGatewayUpdate, NodeHeartbeat,
-        NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, StatusResponse,
-    },
+use crate::model::{
+    BootstrapResponse, ClusterConfigResponse, ClusterConfigUpdate, HeartbeatResponse, JoinRequest,
+    JoinResponse, KvDeleteRequest, KvListResponse, KvLockAcquireRequest, KvLockAcquireResponse,
+    KvLockMutationRequest, KvObjectResponse, KvPutRequest, KvStatResponse, NodeGatewayResponse,
+    NodeGatewayUpdate, NodeHeartbeat, NodeLabelRemoveRequest, NodeLabelSetRequest,
+    NodeLabelsResponse, StatusResponse,
 };
 use swarmlite_stack::parse_stack;
 
@@ -38,7 +35,6 @@ pub(super) fn router(controller: Arc<Controller>) -> Router {
         .route("/v1/stacks/{name}", put(apply_stack))
         .route("/v1/nodes/{node_id}/join", put(join_node))
         .route("/v1/nodes/{node_id}/heartbeat", post(heartbeat))
-        .route("/v1/gateway", get(gateway_config))
         .route(
             "/v1/nodes/{node_id}/gateway",
             get(get_node_gateway).put(update_node_gateway),
@@ -187,14 +183,6 @@ async fn heartbeat(
 ) -> Result<Json<HeartbeatResponse>, ControllerError> {
     require_auth(&controller, &headers)?;
     controller.heartbeat(&node_id, body).await.map(Json)
-}
-
-async fn gateway_config(
-    State(controller): State<Arc<Controller>>,
-    headers: HeaderMap,
-) -> Result<Json<gateway::HttpServer>, ControllerError> {
-    require_auth(&controller, &headers)?;
-    controller.gateway().await.map(Json)
 }
 
 #[derive(Debug, Deserialize)]

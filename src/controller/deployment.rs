@@ -1,5 +1,19 @@
 use super::*;
 
+pub(super) struct StackDeployment<'a> {
+    active: &'a std::sync::Mutex<BTreeSet<String>>,
+    stack_name: String,
+}
+
+impl Drop for StackDeployment<'_> {
+    fn drop(&mut self) {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.stack_name);
+    }
+}
+
 impl Controller {
     pub(super) async fn apply(
         &self,
@@ -7,24 +21,22 @@ impl Controller {
         parsed: ParsedStack,
     ) -> Result<u64, ControllerError> {
         validate_stack_name(stack_name)?;
+        let _deployment = self.begin_stack_deployment(stack_name)?;
         let ParsedStack {
             services,
             gateway: stack_gateway,
         } = parsed;
-        let has_gateway = {
-            let inner = self.inner.lock().await;
-            inner
-                .state
-                .members
-                .values()
-                .any(|member| member.gateway_enabled)
-        };
+        let mut inner = self.inner.lock().await;
+        let has_gateway = inner
+            .state
+            .members
+            .values()
+            .any(|member| member.gateway_enabled);
         if !has_gateway && !stack_gateway.http_routes.is_empty() {
             return Err(ControllerError::Invalid(
                 "gateway routing is enabled but no node has its gateway enabled".to_owned(),
             ));
         }
-        let mut inner = self.inner.lock().await;
         validate_gateway_hostname_ownership(&inner.state, stack_name, &stack_gateway)?;
         let previous = inner.state.clone();
         let previous_gateway = inner
@@ -89,5 +101,24 @@ impl Controller {
             return Err(error.into());
         }
         Ok(inner.generation)
+    }
+
+    pub(super) fn begin_stack_deployment(
+        &self,
+        stack_name: &str,
+    ) -> Result<StackDeployment<'_>, ControllerError> {
+        let mut active = self
+            .deploying_stacks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !active.insert(stack_name.to_owned()) {
+            return Err(ControllerError::Conflict(format!(
+                "stack {stack_name:?} already has a deployment in progress"
+            )));
+        }
+        Ok(StackDeployment {
+            active: &self.deploying_stacks,
+            stack_name: stack_name.to_owned(),
+        })
     }
 }

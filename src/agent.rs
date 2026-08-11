@@ -20,9 +20,8 @@ pub(crate) async fn run_with_token_and_updates(
     updates: tokio::sync::watch::Sender<NodeControl>,
     gateway_report: tokio::sync::watch::Receiver<GatewayReport>,
     local_state: LocalState,
+    runtime: DockerCompatibleRuntime,
 ) -> Result<()> {
-    let runtime_config = config.resolved_runtime()?;
-    let runtime = DockerCompatibleRuntime::connect(&runtime_config)?;
     run_with_runtime(config, token, updates, gateway_report, local_state, runtime).await
 }
 

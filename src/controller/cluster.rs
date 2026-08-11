@@ -7,7 +7,7 @@ impl Controller {
         let inner = self.inner.lock().await;
         Ok(ClusterConfigResponse {
             generation: inner.generation,
-            config: self.cluster_settings(&inner),
+            config: inner.cluster.clone(),
         })
     }
 
@@ -32,7 +32,7 @@ impl Controller {
             ));
         }
 
-        let mut cluster = self.cluster_settings(&inner);
+        let mut cluster = inner.cluster.clone();
         let previous_cluster = inner.cluster.clone();
         let mut changed = false;
 

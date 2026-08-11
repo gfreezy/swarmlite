@@ -4,7 +4,7 @@ impl Controller {
     pub(super) async fn bootstrap(&self) -> Result<BootstrapResponse, ControllerError> {
         let inner = self.inner.lock().await;
         Ok(BootstrapResponse {
-            cluster: self.cluster_settings(&inner),
+            cluster: inner.cluster.clone(),
         })
     }
 
@@ -34,7 +34,7 @@ impl Controller {
         }
 
         let mut inner = self.inner.lock().await;
-        let cluster = self.cluster_settings(&inner);
+        let cluster = inner.cluster.clone();
         let previous = inner.state.clone();
         let mut changed = false;
         let gateway_enabled = if let Some(existing) = inner.state.members.get(node_id).cloned() {

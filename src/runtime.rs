@@ -21,7 +21,8 @@ use tracing::{info, warn};
 
 use crate::{
     config::{ResolvedRuntimeConfig, RuntimeKind},
-    model::{GatewayAssignment, ObservedTaskState, PortBinding, TaskAssignment},
+    gateway,
+    model::{ClusterState, GatewayAssignment, ObservedTaskState, PortBinding, TaskAssignment},
 };
 
 #[cfg(test)]
@@ -40,7 +41,6 @@ const GATEWAY_TOKEN_HASH_LABEL: &str = "io.swarmlite.gateway_token_sha256";
 const GATEWAY_SCHEMA: &str = "4";
 const GATEWAY_CONTAINER_NAME: &str = "swarmlite-gateway";
 const GATEWAY_ADMIN_URL: &str = "http://127.0.0.1:2019";
-const GATEWAY_SERVER_NAME: &str = "swarmlite";
 const TASK_LABEL: &str = "io.swarmlite.task_id";
 const SERVICE_LABEL: &str = "io.swarmlite.service_id";
 const STACK_LABEL: &str = "io.swarmlite.stack";
@@ -273,14 +273,8 @@ impl DockerCompatibleRuntime {
 
     pub(crate) async fn apply_gateway_config(&self, assignment: &GatewayAssignment) -> Result<()> {
         let client = reqwest::Client::new();
-        self.post_gateway_config(&client, "/config/storage", &assignment.storage)
+        self.post_gateway_config(&client, "/load", &assignment.config)
             .await?;
-        self.post_gateway_config(
-            &client,
-            &format!("/config/apps/http/servers/{GATEWAY_SERVER_NAME}"),
-            &assignment.server,
-        )
-        .await?;
         info!(
             generation = assignment.generation,
             runtime = %self.kind,
@@ -537,29 +531,11 @@ fn gateway_ports(listen: &[String]) -> Result<BTreeSet<u16>> {
 }
 
 fn gateway_bootstrap(spec: &GatewayContainerSpec) -> Result<String> {
-    Ok(serde_json::to_string(&serde_json::json!({
-        "admin": {
-            "listen": "0.0.0.0:2019",
-            "config": { "persist": true }
-        },
-        "storage": {
-            "module": "swarmlite",
-            "controller": &spec.controller,
-            "token_env": "SWARMLITE_TOKEN",
-            "timeout": "500ms",
-            "lock_lease": "30s"
-        },
-        "apps": {
-            "http": {
-                "servers": {
-                    "swarmlite": {
-                        "listen": &spec.listen,
-                        "routes": []
-                    }
-                }
-            }
-        }
-    }))?)
+    Ok(serde_json::to_string(&gateway::config(
+        &ClusterState::default(),
+        &spec.listen,
+        spec.controller.clone(),
+    ))?)
 }
 
 fn is_gateway_system_container(labels: &HashMap<String, String>) -> bool {

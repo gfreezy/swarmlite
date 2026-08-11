@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::ClusterSettings;
 
+pub const DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS: u64 = 10;
+
 #[derive(Debug, Clone)]
 pub struct ControllerConfig {
     pub gateway_enabled: bool,
@@ -14,21 +16,8 @@ pub struct ControllerConfig {
     pub advertise_url: String,
     pub node_timeout_seconds: u64,
     pub reconcile_interval_seconds: u64,
-    pub gateway: GatewayConfig,
+    pub gateway_drain_timeout_seconds: u64,
     pub cluster: ClusterSettings,
-}
-
-#[derive(Debug, Clone)]
-pub struct GatewayConfig {
-    pub drain_timeout_seconds: u64,
-}
-
-impl Default for GatewayConfig {
-    fn default() -> Self {
-        Self {
-            drain_timeout_seconds: default_gateway_drain_timeout(),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -37,20 +26,10 @@ pub struct AgentConfig {
     pub node_id: String,
     pub advertise_address: String,
     pub controller: String,
-    pub runtime: Option<RuntimeConfig>,
     pub labels: BTreeMap<String, String>,
     pub heartbeat_interval_seconds: u64,
     pub port_range: PortRangeConfig,
     pub gateway_enabled: bool,
-}
-
-impl AgentConfig {
-    pub fn resolved_runtime(&self) -> Result<ResolvedRuntimeConfig> {
-        match &self.runtime {
-            Some(runtime) => runtime.resolve(),
-            None => resolve_runtime(RuntimeKind::Docker, None),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -125,9 +104,6 @@ impl Default for PortRangeConfig {
     }
 }
 
-const fn default_gateway_drain_timeout() -> u64 {
-    10
-}
 const fn default_port_start() -> u16 {
     20_000
 }

@@ -66,18 +66,26 @@ impl Controller {
                 .await?;
         }
 
+        let gateway_config = gateway::config(
+            &versioned.state,
+            &versioned.cluster.gateway.listen,
+            config.advertise_url.clone(),
+        );
+
         info!(%controller_id, "single controller started");
         Ok(Self {
             config,
             token,
             repository,
             kv_repository,
+            deploying_stacks: std::sync::Mutex::new(BTreeSet::new()),
             inner: Mutex::new(Inner {
                 generation: versioned.generation,
                 cluster: versioned.cluster,
                 state: versioned.state,
                 live_nodes,
                 gateway_generation: versioned.generation,
+                gateway_config,
                 gateway_reports: HashMap::new(),
             }),
         })
@@ -109,16 +117,14 @@ impl Controller {
     }
 
     pub(super) async fn commit_locked(&self, inner: &mut Inner) -> Result<(), StorageError> {
-        let gateway_generation = inner
-            .gateway_generation
-            .checked_add(1)
-            .ok_or_else(|| StorageError::Backend("gateway generation overflow".to_owned()))?;
+        let (gateway_generation, gateway_config) = self.next_gateway_snapshot(inner)?;
         let generation = self
             .repository
             .replace(inner.generation, &inner.cluster, &inner.state)
             .await?;
         inner.generation = generation;
         inner.gateway_generation = gateway_generation;
+        inner.gateway_config = gateway_config;
         Ok(())
     }
 
@@ -132,9 +138,5 @@ impl Controller {
             .await?;
         inner.generation = generation;
         Ok(())
-    }
-
-    pub(super) fn cluster_settings(&self, inner: &Inner) -> ClusterSettings {
-        inner.cluster.clone()
     }
 }

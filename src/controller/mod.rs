@@ -86,6 +86,7 @@ struct Inner {
     state: ClusterState,
     live_nodes: HashMap<String, Instant>,
     gateway_generation: u64,
+    gateway_config: serde_json::Value,
     gateway_reports: HashMap<String, GatewayReport>,
 }
 
@@ -94,6 +95,7 @@ pub struct Controller {
     token: String,
     repository: StateRepository,
     kv_repository: kv::KvRepository,
+    deploying_stacks: std::sync::Mutex<BTreeSet<String>>,
     inner: Mutex<Inner>,
 }
 

@@ -37,8 +37,8 @@ existing container, and keep the existing `/data` and `/config` volumes.
 
 Swarmlite generates the storage block automatically, injects the cluster token through
 `SWARMLITE_TOKEN`, and sends the cluster's fixed controller URL to the node through heartbeat
-configuration. The node applies it through Caddy's loopback-only admin API. The token is not
-written into Caddy's JSON configuration or container labels.
+configuration. The node atomically loads the complete configuration through Caddy's loopback-only
+admin API. The token is not written into Caddy's JSON configuration or container labels.
 
 For a manually configured Caddy instance, export a valid cluster token and run the example:
 

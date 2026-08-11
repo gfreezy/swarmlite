@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use swarmlite_stack::{ParsedStack, parse_stack};
 
 use crate::{
-    config::GatewayConfig,
+    config::DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS,
     model::{
         CLUSTER_SCHEMA_VERSION, ClusterGatewayConfig, KvLockStatus, NodeRecord, PortBinding,
         ServicePort, ServiceSpec, StackGatewaySpec, TaskRecord, TaskReport,
@@ -30,7 +30,7 @@ fn test_controller_config(cluster: &ClusterSettings) -> ControllerConfig {
         advertise_url: "http://10.0.0.10:8080".into(),
         node_timeout_seconds: 20,
         reconcile_interval_seconds: 1,
-        gateway: GatewayConfig::default(),
+        gateway_drain_timeout_seconds: DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS,
         cluster: cluster.clone(),
     }
 }
@@ -47,6 +47,22 @@ async fn test_controller(id: &str) -> (Controller, StateRepository, tempfile::Te
     .await
     .unwrap();
     (controller, repository, directory)
+}
+
+#[tokio::test]
+async fn allows_only_one_inflight_deployment_per_stack() {
+    let (controller, _, _directory) = test_controller("deployment-lock-test").await;
+    let first = controller.begin_stack_deployment("demo").unwrap();
+    assert!(matches!(
+        controller.begin_stack_deployment("demo"),
+        Err(ControllerError::Conflict(message))
+            if message == "stack \"demo\" already has a deployment in progress"
+    ));
+
+    let other = controller.begin_stack_deployment("other").unwrap();
+    drop(other);
+    drop(first);
+    assert!(controller.begin_stack_deployment("demo").is_ok());
 }
 
 fn test_join_request(node_id: &str, address: &str) -> JoinRequest {
@@ -260,7 +276,7 @@ async fn caddy_acknowledgement_starts_drain_deadline() {
     let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
     let mut config = test_controller_config(&cluster);
     config.gateway_enabled = false;
-    config.gateway.drain_timeout_seconds = 3;
+    config.gateway_drain_timeout_seconds = 3;
     let controller = Controller::new(config, "test-token".into(), repository)
         .await
         .unwrap();
@@ -306,9 +322,16 @@ async fn caddy_acknowledgement_starts_drain_deadline() {
         .unwrap()
         .gateway_config
         .unwrap();
-    assert_eq!(desired.storage["controller"], "http://10.0.0.10:8080");
-    assert!(desired.storage.get("controllers").is_none());
-    assert_eq!(desired.server["listen"][0], ":18089");
+    assert_eq!(
+        desired.config["storage"]["controller"],
+        "http://10.0.0.10:8080"
+    );
+    assert!(desired.config["storage"].get("controllers").is_none());
+    assert_eq!(
+        desired.config["apps"]["http"]["servers"]["swarmlite"]["listen"][0],
+        ":18089"
+    );
+    assert_eq!(desired.config["admin"]["listen"], "0.0.0.0:2019");
 
     controller
         .heartbeat(
@@ -331,6 +354,28 @@ async fn caddy_acknowledgement_starts_drain_deadline() {
         inner.gateway_reports["node-a"].applied_generation,
         Some(desired.generation)
     );
+}
+
+#[tokio::test]
+async fn gateway_generation_tracks_rendered_config_only() {
+    let (controller, _, _directory) = test_controller("gateway-generation-test").await;
+    let mut inner = controller.inner.lock().await;
+    let initial_generation = inner.gateway_generation;
+
+    inner.state.nodes.insert("node-a".into(), test_node());
+    controller.refresh_gateway_snapshot(&mut inner).unwrap();
+    assert_eq!(inner.gateway_generation, initial_generation);
+
+    inner.cluster.gateway.listen = vec![":18090".into()];
+    controller.refresh_gateway_snapshot(&mut inner).unwrap();
+    assert_eq!(inner.gateway_generation, initial_generation + 1);
+    assert_eq!(
+        inner.gateway_config["apps"]["http"]["servers"]["swarmlite"]["listen"][0],
+        ":18090"
+    );
+
+    controller.refresh_gateway_snapshot(&mut inner).unwrap();
+    assert_eq!(inner.gateway_generation, initial_generation + 1);
 }
 
 fn test_service() -> ServiceRecord {

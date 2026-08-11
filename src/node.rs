@@ -16,7 +16,8 @@ use crate::{
     agent,
     client::ControllerClient,
     config::{
-        AgentConfig, ControllerConfig, GatewayConfig, PortRangeConfig, RuntimeConfig, RuntimeKind,
+        AgentConfig, ControllerConfig, DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS, PortRangeConfig,
+        RuntimeConfig, RuntimeKind,
     },
     controller,
     local_state::{AgentFence, DATABASE_FILE, FENCE_KEY, LocalState, NODE_KEY},
@@ -31,6 +32,7 @@ use crate::{
 };
 
 const NODE_LOCK_FILE: &str = "serve.lock";
+const NODE_SETTINGS_SCHEMA_VERSION: u32 = 8;
 const LEGACY_LOCAL_STATE_FILE: &str = "local.sqlite";
 const LEGACY_CONTROL_PLANE_FILE: &str = "control-plane.sqlite";
 
@@ -84,6 +86,20 @@ struct NodeSettings {
 enum NodeEvent {
     Agent(Result<()>),
     Controller(Result<()>),
+}
+
+struct NodeSupervisor {
+    data_dir: PathBuf,
+    local_state: LocalState,
+    settings: NodeSettings,
+    public_controller: String,
+    control_rx: watch::Receiver<NodeControl>,
+    events_tx: mpsc::UnboundedSender<NodeEvent>,
+    events_rx: mpsc::UnboundedReceiver<NodeEvent>,
+    agent_handle: tokio::task::JoinHandle<()>,
+    runtime: DockerCompatibleRuntime,
+    gateway_report_tx: watch::Sender<GatewayReport>,
+    advertise_address: String,
 }
 
 pub fn resolve_data_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
@@ -147,7 +163,7 @@ pub async fn init(mut options: InitOptions) -> Result<String> {
         bail!("the cluster token must contain at least 16 bytes");
     }
     let settings = NodeSettings {
-        schema_version: 8,
+        schema_version: NODE_SETTINGS_SCHEMA_VERSION,
         gateway_enabled: options.gateway_enabled,
         cluster: options.cluster.clone(),
         node_id,
@@ -194,13 +210,13 @@ pub async fn run(options: ServeOptions) -> Result<()> {
     let advertise_address = resolve_advertise_address(settings.advertise_address.as_deref())?;
     let public_controller = controller_url(&advertise_address, settings.cluster.controller_port);
     let local_controller = format!("http://127.0.0.1:{}", settings.cluster.controller_port);
-    let runtime = resolve_runtime(
+    let runtime_config = resolve_runtime(
         options.runtime,
         options.runtime_socket.as_deref(),
         settings.runtime.as_ref(),
     );
-    let gateway_runtime = DockerCompatibleRuntime::connect(&runtime.resolve()?)?;
-    gateway_runtime
+    let runtime = DockerCompatibleRuntime::connect(&runtime_config.resolve()?)?;
+    runtime
         .reconcile_gateway(
             &gateway_container_spec(&settings, &advertise_address, &public_controller)?,
             settings.gateway_enabled,
@@ -220,7 +236,6 @@ pub async fn run(options: ServeOptions) -> Result<()> {
         node_id: settings.node_id.clone(),
         advertise_address: advertise_address.clone(),
         controller: agent_controller,
-        runtime: Some(runtime),
         labels: settings.labels.clone(),
         heartbeat_interval_seconds: 2,
         port_range: PortRangeConfig::default(),
@@ -238,6 +253,7 @@ pub async fn run(options: ServeOptions) -> Result<()> {
     let token = settings.token.clone();
     let agent_events = events_tx.clone();
     let agent_local_state = local_state.clone();
+    let agent_runtime = runtime.clone();
     let agent_handle = tokio::spawn(async move {
         let result = agent::run_with_token_and_updates(
             agent_config,
@@ -245,6 +261,7 @@ pub async fn run(options: ServeOptions) -> Result<()> {
             control_tx,
             gateway_report_rx,
             agent_local_state,
+            agent_runtime,
         )
         .await;
         let _ = agent_events.send(NodeEvent::Agent(result));
@@ -257,8 +274,8 @@ pub async fn run(options: ServeOptions) -> Result<()> {
         address = %advertise_address,
         "starting node service"
     );
-    supervise(
-        &options.data_dir,
+    NodeSupervisor {
+        data_dir: options.data_dir,
         local_state,
         settings,
         public_controller,
@@ -266,123 +283,127 @@ pub async fn run(options: ServeOptions) -> Result<()> {
         events_tx,
         events_rx,
         agent_handle,
-        gateway_runtime,
+        runtime,
         gateway_report_tx,
         advertise_address,
-    )
+    }
+    .run()
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn supervise(
-    data_dir: &Path,
-    local_state: LocalState,
-    mut settings: NodeSettings,
-    public_controller: String,
-    mut control_rx: watch::Receiver<NodeControl>,
-    events_tx: mpsc::UnboundedSender<NodeEvent>,
-    mut events_rx: mpsc::UnboundedReceiver<NodeEvent>,
-    agent_handle: tokio::task::JoinHandle<()>,
-    gateway_runtime: DockerCompatibleRuntime,
-    gateway_report_tx: watch::Sender<GatewayReport>,
-    advertise_address: String,
-) -> Result<()> {
-    let has_controller = is_controller(&settings);
-    let mut controller_shutdown = None;
-    if has_controller {
-        controller_shutdown = Some(
-            start_controller(data_dir, &settings, &public_controller, events_tx.clone()).await?,
-        );
-    }
-    if settings.gateway_enabled {
-        info!("gateway enabled; independent Caddy container is running");
-    }
+impl NodeSupervisor {
+    async fn run(self) -> Result<()> {
+        let Self {
+            data_dir,
+            local_state,
+            mut settings,
+            public_controller,
+            mut control_rx,
+            events_tx,
+            mut events_rx,
+            agent_handle,
+            runtime,
+            gateway_report_tx,
+            advertise_address,
+        } = self;
+        let has_controller = is_controller(&settings);
+        let mut controller_shutdown = None;
+        if has_controller {
+            controller_shutdown = Some(
+                start_controller(&data_dir, &settings, &public_controller, events_tx.clone())
+                    .await?,
+            );
+        }
+        if settings.gateway_enabled {
+            info!("gateway enabled; independent Caddy container is running");
+        }
 
-    loop {
-        tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                if let Err(error) = signal {
-                    warn!(%error, "failed to listen for shutdown signal");
+        loop {
+            tokio::select! {
+                signal = tokio::signal::ctrl_c() => {
+                    if let Err(error) = signal {
+                        warn!(%error, "failed to listen for shutdown signal");
+                    }
+                    if let Some(shutdown) = controller_shutdown.take() {
+                        let _ = shutdown.send(());
+                    }
+                    agent_handle.abort();
+                    return Ok(());
                 }
-                if let Some(shutdown) = controller_shutdown.take() {
-                    let _ = shutdown.send(());
-                }
-                agent_handle.abort();
-                return Ok(());
-            }
-            changed = control_rx.changed() => {
-                if changed.is_err() {
-                    bail!("node agent stopped publishing control updates");
-                }
-                let control = control_rx.borrow_and_update().clone();
-                let had_gateway = settings.gateway_enabled;
-                if control.cluster.controller_id != settings.cluster.controller_id {
-                    bail!("controller identity changes are not supported; replace the cluster to move the controller");
-                }
-                settings.gateway_enabled = control.gateway_enabled;
-                settings.labels = control.labels;
-                settings.cluster = control.cluster;
-                local_state.put(NODE_KEY, &settings)?;
-                let has_gateway = settings.gateway_enabled;
-                if has_gateway {
-                    gateway_runtime
-                        .reconcile_gateway(
-                            &gateway_container_spec(
-                                &settings,
-                                &advertise_address,
-                                &public_controller,
-                            )?,
-                            true,
-                        )
-                        .await?;
-                    if let Some(assignment) = &control.gateway_config {
-                        let report = match gateway_runtime.apply_gateway_config(assignment).await {
-                            Ok(()) => GatewayReport {
-                                applied_generation: Some(assignment.generation),
-                                error: None,
-                            },
-                            Err(error) => {
-                                let error = format!("{error:#}");
-                                warn!(%error, "failed to apply local gateway configuration");
-                                GatewayReport {
-                                    applied_generation: None,
-                                    error: Some(error),
+                changed = control_rx.changed() => {
+                    if changed.is_err() {
+                        bail!("node agent stopped publishing control updates");
+                    }
+                    let control = control_rx.borrow_and_update().clone();
+                    let had_gateway = settings.gateway_enabled;
+                    if control.cluster.controller_id != settings.cluster.controller_id {
+                        bail!("controller identity changes are not supported; replace the cluster to move the controller");
+                    }
+                    settings.gateway_enabled = control.gateway_enabled;
+                    settings.labels = control.labels;
+                    settings.cluster = control.cluster;
+                    local_state.put(NODE_KEY, &settings)?;
+                    let has_gateway = settings.gateway_enabled;
+                    if has_gateway {
+                        runtime
+                            .reconcile_gateway(
+                                &gateway_container_spec(
+                                    &settings,
+                                    &advertise_address,
+                                    &public_controller,
+                                )?,
+                                true,
+                            )
+                            .await?;
+                        if let Some(assignment) = &control.gateway_config {
+                            let report = match runtime.apply_gateway_config(assignment).await {
+                                Ok(()) => GatewayReport {
+                                    applied_generation: Some(assignment.generation),
+                                    error: None,
+                                },
+                                Err(error) => {
+                                    let error = format!("{error:#}");
+                                    warn!(%error, "failed to apply local gateway configuration");
+                                    GatewayReport {
+                                        applied_generation: None,
+                                        error: Some(error),
+                                    }
                                 }
-                            }
-                        };
-                        gateway_report_tx.send_replace(report);
-                    }
-                    if !had_gateway {
-                        info!("gateway enabled; started independent Caddy container");
-                    }
-                } else if had_gateway && !has_gateway {
-                    gateway_runtime
-                        .reconcile_gateway(
-                            &gateway_container_spec(
-                                &settings,
-                                &advertise_address,
-                                &public_controller,
-                            )?,
-                            false,
-                        )
-                        .await?;
-                    info!("gateway disabled; removed independent Caddy container");
-                    gateway_report_tx.send_replace(GatewayReport::default());
-                }
-            }
-            event = events_rx.recv() => {
-                match event.context("node task event channel closed")? {
-                    NodeEvent::Agent(result) => {
-                        if let Some(shutdown) = controller_shutdown.take() {
-                            let _ = shutdown.send(());
+                            };
+                            gateway_report_tx.send_replace(report);
                         }
-                        agent_handle.abort();
-                        return result.context("node agent stopped");
+                        if !had_gateway {
+                            info!("gateway enabled; started independent Caddy container");
+                        }
+                    } else if had_gateway && !has_gateway {
+                        runtime
+                            .reconcile_gateway(
+                                &gateway_container_spec(
+                                    &settings,
+                                    &advertise_address,
+                                    &public_controller,
+                                )?,
+                                false,
+                            )
+                            .await?;
+                        info!("gateway disabled; removed independent Caddy container");
+                        gateway_report_tx.send_replace(GatewayReport::default());
                     }
-                    NodeEvent::Controller(result) => {
-                        drop(controller_shutdown.take());
-                        result.context("controller stopped")?;
-                        bail!("controller stopped unexpectedly");
+                }
+                event = events_rx.recv() => {
+                    match event.context("node task event channel closed")? {
+                        NodeEvent::Agent(result) => {
+                            if let Some(shutdown) = controller_shutdown.take() {
+                                let _ = shutdown.send(());
+                            }
+                            agent_handle.abort();
+                            return result.context("node agent stopped");
+                        }
+                        NodeEvent::Controller(result) => {
+                            drop(controller_shutdown.take());
+                            result.context("controller stopped")?;
+                            bail!("controller stopped unexpectedly");
+                        }
                     }
                 }
             }
@@ -419,7 +440,6 @@ async fn start_controller(
     let cluster = settings.cluster.clone();
     let repository =
         StateRepository::open(data_dir, cluster.clone()).map_err(anyhow::Error::msg)?;
-    let gateway = GatewayConfig::default();
     let config = ControllerConfig {
         gateway_enabled: settings.gateway_enabled,
         labels: settings.labels.clone(),
@@ -430,7 +450,7 @@ async fn start_controller(
         advertise_url: public_controller.to_owned(),
         node_timeout_seconds: 20,
         reconcile_interval_seconds: 1,
-        gateway,
+        gateway_drain_timeout_seconds: DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS,
         cluster,
     };
     let token = settings.token.clone();
@@ -519,7 +539,7 @@ pub async fn join(options: JoinOptions) -> Result<String> {
         bail!("cluster settings changed during join; retry the command");
     }
     let settings = NodeSettings {
-        schema_version: 8,
+        schema_version: NODE_SETTINGS_SCHEMA_VERSION,
         gateway_enabled: response.gateway_enabled,
         cluster: response.cluster,
         node_id: node_id.clone(),
@@ -939,7 +959,7 @@ fn control_plane_data_is_present(data_dir: &Path) -> Result<bool> {
 }
 
 fn validate_node_settings(settings: &NodeSettings) -> Result<()> {
-    if settings.schema_version != 8
+    if settings.schema_version != NODE_SETTINGS_SCHEMA_VERSION
         || settings.node_id.trim().is_empty()
         || settings.token.len() < 16
     {

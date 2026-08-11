@@ -130,11 +130,8 @@ impl KvRepository {
         path: &str,
         recursive: bool,
     ) -> StorageResult<Option<KvListResponse>> {
-        let keys = self.keys()?;
-        if !keys
-            .iter()
-            .any(|key| key == path || is_component_descendant(key, path))
-        {
+        let keys = self.keys_at(path)?;
+        if keys.is_empty() {
             return Ok(None);
         }
         let mut result = BTreeSet::new();
@@ -375,13 +372,32 @@ impl KvRepository {
         transaction.commit().map_err(backend)
     }
 
-    fn keys(&self) -> StorageResult<Vec<String>> {
+    fn keys_at(&self, path: &str) -> StorageResult<Vec<String>> {
         let connection = self.database.connect().map_err(backend)?;
+        if path.is_empty() {
+            let mut statement = connection
+                .prepare("SELECT key FROM kv_objects ORDER BY key")
+                .map_err(backend)?;
+            return statement
+                .query_map([], |row| row.get(0))
+                .map_err(backend)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(backend);
+        }
+
+        // With SQLite's default BINARY collation, every component descendant
+        // falls between `path/` and `path0` because '/' immediately precedes '0'.
+        let lower = format!("{path}/");
+        let upper = format!("{path}0");
         let mut statement = connection
-            .prepare("SELECT key FROM kv_objects ORDER BY key")
+            .prepare(
+                "SELECT key FROM kv_objects
+                 WHERE key = ?1 OR (key >= ?2 AND key < ?3)
+                 ORDER BY key",
+            )
             .map_err(backend)?;
         statement
-            .query_map([], |row| row.get(0))
+            .query_map(params![path, lower, upper], |row| row.get(0))
             .map_err(backend)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(backend)
@@ -480,6 +496,7 @@ mod tests {
         let (repository, _directory) = repository();
         repository.put("apps/a/config", b"a", 10).unwrap();
         repository.put("apps/b", b"b", 11).unwrap();
+        repository.put("appstore/unrelated", b"c", 12).unwrap();
         assert_eq!(
             repository.list("apps", false).unwrap().unwrap().keys,
             ["apps/a", "apps/b"]

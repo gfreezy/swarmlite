@@ -148,6 +148,10 @@ swarmlite deploy --name demo --file examples/stack.yaml
 swarmlite status
 ```
 
+The controller accepts only one in-progress deployment for a given Stack name. A concurrent
+deployment of the same Stack returns `409 Conflict`; deployments using different Stack names may
+be submitted independently.
+
 ## Join nodes and configure gateways
 
 Print a join command on an initialized node:
@@ -338,9 +342,10 @@ local certificate data and local lock. Existing HTTPS traffic continues; gateway
 duplicate certificates until coordination returns.
 
 The gateway admin API listens inside the container on `0.0.0.0:2019`, but host port 2019 is
-published only on `127.0.0.1`. The local Swarmlite node applies routing configuration received in
-its heartbeat response and reports the applied generation to the controller. Gateway traffic ports
-are published on all host interfaces.
+published only on `127.0.0.1`. The local Swarmlite node atomically loads the complete Caddy
+configuration received in its heartbeat response and reports the applied generation to the
+controller. The generation changes only when the rendered Caddy configuration changes. Gateway
+traffic ports are published on all host interfaces.
 
 Disabling the Gateway intentionally stops the container and deletes both its container and
 persistent volumes. Enabling it again therefore starts with empty Caddy data. Container

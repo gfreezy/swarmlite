@@ -19,7 +19,6 @@ impl Controller {
         let mut inner = self.inner.lock().await;
         let previous = inner.state.clone();
         let mut changed = false;
-        let mut soft_changed = false;
         let (gateway_enabled, desired_labels) = {
             let member = inner.state.members.get_mut(node_id).ok_or_else(|| {
                 ControllerError::Invalid("node must join before sending heartbeats".to_owned())
@@ -39,9 +38,6 @@ impl Controller {
         } else {
             inner.gateway_reports.remove(node_id);
         }
-        soft_changed |= inner.state.nodes.get(node_id).is_none_or(|existing| {
-            serde_json::to_value(existing).ok() != serde_json::to_value(&node).ok()
-        });
         inner.live_nodes.insert(node_id.to_owned(), Instant::now());
         inner.state.nodes.insert(node_id.to_owned(), node);
 
@@ -50,15 +46,13 @@ impl Controller {
             .map(|report| (report.id.clone(), report))
             .collect();
         let reported_ids = reports.keys().cloned().collect::<BTreeSet<_>>();
-        let before_unclaimed = inner.state.unclaimed_tasks.len();
         inner
             .state
             .unclaimed_tasks
             .retain(|task_id, task| task.node_id != node_id || reported_ids.contains(task_id));
-        soft_changed |= inner.state.unclaimed_tasks.len() != before_unclaimed;
         for report in reports.values() {
             if inner.state.tasks.contains_key(&report.id) {
-                soft_changed |= inner.state.unclaimed_tasks.remove(&report.id).is_some();
+                inner.state.unclaimed_tasks.remove(&report.id);
                 continue;
             }
             let unclaimed = report
@@ -86,7 +80,6 @@ impl Controller {
                     .state
                     .unclaimed_tasks
                     .insert(report.id.clone(), unclaimed);
-                soft_changed = true;
             }
         }
         let assigned_ids: Vec<String> = inner
@@ -105,7 +98,6 @@ impl Controller {
                     {
                         task.observed = report.observed.clone();
                         task.container_id = report.container_id.clone();
-                        soft_changed = true;
                     }
                 }
                 None if task.desired == DesiredTaskState::Stopped => {
@@ -119,7 +111,6 @@ impl Controller {
                 ) =>
                 {
                     task.observed = ObservedTaskState::Failed;
-                    soft_changed = true;
                 }
                 None => {}
             }
@@ -135,11 +126,8 @@ impl Controller {
             inner.state = previous;
             return Err(error.into());
         }
-        if soft_changed && !changed {
-            inner.gateway_generation =
-                inner.gateway_generation.checked_add(1).ok_or_else(|| {
-                    ControllerError::Invalid("gateway generation overflow".to_owned())
-                })?;
+        if !changed {
+            self.refresh_gateway_snapshot(&mut inner)?;
         }
         self.acknowledge_gateway_drains(&mut inner).await?;
 
@@ -179,7 +167,7 @@ impl Controller {
             .filter(|task| task.node_id == node_id && task.desired == DesiredTaskState::Stopped)
             .map(|task| task.id.clone())
             .collect();
-        let gateway_config = self.gateway_assignment(&inner, gateway_enabled)?;
+        let gateway_config = self.gateway_assignment(&inner, gateway_enabled);
         Ok(HeartbeatResponse {
             generation,
             cluster: inner.cluster.clone(),

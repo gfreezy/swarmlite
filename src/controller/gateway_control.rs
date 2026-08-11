@@ -1,31 +1,46 @@
 use super::*;
 
 impl Controller {
-    pub(super) async fn gateway(&self) -> Result<gateway::HttpServer, ControllerError> {
-        let inner = self.inner.lock().await;
-        Ok(gateway::generate(
-            &inner.state,
-            &inner.cluster.gateway.listen,
-        ))
-    }
-
     pub(super) fn gateway_assignment(
         &self,
         inner: &Inner,
         enabled: bool,
-    ) -> Result<Option<GatewayAssignment>, ControllerError> {
-        if !enabled {
-            return Ok(None);
-        }
-        let server = gateway::generate(&inner.state, &inner.cluster.gateway.listen);
-        let storage = gateway::storage(self.config.advertise_url.clone());
-        Ok(Some(GatewayAssignment {
+    ) -> Option<GatewayAssignment> {
+        enabled.then(|| GatewayAssignment {
             generation: inner.gateway_generation,
-            server: serde_json::to_value(server)
-                .map_err(|error| ControllerError::Invalid(error.to_string()))?,
-            storage: serde_json::to_value(storage)
-                .map_err(|error| ControllerError::Invalid(error.to_string()))?,
-        }))
+            config: inner.gateway_config.clone(),
+        })
+    }
+
+    pub(super) fn rendered_gateway_config(&self, inner: &Inner) -> serde_json::Value {
+        gateway::config(
+            &inner.state,
+            &inner.cluster.gateway.listen,
+            self.config.advertise_url.clone(),
+        )
+    }
+
+    pub(super) fn next_gateway_snapshot(
+        &self,
+        inner: &Inner,
+    ) -> Result<(u64, serde_json::Value), StorageError> {
+        let config = self.rendered_gateway_config(inner);
+        let generation = if config == inner.gateway_config {
+            inner.gateway_generation
+        } else {
+            inner
+                .gateway_generation
+                .checked_add(1)
+                .ok_or_else(|| StorageError::Backend("gateway generation overflow".to_owned()))?
+        };
+        Ok((generation, config))
+    }
+
+    pub(super) fn refresh_gateway_snapshot(&self, inner: &mut Inner) -> Result<(), StorageError> {
+        let (generation, config) = self.next_gateway_snapshot(inner)?;
+        inner.gateway_generation = generation;
+        inner.gateway_config = config;
+        Ok(())
     }
 
     pub(super) async fn acknowledge_gateway_drains(
@@ -50,7 +65,7 @@ impl Controller {
             return Ok(());
         }
 
-        let deadline = unix_ms() + self.config.gateway.drain_timeout_seconds as i64 * 1000;
+        let deadline = unix_ms() + self.config.gateway_drain_timeout_seconds as i64 * 1000;
         let previous = inner.state.clone();
         let mut changed = false;
         for task in inner.state.tasks.values_mut() {
