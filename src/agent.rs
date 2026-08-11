@@ -13,7 +13,7 @@ use tracing::{error, info, warn};
 use crate::{
     client::ControllerClient,
     config::AgentConfig,
-    data_plane::{DataChannel, DataFrame, MAX_DATA_PAYLOAD_BYTES},
+    data_plane::{DATA_STREAM_WRITE_TIMEOUT, DataChannel, DataFrame, MAX_DATA_PAYLOAD_BYTES},
     local_state::{AgentFence, FENCE_KEY, LocalState},
     model::{
         AgentCommand, AgentCommandAck, AgentCommandOperation, AgentCommandPollResponse,
@@ -26,6 +26,9 @@ use crate::{
         RuntimeLogChunk,
     },
 };
+
+const AGENT_DATA_QUEUE_FRAMES: usize = 64;
+const RUNTIME_LOG_QUEUE_FRAMES: usize = 16;
 
 pub(crate) async fn run_with_token_and_updates(
     config: AgentConfig,
@@ -277,7 +280,7 @@ async fn run_data_session<R: ContainerRuntime>(
     >,
 ) -> Result<()> {
     let containers = runtime.list_managed(&cluster_id).await;
-    let (frame_sender, mut frame_receiver) = mpsc::channel::<Vec<u8>>(128);
+    let (frame_sender, mut frame_receiver) = mpsc::channel::<Vec<u8>>(AGENT_DATA_QUEUE_FRAMES);
     let mut tasks = tokio::task::JoinSet::new();
 
     match containers {
@@ -322,7 +325,14 @@ async fn run_data_session<R: ContainerRuntime>(
             tokio::select! {
                 frame = frame_receiver.recv() => {
                     let Some(frame) = frame else { break; };
-                    sink.send(Message::Binary(frame.into())).await?;
+                    tokio::time::timeout(
+                        DATA_STREAM_WRITE_TIMEOUT,
+                        sink.send(Message::Binary(frame.into())),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!(
+                        "timed out writing to the Controller data stream"
+                    ))??;
                 }
                 incoming = source.next() => {
                     match incoming {
@@ -337,7 +347,7 @@ async fn run_data_session<R: ContainerRuntime>(
     .await;
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
-    let _ = sink.close().await;
+    let _ = tokio::time::timeout(DATA_STREAM_WRITE_TIMEOUT, sink.close()).await;
     transfer
 }
 
@@ -349,7 +359,8 @@ async fn stream_agent_data<R: ContainerRuntime>(
 ) -> Result<()> {
     match stream.operation {
         AgentDataStreamOperation::Logs { tail, follow } => {
-            let (log_sender, mut log_receiver) = mpsc::channel::<RuntimeLogChunk>(16);
+            let (log_sender, mut log_receiver) =
+                mpsc::channel::<RuntimeLogChunk>(RUNTIME_LOG_QUEUE_FRAMES);
             let log_future = runtime.stream_task_logs(&container, tail, follow, log_sender);
             tokio::pin!(log_future);
             let mut result = None;
@@ -762,6 +773,47 @@ mod tests {
         let end = DataFrame::decode(&receiver.recv().await.unwrap()).unwrap();
         assert_eq!(end.kind, crate::data_plane::DataFrameKind::End);
         assert_eq!(end.sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn data_session_splits_large_log_chunks_without_data_loss() {
+        let payload = (0..(MAX_DATA_PAYLOAD_BYTES * 3 + 17))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let runtime = Arc::new(FakeRuntime {
+            log_output: Arc::new(Mutex::new(payload.clone())),
+            ..FakeRuntime::default()
+        });
+        let (sender, mut receiver) = mpsc::channel(8);
+
+        stream_agent_data(
+            runtime,
+            managed("task-a"),
+            AgentDataStream {
+                stream_id: 7,
+                task_id: "task-a".into(),
+                operation: AgentDataStreamOperation::Logs {
+                    tail: 10,
+                    follow: true,
+                },
+            },
+            sender,
+        )
+        .await
+        .unwrap();
+
+        let mut reconstructed = Vec::new();
+        for sequence in 0..4 {
+            let data = DataFrame::decode(&receiver.recv().await.unwrap()).unwrap();
+            assert_eq!(data.kind, crate::data_plane::DataFrameKind::Data);
+            assert_eq!(data.sequence, sequence);
+            assert!(data.payload.len() <= MAX_DATA_PAYLOAD_BYTES);
+            reconstructed.extend_from_slice(&data.payload);
+        }
+        let end = DataFrame::decode(&receiver.recv().await.unwrap()).unwrap();
+        assert_eq!(end.kind, crate::data_plane::DataFrameKind::End);
+        assert_eq!(end.sequence, 4);
+        assert_eq!(reconstructed, payload);
     }
 
     fn test_cluster() -> ClusterSettings {

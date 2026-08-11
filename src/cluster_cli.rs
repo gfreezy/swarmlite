@@ -8,17 +8,20 @@ use clap::Args;
 use futures_util::{SinkExt, StreamExt};
 use swarmlite::{
     client::ControllerClient,
-    data_plane::{DataChannel, DataFrame, DataFrameKind},
+    data_plane::{DATA_STREAM_WRITE_TIMEOUT, DataChannel, DataFrame, DataFrameKind},
     model::{
         DataSessionCreateResponse, DataSessionOperation, DataSessionStream, ServiceInspectResponse,
         ServiceListResponse, ServiceScaleRequest, StackDeploymentResponse, TaskListResponse,
     },
     node,
 };
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::{ConnectionArgs, deploy, finish_deployment};
+
+const LOG_OUTPUT_BUFFER_BYTES: usize = 256 * 1024;
+const LOG_OUTPUT_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[derive(Debug, Args)]
 pub(super) struct DeployArgs {
@@ -341,15 +344,22 @@ async fn receive_logs(
     let mut failed = HashSet::new();
     let mut sequences = HashMap::<u32, u64>::new();
     let mut line_buffers = HashMap::<u32, Vec<u8>>::new();
-    let mut stdout = tokio::io::stdout();
-    let mut stderr = tokio::io::stderr();
+    let mut stdout = BufWriter::with_capacity(LOG_OUTPUT_BUFFER_BYTES, tokio::io::stdout());
+    let mut stderr = BufWriter::with_capacity(LOG_OUTPUT_BUFFER_BYTES, tokio::io::stderr());
+    let mut flush_interval = tokio::time::interval(LOG_OUTPUT_FLUSH_INTERVAL);
+    flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    flush_interval.reset();
     let (mut sink, mut source) = socket.split();
 
     while ended.len() < expected_streams.len() {
-        let message = source
-            .next()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("data session closed before all streams completed"))??;
+        let message = tokio::select! {
+            message = source.next() => message,
+            _ = flush_interval.tick() => {
+                flush_log_outputs(&mut stdout, &mut stderr).await?;
+                continue;
+            }
+        }
+        .ok_or_else(|| anyhow::anyhow!("data session closed before all streams completed"))??;
         let Message::Binary(encoded) = message else {
             if matches!(message, Message::Close(_)) {
                 anyhow::bail!("data session closed before all streams completed");
@@ -383,41 +393,36 @@ async fn receive_logs(
                     )
                     .await?;
                 } else if frame.channel == DataChannel::Stderr {
-                    stderr.write_all(&frame.payload).await?;
-                    stderr.flush().await?;
+                    write_log_output(&mut stderr, &frame.payload).await?;
                 } else {
-                    stdout.write_all(&frame.payload).await?;
-                    stdout.flush().await?;
+                    write_log_output(&mut stdout, &frame.payload).await?;
                 }
             }
             DataFrameKind::Error => {
                 failed.insert(frame.stream_id);
                 let prefix = prefixes.get(&frame.stream_id).expect("known stream");
-                stderr.write_all(prefix).await?;
-                stderr.write_all(b"ERROR: ").await?;
-                stderr.write_all(&frame.payload).await?;
-                stderr.write_all(b"\n").await?;
-                stderr.flush().await?;
+                write_log_error(&mut stderr, prefix, &frame.payload).await?;
+                flush_log_outputs(&mut stdout, &mut stderr).await?;
             }
             DataFrameKind::End => {
                 if prefixed
                     && let Some(buffer) = line_buffers.get_mut(&frame.stream_id)
                     && !buffer.is_empty()
                 {
-                    stdout
-                        .write_all(prefixes.get(&frame.stream_id).expect("known stream"))
-                        .await?;
-                    stdout.write_all(buffer).await?;
-                    stdout.write_all(b"\n").await?;
-                    buffer.clear();
-                    stdout.flush().await?;
+                    write_prefixed_log_remainder(
+                        &mut stdout,
+                        prefixes.get(&frame.stream_id).expect("known stream"),
+                        buffer,
+                    )
+                    .await?;
                 }
                 ended.insert(frame.stream_id);
             }
             _ => anyhow::bail!("received unsupported {:?} frame", frame.kind),
         }
     }
-    let _ = sink.send(Message::Close(None)).await;
+    flush_log_outputs(&mut stdout, &mut stderr).await?;
+    let _ = tokio::time::timeout(DATA_STREAM_WRITE_TIMEOUT, sink.send(Message::Close(None))).await;
     if failed.is_empty() {
         Ok(())
     } else {
@@ -425,27 +430,103 @@ async fn receive_logs(
     }
 }
 
-async fn write_prefixed_log_data(
-    output: &mut tokio::io::Stdout,
+async fn write_prefixed_log_data<W>(
+    output: &mut W,
     prefix: &[u8],
     buffer: &mut Vec<u8>,
     payload: &[u8],
-) -> std::io::Result<()> {
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     const MAX_PREFIXED_LINE_BYTES: usize = 64 * 1024;
 
-    buffer.extend_from_slice(payload);
-    while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+    tokio::time::timeout(DATA_STREAM_WRITE_TIMEOUT, async {
+        buffer.extend_from_slice(payload);
+        let mut consumed = 0;
+        while let Some(newline) = buffer[consumed..].iter().position(|byte| *byte == b'\n') {
+            let end = consumed + newline + 1;
+            output.write_all(prefix).await?;
+            output.write_all(&buffer[consumed..end]).await?;
+            consumed = end;
+        }
+        if consumed > 0 {
+            buffer.drain(..consumed);
+        }
+
+        let complete_bytes = buffer.len() / MAX_PREFIXED_LINE_BYTES * MAX_PREFIXED_LINE_BYTES;
+        for chunk in buffer[..complete_bytes].chunks(MAX_PREFIXED_LINE_BYTES) {
+            output.write_all(prefix).await?;
+            output.write_all(chunk).await?;
+            output.write_all(b"\n").await?;
+        }
+        if complete_bytes > 0 {
+            buffer.drain(..complete_bytes);
+        }
+        std::io::Result::Ok(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out writing logs to local output"))??;
+    Ok(())
+}
+
+async fn write_prefixed_log_remainder<W>(
+    output: &mut W,
+    prefix: &[u8],
+    buffer: &mut Vec<u8>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    tokio::time::timeout(DATA_STREAM_WRITE_TIMEOUT, async {
         output.write_all(prefix).await?;
-        output.write_all(&buffer[..=newline]).await?;
-        buffer.drain(..=newline);
-    }
-    while buffer.len() >= MAX_PREFIXED_LINE_BYTES {
-        output.write_all(prefix).await?;
-        output.write_all(&buffer[..MAX_PREFIXED_LINE_BYTES]).await?;
+        output.write_all(buffer).await?;
         output.write_all(b"\n").await?;
-        buffer.drain(..MAX_PREFIXED_LINE_BYTES);
-    }
-    output.flush().await
+        std::io::Result::Ok(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out writing logs to local output"))??;
+    buffer.clear();
+    Ok(())
+}
+
+async fn write_log_error<W>(output: &mut W, prefix: &[u8], payload: &[u8]) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    tokio::time::timeout(DATA_STREAM_WRITE_TIMEOUT, async {
+        output.write_all(prefix).await?;
+        output.write_all(b"ERROR: ").await?;
+        output.write_all(payload).await?;
+        output.write_all(b"\n").await
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out writing logs to local output"))??;
+    Ok(())
+}
+
+async fn write_log_output<W>(output: &mut W, payload: &[u8]) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    tokio::time::timeout(DATA_STREAM_WRITE_TIMEOUT, output.write_all(payload))
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out writing logs to local output"))??;
+    Ok(())
+}
+
+async fn flush_log_outputs<Out, Err>(stdout: &mut Out, stderr: &mut Err) -> Result<()>
+where
+    Out: AsyncWrite + Unpin,
+    Err: AsyncWrite + Unpin,
+{
+    tokio::time::timeout(DATA_STREAM_WRITE_TIMEOUT, async {
+        stdout.flush().await?;
+        stderr.flush().await
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out flushing logs to local output"))??;
+    Ok(())
 }
 
 fn display_id(id: &str, no_trunc: bool) -> String {
@@ -492,6 +573,8 @@ fn print_table_row(values: &[String], widths: &[usize]) {
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::AsyncReadExt;
+
     use super::*;
 
     #[test]
@@ -499,5 +582,30 @@ mod tests {
         assert_eq!(parse_scale("demo.web=3").unwrap(), ("demo.web", 3));
         assert!(parse_scale("web=3").is_err());
         assert!(parse_scale("demo.web=-1").is_err());
+    }
+
+    #[tokio::test]
+    async fn prefixes_fragmented_lines_and_bounds_unterminated_lines() {
+        let (mut output, mut input) = tokio::io::duplex(256 * 1024);
+        let mut buffer = Vec::new();
+
+        write_prefixed_log_data(&mut output, b"task | ", &mut buffer, b"one\npar")
+            .await
+            .unwrap();
+        write_prefixed_log_data(&mut output, b"task | ", &mut buffer, b"tial\n")
+            .await
+            .unwrap();
+        write_prefixed_log_data(&mut output, b"task | ", &mut buffer, &vec![b'x'; 64 * 1024])
+            .await
+            .unwrap();
+        drop(output);
+
+        let mut rendered = Vec::new();
+        input.read_to_end(&mut rendered).await.unwrap();
+        let mut expected = b"task | one\ntask | partial\ntask | ".to_vec();
+        expected.extend(std::iter::repeat_n(b'x', 64 * 1024));
+        expected.push(b'\n');
+        assert_eq!(rendered, expected);
+        assert!(buffer.is_empty());
     }
 }

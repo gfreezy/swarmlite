@@ -200,6 +200,11 @@ stream IDs and frame sequence numbers, and relays bounded binary frames without 
 payloads to UTF-8. Closing the CLI connection cancels the Agent streams. Multiple Tasks are
 multiplexed by numeric stream ID; a single raw stream preserves arbitrary bytes. `logs` supports
 snapshots and `--follow`, with `--tail` limited to 10,000 lines and at most 64 selected Tasks.
+Log buffers are bounded throughout the Runtime, Agent, Controller, and CLI. When output is faster
+than the consumer, backpressure pauses upstream reads instead of silently dropping frames. The CLI
+batches writes and normally flushes every 100 ms. A data connection or local output that cannot
+accept data for 30 seconds terminates that log session so a slow consumer cannot retain resources
+indefinitely.
 
 ## Join nodes and configure gateways
 

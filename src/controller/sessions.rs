@@ -7,13 +7,14 @@ use std::{
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, watch};
+use tracing::warn;
 use uuid::Uuid;
 
-use crate::data_plane::{DataFrame, DataFrameKind};
+use crate::data_plane::{DATA_STREAM_WRITE_TIMEOUT, DataFrame, DataFrameKind};
 
 use super::ControllerError;
 
-const SESSION_QUEUE_FRAMES: usize = 256;
+const SESSION_QUEUE_FRAMES: usize = 64;
 const SESSION_ATTACH_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ACTIVE_DATA_SESSIONS: usize = 128;
 
@@ -215,8 +216,19 @@ impl ClientDataAttachment {
             tokio::select! {
                 frame = self.receiver.recv() => {
                     let Some(frame) = frame else { break; };
-                    if sink.send(Message::Binary(frame.into())).await.is_err() {
-                        break;
+                    match tokio::time::timeout(
+                        DATA_STREAM_WRITE_TIMEOUT,
+                        sink.send(Message::Binary(frame.into())),
+                    ).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            warn!(session_id = %self.session_id, %error, "client data stream failed");
+                            break;
+                        }
+                        Err(_) => {
+                            warn!(session_id = %self.session_id, "client data stream write timed out");
+                            break;
+                        }
                     }
                 }
                 incoming = source.next() => {
@@ -233,7 +245,7 @@ impl ClientDataAttachment {
             }
         }
         self.broker.cancel(&self.session_id);
-        let _ = sink.close().await;
+        let _ = tokio::time::timeout(DATA_STREAM_WRITE_TIMEOUT, sink.close()).await;
     }
 }
 

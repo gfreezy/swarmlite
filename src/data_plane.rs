@@ -1,9 +1,12 @@
+use std::time::Duration;
+
 use bytes::Bytes;
 
 pub const DATA_PROTOCOL_VERSION: u8 = 1;
 pub const DATA_FRAME_HEADER_BYTES: usize = 16;
 pub const MAX_DATA_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_DATA_FRAME_BYTES: usize = DATA_FRAME_HEADER_BYTES + MAX_DATA_PAYLOAD_BYTES;
+pub const DATA_STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

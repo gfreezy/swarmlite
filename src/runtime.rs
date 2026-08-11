@@ -25,6 +25,7 @@ use tracing::{info, warn};
 
 use crate::{
     config::{ResolvedRuntimeConfig, RuntimeKind},
+    data_plane::MAX_DATA_PAYLOAD_BYTES,
     gateway,
     model::{ClusterState, GatewayAssignment, ObservedTaskState, PortBinding, TaskAssignment},
 };
@@ -784,19 +785,32 @@ impl ContainerRuntime for DockerCompatibleRuntime {
                 LogOutput::StdIn { .. } => RuntimeLogChannel::Stdin,
                 LogOutput::Console { .. } => RuntimeLogChannel::Console,
             };
-            if output
-                .send(RuntimeLogChunk {
-                    channel,
-                    payload: chunk.into_bytes(),
-                })
-                .await
-                .is_err()
-            {
+            if !send_runtime_log_chunks(&output, channel, chunk.into_bytes()).await {
                 return Ok(());
             }
         }
         Ok(())
     }
+}
+
+async fn send_runtime_log_chunks(
+    output: &mpsc::Sender<RuntimeLogChunk>,
+    channel: RuntimeLogChannel,
+    payload: Bytes,
+) -> bool {
+    for payload in payload.chunks(MAX_DATA_PAYLOAD_BYTES) {
+        if output
+            .send(RuntimeLogChunk {
+                channel,
+                payload: Bytes::copy_from_slice(payload),
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn task_labels(assignment: &TaskAssignment) -> Result<HashMap<String, String>> {
@@ -868,6 +882,37 @@ mod tests {
     #[test]
     fn sanitizes_runtime_container_names() {
         assert_eq!(sanitize_name("demo/web:v1"), "demo-web-v1");
+    }
+
+    #[tokio::test]
+    async fn runtime_log_queue_receives_bounded_chunks_without_data_loss() {
+        let payload = (0..(MAX_DATA_PAYLOAD_BYTES * 2 + 17))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let (sender, mut receiver) = mpsc::channel(4);
+
+        assert!(
+            send_runtime_log_chunks(
+                &sender,
+                RuntimeLogChannel::Stdout,
+                Bytes::from(payload.clone()),
+            )
+            .await
+        );
+        drop(sender);
+
+        let mut reconstructed = Vec::new();
+        let mut lengths = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            assert_eq!(chunk.channel, RuntimeLogChannel::Stdout);
+            lengths.push(chunk.payload.len());
+            reconstructed.extend_from_slice(&chunk.payload);
+        }
+        assert_eq!(
+            lengths,
+            vec![MAX_DATA_PAYLOAD_BYTES, MAX_DATA_PAYLOAD_BYTES, 17]
+        );
+        assert_eq!(reconstructed, payload);
     }
 
     #[test]
