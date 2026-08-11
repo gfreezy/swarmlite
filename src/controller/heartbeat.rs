@@ -241,6 +241,8 @@ impl Controller {
             })
             .collect();
         let gateway_config = self.gateway_assignment(&inner, gateway_enabled);
+        let registry_credentials = inner.state.registry_credentials.clone();
+        let registry_credentials_hash = crate::registry::credentials_hash(&registry_credentials);
         Ok(HeartbeatResponse {
             generation,
             cluster: inner.cluster.clone(),
@@ -249,6 +251,8 @@ impl Controller {
             labels: desired_labels,
             remove_tasks,
             gateway_config,
+            registry_credentials,
+            registry_credentials_hash,
         })
     }
 

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
 pub use swarmlite_stack::{
@@ -252,6 +252,50 @@ pub struct ClusterState {
     pub tasks: BTreeMap<String, TaskRecord>,
     pub members: BTreeMap<String, NodeMember>,
     pub unclaimed_tasks: BTreeMap<String, UnclaimedTask>,
+    #[serde(default)]
+    pub registry_credentials: BTreeMap<String, RegistryCredential>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryCredential {
+    pub username: String,
+    pub password: String,
+}
+
+impl fmt::Debug for RegistryCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RegistryCredential")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryLoginRequest {
+    pub registry: String,
+    pub username: String,
+    pub password: String,
+}
+
+impl fmt::Debug for RegistryLoginRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RegistryLoginRequest")
+            .field("registry", &self.registry)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegistryLoginResponse {
+    pub registry: String,
+    pub username: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -332,6 +376,10 @@ pub struct HeartbeatResponse {
     pub remove_tasks: Vec<TaskRemovalAssignment>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway_config: Option<GatewayAssignment>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub registry_credentials: BTreeMap<String, RegistryCredential>,
+    #[serde(default)]
+    pub registry_credentials_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -346,6 +394,7 @@ pub struct NodeControl {
     pub gateway_enabled: bool,
     pub labels: BTreeMap<String, String>,
     pub gateway_config: Option<GatewayAssignment>,
+    pub registry_credentials_hash: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -379,6 +428,8 @@ pub struct JoinResponse {
     pub cluster: ClusterSettings,
     pub gateway_enabled: bool,
     pub labels: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub registry_credentials: BTreeMap<String, RegistryCredential>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -25,6 +25,7 @@ use crate::{
         BootstrapResponse, CLUSTER_SCHEMA_VERSION, ClusterSettings, GatewayReport, JoinRequest,
         JoinResponse, NodeControl, valid_gateway_image,
     },
+    registry::{RegistryCredentialStore, credentials_hash},
     runtime::{
         ContainerRuntime, DockerCompatibleRuntime, GatewayContainerSpec, ManagedClusterInventory,
     },
@@ -215,7 +216,11 @@ pub async fn run(options: ServeOptions) -> Result<()> {
         options.runtime_socket.as_deref(),
         settings.runtime.as_ref(),
     );
-    let runtime = DockerCompatibleRuntime::connect(&runtime_config.resolve()?)?;
+    let registry_credentials = RegistryCredentialStore::new(local_state.clone());
+    let runtime = DockerCompatibleRuntime::connect_with_registry_credentials(
+        &runtime_config.resolve()?,
+        registry_credentials.clone(),
+    )?;
     runtime
         .reconcile_gateway(
             &gateway_container_spec(&settings, &advertise_address, &public_controller)?,
@@ -246,6 +251,7 @@ pub async fn run(options: ServeOptions) -> Result<()> {
         gateway_enabled: settings.gateway_enabled,
         labels: settings.labels.clone(),
         gateway_config: None,
+        registry_credentials_hash: credentials_hash(&registry_credentials.snapshot()?),
     };
     let (control_tx, control_rx) = watch::channel(initial_control);
     let (gateway_report_tx, gateway_report_rx) = watch::channel(GatewayReport::default());
@@ -539,6 +545,7 @@ pub async fn join(options: JoinOptions) -> Result<String> {
     if response.cluster != bootstrap.cluster {
         bail!("cluster settings changed during join; retry the command");
     }
+    RegistryCredentialStore::new(local_state.clone()).replace(&response.registry_credentials)?;
     let settings = NodeSettings {
         schema_version: NODE_SETTINGS_SCHEMA_VERSION,
         gateway_enabled: response.gateway_enabled,
@@ -1223,6 +1230,7 @@ mod tests {
     #[derive(Clone)]
     struct MockJoinState {
         cluster: ClusterSettings,
+        registry_credentials: BTreeMap<String, crate::model::RegistryCredential>,
     }
 
     fn assert_no_json_state(data_dir: &Path) {
@@ -1560,6 +1568,13 @@ mod tests {
         let controller = format!("http://{address}");
         let state = MockJoinState {
             cluster: cluster.clone(),
+            registry_credentials: BTreeMap::from([(
+                "ghcr.io".into(),
+                crate::model::RegistryCredential {
+                    username: "octocat".into(),
+                    password: "private-token".into(),
+                },
+            )]),
         };
         let app = Router::new()
             .route("/v1/cluster", get(mock_bootstrap))
@@ -1589,6 +1604,11 @@ mod tests {
             BTreeMap::from([("region".into(), "cn-east".into())])
         );
         assert_eq!(settings.controller_url, controller);
+        let registry_credentials =
+            RegistryCredentialStore::new(LocalState::open(directory.path()).unwrap())
+                .snapshot()
+                .unwrap();
+        assert_eq!(registry_credentials["ghcr.io"].password, "private-token");
         assert!(directory.path().join(DATABASE_FILE).exists());
         assert_no_json_state(directory.path());
         server.abort();
@@ -1609,7 +1629,10 @@ mod tests {
         let app = Router::new()
             .route("/v1/cluster", get(mock_bootstrap))
             .route("/v1/nodes/{node_id}/join", put(mock_join))
-            .with_state(MockJoinState { cluster });
+            .with_state(MockJoinState {
+                cluster,
+                registry_credentials: BTreeMap::new(),
+            });
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let directory = tempfile::tempdir().unwrap();
 
@@ -1708,6 +1731,7 @@ mod tests {
             cluster: state.cluster,
             gateway_enabled: request.gateway_enabled,
             labels: request.labels,
+            registry_credentials: state.registry_credentials,
         })
     }
 }

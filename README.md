@@ -101,6 +101,7 @@ gateway status|enable|disable
                      read or update one node's gateway switch
 node label get|set|remove
                      read or update one node's placement labels
+registry login       store cluster-wide private registry credentials
 deploy               deploy or update a Stack
 ls [STACK]           list cluster Services
 ps TARGET            list tasks for a Stack or Service
@@ -146,6 +147,25 @@ uses the control-plane, KV object, and KV lock tables. The default data director
 
 ```bash
 swarmlite --data-dir /var/lib/swarmlite serve
+```
+
+Store private registry credentials once on the Controller. The password or access token is read
+only from standard input, persisted in the protected control-plane SQLite state, and synchronized
+to every joined Agent. Agents cache the latest credentials in their protected local SQLite state
+and use them whenever they pull an image.
+
+```bash
+printf '%s' "$GHCR_TOKEN" | swarmlite registry login ghcr.io \
+  --username github-user --password-stdin
+```
+
+The command uses the saved Controller URL and cluster token. When running it away from a joined
+node, pass both connection options explicitly:
+
+```bash
+printf '%s' "$GHCR_TOKEN" | swarmlite registry login ghcr.io \
+  --username github-user --password-stdin \
+  --controller http://controller.example:8080 --token "$SWARMLITE_TOKEN"
 ```
 
 Deploy and inspect a stack using the saved controller URL and token:

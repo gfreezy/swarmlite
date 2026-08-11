@@ -28,6 +28,7 @@ use crate::{
     data_plane::MAX_DATA_PAYLOAD_BYTES,
     gateway,
     model::{ClusterState, GatewayAssignment, ObservedTaskState, PortBinding, TaskAssignment},
+    registry::RegistryCredentialStore,
 };
 
 #[cfg(test)]
@@ -157,10 +158,25 @@ pub struct DockerCompatibleRuntime {
     client: Docker,
     kind: RuntimeKind,
     socket: String,
+    registry_credentials: Option<RegistryCredentialStore>,
 }
 
 impl DockerCompatibleRuntime {
     pub fn connect(config: &ResolvedRuntimeConfig) -> Result<Self> {
+        Self::connect_inner(config, None)
+    }
+
+    pub(crate) fn connect_with_registry_credentials(
+        config: &ResolvedRuntimeConfig,
+        registry_credentials: RegistryCredentialStore,
+    ) -> Result<Self> {
+        Self::connect_inner(config, Some(registry_credentials))
+    }
+
+    fn connect_inner(
+        config: &ResolvedRuntimeConfig,
+        registry_credentials: Option<RegistryCredentialStore>,
+    ) -> Result<Self> {
         let client = Docker::connect_with_socket(&config.socket, 120, API_DEFAULT_VERSION)
             .with_context(|| {
                 format!(
@@ -172,6 +188,7 @@ impl DockerCompatibleRuntime {
             client,
             kind: config.kind,
             socket: config.socket.clone(),
+            registry_credentials,
         })
     }
 
@@ -489,10 +506,16 @@ impl DockerCompatibleRuntime {
         if self.client.inspect_image(image).await.is_ok() {
             return Ok(());
         }
+        let credentials = self
+            .registry_credentials
+            .as_ref()
+            .map(|store| store.credentials_for_image(image))
+            .transpose()?
+            .flatten();
         let options = CreateImageOptionsBuilder::default()
             .from_image(image)
             .build();
-        let mut pull = self.client.create_image(Some(options), None, None);
+        let mut pull = self.client.create_image(Some(options), None, credentials);
         while let Some(item) = pull.next().await {
             item.with_context(|| format!("failed to pull {image}"))?;
         }

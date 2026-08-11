@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use swarmlite::{
     client::ControllerClient,
@@ -8,11 +8,12 @@ use swarmlite::{
     model::{
         CLUSTER_SCHEMA_VERSION, ClusterConfigResponse, ClusterConfigUpdate, ClusterGatewayConfig,
         ClusterSettings, DEFAULT_GATEWAY_IMAGE, NodeGatewayResponse, NodeGatewayUpdate,
-        NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, StackDeploymentResponse,
-        StackDeploymentStatus,
+        NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, RegistryLoginRequest,
+        RegistryLoginResponse, StackDeploymentResponse, StackDeploymentStatus,
     },
-    node,
+    node, registry,
 };
+use tokio::io::AsyncReadExt;
 
 mod cluster_cli;
 
@@ -77,6 +78,11 @@ enum Command {
     Node {
         #[command(subcommand)]
         action: NodeCommand,
+    },
+    /// Manage cluster-wide private container registry credentials.
+    Registry {
+        #[command(subcommand)]
+        action: RegistryCommand,
     },
     /// Deploy a new Stack or update an existing Stack.
     Deploy {
@@ -201,6 +207,22 @@ enum NodeLabelCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum RegistryCommand {
+    /// Store credentials used by every node when pulling private images.
+    Login {
+        /// Registry hostname with an optional port, such as ghcr.io.
+        registry: String,
+        #[arg(short = 'u', long)]
+        username: String,
+        /// Read the registry password or token from standard input.
+        #[arg(long, required = true)]
+        password_stdin: bool,
+        #[command(flatten)]
+        connection: RegistryConnectionArgs,
+    },
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ConfigKey {
     GatewayImage,
@@ -209,6 +231,14 @@ enum ConfigKey {
 #[derive(Debug, Args)]
 struct ConnectionArgs {
     #[arg(short = 'u', long)]
+    controller: Option<String>,
+    #[arg(long, env = "SWARMLITE_TOKEN")]
+    token: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct RegistryConnectionArgs {
+    #[arg(long)]
     controller: Option<String>,
     #[arg(long, env = "SWARMLITE_TOKEN")]
     token: Option<String>,
@@ -407,6 +437,35 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Command::Registry { action } => match action {
+            RegistryCommand::Login {
+                registry: registry_host,
+                username,
+                password_stdin: _,
+                connection,
+            } => {
+                let password = read_registry_password().await?;
+                let (controller, token) =
+                    node::resolve_connection(&data_dir, connection.controller, connection.token)
+                        .await?;
+                let response: RegistryLoginResponse = ControllerClient::new(controller, token)
+                    .send_json(
+                        reqwest::Method::PUT,
+                        "/v1/registry-credentials",
+                        Some(&RegistryLoginRequest {
+                            registry: registry_host,
+                            username,
+                            password,
+                        }),
+                    )
+                    .await?;
+                println!(
+                    "stored credentials for {} as {} across the cluster",
+                    response.registry, response.username
+                );
+                Ok(())
+            }
+        },
         Command::Deploy { options } => cluster_cli::run_deploy(&data_dir, options).await,
         Command::Ls { options } => cluster_cli::run_list(&data_dir, options).await,
         Command::Ps { options } => cluster_cli::run_ps(&data_dir, options).await,
@@ -421,6 +480,23 @@ async fn main() -> Result<()> {
             status(controller, token).await
         }
     }
+}
+
+async fn read_registry_password() -> Result<String> {
+    let mut password = String::new();
+    tokio::io::stdin()
+        .take((registry::MAX_PASSWORD_BYTES + 1) as u64)
+        .read_to_string(&mut password)
+        .await
+        .context("failed to read registry password from stdin")?;
+    let password = password.trim_end_matches(['\r', '\n']).to_owned();
+    if password.len() > registry::MAX_PASSWORD_BYTES {
+        bail!(
+            "registry password must contain at most {} bytes",
+            registry::MAX_PASSWORD_BYTES
+        );
+    }
+    Ok(password)
 }
 
 async fn finish_deployment(
@@ -646,6 +722,7 @@ mod tests {
         assert!(names.contains(&"config"));
         assert!(names.contains(&"gateway"));
         assert!(names.contains(&"node"));
+        assert!(names.contains(&"registry"));
         for name in [
             "deploy", "ls", "ps", "inspect", "logs", "scale", "restart", "rm",
         ] {
@@ -656,6 +733,43 @@ mod tests {
         assert!(!names.contains(&"role"));
         assert!(!names.contains(&"controller"));
         assert!(!names.contains(&"agent"));
+    }
+
+    #[test]
+    fn registry_login_requires_username_and_password_stdin() {
+        assert!(
+            Cli::try_parse_from([
+                "swarmlite",
+                "registry",
+                "login",
+                "ghcr.io",
+                "--username",
+                "octocat",
+                "--password-stdin",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "swarmlite",
+                "registry",
+                "login",
+                "ghcr.io",
+                "--username",
+                "octocat",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "swarmlite",
+                "registry",
+                "login",
+                "ghcr.io",
+                "--password-stdin",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

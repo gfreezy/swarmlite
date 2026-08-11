@@ -78,6 +78,7 @@ impl Controller {
             cluster,
             gateway_enabled,
             labels,
+            registry_credentials: inner.state.registry_credentials.clone(),
         })
     }
 

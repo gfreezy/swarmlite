@@ -18,9 +18,9 @@ use crate::model::{
     HeartbeatResponse, JoinRequest, JoinResponse, KvDeleteRequest, KvListResponse,
     KvLockAcquireRequest, KvLockAcquireResponse, KvLockMutationRequest, KvObjectResponse,
     KvPutRequest, KvStatResponse, NodeGatewayResponse, NodeGatewayUpdate, NodeHeartbeat,
-    NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, ServiceInspectResponse,
-    ServiceListResponse, ServiceScaleRequest, StackDeploymentResponse, StackListResponse,
-    StatusResponse, TaskListResponse,
+    NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, RegistryLoginRequest,
+    RegistryLoginResponse, ServiceInspectResponse, ServiceListResponse, ServiceScaleRequest,
+    StackDeploymentResponse, StackListResponse, StatusResponse, TaskListResponse,
 };
 use swarmlite_stack::parse_stack;
 
@@ -35,6 +35,7 @@ pub(super) fn router(controller: Arc<Controller>) -> Router {
             "/v1/config",
             get(get_cluster_config).patch(update_cluster_config),
         )
+        .route("/v1/registry-credentials", put(set_registry_credential))
         .route("/v1/stacks", get(list_stacks))
         .route("/v1/stacks/{name}", put(apply_stack).delete(remove_stack))
         .route("/v1/stacks/{name}/tasks", get(stack_tasks))
@@ -123,6 +124,15 @@ async fn update_cluster_config(
 ) -> Result<Json<ClusterConfigResponse>, ControllerError> {
     require_auth(&controller, &headers)?;
     controller.update_cluster_config(update).await.map(Json)
+}
+
+async fn set_registry_credential(
+    State(controller): State<Arc<Controller>>,
+    headers: HeaderMap,
+    Json(request): Json<RegistryLoginRequest>,
+) -> Result<Json<RegistryLoginResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.set_registry_credential(request).await.map(Json)
 }
 
 async fn join_node(

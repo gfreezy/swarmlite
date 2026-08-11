@@ -21,6 +21,7 @@ use crate::{
         HeartbeatResponse, NodeControl, NodeHeartbeat, NodeRecord, ObservedTaskState,
         TaskReconcilePhase, TaskReconcileReport, TaskReport,
     },
+    registry::RegistryCredentialStore,
     runtime::{
         ContainerRuntime, DockerCompatibleRuntime, ManagedContainer, RuntimeLogChannel,
         RuntimeLogChunk,
@@ -54,6 +55,7 @@ async fn run_with_runtime<R: ContainerRuntime>(
     let mut fence = local_state
         .get::<AgentFence>(FENCE_KEY)?
         .unwrap_or_default();
+    let registry_credentials = RegistryCredentialStore::new(local_state.clone());
     let mut node = NodeRecord {
         id: config.node_id.clone(),
         address: config.advertise_address.clone(),
@@ -167,11 +169,16 @@ async fn run_with_runtime<R: ContainerRuntime>(
             error!(%error, "failed to persist fencing state; refusing to change containers");
             continue;
         }
+        if let Err(error) = registry_credentials.replace(&response.registry_credentials) {
+            error!(%error, "failed to persist registry credentials; refusing to change containers");
+            continue;
+        }
         let next_control = NodeControl {
             cluster: response.cluster.clone(),
             gateway_enabled: response.gateway_enabled,
             labels: response.labels.clone(),
             gateway_config: response.gateway_config.clone(),
+            registry_credentials_hash: response.registry_credentials_hash.clone(),
         };
         let gateway_needs_apply = response.gateway_enabled
             && response.gateway_config.as_ref().is_some_and(|assignment| {
@@ -838,6 +845,8 @@ mod tests {
             labels: Default::default(),
             remove_tasks: Vec::new(),
             gateway_config: None,
+            registry_credentials: Default::default(),
+            registry_credentials_hash: String::new(),
         };
 
         let reports = reconcile_containers(&runtime, &existing, &response).await;
@@ -899,6 +908,8 @@ mod tests {
             labels: Default::default(),
             remove_tasks: Vec::new(),
             gateway_config: None,
+            registry_credentials: Default::default(),
+            registry_credentials_hash: String::new(),
         };
 
         let reports = reconcile_containers(&runtime, &existing, &response).await;
@@ -948,6 +959,8 @@ mod tests {
             labels: Default::default(),
             remove_tasks: Vec::new(),
             gateway_config: None,
+            registry_credentials: Default::default(),
+            registry_credentials_hash: String::new(),
         };
 
         let reports = reconcile_containers(&runtime, &existing, &response).await;
@@ -998,6 +1011,8 @@ mod tests {
             labels: Default::default(),
             remove_tasks: Vec::new(),
             gateway_config: None,
+            registry_credentials: Default::default(),
+            registry_credentials_hash: String::new(),
         };
 
         let reports = reconcile_containers(&runtime, &HashMap::new(), &response).await;

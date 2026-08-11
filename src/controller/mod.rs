@@ -29,12 +29,12 @@ use crate::{
         KvLockAcquireResponse, KvLockMutationRequest, KvObjectResponse, KvPutRequest,
         KvStatResponse, NodeGatewayResponse, NodeGatewayUpdate, NodeHeartbeat,
         NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, NodeMember,
-        ObservedTaskState, ServiceInspectResponse, ServiceListResponse, ServiceRecord,
-        ServiceSummary, StackDeploymentError, StackDeploymentRecord, StackDeploymentResponse,
-        StackDeploymentServiceProgress, StackDeploymentStatus, StackListResponse, StackRecord,
-        StackSummary, StatusResponse, TaskAssignment, TaskListResponse, TaskReconcileError,
-        TaskReconcileReport, TaskRecord, TaskRemovalAssignment, TaskSummary, UnclaimedTask,
-        service_spec_hash, valid_gateway_image,
+        ObservedTaskState, RegistryLoginRequest, RegistryLoginResponse, ServiceInspectResponse,
+        ServiceListResponse, ServiceRecord, ServiceSummary, StackDeploymentError,
+        StackDeploymentRecord, StackDeploymentResponse, StackDeploymentServiceProgress,
+        StackDeploymentStatus, StackListResponse, StackRecord, StackSummary, StatusResponse,
+        TaskAssignment, TaskListResponse, TaskReconcileError, TaskReconcileReport, TaskRecord,
+        TaskRemovalAssignment, TaskSummary, UnclaimedTask, service_spec_hash, valid_gateway_image,
     },
     scheduler,
     storage::{StateRepository, StorageError},
@@ -52,6 +52,7 @@ mod lifecycle;
 mod membership;
 mod nodes;
 mod recovery;
+mod registries;
 mod resources;
 mod sessions;
 mod stacks;

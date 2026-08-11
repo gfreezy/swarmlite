@@ -9,12 +9,13 @@ use crate::{
     kv::{KvRepository, LegacyKvImport, LegacyKvLock, LegacyKvObject},
     model::{
         ClusterSettings, ClusterState, DesiredTaskState, NodeMember, ObservedTaskState,
-        PortBinding, ServiceRecord, StackRecord, TaskRecord,
+        PortBinding, RegistryCredential, ServiceRecord, StackRecord, TaskRecord,
     },
 };
 
 const LEGACY_PERSISTED_SCHEMA_VERSION: u32 = 7;
-const PERSISTED_SCHEMA_VERSION: u32 = 8;
+const PREVIOUS_PERSISTED_SCHEMA_VERSION: u32 = 8;
+const PERSISTED_SCHEMA_VERSION: u32 = 9;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -86,6 +87,8 @@ struct PersistedClusterState {
     services: BTreeMap<String, ServiceRecord>,
     tasks: BTreeMap<String, PersistedTaskRecord>,
     members: BTreeMap<String, NodeMember>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    registry_credentials: BTreeMap<String, RegistryCredential>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,7 +322,9 @@ fn read_versioned(
         .map_err(|_| StorageError::InvalidData("negative SQLite generation".to_owned()))?;
     if !matches!(
         schema_version,
-        LEGACY_PERSISTED_SCHEMA_VERSION | PERSISTED_SCHEMA_VERSION
+        LEGACY_PERSISTED_SCHEMA_VERSION
+            | PREVIOUS_PERSISTED_SCHEMA_VERSION
+            | PERSISTED_SCHEMA_VERSION
     ) || cluster_id != expected_cluster.cluster_id
     {
         return Err(StorageError::InvalidData(
@@ -329,7 +334,9 @@ fn read_versioned(
     let value: PersistedControlPlane = serde_json::from_slice(&document).map_err(invalid)?;
     if !matches!(
         value.schema_version,
-        LEGACY_PERSISTED_SCHEMA_VERSION | PERSISTED_SCHEMA_VERSION
+        LEGACY_PERSISTED_SCHEMA_VERSION
+            | PREVIOUS_PERSISTED_SCHEMA_VERSION
+            | PERSISTED_SCHEMA_VERSION
     ) || value.cluster_id != expected_cluster.cluster_id
         || !same_cluster_identity(&value.cluster, expected_cluster)
     {
@@ -416,6 +423,7 @@ impl PersistedClusterState {
                 .map(|(id, task)| (id.clone(), PersistedTaskRecord::from_runtime(task)))
                 .collect(),
             members: state.members.clone(),
+            registry_credentials: state.registry_credentials.clone(),
         }
     }
 
@@ -431,6 +439,7 @@ impl PersistedClusterState {
                 .collect(),
             members: self.members,
             unclaimed_tasks: BTreeMap::new(),
+            registry_credentials: self.registry_credentials,
         }
     }
 }
@@ -478,7 +487,9 @@ fn invalid(error: impl std::fmt::Display) -> StorageError {
 #[cfg(test)]
 mod tests {
     use crate::local_state::{LocalState, NODE_KEY};
-    use crate::model::{ClusterGatewayConfig, KvLockStatus, NodeRecord, ServiceSpec};
+    use crate::model::{
+        ClusterGatewayConfig, KvLockStatus, NodeRecord, RegistryCredential, ServiceSpec,
+    };
     use base64::{Engine as _, engine::general_purpose::STANDARD};
 
     use super::*;
@@ -557,6 +568,13 @@ mod tests {
                 reconcile_error: None,
             },
         );
+        state.registry_credentials.insert(
+            "ghcr.io".into(),
+            RegistryCredential {
+                username: "octocat".into(),
+                password: "private-token".into(),
+            },
+        );
 
         let generation = repository
             .replace(first.generation, &cluster, &state)
@@ -575,6 +593,10 @@ mod tests {
             ObservedTaskState::Pending
         );
         assert!(loaded.state.tasks["task-1"].container_id.is_none());
+        assert_eq!(
+            loaded.state.registry_credentials["ghcr.io"].password,
+            "private-token"
+        );
         assert!(directory.path().join(DATABASE_FILE).exists());
         assert!(control_plane_state_exists(directory.path()).unwrap());
         assert_eq!(

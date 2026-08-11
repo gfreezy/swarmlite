@@ -9,6 +9,7 @@ mod kv;
 mod local_state;
 pub mod model;
 pub mod node;
+pub mod registry;
 pub mod runtime;
 pub mod scheduler;
 pub mod storage;

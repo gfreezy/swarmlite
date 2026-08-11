@@ -52,6 +52,56 @@ async fn test_controller(id: &str) -> (Controller, StateRepository, tempfile::Te
 }
 
 #[tokio::test]
+async fn registry_login_is_persisted_and_synchronized_to_nodes() {
+    let (controller, repository, _directory) = test_controller("registry-login-test").await;
+    let response = controller
+        .set_registry_credential(RegistryLoginRequest {
+            registry: "GHCR.IO".into(),
+            username: "octocat".into(),
+            password: "private-token".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.registry, "ghcr.io");
+    assert_eq!(response.username, "octocat");
+    assert!(
+        !serde_json::to_string(&response)
+            .unwrap()
+            .contains("private-token")
+    );
+
+    let persisted = repository.load().await.unwrap();
+    assert_eq!(
+        persisted.state.registry_credentials["ghcr.io"].password,
+        "private-token"
+    );
+
+    let joined = controller
+        .join_node("node-a", test_join_request("node-a", "127.0.0.1"))
+        .await
+        .unwrap();
+    assert_eq!(joined.registry_credentials["ghcr.io"].username, "octocat");
+    let heartbeat = controller
+        .heartbeat(
+            "node-a",
+            NodeHeartbeat {
+                node: test_node(),
+                tasks: Vec::new(),
+                task_inventory_error: None,
+                task_results: Vec::new(),
+                gateway: GatewayReport::default(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        heartbeat.registry_credentials["ghcr.io"].password,
+        "private-token"
+    );
+    assert_eq!(heartbeat.registry_credentials_hash.len(), 64);
+}
+
+#[tokio::test]
 async fn allows_only_one_inflight_deployment_per_stack() {
     let (controller, _, _directory) = test_controller("deployment-lock-test").await;
     let first = controller.begin_stack_deployment("demo").unwrap();
