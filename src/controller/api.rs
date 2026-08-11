@@ -18,13 +18,13 @@ use crate::{
         BootstrapResponse, ClusterConfigResponse, ClusterConfigUpdate, HeartbeatResponse,
         JoinRequest, JoinResponse, KvDeleteRequest, KvListResponse, KvLockAcquireRequest,
         KvLockAcquireResponse, KvLockMutationRequest, KvObjectResponse, KvPutRequest,
-        KvPutResponse, KvStatResponse, NodeHeartbeat, NodeLabelRemoveRequest, NodeLabelSetRequest,
-        NodeLabelsResponse, NodeRolesResponse, NodeRolesUpdate, StatusResponse,
+        KvPutResponse, KvStatResponse, NodeGatewayResponse, NodeGatewayUpdate, NodeHeartbeat,
+        NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, StatusResponse,
     },
 };
 use swarmlite_stack::parse_stack;
 
-use super::{Controller, ControllerError, RoleOperation};
+use super::{Controller, ControllerError};
 
 pub(super) fn router(controller: Arc<Controller>) -> Router {
     Router::new()
@@ -40,11 +40,8 @@ pub(super) fn router(controller: Arc<Controller>) -> Router {
         .route("/v1/nodes/{node_id}/heartbeat", post(heartbeat))
         .route("/v1/gateway", get(gateway_config))
         .route(
-            "/v1/nodes/{node_id}/roles",
-            get(get_node_roles)
-                .put(set_node_roles)
-                .patch(add_node_roles)
-                .delete(remove_node_roles),
+            "/v1/nodes/{node_id}/gateway",
+            get(get_node_gateway).put(update_node_gateway),
         )
         .route(
             "/v1/nodes/{node_id}/labels",
@@ -65,11 +62,8 @@ async fn health(State(controller): State<Arc<Controller>>) -> Json<serde_json::V
     let status = controller.status().await;
     Json(json!({
         "ok": true,
-        "controller_id": controller.config.controller_id,
-        "is_leader": status.is_leader,
-        "leader": status.leader,
+        "controller_id": controller.config.cluster.controller_id,
         "generation": status.generation,
-        "controller_set_generation": status.controller_set_generation,
     }))
 }
 
@@ -78,7 +72,7 @@ async fn status(
     headers: HeaderMap,
 ) -> Result<Json<StatusResponse>, ControllerError> {
     require_auth(&controller, &headers)?;
-    controller.leader_status().await.map(Json)
+    Ok(Json(controller.status().await))
 }
 
 async fn bootstrap(
@@ -116,50 +110,24 @@ async fn join_node(
     controller.join_node(&node_id, body).await.map(Json)
 }
 
-async fn get_node_roles(
+async fn get_node_gateway(
     State(controller): State<Arc<Controller>>,
     Path(node_id): Path<String>,
     headers: HeaderMap,
-) -> Result<Json<NodeRolesResponse>, ControllerError> {
+) -> Result<Json<NodeGatewayResponse>, ControllerError> {
     require_auth(&controller, &headers)?;
-    controller.node_roles(&node_id).await.map(Json)
+    controller.node_gateway(&node_id).await.map(Json)
 }
 
-async fn set_node_roles(
+async fn update_node_gateway(
     State(controller): State<Arc<Controller>>,
     Path(node_id): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<NodeRolesUpdate>,
-) -> Result<Json<NodeRolesResponse>, ControllerError> {
+    Json(body): Json<NodeGatewayUpdate>,
+) -> Result<Json<NodeGatewayResponse>, ControllerError> {
     require_auth(&controller, &headers)?;
     controller
-        .update_node_roles(&node_id, body, RoleOperation::Set)
-        .await
-        .map(Json)
-}
-
-async fn add_node_roles(
-    State(controller): State<Arc<Controller>>,
-    Path(node_id): Path<String>,
-    headers: HeaderMap,
-    Json(body): Json<NodeRolesUpdate>,
-) -> Result<Json<NodeRolesResponse>, ControllerError> {
-    require_auth(&controller, &headers)?;
-    controller
-        .update_node_roles(&node_id, body, RoleOperation::Add)
-        .await
-        .map(Json)
-}
-
-async fn remove_node_roles(
-    State(controller): State<Arc<Controller>>,
-    Path(node_id): Path<String>,
-    headers: HeaderMap,
-    Json(body): Json<NodeRolesUpdate>,
-) -> Result<Json<NodeRolesResponse>, ControllerError> {
-    require_auth(&controller, &headers)?;
-    controller
-        .update_node_roles(&node_id, body, RoleOperation::Remove)
+        .update_node_gateway(&node_id, body)
         .await
         .map(Json)
 }
@@ -346,22 +314,6 @@ impl IntoResponse for ControllerError {
             Self::Conflict(message) => {
                 (StatusCode::CONFLICT, Json(json!({"error": message}))).into_response()
             }
-            Self::NotLeader(Some(location)) => {
-                let mut response = (
-                    StatusCode::TEMPORARY_REDIRECT,
-                    Json(json!({"error": "not leader", "leader": location})),
-                )
-                    .into_response();
-                if let Ok(value) = location.parse() {
-                    response.headers_mut().insert(header::LOCATION, value);
-                }
-                response
-            }
-            Self::NotLeader(None) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "no active leader"})),
-            )
-                .into_response(),
             Self::Storage(error) => {
                 error!(%error, "controller storage request failed");
                 (

@@ -2,11 +2,7 @@ use super::*;
 
 impl Controller {
     pub(super) async fn gateway(&self) -> Result<gateway::HttpServer, ControllerError> {
-        let mut inner = self.inner.lock().await;
-        self.expire_local_lease(&mut inner);
-        if !inner.is_leader {
-            return Err(self.leader_redirect("/v1/gateway"));
-        }
+        let inner = self.inner.lock().await;
         Ok(gateway::generate(&inner.state, &self.config.gateway.listen))
     }
 
@@ -38,21 +34,12 @@ impl Controller {
     }
 
     pub(super) async fn sync_gateway_once(&self) -> Result<(), String> {
-        let (generation, controller_set_generation, server, storage, endpoints) = {
-            let mut inner = self.inner.lock().await;
-            self.expire_local_lease(&mut inner);
-            if !inner.is_leader {
-                return Ok(());
-            }
-            let (controller_set_generation, voters) = self.repository.controller_set();
+        let (generation, server, storage, endpoints) = {
+            let inner = self.inner.lock().await;
             (
                 inner.generation,
-                controller_set_generation,
                 gateway::generate(&inner.state, &self.config.gateway.listen),
-                gateway::storage(
-                    controller_urls(&inner.state, Some(&self.config.advertise_url), &voters),
-                    controller_set_generation,
-                ),
+                gateway::storage(self.config.advertise_url.clone()),
                 gateway_endpoints(&inner.state, self.config.gateway.admin_port),
             )
         };
@@ -60,7 +47,6 @@ impl Controller {
         if endpoints.is_empty() {
             let mut sync = self.gateway_sync.lock().await;
             sync.applied_generation = None;
-            sync.applied_controller_set_generations.clear();
             sync.endpoint_errors.clear();
             return Ok(());
         }
@@ -73,11 +59,7 @@ impl Controller {
         }))
         .await;
         let mut endpoint_errors = BTreeMap::new();
-        let mut storage_applied = Vec::new();
-        for (endpoint, (storage_succeeded, result)) in endpoints.iter().cloned().zip(results) {
-            if storage_succeeded {
-                storage_applied.push(endpoint.clone());
-            }
+        for (endpoint, (_, result)) in endpoints.iter().cloned().zip(results) {
             if let Err(error) = result {
                 endpoint_errors.insert(endpoint, error);
             }
@@ -85,12 +67,6 @@ impl Controller {
         {
             let mut sync = self.gateway_sync.lock().await;
             sync.endpoint_errors = endpoint_errors.clone();
-            sync.applied_controller_set_generations
-                .retain(|endpoint, _| endpoints.contains(endpoint));
-            for endpoint in storage_applied {
-                sync.applied_controller_set_generations
-                    .insert(endpoint, controller_set_generation);
-            }
             if endpoint_errors.is_empty() {
                 sync.applied_generation = Some(generation);
             }
@@ -103,13 +79,9 @@ impl Controller {
                 .join("; "));
         }
 
-        info!(
-            generation,
-            controller_set_generation, "gateway configuration applied"
-        );
+        info!(generation, "gateway configuration applied");
         let mut inner = self.inner.lock().await;
-        self.expire_local_lease(&mut inner);
-        if !inner.is_leader || inner.generation != generation {
+        if inner.generation != generation {
             self.gateway_notify.notify_one();
             return Ok(());
         }

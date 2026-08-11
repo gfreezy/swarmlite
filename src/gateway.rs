@@ -59,7 +59,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::model::{
-        NodeRecord, PortBinding, ServicePort, ServiceSpec, StackRecord, TaskRecord, agent_roles,
+        NodeRecord, PortBinding, ServicePort, ServiceSpec, StackRecord, TaskRecord,
     };
     use swarmlite_stack::parse_stack;
 
@@ -170,11 +170,7 @@ x-swarmlite:
             memory_bytes: 1024,
             port_range_start: 20_000,
             port_range_end: 29_999,
-            roles: agent_roles(),
-            controller_url: String::new(),
-            raft_id: 1,
-            raft_url: String::new(),
-            controller_set_generation: 0,
+            gateway_enabled: false,
         }
     }
 

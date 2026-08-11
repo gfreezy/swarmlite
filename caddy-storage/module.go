@@ -20,13 +20,12 @@ func init() {
 // errors only reduce cross-instance certificate reuse; they never make local
 // storage unavailable.
 type Module struct {
-	Root                    string         `json:"root,omitempty"`
-	Controllers             []string       `json:"controllers,omitempty"`
-	ControllerSetGeneration uint64         `json:"controller_set_generation,omitempty"`
-	Token                   string         `json:"token,omitempty"`
-	TokenEnv                string         `json:"token_env,omitempty"`
-	Timeout                 caddy.Duration `json:"timeout,omitempty"`
-	LockLease               caddy.Duration `json:"lock_lease,omitempty"`
+	Root       string         `json:"root,omitempty"`
+	Controller string         `json:"controller,omitempty"`
+	Token      string         `json:"token,omitempty"`
+	TokenEnv   string         `json:"token_env,omitempty"`
+	Timeout    caddy.Duration `json:"timeout,omitempty"`
+	LockLease  caddy.Duration `json:"lock_lease,omitempty"`
 }
 
 func (Module) CaddyModule() caddy.ModuleInfo {
@@ -58,7 +57,7 @@ func (m Module) CertMagicStorage() (certmagic.Storage, error) {
 	if lease < time.Second || lease > 5*time.Minute {
 		return nil, fmt.Errorf("lock_lease must be between 1s and 5m")
 	}
-	return newStorage(root, m.Controllers, token, timeout, lease), nil
+	return newStorage(root, m.Controller, token, timeout, lease), nil
 }
 
 func (m *Module) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
@@ -73,10 +72,10 @@ func (m *Module) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			m.Root = filepath.Clean(d.Val())
 		case "controller":
-			if !d.NextArg() {
+			if !d.NextArg() || m.Controller != "" {
 				return d.ArgErr()
 			}
-			m.Controllers = append(m.Controllers, d.Val())
+			m.Controller = d.Val()
 		case "token":
 			if !d.NextArg() || m.Token != "" {
 				return d.ArgErr()

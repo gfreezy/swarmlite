@@ -4,12 +4,11 @@ use anyhow::{Result, bail};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{ClusterSettings, NodeRoles};
+use crate::model::ClusterSettings;
 
 #[derive(Debug, Clone)]
 pub struct ControllerConfig {
-    pub controller_id: String,
-    pub roles: NodeRoles,
+    pub gateway_enabled: bool,
     pub labels: BTreeMap<String, String>,
     pub listen: SocketAddr,
     pub advertise_url: String,
@@ -49,16 +48,12 @@ pub struct AgentConfig {
     pub cluster_id: String,
     pub node_id: String,
     pub advertise_address: String,
-    pub controllers: Vec<String>,
-    pub controller_set_generation: u64,
+    pub controller: String,
     pub runtime: Option<RuntimeConfig>,
     pub labels: BTreeMap<String, String>,
     pub heartbeat_interval_seconds: u64,
     pub port_range: PortRangeConfig,
-    pub roles: NodeRoles,
-    pub controller_url: String,
-    pub raft_id: u64,
-    pub raft_url: String,
+    pub gateway_enabled: bool,
 }
 
 impl AgentConfig {

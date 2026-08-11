@@ -13,49 +13,20 @@ impl Controller {
             ));
         }
         let mut inner = self.inner.lock().await;
-        self.expire_local_lease(&mut inner);
-        if !inner.is_leader {
-            return Err(self.leader_redirect(&format!("/v1/nodes/{node_id}/heartbeat")));
-        }
-
         let previous = inner.state.clone();
-        let now = unix_ms();
-        let voters = self.repository.voter_ids();
-        let mut changed = prune_controllers(&mut inner.state, now, &voters);
+        let mut changed = false;
         let mut soft_changed = false;
-        let (desired_roles, desired_labels) = {
+        let (gateway_enabled, desired_labels) = {
             let member = inner.state.members.get_mut(node_id).ok_or_else(|| {
                 ControllerError::Invalid("node must join before sending heartbeats".to_owned())
             })?;
-            if member.raft_id != node.raft_id {
-                return Err(ControllerError::Invalid(
-                    "heartbeat raft_id differs from the joined node identity".to_owned(),
-                ));
-            }
             if member.address != node.address {
                 member.address.clone_from(&node.address);
                 changed = true;
             }
-            (member.roles.clone(), member.labels.clone())
+            (member.gateway_enabled, member.labels.clone())
         };
-        if desired_roles.contains(&NodeRole::Controller) {
-            changed |= ensure_controller_record(&mut inner.state, node_id, now)?;
-            if node.roles.contains(&NodeRole::Controller) {
-                let record = inner.state.controllers[node_id].clone();
-                if !self.repository.is_voter(record.raft_id) {
-                    self.repository
-                        .ensure_voter(
-                            record.raft_id,
-                            swarmlite_raft::ControllerNode {
-                                raft_url: record.raft_url,
-                                api_url: record.advertise_url,
-                            },
-                        )
-                        .await?;
-                    self.gateway_notify.notify_one();
-                }
-            }
-        }
+        node.gateway_enabled = gateway_enabled;
         node.labels.clone_from(&desired_labels);
         soft_changed |= inner.state.nodes.get(node_id).is_none_or(|existing| {
             serde_json::to_value(existing).ok() != serde_json::to_value(&node).ok()
@@ -157,7 +128,6 @@ impl Controller {
             self.gateway_notify.notify_one();
         }
 
-        let term = self.repository.current_term();
         let generation = inner.generation;
         let assignments = inner
             .state
@@ -182,7 +152,6 @@ impl Controller {
                     slot: task.slot,
                     spec: service.spec.clone(),
                     ports: task.ports.clone(),
-                    leader_term: term,
                     generation,
                     spec_hash: service_spec_hash(&service.spec),
                 })
@@ -195,39 +164,19 @@ impl Controller {
             .filter(|task| task.node_id == node_id && task.desired == DesiredTaskState::Stopped)
             .map(|task| task.id.clone())
             .collect();
-        let (controller_set_generation, voters) = self.repository.controller_set();
         Ok(HeartbeatResponse {
-            leader_term: term,
             generation,
-            controller_set_generation,
             cluster: inner.cluster.clone(),
             assignments,
-            roles: desired_roles,
+            gateway_enabled,
             labels: desired_labels,
-            controllers: controller_urls(&inner.state, Some(&self.config.advertise_url), &voters),
             remove_tasks,
         })
     }
 
     pub(super) async fn status(&self) -> StatusResponse {
-        let mut inner = self.inner.lock().await;
-        self.expire_local_lease(&mut inner);
+        let inner = self.inner.lock().await;
         let generation = inner.generation;
-        let (controller_set_generation, _) = self.repository.controller_set();
-        let leader = self.repository.raft().leader().map(|(raft_id, node)| {
-            let id = inner
-                .state
-                .controllers
-                .values()
-                .find(|record| record.raft_id == raft_id)
-                .map_or_else(|| raft_id.to_string(), |record| record.node_id.clone());
-            LeaderRecord {
-                id,
-                term: self.repository.current_term(),
-                advertise_url: node.api_url,
-            }
-        });
-        let is_leader = inner.is_leader;
         let state = inner.state.clone();
         let recovery = recovery_status(&state);
         drop(inner);
@@ -235,35 +184,15 @@ impl Controller {
         StatusResponse {
             cluster_id: self.config.cluster.cluster_id.clone(),
             generation,
-            controller_set_generation,
-            leader,
-            is_leader,
+            controller_id: self.config.cluster.controller_id.clone(),
             gateway: GatewayStatus {
-                enabled: state
-                    .members
-                    .values()
-                    .any(|member| member.roles.contains(&NodeRole::Gateway)),
+                enabled: state.members.values().any(|member| member.gateway_enabled),
                 desired_generation: generation,
                 applied_generation: gateway_sync.applied_generation,
-                desired_controller_set_generation: controller_set_generation,
-                applied_controller_set_generations: gateway_sync
-                    .applied_controller_set_generations
-                    .clone(),
                 endpoint_errors: gateway_sync.endpoint_errors.clone(),
             },
             recovery,
             state,
-        }
-    }
-
-    pub(super) async fn leader_status(&self) -> Result<StatusResponse, ControllerError> {
-        let status = self.status().await;
-        if status.is_leader {
-            Ok(status)
-        } else if self.repository.is_leader() {
-            Err(StorageError::Backend("Raft leader is still initializing".to_owned()).into())
-        } else {
-            Err(self.leader_redirect("/v1/status"))
         }
     }
 }

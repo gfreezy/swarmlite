@@ -10,7 +10,7 @@
 - deterministic rule ordering;
 - Caddy JSON generation.
 
-The crate has no dependency on controllers, scheduling, Raft, redb, or a container runtime. It
+The crate has no dependency on controllers, scheduling, SQLite, or a container runtime. It
 parses a complete Stack file in one pass, validates `backend.service` against that file's `services`
 map, and exposes a renderer callback which resolves an internal `(stack, service, port)` into
 healthy dial addresses. The main `swarmlite` crate implements that runtime adapter from replicated

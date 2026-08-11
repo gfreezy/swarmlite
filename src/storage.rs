@@ -1,26 +1,29 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
-use swarmlite_raft::{
-    CommandOutcome, ControllerNode, NodeId, RaftNode, ReplicatedState, SubmitError,
-};
 use thiserror::Error;
-use uuid::Uuid;
 
-use crate::model::{
-    ClusterSettings, ClusterState, ControllerRecord, DesiredTaskState, KvState, NodeMember,
-    ObservedTaskState, PortBinding, ServiceRecord, StackRecord, TaskRecord,
+use crate::{
+    local_state::DATABASE_FILE,
+    model::{
+        ClusterSettings, ClusterState, DesiredTaskState, KvState, NodeMember, ObservedTaskState,
+        PortBinding, ServiceRecord, StackRecord, TaskRecord,
+    },
 };
 
-const PERSISTED_SCHEMA_VERSION: u32 = 5;
+const PERSISTED_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("control-plane state was modified concurrently")]
     Conflict,
-    #[error("this controller is not the Raft leader")]
-    NotLeader(Option<String>),
-    #[error("Raft storage error: {0}")]
+    #[error("SQLite storage error: {0}")]
     Backend(String),
     #[error("invalid persisted data: {0}")]
     InvalidData(String),
@@ -51,7 +54,6 @@ struct PersistedClusterState {
     services: BTreeMap<String, ServiceRecord>,
     tasks: BTreeMap<String, PersistedTaskRecord>,
     members: BTreeMap<String, NodeMember>,
-    controllers: BTreeMap<String, ControllerRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,79 +68,47 @@ struct PersistedTaskRecord {
     drain_until_unix_ms: Option<i64>,
 }
 
-/// Adapts Swarmlite's durable desired state to the opaque CAS value replicated
-/// by `swarmlite-raft`. Node heartbeats and task observations are deliberately
-/// removed before persistence and are rebuilt after leadership changes.
+/// SQLite-backed desired-state repository. Runtime heartbeat observations are
+/// intentionally excluded and rebuilt after a controller restart.
 #[derive(Clone)]
 pub struct StateRepository {
-    raft: Arc<RaftNode>,
+    path: Arc<PathBuf>,
     cluster: ClusterSettings,
 }
 
 impl StateRepository {
-    pub fn new(raft: Arc<RaftNode>, cluster: ClusterSettings) -> Self {
-        Self { raft, cluster }
-    }
-
-    pub fn raft(&self) -> &Arc<RaftNode> {
-        &self.raft
-    }
-
-    pub fn is_leader(&self) -> bool {
-        self.raft.is_leader()
-    }
-
-    pub fn current_term(&self) -> u64 {
-        self.raft.current_term()
-    }
-
-    pub fn leader_url(&self) -> Option<String> {
-        self.raft.leader().map(|(_, node)| node.api_url)
-    }
-
-    pub fn voter_ids(&self) -> std::collections::BTreeSet<NodeId> {
-        self.raft.voter_ids()
-    }
-
-    pub fn controller_set(&self) -> (u64, std::collections::BTreeSet<NodeId>) {
-        self.raft.controller_set()
-    }
-
-    pub fn is_voter(&self, node_id: NodeId) -> bool {
-        self.raft.voter_ids().contains(&node_id)
-    }
-
-    pub async fn ensure_voter(&self, node_id: NodeId, node: ControllerNode) -> StorageResult<()> {
-        if let Some(existing) = self.raft.member(node_id) {
-            if self.is_voter(node_id) {
-                if existing != node {
-                    self.raft
-                        .add_learner(node_id, node)
-                        .await
-                        .map_err(map_raft_error)?;
-                }
-                return Ok(());
-            }
-            if existing != node {
-                self.raft
-                    .add_learner(node_id, node.clone())
-                    .await
-                    .map_err(map_raft_error)?;
-            }
-        } else {
-            self.raft
-                .add_learner(node_id, node)
-                .await
-                .map_err(map_raft_error)?;
+    pub fn open(data_dir: &Path, cluster: ClusterSettings) -> StorageResult<Self> {
+        std::fs::create_dir_all(data_dir).map_err(backend)?;
+        let repository = Self {
+            path: Arc::new(data_dir.join(DATABASE_FILE)),
+            cluster,
+        };
+        repository.with_connection(|connection| {
+            connection
+                .execute_batch(
+                    "PRAGMA journal_mode = WAL;
+                     PRAGMA synchronous = FULL;
+                     CREATE TABLE IF NOT EXISTS control_plane (
+                         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                         generation INTEGER NOT NULL CHECK (generation >= 0),
+                         schema_version INTEGER NOT NULL,
+                         cluster_id TEXT NOT NULL,
+                         document BLOB NOT NULL
+                     ) STRICT;",
+                )
+                .map_err(backend)?;
+            Ok(())
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                repository.path.as_ref(),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .map_err(backend)?;
         }
-        self.raft.promote(node_id).await.map_err(map_raft_error)
-    }
-
-    pub async fn remove_voter(&self, node_id: NodeId) -> StorageResult<()> {
-        self.raft
-            .remove_voter(node_id, false)
-            .await
-            .map_err(map_raft_error)
+        Ok(repository)
     }
 
     pub async fn initialize_with_cluster(
@@ -150,52 +120,39 @@ impl StateRepository {
                 "repository was opened with different cluster settings".to_owned(),
             ));
         }
-        let replica = self.raft.local_state().await;
-        if let Some(value) = self.decode_replica(&replica)? {
-            return Ok(VersionedState {
-                generation: replica.generation,
-                cluster: value.cluster,
-                state: value.state.into_runtime(),
-                kv: value.kv,
-            });
-        }
-
-        let state = ClusterState::default();
-        if !self.raft.is_leader() {
-            return Ok(VersionedState {
-                generation: replica.generation,
+        self.with_connection(|connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(backend)?;
+            if let Some(versioned) = read_versioned(&transaction, &self.cluster)? {
+                transaction.commit().map_err(backend)?;
+                return Ok(versioned);
+            }
+            let value = PersistedControlPlane::new(cluster.clone(), ClusterState::default(), KvState::default());
+            let document = serde_json::to_vec(&value).map_err(invalid)?;
+            transaction
+                .execute(
+                    "INSERT INTO control_plane(singleton, generation, schema_version, cluster_id, document)
+                     VALUES (1, 1, ?1, ?2, ?3)",
+                    params![PERSISTED_SCHEMA_VERSION, cluster.cluster_id, document],
+                )
+                .map_err(backend)?;
+            transaction.commit().map_err(backend)?;
+            Ok(VersionedState {
+                generation: 1,
                 cluster: cluster.clone(),
-                state,
+                state: ClusterState::default(),
                 kv: KvState::default(),
-            });
-        }
-        match self
-            .replace(replica.generation, cluster, &state, &KvState::default())
-            .await
-        {
-            Ok(generation) => Ok(VersionedState {
-                generation,
-                cluster: cluster.clone(),
-                state,
-                kv: KvState::default(),
-            }),
-            Err(StorageError::Conflict) => self.load_local().await,
-            Err(error) => Err(error),
-        }
+            })
+        })
     }
 
-    pub async fn load_local(&self) -> StorageResult<VersionedState> {
-        let replica = self.raft.local_state().await;
-        self.versioned_state(replica)
-    }
-
-    pub async fn load_consistent(&self) -> StorageResult<VersionedState> {
-        let replica = self
-            .raft
-            .consistent_state()
-            .await
-            .map_err(map_check_is_leader_error)?;
-        self.versioned_state(replica)
+    pub async fn load(&self) -> StorageResult<VersionedState> {
+        self.with_connection(|connection| {
+            read_versioned(connection, &self.cluster)?.ok_or_else(|| {
+                StorageError::InvalidData("control-plane state is not initialized".to_owned())
+            })
+        })
     }
 
     pub async fn replace(
@@ -210,77 +167,151 @@ impl StateRepository {
                 "cluster identity cannot be changed".to_owned(),
             ));
         }
-        let value = PersistedControlPlane {
-            schema_version: PERSISTED_SCHEMA_VERSION,
-            cluster_id: cluster.cluster_id.clone(),
-            cluster: cluster.clone(),
-            state: PersistedClusterState::from_runtime(state),
-            kv: kv.clone(),
-        };
-        let body = serde_json::to_vec(&value)
-            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-        let response = self
-            .raft
-            .replace(
-                format!("control-plane-{}", Uuid::new_v4().simple()),
-                expected_generation,
-                body,
-            )
-            .await
-            .map_err(map_submit_error)?;
-        match response.outcome {
-            CommandOutcome::Applied => Ok(response.generation),
-            CommandOutcome::Conflict => Err(StorageError::Conflict),
-            CommandOutcome::Ignored => Err(StorageError::Backend(
-                "Raft ignored a control-plane command".to_owned(),
-            )),
-        }
-    }
-
-    fn versioned_state(&self, replica: ReplicatedState) -> StorageResult<VersionedState> {
-        let (cluster, state, kv) = self.decode_replica(&replica)?.map_or_else(
-            || {
-                (
-                    self.cluster.clone(),
-                    ClusterState::default(),
-                    KvState::default(),
+        let value = PersistedControlPlane::new(cluster.clone(), state.clone(), kv.clone());
+        let document = serde_json::to_vec(&value).map_err(invalid)?;
+        let next_generation = expected_generation
+            .checked_add(1)
+            .ok_or_else(|| StorageError::Backend("generation overflow".to_owned()))?;
+        let expected_generation_sql = i64::try_from(expected_generation).map_err(|_| {
+            StorageError::Backend("generation exceeds SQLite integer range".to_owned())
+        })?;
+        let next_generation_sql = i64::try_from(next_generation).map_err(|_| {
+            StorageError::Backend("generation exceeds SQLite integer range".to_owned())
+        })?;
+        self.with_connection(|connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(backend)?;
+            let changed = transaction
+                .execute(
+                    "UPDATE control_plane
+                     SET generation = ?1, schema_version = ?2, document = ?3
+                     WHERE singleton = 1 AND generation = ?4 AND cluster_id = ?5",
+                    params![
+                        next_generation_sql,
+                        PERSISTED_SCHEMA_VERSION,
+                        document,
+                        expected_generation_sql,
+                        cluster.cluster_id
+                    ],
                 )
-            },
-            |value| (value.cluster, value.state.into_runtime(), value.kv),
-        );
-        Ok(VersionedState {
-            generation: replica.generation,
-            cluster,
-            state,
-            kv,
+                .map_err(backend)?;
+            if changed != 1 {
+                return Err(StorageError::Conflict);
+            }
+            transaction.commit().map_err(backend)?;
+            Ok(next_generation)
         })
     }
 
-    fn decode_replica(
+    fn with_connection<T>(
         &self,
-        replica: &ReplicatedState,
-    ) -> StorageResult<Option<PersistedControlPlane>> {
-        if replica.value.is_empty() {
-            return Ok(None);
-        }
-        let value: PersistedControlPlane = serde_json::from_slice(&replica.value)
-            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-        if value.schema_version != PERSISTED_SCHEMA_VERSION
-            || value.cluster_id != self.cluster.cluster_id
-            || !same_cluster_identity(&value.cluster, &self.cluster)
-        {
-            return Err(StorageError::InvalidData(
-                "persisted Raft state belongs to a different or unsupported cluster".to_owned(),
-            ));
-        }
-        Ok(Some(value))
+        operation: impl FnOnce(&mut Connection) -> StorageResult<T>,
+    ) -> StorageResult<T> {
+        let mut connection = Connection::open(self.path.as_ref()).map_err(backend)?;
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(backend)?;
+        operation(&mut connection)
     }
+}
+
+pub(crate) fn control_plane_state_exists(data_dir: &Path) -> StorageResult<bool> {
+    let path = data_dir.join(DATABASE_FILE);
+    if !path.exists() {
+        return Ok(false);
+    }
+    let connection =
+        Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(backend)?;
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(backend)?;
+    let table_exists = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'control_plane'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(backend)?;
+    if !table_exists {
+        return Ok(false);
+    }
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM control_plane WHERE singleton = 1)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(backend)
+}
+
+fn read_versioned(
+    connection: &Connection,
+    expected_cluster: &ClusterSettings,
+) -> StorageResult<Option<VersionedState>> {
+    let row = connection
+        .query_row(
+            "SELECT generation, schema_version, cluster_id, document
+             FROM control_plane WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(backend)?;
+    let Some((generation, schema_version, cluster_id, document)) = row else {
+        return Ok(None);
+    };
+    let generation = u64::try_from(generation)
+        .map_err(|_| StorageError::InvalidData("negative SQLite generation".to_owned()))?;
+    if schema_version != PERSISTED_SCHEMA_VERSION || cluster_id != expected_cluster.cluster_id {
+        return Err(StorageError::InvalidData(
+            "persisted SQLite state belongs to a different or unsupported cluster".to_owned(),
+        ));
+    }
+    let value: PersistedControlPlane = serde_json::from_slice(&document).map_err(invalid)?;
+    if value.schema_version != PERSISTED_SCHEMA_VERSION
+        || value.cluster_id != expected_cluster.cluster_id
+        || !same_cluster_identity(&value.cluster, expected_cluster)
+    {
+        return Err(StorageError::InvalidData(
+            "persisted SQLite document belongs to a different or unsupported cluster".to_owned(),
+        ));
+    }
+    Ok(Some(VersionedState {
+        generation,
+        cluster: value.cluster,
+        state: value.state.into_runtime(),
+        kv: value.kv,
+    }))
 }
 
 fn same_cluster_identity(left: &ClusterSettings, right: &ClusterSettings) -> bool {
     left.schema_version == right.schema_version
         && left.cluster_id == right.cluster_id
+        && left.controller_id == right.controller_id
         && left.controller_port == right.controller_port
+}
+
+impl PersistedControlPlane {
+    fn new(cluster: ClusterSettings, state: ClusterState, kv: KvState) -> Self {
+        Self {
+            schema_version: PERSISTED_SCHEMA_VERSION,
+            cluster_id: cluster.cluster_id.clone(),
+            cluster,
+            state: PersistedClusterState::from_runtime(&state),
+            kv,
+        }
+    }
 }
 
 impl PersistedClusterState {
@@ -294,7 +325,6 @@ impl PersistedClusterState {
                 .map(|(id, task)| (id.clone(), PersistedTaskRecord::from_runtime(task)))
                 .collect(),
             members: state.members.clone(),
-            controllers: state.controllers.clone(),
         }
     }
 
@@ -309,7 +339,6 @@ impl PersistedClusterState {
                 .map(|(id, task)| (id, task.into_runtime()))
                 .collect(),
             members: self.members,
-            controllers: self.controllers,
             unclaimed_tasks: BTreeMap::new(),
         }
     }
@@ -345,89 +374,38 @@ impl PersistedTaskRecord {
     }
 }
 
-fn map_submit_error(error: SubmitError) -> StorageError {
-    match error {
-        SubmitError::EmptyRequestId => StorageError::Backend(error.to_string()),
-        SubmitError::Raft(error) => {
-            if let Some(forward) = error.forward_to_leader::<ControllerNode>() {
-                StorageError::NotLeader(
-                    forward
-                        .leader_node
-                        .as_ref()
-                        .map(|node| node.api_url.clone()),
-                )
-            } else {
-                StorageError::Backend(error.to_string())
-            }
-        }
-    }
+fn backend(error: impl std::fmt::Display) -> StorageError {
+    StorageError::Backend(error.to_string())
 }
 
-fn map_raft_error(error: swarmlite_raft::ClientWriteRaftError) -> StorageError {
-    if let Some(forward) = error.forward_to_leader::<ControllerNode>() {
-        StorageError::NotLeader(
-            forward
-                .leader_node
-                .as_ref()
-                .map(|node| node.api_url.clone()),
-        )
-    } else {
-        StorageError::Backend(error.to_string())
-    }
-}
-
-fn map_check_is_leader_error(error: swarmlite_raft::CheckIsLeaderRaftError) -> StorageError {
-    if let Some(forward) = error.forward_to_leader::<ControllerNode>() {
-        StorageError::NotLeader(
-            forward
-                .leader_node
-                .as_ref()
-                .map(|node| node.api_url.clone()),
-        )
-    } else {
-        StorageError::Backend(error.to_string())
-    }
+fn invalid(error: impl std::fmt::Display) -> StorageError {
+    StorageError::InvalidData(error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use swarmlite_raft::{ControllerNode, NodeConfig};
-
-    use crate::model::{ClusterGatewayConfig, NodeRecord, ServiceRecord, ServiceSpec, TaskRecord};
+    use crate::local_state::{LocalState, NODE_KEY};
+    use crate::model::{ClusterGatewayConfig, NodeRecord, ServiceSpec};
 
     use super::*;
 
-    #[tokio::test]
-    async fn persists_only_durable_state_through_raft_cas() {
-        let directory = tempfile::tempdir().unwrap();
-        let raft = RaftNode::open(NodeConfig::new(
-            1,
-            ControllerNode {
-                raft_url: "http://127.0.0.1:19090/internal/raft".into(),
-                api_url: "http://127.0.0.1:19090".into(),
-            },
-            directory.path(),
-            "storage-test",
-            "0123456789abcdef0123456789abcdef",
-        ))
-        .await
-        .unwrap();
-        raft.initialize().await.unwrap();
-        raft.raft()
-            .wait(Some(Duration::from_secs(5)))
-            .current_leader(1, "test node becomes leader")
-            .await
-            .unwrap();
-        let cluster = ClusterSettings {
+    fn cluster() -> ClusterSettings {
+        ClusterSettings {
             schema_version: crate::model::CLUSTER_SCHEMA_VERSION,
             cluster_id: "storage-test".into(),
-            mode: crate::model::ClusterMode::Standalone,
+            controller_id: "controller-node".into(),
             controller_port: 19090,
             gateway: ClusterGatewayConfig::default(),
-        };
-        let repository = StateRepository::new(raft.clone(), cluster.clone());
+        }
+    }
+
+    #[tokio::test]
+    async fn persists_only_durable_state_with_sqlite_cas() {
+        let directory = tempfile::tempdir().unwrap();
+        let cluster = cluster();
+        let local_state = LocalState::open(directory.path()).unwrap();
+        local_state.put(NODE_KEY, &"controller-node").unwrap();
+        let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
         let first = repository.initialize_with_cluster(&cluster).await.unwrap();
         let mut state = ClusterState::default();
         state.nodes.insert(
@@ -440,11 +418,7 @@ mod tests {
                 memory_bytes: 1024,
                 port_range_start: 20_000,
                 port_range_end: 29_999,
-                roles: crate::model::agent_roles(),
-                controller_url: String::new(),
-                raft_id: 1,
-                raft_url: String::new(),
-                controller_set_generation: 0,
+                gateway_enabled: false,
             },
         );
         state.services.insert(
@@ -480,7 +454,7 @@ mod tests {
                 revision: 1,
                 slot: 0,
                 node_id: "soft-node".into(),
-                desired: crate::model::DesiredTaskState::Running,
+                desired: DesiredTaskState::Running,
                 observed: ObservedTaskState::Healthy,
                 ports: Vec::new(),
                 container_id: Some("container-1".into()),
@@ -488,17 +462,18 @@ mod tests {
             },
         );
 
-        repository
+        let generation = repository
             .replace(first.generation, &cluster, &state, &KvState::default())
             .await
             .unwrap();
-        let raw = raft.local_state().await;
-        let json = std::str::from_utf8(&raw.value).unwrap();
-        assert!(!json.contains("\"nodes\""));
-        assert!(!json.contains("\"observed\""));
-        assert!(!json.contains("\"container_id\""));
-        let loaded = repository.load_consistent().await.unwrap();
-        assert_eq!(loaded.cluster, cluster);
+        assert_eq!(generation, first.generation + 1);
+        assert!(matches!(
+            repository
+                .replace(first.generation, &cluster, &state, &KvState::default())
+                .await,
+            Err(StorageError::Conflict)
+        ));
+        let loaded = repository.load().await.unwrap();
         assert!(loaded.state.nodes.is_empty());
         assert_eq!(loaded.state.services.len(), 1);
         assert_eq!(
@@ -506,6 +481,11 @@ mod tests {
             ObservedTaskState::Pending
         );
         assert!(loaded.state.tasks["task-1"].container_id.is_none());
-        raft.shutdown().await.unwrap();
+        assert!(directory.path().join(DATABASE_FILE).exists());
+        assert!(control_plane_state_exists(directory.path()).unwrap());
+        assert_eq!(
+            local_state.get::<String>(NODE_KEY).unwrap().as_deref(),
+            Some("controller-node")
+        );
     }
 }

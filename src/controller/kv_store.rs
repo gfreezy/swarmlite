@@ -6,10 +6,6 @@ impl Controller {
         request: KvPutRequest,
     ) -> Result<KvPutResponse, ControllerError> {
         let mut inner = self.inner.lock().await;
-        self.expire_local_lease(&mut inner);
-        if !inner.is_leader {
-            return Err(self.leader_redirect("/v1/kv"));
-        }
         let previous = inner.kv.clone();
         let response = kv::apply_put(&mut inner.kv, request).map_err(ControllerError::Invalid)?;
         if response.applied
@@ -26,10 +22,6 @@ impl Controller {
         request: KvDeleteRequest,
     ) -> Result<KvPutResponse, ControllerError> {
         let mut inner = self.inner.lock().await;
-        self.expire_local_lease(&mut inner);
-        if !inner.is_leader {
-            return Err(self.leader_redirect("/v1/kv"));
-        }
         let previous = inner.kv.clone();
         let response =
             kv::apply_delete(&mut inner.kv, request).map_err(ControllerError::Invalid)?;
@@ -43,11 +35,7 @@ impl Controller {
     }
 
     pub(super) async fn kv_object(&self, key: &str) -> Result<KvObjectResponse, ControllerError> {
-        let mut inner = self.inner.lock().await;
-        self.expire_local_lease(&mut inner);
-        if !inner.is_leader {
-            return Err(self.leader_redirect_with_query("/v1/kv", &[("key", key.to_owned())]));
-        }
+        let inner = self.inner.lock().await;
         kv::get(&inner.kv, key)
             .map_err(ControllerError::Invalid)?
             .ok_or_else(|| ControllerError::NotFound(format!("KV key {key} was not found")))
@@ -58,28 +46,14 @@ impl Controller {
         path: &str,
         recursive: bool,
     ) -> Result<KvListResponse, ControllerError> {
-        let mut inner = self.inner.lock().await;
-        self.expire_local_lease(&mut inner);
-        if !inner.is_leader {
-            return Err(self.leader_redirect_with_query(
-                "/v1/kv/keys",
-                &[
-                    ("prefix", path.to_owned()),
-                    ("recursive", recursive.to_string()),
-                ],
-            ));
-        }
+        let inner = self.inner.lock().await;
         kv::list(&inner.kv, path, recursive)
             .map_err(ControllerError::Invalid)?
             .ok_or_else(|| ControllerError::NotFound(format!("KV path {path} was not found")))
     }
 
     pub(super) async fn stat_kv(&self, key: &str) -> Result<KvStatResponse, ControllerError> {
-        let mut inner = self.inner.lock().await;
-        self.expire_local_lease(&mut inner);
-        if !inner.is_leader {
-            return Err(self.leader_redirect_with_query("/v1/kv/stat", &[("key", key.to_owned())]));
-        }
+        let inner = self.inner.lock().await;
         kv::stat(&inner.kv, key)
             .map_err(ControllerError::Invalid)?
             .ok_or_else(|| ControllerError::NotFound(format!("KV key {key} was not found")))
@@ -92,10 +66,6 @@ impl Controller {
         validate_kv_lock_identity(&request.name, &request.owner_id)?;
         validate_kv_lock_lease(request.lease_millis)?;
         let mut inner = self.inner.lock().await;
-        self.expire_local_lease(&mut inner);
-        if !inner.is_leader {
-            return Err(self.leader_redirect("/v1/kv/locks/acquire"));
-        }
 
         let now = unix_ms();
         if let Some(lock) = inner.kv.locks.get(&request.name)
@@ -161,10 +131,6 @@ impl Controller {
             .ok_or_else(|| ControllerError::Invalid("lease_millis is required".to_owned()))?;
         validate_kv_lock_lease(lease_millis)?;
         let mut inner = self.inner.lock().await;
-        self.expire_local_lease(&mut inner);
-        if !inner.is_leader {
-            return Err(self.leader_redirect("/v1/kv/locks/renew"));
-        }
         let now = unix_ms();
         let previous = inner.kv.clone();
         let lock = inner
@@ -193,10 +159,6 @@ impl Controller {
     ) -> Result<(), ControllerError> {
         validate_kv_lock_identity(&request.name, &request.owner_id)?;
         let mut inner = self.inner.lock().await;
-        self.expire_local_lease(&mut inner);
-        if !inner.is_leader {
-            return Err(self.leader_redirect("/v1/kv/locks/release"));
-        }
         let Some(lock) = inner.kv.locks.get(&request.name) else {
             return Ok(());
         };

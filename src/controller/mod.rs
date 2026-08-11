@@ -13,9 +13,8 @@ use tokio::{
     sync::{Mutex, Notify},
 };
 use tower_http::trace::TraceLayer;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
-const CONTROLLER_TIMEOUT_MS: i64 = 60_000;
 const MIN_KV_LOCK_LEASE_MS: u64 = 1_000;
 const MAX_KV_LOCK_LEASE_MS: u64 = 300_000;
 const MAX_HTTP_BODY_BYTES: usize = 6 * 1024 * 1024;
@@ -24,15 +23,14 @@ use crate::{
     config::ControllerConfig,
     gateway, kv,
     model::{
-        BootstrapResponse, ClusterConfigResponse, ClusterConfigUpdate, ClusterMode,
-        ClusterSettings, ClusterState, ControllerRecord, DesiredTaskState, GatewayStatus,
-        HeartbeatResponse, JoinRequest, JoinResponse, KvDeleteRequest, KvListResponse, KvLock,
-        KvLockAcquireRequest, KvLockAcquireResponse, KvLockMutationRequest, KvLockStatus,
-        KvObjectResponse, KvPutRequest, KvPutResponse, KvStatResponse, KvState, LeaderRecord,
+        BootstrapResponse, ClusterConfigResponse, ClusterConfigUpdate, ClusterSettings,
+        ClusterState, DesiredTaskState, GatewayStatus, HeartbeatResponse, JoinRequest,
+        JoinResponse, KvDeleteRequest, KvListResponse, KvLock, KvLockAcquireRequest,
+        KvLockAcquireResponse, KvLockMutationRequest, KvLockStatus, KvObjectResponse, KvPutRequest,
+        KvPutResponse, KvStatResponse, KvState, NodeGatewayResponse, NodeGatewayUpdate,
         NodeHeartbeat, NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, NodeMember,
-        NodeRole, NodeRolesResponse, NodeRolesUpdate, ObservedTaskState, ServiceRecord,
-        StackRecord, StatusResponse, TaskAssignment, UnclaimedTask, service_spec_hash,
-        valid_gateway_image,
+        ObservedTaskState, ServiceRecord, StackRecord, StatusResponse, TaskAssignment,
+        UnclaimedTask, service_spec_hash, valid_gateway_image,
     },
     scheduler,
     storage::{StateRepository, StorageError},
@@ -45,7 +43,7 @@ mod deployment;
 mod gateway_sync;
 mod heartbeat;
 mod kv_store;
-mod leadership;
+mod lifecycle;
 mod membership;
 mod nodes;
 mod recovery;
@@ -64,15 +62,12 @@ pub(crate) async fn run_with_repository_and_token_until<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let raft = repository.raft().clone();
-    let raft_router = raft.rpc_router();
     let controller = Arc::new(
         Controller::new(config.clone(), token, repository)
             .await
             .map_err(anyhow::Error::msg)?,
     );
     let app = api::router(controller.clone())
-        .nest("/internal/raft", raft_router)
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .layer(TraceLayer::new_for_http());
     let listener = TcpListener::bind(config.listen)
@@ -89,8 +84,7 @@ where
         .map_err(anyhow::Error::from);
     control_loop.abort();
     gateway_loop.abort();
-    let shutdown_result = raft.shutdown().await.map_err(anyhow::Error::msg);
-    result.and(shutdown_result)
+    result
 }
 
 struct Inner {
@@ -98,9 +92,7 @@ struct Inner {
     cluster: ClusterSettings,
     state: ClusterState,
     kv: KvState,
-    is_leader: bool,
     live_nodes: HashMap<String, Instant>,
-    controller_ack_candidates: HashMap<String, Instant>,
 }
 
 pub struct Controller {
@@ -116,15 +108,7 @@ pub struct Controller {
 #[derive(Debug, Default)]
 struct GatewaySyncState {
     applied_generation: Option<u64>,
-    applied_controller_set_generations: BTreeMap<String, u64>,
     endpoint_errors: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RoleOperation {
-    Set,
-    Add,
-    Remove,
 }
 
 #[derive(Debug)]
@@ -133,16 +117,12 @@ enum ControllerError {
     Invalid(String),
     NotFound(String),
     Conflict(String),
-    NotLeader(Option<String>),
     Storage(StorageError),
 }
 
 impl From<StorageError> for ControllerError {
     fn from(value: StorageError) -> Self {
-        match value {
-            StorageError::NotLeader(location) => Self::NotLeader(location),
-            error => Self::Storage(error),
-        }
+        Self::Storage(value)
     }
 }
 

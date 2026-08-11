@@ -5,7 +5,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     config::AgentConfig,
-    local_state::{AgentControllerSet, AgentFence, CONTROLLER_SET_KEY, FENCE_KEY, LocalState},
+    local_state::{AgentFence, FENCE_KEY, LocalState},
     model::{
         HeartbeatResponse, NodeControl, NodeHeartbeat, NodeRecord, ObservedTaskState, TaskReport,
     },
@@ -35,17 +35,6 @@ async fn run_with_runtime<R: ContainerRuntime>(
     let mut fence = local_state
         .get::<AgentFence>(FENCE_KEY)?
         .unwrap_or_default();
-    let configured_controller_set = AgentControllerSet {
-        generation: config.controller_set_generation,
-        controllers: config.controllers.clone(),
-    };
-    let controller_set = local_state
-        .get::<AgentControllerSet>(CONTROLLER_SET_KEY)?
-        .filter(|persisted| {
-            !persisted.controllers.is_empty()
-                && persisted.generation > configured_controller_set.generation
-        })
-        .unwrap_or(configured_controller_set);
     let mut node = NodeRecord {
         id: config.node_id.clone(),
         address: config.advertise_address.clone(),
@@ -54,16 +43,9 @@ async fn run_with_runtime<R: ContainerRuntime>(
         memory_bytes: system.memory_bytes,
         port_range_start: config.port_range.start,
         port_range_end: config.port_range.end,
-        roles: config.roles.clone(),
-        controller_url: config.controller_url.clone(),
-        raft_id: config.raft_id,
-        raft_url: config.raft_url.clone(),
-        controller_set_generation: controller_set.generation,
+        gateway_enabled: config.gateway_enabled,
     };
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
-    let mut controllers = controller_set.controllers;
+    let client = reqwest::Client::new();
     let (assignments_tx, assignments_rx) = tokio::sync::watch::channel(None);
     let runtime = Arc::new(runtime);
     let reconcile_runtime = Arc::clone(&runtime);
@@ -109,7 +91,7 @@ async fn run_with_runtime<R: ContainerRuntime>(
         };
         let response = match send_heartbeat(
             &client,
-            &controllers,
+            &config.controller,
             &config.node_id,
             &token,
             &heartbeat,
@@ -118,58 +100,29 @@ async fn run_with_runtime<R: ContainerRuntime>(
         {
             Ok(response) => response,
             Err(error) => {
-                warn!(%error, "all controllers are unavailable; leaving current containers unchanged");
+                warn!(%error, "controller is unavailable; leaving current containers unchanged");
                 continue;
             }
         };
-        if response.leader_term < fence.term
-            || (response.leader_term == fence.term && response.generation < fence.generation)
-        {
+        if response.generation < fence.generation {
             warn!(
-                received_term = response.leader_term,
-                current_term = fence.term,
                 received_generation = response.generation,
                 current_generation = fence.generation,
                 "rejected stale controller response"
             );
             continue;
         }
-        fence.term = response.leader_term;
         fence.generation = response.generation;
-        let next_controller_set = (response.controller_set_generation
-            >= node.controller_set_generation
-            && !response.controllers.is_empty())
-        .then(|| AgentControllerSet {
-            generation: response.controller_set_generation,
-            controllers: response.controllers.clone(),
-        });
-        let persist_result = match &next_controller_set {
-            Some(controller_set) => {
-                local_state.put_pair((FENCE_KEY, &fence), (CONTROLLER_SET_KEY, controller_set))
-            }
-            None => local_state.put(FENCE_KEY, &fence),
-        };
-        if let Err(error) = persist_result {
+        if let Err(error) = local_state.put(FENCE_KEY, &fence) {
             error!(%error, "failed to persist fencing state; refusing to change containers");
             continue;
         }
-        if let Some(controller_set) = next_controller_set {
-            controllers = controller_set.controllers;
-            node.controller_set_generation = controller_set.generation;
-        } else if response.controller_set_generation < node.controller_set_generation {
-            warn!(
-                received_controller_set_generation = response.controller_set_generation,
-                applied_controller_set_generation = node.controller_set_generation,
-                "rejected stale controller set"
-            );
-        }
         let next_control = NodeControl {
             cluster: response.cluster.clone(),
-            roles: response.roles.clone(),
+            gateway_enabled: response.gateway_enabled,
             labels: response.labels.clone(),
-            controllers: controllers.clone(),
         };
-        node.roles.clone_from(&response.roles);
+        node.gateway_enabled = response.gateway_enabled;
         node.labels.clone_from(&response.labels);
         updates.send_if_modified(|current| {
             if *current == next_control {
@@ -209,61 +162,31 @@ async fn reconciliation_loop<R: ContainerRuntime>(
 
 async fn send_heartbeat(
     client: &reqwest::Client,
-    controllers: &[String],
+    controller: &str,
     node_id: &str,
     token: &str,
     heartbeat: &NodeHeartbeat,
 ) -> Result<HeartbeatResponse> {
-    let mut errors = Vec::new();
-    for controller in controllers {
-        let url = format!(
-            "{}/v1/nodes/{}/heartbeat",
-            controller.trim_end_matches('/'),
-            node_id
-        );
-        match post_heartbeat(client, &url, token, heartbeat).await {
-            Ok(response) if response.status().is_success() => {
-                return response
-                    .json()
-                    .await
-                    .with_context(|| format!("controller {url} returned invalid JSON"));
-            }
-            Ok(response) => {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                errors.push(format!("{url}: {status} {body}"));
-            }
-            Err(error) => errors.push(format!("{url}: {error}")),
-        }
+    let url = format!(
+        "{}/v1/nodes/{}/heartbeat",
+        controller.trim_end_matches('/'),
+        node_id
+    );
+    let response = client
+        .post(&url)
+        .bearer_auth(token)
+        .json(heartbeat)
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        bail!("controller {url} returned {status}: {body}");
     }
-    bail!(errors.join("; "))
-}
-
-async fn post_heartbeat(
-    client: &reqwest::Client,
-    initial_url: &str,
-    token: &str,
-    heartbeat: &NodeHeartbeat,
-) -> Result<reqwest::Response> {
-    let mut url = initial_url.to_owned();
-    for _ in 0..3 {
-        let response = client
-            .post(&url)
-            .bearer_auth(token)
-            .json(heartbeat)
-            .send()
-            .await?;
-        if response.status() != reqwest::StatusCode::TEMPORARY_REDIRECT {
-            return Ok(response);
-        }
-        url = response
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|value| value.to_str().ok())
-            .context("controller redirect omitted a valid Location header")?
-            .to_owned();
-    }
-    bail!("too many controller redirects")
+    response
+        .json()
+        .await
+        .with_context(|| format!("controller {url} returned invalid JSON"))
 }
 
 async fn reconcile_containers<R: ContainerRuntime>(
@@ -306,9 +229,7 @@ mod tests {
 
     use crate::{
         config::RuntimeKind,
-        model::{
-            ClusterGatewayConfig, ClusterMode, ClusterSettings, HeartbeatResponse, agent_roles,
-        },
+        model::{ClusterGatewayConfig, ClusterSettings, HeartbeatResponse},
         runtime::RuntimeSystemInfo,
     };
 
@@ -383,7 +304,7 @@ mod tests {
         ClusterSettings {
             schema_version: crate::model::CLUSTER_SCHEMA_VERSION,
             cluster_id: "cluster-test".into(),
-            mode: ClusterMode::Standalone,
+            controller_id: "controller-a".into(),
             controller_port: 8080,
             gateway: ClusterGatewayConfig::default(),
         }
@@ -394,14 +315,11 @@ mod tests {
         let runtime = FakeRuntime::default();
         let existing = HashMap::from([("old-task".into(), managed("old-task"))]);
         let mut response = HeartbeatResponse {
-            leader_term: 1,
             generation: 1,
-            controller_set_generation: 1,
             cluster: test_cluster(),
             assignments: Vec::new(),
-            roles: agent_roles(),
+            gateway_enabled: false,
             labels: Default::default(),
-            controllers: Vec::new(),
             remove_tasks: Vec::new(),
         };
 
@@ -425,9 +343,7 @@ mod tests {
         container.observed = ObservedTaskState::Failed;
         let existing = HashMap::from([("task-1".into(), container)]);
         let response = HeartbeatResponse {
-            leader_term: 1,
             generation: 1,
-            controller_set_generation: 1,
             cluster: test_cluster(),
             assignments: vec![crate::model::TaskAssignment {
                 id: "task-1".into(),
@@ -453,13 +369,11 @@ mod tests {
                     stop_grace_period_seconds: 10,
                 },
                 ports: Vec::new(),
-                leader_term: 1,
                 generation: 1,
                 spec_hash: "hash".into(),
             }],
-            roles: agent_roles(),
+            gateway_enabled: false,
             labels: Default::default(),
-            controllers: Vec::new(),
             remove_tasks: Vec::new(),
         };
 

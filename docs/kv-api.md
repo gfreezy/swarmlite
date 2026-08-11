@@ -1,9 +1,8 @@
 # Generic KV API
 
-Every request requires `Authorization: Bearer <cluster-token>`. Followers respond with `307`
-and an absolute leader URL. No active leader returns `503`; mutations and lock changes can also
-return `503` without a Raft quorum. Reads return the leader's current cache and may be stale.
-Consumers may treat any unavailable response as a cache miss when KV is only an optimization.
+Every request requires `Authorization: Bearer <cluster-token>`. The single controller serves all
+reads and writes from its SQLite database. Consumers may treat an unavailable response as a cache
+miss when KV is only an optimization.
 
 ## Values
 

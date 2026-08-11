@@ -85,24 +85,18 @@ type lockMutationRequest struct {
 }
 
 type coordinator struct {
-	controllers []string
-	token       string
-	timeout     time.Duration
-	client      *http.Client
+	controller string
+	token      string
+	timeout    time.Duration
+	client     *http.Client
 }
 
-func newCoordinator(controllers []string, token string, timeout time.Duration) *coordinator {
-	normalized := make([]string, 0, len(controllers))
-	for _, controller := range controllers {
-		controller = strings.TrimRight(strings.TrimSpace(controller), "/")
-		if controller != "" {
-			normalized = append(normalized, controller)
-		}
-	}
+func newCoordinator(controller string, token string, timeout time.Duration) *coordinator {
+	controller = strings.TrimRight(strings.TrimSpace(controller), "/")
 	return &coordinator{
-		controllers: normalized,
-		token:       token,
-		timeout:     timeout,
+		controller: controller,
+		token:      token,
+		timeout:    timeout,
 		client: &http.Client{
 			Timeout: timeout,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -113,7 +107,7 @@ func newCoordinator(controllers []string, token string, timeout time.Duration) *
 }
 
 func (c *coordinator) configured() bool {
-	return c != nil && len(c.controllers) > 0 && c.token != ""
+	return c != nil && c.controller != "" && c.token != ""
 }
 
 func (c *coordinator) put(ctx context.Context, request putRequest) (putResponse, error) {
@@ -213,51 +207,30 @@ func (c *coordinator) doJSON(
 			return err
 		}
 	}
-	var lastErr error
-	for _, controller := range c.controllers {
-		requestURL := controller + path
-		if len(query) > 0 {
-			requestURL += "?" + query.Encode()
-		}
-		for redirects := 0; redirects < 2; redirects++ {
-			response, requestErr := c.send(ctx, method, requestURL, encoded)
-			if requestErr != nil {
-				lastErr = requestErr
-				break
-			}
-			if response.StatusCode == http.StatusTemporaryRedirect || response.StatusCode == http.StatusPermanentRedirect {
-				location := response.Header.Get("Location")
-				response.Body.Close()
-				requestURL, requestErr = redirectedURL(location, path, query)
-				if requestErr != nil {
-					lastErr = requestErr
-					break
-				}
-				continue
-			}
-			defer response.Body.Close()
-			switch {
-			case response.StatusCode == http.StatusNotFound:
-				return errRemoteNotFound
-			case response.StatusCode >= 200 && response.StatusCode < 300:
-				if output == nil || response.StatusCode == http.StatusNoContent {
-					return nil
-				}
-				if err := json.NewDecoder(io.LimitReader(response.Body, 8<<20)).Decode(output); err != nil {
-					return fmt.Errorf("decode Swarmlite response: %w", err)
-				}
-				return nil
-			default:
-				io.Copy(io.Discard, io.LimitReader(response.Body, 4<<10))
-				lastErr = fmt.Errorf("Swarmlite returned HTTP %d", response.StatusCode)
-			}
-			break
-		}
+	requestURL := c.controller + path
+	if len(query) > 0 {
+		requestURL += "?" + query.Encode()
 	}
-	if lastErr == nil {
-		lastErr = errRemoteUnavailable
+	response, err := c.send(ctx, method, requestURL, encoded)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errRemoteUnavailable, err)
 	}
-	return fmt.Errorf("%w: %v", errRemoteUnavailable, lastErr)
+	defer response.Body.Close()
+	switch {
+	case response.StatusCode == http.StatusNotFound:
+		return errRemoteNotFound
+	case response.StatusCode >= 200 && response.StatusCode < 300:
+		if output == nil || response.StatusCode == http.StatusNoContent {
+			return nil
+		}
+		if err := json.NewDecoder(io.LimitReader(response.Body, 8<<20)).Decode(output); err != nil {
+			return fmt.Errorf("decode Swarmlite response: %w", err)
+		}
+		return nil
+	default:
+		io.Copy(io.Discard, io.LimitReader(response.Body, 4<<10))
+		return fmt.Errorf("%w: Swarmlite returned HTTP %d", errRemoteUnavailable, response.StatusCode)
+	}
 }
 
 func (c *coordinator) send(ctx context.Context, method, requestURL string, body []byte) (*http.Response, error) {
@@ -270,18 +243,4 @@ func (c *coordinator) send(ctx context.Context, method, requestURL string, body 
 		request.Header.Set("Content-Type", "application/json")
 	}
 	return c.client.Do(request)
-}
-
-func redirectedURL(location, originalPath string, query url.Values) (string, error) {
-	parsed, err := url.Parse(location)
-	if err != nil || !parsed.IsAbs() {
-		return "", fmt.Errorf("invalid Swarmlite leader redirect %q", location)
-	}
-	if parsed.Path == "" || parsed.Path == "/" {
-		parsed.Path = originalPath
-	}
-	if parsed.RawQuery == "" {
-		parsed.RawQuery = query.Encode()
-	}
-	return parsed.String(), nil
 }

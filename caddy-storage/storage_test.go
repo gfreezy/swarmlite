@@ -8,30 +8,28 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"testing"
 	"time"
 
 	"github.com/caddyserver/certmagic"
 )
 
-func TestModuleAcceptsControllerSetGeneration(t *testing.T) {
+func TestModuleAcceptsSingleController(t *testing.T) {
 	var module Module
 	if err := json.Unmarshal([]byte(`{
-		"controllers":["http://10.0.0.2:8080"],
-		"controller_set_generation":42
+		"controller":"http://10.0.0.2:8080"
 	}`), &module); err != nil {
 		t.Fatal(err)
 	}
-	if module.ControllerSetGeneration != 42 {
-		t.Fatalf("unexpected controller set generation %d", module.ControllerSetGeneration)
+	if module.Controller != "http://10.0.0.2:8080" {
+		t.Fatalf("unexpected controller %q", module.Controller)
 	}
 }
 
 func TestLocalStorageSurvivesCoordinatorFailure(t *testing.T) {
 	storage := newStorage(
 		t.TempDir(),
-		[]string{"http://127.0.0.1:1"},
+		"http://127.0.0.1:1",
 		"test-token",
 		20*time.Millisecond,
 		30*time.Second,
@@ -78,7 +76,7 @@ func TestRemoteLoadPopulatesAuthoritativeLocalStorage(t *testing.T) {
 	}))
 
 	root := t.TempDir()
-	storage := newStorage(root, []string{server.URL}, "test-token", time.Second, 30*time.Second)
+	storage := newStorage(root, server.URL, "test-token", time.Second, 30*time.Second)
 	loaded, err := storage.Load(context.Background(), "certificates/example.crt")
 	if err != nil {
 		t.Fatal(err)
@@ -104,7 +102,7 @@ func TestBusyDistributedLockDoesNotFallBackToLocal(t *testing.T) {
 	defer server.Close()
 
 	root := t.TempDir()
-	storage := newStorage(root, []string{server.URL}, "test-token", time.Second, 30*time.Second)
+	storage := newStorage(root, server.URL, "test-token", time.Second, 30*time.Second)
 	locked, err := storage.TryLock(context.Background(), "issue-example")
 	if err != nil {
 		t.Fatal(err)
@@ -124,8 +122,8 @@ func TestBusyDistributedLockDoesNotFallBackToLocal(t *testing.T) {
 
 func TestUnavailableCoordinatorFallsBackToLocalLock(t *testing.T) {
 	root := t.TempDir()
-	first := newStorage(root, []string{"http://127.0.0.1:1"}, "test-token", 20*time.Millisecond, 30*time.Second)
-	second := newStorage(root, []string{"http://127.0.0.1:1"}, "test-token", 20*time.Millisecond, 30*time.Second)
+	first := newStorage(root, "http://127.0.0.1:1", "test-token", 20*time.Millisecond, 30*time.Second)
+	second := newStorage(root, "http://127.0.0.1:1", "test-token", 20*time.Millisecond, 30*time.Second)
 	ctx := context.Background()
 	locked, err := first.TryLock(ctx, "issue-example")
 	if err != nil || !locked {
@@ -140,23 +138,5 @@ func TestUnavailableCoordinatorFallsBackToLocalLock(t *testing.T) {
 	}
 	if err := first.Unlock(ctx, "issue-example"); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestLeaderRedirectKeepsOriginalQuery(t *testing.T) {
-	redirected, err := redirectedURL(
-		"http://10.0.0.22:8080/v1/kv",
-		"/v1/kv",
-		url.Values{"key": []string{"caddy/certificates/example.crt"}},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	parsed, err := url.Parse(redirected)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if key := parsed.Query().Get("key"); key != "caddy/certificates/example.crt" {
-		t.Fatalf("redirect lost key query: %q", key)
 	}
 }

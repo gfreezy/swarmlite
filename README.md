@@ -1,13 +1,8 @@
 # Swarmlite
 
-Swarmlite is a small Rust container orchestrator for one LAN or region. Every machine runs the
-same `swarmlite serve` command; a node's role set decides which components the node maintains.
-
-Roles are composable:
-
-- `agent` runs containers. It is mandatory on every node and cannot be removed.
-- `controller` runs the API and a Raft voter.
-- `gateway` maintains an independent Caddy container and publishes service routes to it.
+Swarmlite is a small Rust container orchestrator for one LAN or region. Every machine runs an
+Agent through the same `swarmlite serve` command. The initialized node also runs the cluster's
+single, immutable Controller. A per-node switch controls whether it also runs a Gateway.
 
 This is an MVP, not a drop-in replacement for Docker Swarm or Kubernetes. It intentionally has
 no overlay network or routing mesh.
@@ -45,7 +40,7 @@ Initialize the first node and start it:
 
 ```bash
 . /etc/swarmlite/runtime.env
-sudo swarmlite --data-dir /var/lib/swarmlite init --mode standalone \
+sudo swarmlite --data-dir /var/lib/swarmlite init \
   --runtime "$SWARMLITE_RUNTIME" --runtime-socket "$SWARMLITE_RUNTIME_SOCKET"
 sudo systemctl enable --now swarmlite
 ```
@@ -98,12 +93,12 @@ Go is needed only when developing or publishing the gateway image itself.
 ## Commands
 
 ```text
-init                 initialize a standalone or HA cluster
+init                 initialize a single-controller cluster
 join                 pull cluster settings and configure another node
-serve                run this node's assigned components
+serve                run this node's fixed components
 config get|set       read or update cluster-wide settings
-role get|set|add|remove
-                     read or update one node's role set
+gateway status|enable|disable
+                     read or update one node's gateway switch
 node label get|set|remove
                      read or update one node's placement labels
 deploy               deploy or update a stack
@@ -117,7 +112,7 @@ There are no separate public `controller`, `agent`, or `gateway` runtime command
 Initialize and serve the first node:
 
 ```bash
-swarmlite init --mode standalone
+swarmlite init
 swarmlite serve
 ```
 
@@ -125,8 +120,9 @@ Those commands show foreground operation. On a Linux server installed with `inst
 or join the node under `/var/lib/swarmlite` as shown above, then use
 `sudo systemctl enable --now swarmlite` instead of starting `serve` manually.
 
-The first node receives `controller,agent,gateway`. Later standalone joins receive only `agent`
-unless roles are requested explicitly.
+Every node runs an Agent. The initialized node is permanently the Controller and has its Gateway
+enabled by default. Joined nodes are never Controllers and have their Gateway disabled by default.
+Use `swarmlite init --no-gateway` when the initial node should not expose a Gateway.
 
 `serve` detects Docker or Podman and automatically selects the address used by the operating
 system's default route. Specify an address only when detection cannot choose a reachable one:
@@ -135,9 +131,11 @@ system's default route. Specify an address only when detection cannot choose a r
 swarmlite serve --advertise-address 10.0.0.21
 ```
 
-The override is persisted. Node identity, credentials, roles, CLI defaults, and the agent fence
-are stored together in `local.redb`; Swarmlite does not maintain separate JSON state files. The
-default data directory is `$XDG_STATE_HOME/swarmlite`, or `$HOME/.local/state/swarmlite`.
+The override is persisted. All durable Swarmlite state on a node is stored in one
+`swarmlite.sqlite` database; Swarmlite does not maintain separate local and control-plane database
+files or JSON state files. Agent nodes use only the local-state table, while the controller also
+uses the control-plane table. The default data directory is `$XDG_STATE_HOME/swarmlite`, or
+`$HOME/.local/state/swarmlite`.
 
 ```bash
 swarmlite --data-dir /var/lib/swarmlite serve
@@ -150,7 +148,7 @@ swarmlite deploy --name demo --file examples/stack.yaml
 swarmlite status
 ```
 
-## Join nodes and assign roles
+## Join nodes and configure gateways
 
 Print a join command on an initialized node:
 
@@ -165,47 +163,33 @@ swarmlite join http://10.0.0.21:8080 --token '<generated-token>'
 swarmlite serve
 ```
 
-The default role allocation is:
-
-| Mode | First node | Later automatic joins |
-| --- | --- | --- |
-| `standalone` | `controller,agent,gateway` | `agent` |
-| `ha` | `controller,agent,gateway` | `controller,agent` until 3 controllers exist, then `agent` |
-
-Gateway is never assigned automatically after `init`. A cluster must retain at least one gateway,
-but gateway count has no upper limit. Request an exact role set during join when needed; `agent`
-is added automatically:
+The initialized node is permanently the only Controller. Enable the Gateway while joining a node
+when needed:
 
 ```bash
 swarmlite join http://10.0.0.21:8080 \
   --token '<generated-token>' \
-  --roles gateway
+  --gateway
 ```
 
-An explicit join is all-or-nothing. It fails if its controller request would exceed the mode's
-limit. Existing nodes keep their reserved roles while offline.
-
-Read or change a joined node after startup:
+Read or change the Gateway switch after startup:
 
 ```bash
-swarmlite role get node-a
-swarmlite role set node-a agent,gateway
-swarmlite role add node-b controller
-swarmlite role remove node-c controller
+swarmlite gateway status node-a
+swarmlite gateway enable node-a
+swarmlite gateway disable node-a
 ```
 
-`set` replaces the role set except for mandatory `agent`; `add` and `remove` change only the
-listed roles. Swarmlite refuses to remove the final controller or final gateway. To move a
-controller, remove it from the old node before adding it to the new one. Removing the current
-leader first commits the new role set, removes that voter, and lets the remaining voters elect a
-new leader. To move a gateway, add the new gateway first, then remove the old one.
+The cluster may temporarily have no Gateway. Deploying a Stack with HTTP routes is rejected until
+one is enabled. Moving the Controller requires stopping the entire cluster and initializing a new
+cluster on the replacement node.
 
 ## Node labels and placement
 
 Set initial labels while creating or joining a node:
 
 ```bash
-swarmlite init --mode standalone --label region=cn-east --label disk=nvme
+swarmlite init --label region=cn-east --label disk=nvme
 swarmlite join http://10.0.0.21:8080 \
   --token '<generated-token>' \
   --label region=cn-east
@@ -221,8 +205,8 @@ swarmlite node label remove node-a disk
 ```
 
 `serve` does not accept labels. A heartbeat cannot add or overwrite labels; it receives the
-authoritative label set from the controller and caches that set in the node's local redb state.
-Label changes are replicated by Raft.
+authoritative label set from the controller and caches it in the node's local SQLite state.
+Label changes are committed to the controller's SQLite database.
 
 Use the labels with Swarm-style hard placement constraints:
 
@@ -243,46 +227,18 @@ through the normal drain/remove flow and schedules its replacement on an eligibl
 no node matches, the service remains under-replicated until one does; constraints are never
 silently ignored.
 
-## HA
+## Controller lifecycle
 
-Initialize HA directly:
-
-```console
-first$ swarmlite init --mode ha
-first$ swarmlite serve
-```
-
-The next two default joins receive `controller,agent`; later joins receive only `agent`. Three
-controller voters tolerate one controller failure. A joining controller starts as a Raft learner
-and is promoted after it starts and reports the assigned role.
-
-A live standalone cluster can be promoted in place:
-
-```bash
-swarmlite config set mode ha
-```
-
-The controller deterministically assigns existing automatically joined agent nodes until the cluster
-has three controllers. Future joins fill any remaining slots. Switching HA back to standalone is
-not supported.
-
-```bash
-swarmlite config get
-```
-
-Cluster configuration and node roles are replicated through Raft. Controller addresses are sent
-in heartbeats and persisted locally, so agents do not need a hand-written controller list. Every
-advertised Controller set carries a `controller_set_generation` derived from the committed Raft
-membership log. Agents persist that generation with the addresses and report the applied generation
-in their next heartbeat; `swarmlite status` exposes both the current generation and each live node's
-reported generation. Removing a Controller voter returns `409 Conflict` until every active Agent has
-reported the current generation and every active Gateway's Caddy Admin API has accepted the matching
-storage configuration. Agents beyond the node heartbeat timeout do not block removal; if they only
-know the removed Controller, they must be given a reachable join address when they return.
+The controller identity is immutable for the lifetime of a cluster. Swarmlite has no promotion,
+demotion, election, or automatic failover path. Back up the controller's `swarmlite.sqlite` file.
+To move the controller, stop every node, initialize a new cluster on the replacement controller,
+rejoin the agents with the new token, and redeploy the original Stack files. Existing matching
+workload containers can be adopted through the recovery workflow below.
 
 ## Gateway and HTTPS
 
-A gateway role makes `serve` create or start a separate `swarmlite-gateway` container. The
+A node with its Gateway enabled makes `serve` create or start a separate `swarmlite-gateway`
+container. The
 container has `restart=unless-stopped`; stopping, crashing, or upgrading the Swarmlite process
 does not stop Caddy. The first node is always a gateway and additional gateways are opt-in. The
 controller discovers active gateways and publishes routing configuration automatically. Gateways
@@ -367,27 +323,27 @@ service specs and resolves internal service references to healthy task addresses
 
 Caddy keeps certificates in a cluster-specific Docker volume mounted at `/data`, and the last
 accepted runtime configuration in another volume mounted at `/config`. It starts with `--resume`,
-so it can restore the last routes even when no controller is available. Loss of quorum or total
-loss of Swarmlite data does not remove either volume.
+so it can restore the last routes even when the controller is unavailable. Total loss of
+Swarmlite data does not remove either volume.
 
 The gateway image includes and automatically enables `caddy.storage.swarmlite`. Local
 `FileStorage` remains authoritative, while certificate objects are copied to the generic KV API
 and certificate issuance uses its distributed locks. This normally lets additional gateway nodes
-reuse an existing certificate instead of applying for another one. The leader keeps the module's
-controller list current through Caddy's admin API; the cluster token is supplied only through the
+reuse an existing certificate instead of applying for another one. The controller keeps its fixed
+URL current through Caddy's admin API; the cluster token is supplied only through the
 container environment and only its SHA-256 fingerprint is stored in a recovery label.
 
-If Swarmlite, its KV state, or Raft quorum is unavailable, Caddy immediately falls back to its
+If Swarmlite or its KV state is unavailable, Caddy immediately falls back to its
 local certificate data and local lock. Existing HTTPS traffic continues; gateways may apply for
 duplicate certificates until coordination returns.
 
 The gateway admin API listens inside the container on `0.0.0.0:2019`, but host port 2019 is
-published only on this node's detected or explicitly configured `advertise-address`. Controllers
-push routes to `http://<advertise-address>:2019`; restrict that port to controller nodes on the
+published only on this node's detected or explicitly configured `advertise-address`. The controller
+pushes routes to `http://<advertise-address>:2019`; restrict that port to the controller node on the
 trusted cluster network. Gateway traffic ports are published on all host interfaces.
 
-Removing the gateway role intentionally stops the container and deletes both its container and
-persistent volumes. Adding the role again therefore starts with empty Caddy data. Container
+Disabling the Gateway intentionally stops the container and deletes both its container and
+persistent volumes. Enabling it again therefore starts with empty Caddy data. Container
 replacement caused by an image, listener, or advertise-address change retains the volumes. Any
 configured image must contain `caddy.storage.swarmlite`. See
 [caddy-storage/README.md](caddy-storage/README.md).
@@ -411,9 +367,10 @@ Request and response bodies are documented in [docs/kv-api.md](docs/kv-api.md).
 
 ## Persistence and extreme recovery
 
-Raft persists cluster settings, member roles and labels, stacks, service specifications, desired
-task assignments, ports, drain deadlines, controller identities, KV state, and Raft metadata.
-Heartbeat liveness, resources, and observed container state are rebuilt from agent heartbeats.
+On the controller, `swarmlite.sqlite` persists local node settings together with cluster settings,
+member Gateway switches and labels, stacks, service specifications, desired task assignments, ports, drain
+deadlines, and KV state. Heartbeat liveness, resources, and observed container state are rebuilt
+from agent heartbeats.
 
 Every managed workload container carries the minimal labels needed to collect it after total
 control-plane loss: cluster, task, stack, service, slot, revision, normalized spec hash, and
@@ -431,7 +388,7 @@ It carries these labels:
   `io.swarmlite.gateway_schema`
 - `io.swarmlite.gateway_token_sha256`, never the token itself
 
-They let recovery identify the cluster, restore the gateway role and listener settings, and keep
+They let recovery identify the cluster, restore the Gateway switch and listener settings, and keep
 using the existing Caddy image without mistaking the container for a stack service.
 
 Stop every old `swarmlite serve`, then rebuild the control plane on a machine that still has local
@@ -443,10 +400,11 @@ swarmlite serve
 ```
 
 Recovery detects the old cluster ID, including when Caddy is the only remaining managed
-container, archives stale `local.redb` and Raft data under `recovery-backup/`, creates a fresh
-standalone control plane, and rotates the join token. It never deletes or changes a container.
-On another recovered node, a join without explicit `--roles` detects the labeled local Caddy
-container and restores its gateway role automatically. Rejoin and serve other nodes using the new
+container, archives stale SQLite state under `recovery-backup/`, creates a fresh single-controller
+control plane, and rotates the join token. Legacy `local.redb` and Raft data are archived too. It
+never deletes or changes a container.
+On another recovered node, join detects the labeled local Caddy container and restores its Gateway
+switch automatically. Rejoin and serve other nodes using the new
 token, then deploy the same stack name and file:
 
 ```bash
@@ -481,7 +439,7 @@ host ports and gateways connect to `node-advertise-address:allocated-host-port`.
 - Gateway routing intentionally supports the documented host/path/rewrite/backend model, not
   arbitrary Caddy handlers.
 - The controller API is HTTP; use a trusted private network or terminate TLS in front of it.
-- Controller membership changes require a live Raft quorum.
+- The controller is a single point of control-plane availability and cannot be changed in place.
 
 ## Test
 

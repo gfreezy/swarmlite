@@ -7,7 +7,7 @@
   },
   "storage": {
     "module": "swarmlite",
-    "controllers": ["{env.SWARMLITE_CONTROLLER}"],
+    "controller": "{env.SWARMLITE_CONTROLLER}",
     "token_env": "SWARMLITE_TOKEN",
     "timeout": "500ms",
     "lock_lease": "30s"

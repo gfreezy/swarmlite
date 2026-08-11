@@ -59,7 +59,7 @@ fn reconcile_service(
     // Constraints are hard requirements. A task from the active revision must
     // leave a node as soon as a current heartbeat shows that the node no longer
     // matches (for example after a node-label update). Missing soft node state
-    // is not a mismatch: after controller failover it is empty until the next
+    // is not a mismatch: after a controller restart it is empty until the next
     // heartbeat. Retire before counting rollout capacity so a stopped or
     // draining container occupies its slot until the agent acknowledges its
     // removal.
@@ -422,11 +422,7 @@ mod tests {
                     memory_bytes: 1024,
                     port_range_start: 20_000,
                     port_range_end: 20_010,
-                    roles: crate::model::agent_roles(),
-                    controller_url: String::new(),
-                    raft_id: 1,
-                    raft_url: String::new(),
-                    controller_set_generation: 0,
+                    gateway_enabled: false,
                 },
             );
         }
@@ -586,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_soft_node_state_after_failover_does_not_violate_constraints() {
+    fn missing_soft_node_state_after_restart_does_not_violate_constraints() {
         let (mut state, live) = state_with_nodes();
         state
             .nodes

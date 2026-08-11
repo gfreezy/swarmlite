@@ -38,7 +38,7 @@ const GATEWAY_SCHEMA_LABEL: &str = "io.swarmlite.gateway_schema";
 const GATEWAY_IMAGE_LABEL: &str = "io.swarmlite.gateway_image";
 const GATEWAY_LISTEN_LABEL: &str = "io.swarmlite.gateway_listen";
 const GATEWAY_TOKEN_HASH_LABEL: &str = "io.swarmlite.gateway_token_sha256";
-const GATEWAY_SCHEMA: &str = "2";
+const GATEWAY_SCHEMA: &str = "3";
 const GATEWAY_CONTAINER_NAME: &str = "swarmlite-gateway";
 const TASK_LABEL: &str = "io.swarmlite.task_id";
 const SERVICE_LABEL: &str = "io.swarmlite.service_id";
@@ -87,7 +87,7 @@ pub(crate) struct GatewayContainerSpec {
     pub advertise_address: String,
     pub admin_bind_address: String,
     pub listen: Vec<String>,
-    pub controllers: Vec<String>,
+    pub controller: String,
     pub token: String,
     pub image: String,
 }
@@ -511,7 +511,7 @@ fn gateway_bootstrap(spec: &GatewayContainerSpec) -> Result<String> {
         },
         "storage": {
             "module": "swarmlite",
-            "controllers": &spec.controllers,
+            "controller": &spec.controller,
             "token_env": "SWARMLITE_TOKEN",
             "timeout": "500ms",
             "lock_lease": "30s"
@@ -822,7 +822,7 @@ mod tests {
             advertise_address: "10.0.0.21".into(),
             admin_bind_address: "10.0.0.21".into(),
             listen: vec![":80".into()],
-            controllers: vec!["http://10.0.0.21:8080".into()],
+            controller: "http://10.0.0.21:8080".into(),
             token: "0123456789abcdef".into(),
             image: DEFAULT_GATEWAY_IMAGE.into(),
         };
@@ -862,7 +862,7 @@ mod tests {
             advertise_address: "10.0.0.21".into(),
             admin_bind_address: "10.0.0.21".into(),
             listen: vec![":80".into()],
-            controllers: vec!["http://10.0.0.21:8080".into()],
+            controller: "http://10.0.0.21:8080".into(),
             token: "0123456789abcdef".into(),
             image: DEFAULT_GATEWAY_IMAGE.into(),
         };
@@ -899,10 +899,7 @@ mod tests {
             advertise_address: "10.0.0.21".into(),
             admin_bind_address: "10.0.0.21".into(),
             listen: vec![":80".into()],
-            controllers: vec![
-                "http://10.0.0.21:8080".into(),
-                "http://10.0.0.22:8080".into(),
-            ],
+            controller: "http://10.0.0.21:8080".into(),
             token: "do-not-persist-this-token".into(),
             image: DEFAULT_GATEWAY_IMAGE.into(),
         };
@@ -911,7 +908,8 @@ mod tests {
         assert_eq!(value["admin"]["listen"], "0.0.0.0:2019");
         assert_eq!(value["admin"]["config"]["persist"], true);
         assert_eq!(value["storage"]["module"], "swarmlite");
-        assert_eq!(value["storage"]["controllers"][1], "http://10.0.0.22:8080");
+        assert_eq!(value["storage"]["controller"], "http://10.0.0.21:8080");
+        assert!(value["storage"].get("controllers").is_none());
         assert_eq!(value["storage"]["token_env"], "SWARMLITE_TOKEN");
         assert!(!encoded.contains("do-not-persist-this-token"));
         assert_eq!(
@@ -946,7 +944,6 @@ mod tests {
                 stop_grace_period_seconds: 10,
             },
             ports: Vec::new(),
-            leader_term: 3,
             generation: 4,
             spec_hash: "abc123".into(),
         };

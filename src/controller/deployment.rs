@@ -17,18 +17,14 @@ impl Controller {
                 .state
                 .members
                 .values()
-                .any(|member| member.roles.contains(&NodeRole::Gateway))
+                .any(|member| member.gateway_enabled)
         };
         if !has_gateway && !stack_gateway.http_routes.is_empty() {
             return Err(ControllerError::Invalid(
-                "gateway routing is enabled but no node has the gateway role".to_owned(),
+                "gateway routing is enabled but no node has its gateway enabled".to_owned(),
             ));
         }
         let mut inner = self.inner.lock().await;
-        self.expire_local_lease(&mut inner);
-        if !inner.is_leader {
-            return Err(self.leader_redirect(&format!("/v1/stacks/{stack_name}")));
-        }
         validate_gateway_hostname_ownership(&inner.state, stack_name, &stack_gateway)?;
         let previous = inner.state.clone();
         let previous_gateway = inner

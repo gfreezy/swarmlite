@@ -41,11 +41,11 @@ type hybridClock struct {
 	replicaID  string
 }
 
-func newStorage(root string, controllers []string, token string, timeout, lockLease time.Duration) *storage {
+func newStorage(root string, controller string, token string, timeout, lockLease time.Duration) *storage {
 	ownerID := randomID()
 	return &storage{
 		local:       &certmagic.FileStorage{Path: root},
-		coordinator: newCoordinator(controllers, token, timeout),
+		coordinator: newCoordinator(controller, token, timeout),
 		timeout:     timeout,
 		lockLease:   lockLease,
 		ownerID:     ownerID,

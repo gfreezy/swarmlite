@@ -186,8 +186,7 @@ pub struct AutomaticHttps {
 #[derive(Debug, Clone, Serialize)]
 pub struct StorageConfig {
     pub module: &'static str,
-    pub controllers: Vec<String>,
-    pub controller_set_generation: u64,
+    pub controller: String,
     pub token_env: &'static str,
     pub timeout: &'static str,
     pub lock_lease: &'static str,
@@ -331,11 +330,10 @@ pub fn generate<'a>(
     }
 }
 
-pub fn storage(controllers: Vec<String>, controller_set_generation: u64) -> StorageConfig {
+pub fn storage(controller: String) -> StorageConfig {
     StorageConfig {
         module: "swarmlite",
-        controllers,
-        controller_set_generation,
+        controller,
         token_env: "SWARMLITE_TOKEN",
         timeout: "500ms",
         lock_lease: "30s",

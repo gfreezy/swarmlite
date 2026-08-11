@@ -3,7 +3,7 @@ name = "swarmlite"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "A small container orchestrator with one-command node serving and optional HA"
+description = "A small single-controller container orchestrator for one LAN or region"
 
 [dependencies]
 anyhow = "1.0"
@@ -13,11 +13,10 @@ bollard = "0.21"
 clap = { version = "4.5", features = ["derive", "env"] }
 futures-util = "0.3"
 reqwest = { version = "0.13", features = ["json"] }
-redb = "4.1"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-swarmlite-raft = { path = "crates/swarmlite-raft" }
 swarmlite-stack = { path = "crates/swarmlite-stack" }
 thiserror = "2.0"
 tokio = { version = "1.49", features = ["full"] }
@@ -36,5 +35,5 @@ lto = "thin"
 strip = true
 
 [workspace]
-members = [".", "crates/swarmlite-raft", "crates/swarmlite-stack"]
+members = [".", "crates/swarmlite-stack"]
 resolver = "3"

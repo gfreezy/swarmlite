@@ -329,14 +329,16 @@ chmod 0644 "$runtime_config"
 install -m 0644 "$install_tmp/swarmlite.service" "$service_path"
 systemctl daemon-reload
 
-if [ -f "$data_dir/local.redb" ]; then
+if [ -f "$data_dir/swarmlite.sqlite" ]; then
     log "existing node state found; enabling and restarting Swarmlite"
     systemctl enable swarmlite.service
     systemctl restart swarmlite.service
+elif [ -f "$data_dir/local.sqlite" ] || [ -f "$data_dir/control-plane.sqlite" ] || [ -f "$data_dir/local.redb" ] || [ -d "$data_dir/raft" ]; then
+    log "legacy SQLite/Raft/redb state found; stop the old cluster and run 'swarmlite init --recover'"
 else
     log "installation complete; runtime: $selected_runtime"
     printf '\n%s\n' "Initialize or join this node, then start the service:"
-    printf '  sudo swarmlite --data-dir %s init --mode standalone --runtime %s --runtime-socket %s\n' \
+    printf '  sudo swarmlite --data-dir %s init --runtime %s --runtime-socket %s\n' \
         "$data_dir" "$selected_runtime" "$runtime_socket"
     printf '  # or: sudo swarmlite --data-dir %s join <controller-url> --token <token> --runtime %s --runtime-socket %s\n' \
         "$data_dir" "$selected_runtime" "$runtime_socket"
