@@ -5,10 +5,43 @@ use tracing::info;
 use crate::{
     gateway,
     model::{
-        ClusterState, DesiredTaskState, ObservedTaskState, RecoveryStatus, TaskRecord,
-        service_spec_hash,
+        ClusterState, DesiredTaskState, ObservedTaskState, RecoveryStatus, ServiceRecord,
+        TaskRecord, UnclaimedTask, service_spec_hash,
     },
 };
+
+pub(super) fn restore_unclaimed_service_revisions(
+    state: &mut ClusterState,
+    new_service_ids: &BTreeSet<String>,
+) {
+    for service_id in new_service_ids {
+        let Some(service) = state.services.get(service_id).cloned() else {
+            continue;
+        };
+        let spec_hash = service_spec_hash(&service.spec);
+        let routed_ports = gateway::service_ports(state, &service);
+        let revision = state
+            .unclaimed_tasks
+            .values()
+            .filter(|task| {
+                recovery_candidate_matches(task, &service, &spec_hash, &routed_ports)
+                    && task.revision > 0
+                    && task.revision < u64::MAX
+            })
+            .map(|task| task.revision)
+            .max();
+        let Some(revision) = revision else { continue };
+        state
+            .services
+            .get_mut(service_id)
+            .expect("new recovery service must still exist")
+            .revision = revision;
+        info!(
+            service = service_id,
+            revision, "restored service revision from existing task containers"
+        );
+    }
+}
 
 pub(super) fn adopt_unclaimed_tasks(state: &mut ClusterState, stack_name: &str) {
     let services = state
@@ -33,15 +66,8 @@ pub(super) fn adopt_unclaimed_tasks(state: &mut ClusterState, stack_name: &str) 
             .unclaimed_tasks
             .values()
             .filter(|task| {
-                task.stack == stack_name
-                    && task.service == service.name
-                    && task.spec_hash == spec_hash
-                    && task.slot < service.spec.replicas
-                    && routed_ports.iter().all(|target| {
-                        task.ports
-                            .iter()
-                            .any(|port| port.target == *target && port.protocol == "tcp")
-                    })
+                recovery_candidate_matches(task, &service, &spec_hash, &routed_ports)
+                    && task.revision == service.revision
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -87,6 +113,23 @@ pub(super) fn adopt_unclaimed_tasks(state: &mut ClusterState, stack_name: &str) 
             adopted, "adopted existing task containers"
         );
     }
+}
+
+fn recovery_candidate_matches(
+    task: &UnclaimedTask,
+    service: &ServiceRecord,
+    spec_hash: &str,
+    routed_ports: &BTreeSet<u16>,
+) -> bool {
+    task.stack == service.stack
+        && task.service == service.name
+        && task.spec_hash == spec_hash
+        && task.slot < service.spec.replicas
+        && routed_ports.iter().all(|target| {
+            task.ports
+                .iter()
+                .any(|port| port.target == *target && port.protocol == "tcp")
+        })
 }
 
 pub(super) fn recovery_status(state: &ClusterState) -> RecoveryStatus {

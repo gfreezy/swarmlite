@@ -859,7 +859,152 @@ async fn heartbeat_then_deploy_adopts_the_existing_container() {
         inner.state.tasks["existing-task"].container_id.as_deref(),
         Some("container-existing")
     );
+    assert_eq!(inner.state.services["demo.web"].revision, 7);
+    assert_eq!(inner.state.tasks["existing-task"].revision, 7);
     assert!(inner.state.unclaimed_tasks.is_empty());
+}
+
+#[tokio::test]
+async fn recovery_restores_the_latest_service_revision_and_leaves_old_tasks_unclaimed() {
+    let (controller, _, _directory) = test_controller("revision-recovery-test").await;
+    controller
+        .join_node("node-a", test_join_request("node-a", "127.0.0.1"))
+        .await
+        .unwrap();
+    let mut service = test_service();
+    service.spec.replicas = 3;
+    service.spec.service_labels.clear();
+    let spec_hash = service_spec_hash(&service.spec);
+    let report = |id: &str, slot: u32, revision: u64, observed: ObservedTaskState| TaskReport {
+        id: id.into(),
+        observed,
+        container_id: Some(format!("container-{id}")),
+        cluster_id: Some("revision-recovery-test".into()),
+        stack: Some("demo".into()),
+        service: Some("web".into()),
+        slot: Some(slot),
+        revision: Some(revision),
+        spec_hash: Some(spec_hash.clone()),
+        ports: vec![PortBinding {
+            target: 80,
+            published: 20_001 + u16::try_from(slot).unwrap(),
+            protocol: "tcp".into(),
+        }],
+    };
+    controller
+        .heartbeat(
+            "node-a",
+            NodeHeartbeat {
+                node: test_node(),
+                tasks: vec![
+                    report("revision-7-slot-0", 0, 7, ObservedTaskState::Healthy),
+                    report("revision-7-slot-1", 1, 7, ObservedTaskState::Running),
+                    report("revision-6-slot-2", 2, 6, ObservedTaskState::Healthy),
+                    report("revision-99-slot-9", 9, 99, ObservedTaskState::Healthy),
+                ],
+                task_inventory_error: None,
+                task_results: Vec::new(),
+                gateway: GatewayReport::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    controller
+        .apply(
+            "demo",
+            ParsedStack {
+                services: BTreeMap::from([("web".into(), service.spec)]),
+                gateway: StackGatewaySpec::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let inner = controller.inner.lock().await;
+    assert_eq!(inner.state.services["demo.web"].revision, 7);
+    assert!(inner.state.tasks.contains_key("revision-7-slot-0"));
+    assert!(inner.state.tasks.contains_key("revision-7-slot-1"));
+    assert!(!inner.state.tasks.contains_key("revision-6-slot-2"));
+    assert!(
+        inner
+            .state
+            .unclaimed_tasks
+            .contains_key("revision-6-slot-2")
+    );
+    assert!(
+        inner
+            .state
+            .unclaimed_tasks
+            .contains_key("revision-99-slot-9")
+    );
+    let replacement = inner
+        .state
+        .tasks
+        .values()
+        .find(|task| task.service_id == "demo.web" && task.slot == 2)
+        .unwrap();
+    assert_eq!(replacement.revision, 7);
+}
+
+#[tokio::test]
+async fn recovery_ignores_invalid_service_revisions() {
+    let (controller, _, _directory) = test_controller("invalid-revision-recovery-test").await;
+    controller
+        .join_node("node-a", test_join_request("node-a", "127.0.0.1"))
+        .await
+        .unwrap();
+    let mut service = test_service();
+    service.spec.service_labels.clear();
+    let spec_hash = service_spec_hash(&service.spec);
+    controller
+        .heartbeat(
+            "node-a",
+            NodeHeartbeat {
+                node: test_node(),
+                tasks: [("revision-zero", 0_u64), ("revision-max", u64::MAX)]
+                    .into_iter()
+                    .map(|(id, revision)| TaskReport {
+                        id: id.into(),
+                        observed: ObservedTaskState::Healthy,
+                        container_id: Some(format!("container-{id}")),
+                        cluster_id: Some("invalid-revision-recovery-test".into()),
+                        stack: Some("demo".into()),
+                        service: Some("web".into()),
+                        slot: Some(0),
+                        revision: Some(revision),
+                        spec_hash: Some(spec_hash.clone()),
+                        ports: vec![PortBinding {
+                            target: 80,
+                            published: 20_001,
+                            protocol: "tcp".into(),
+                        }],
+                    })
+                    .collect(),
+                task_inventory_error: None,
+                task_results: Vec::new(),
+                gateway: GatewayReport::default(),
+            },
+        )
+        .await
+        .unwrap();
+    controller
+        .apply(
+            "demo",
+            ParsedStack {
+                services: BTreeMap::from([("web".into(), service.spec)]),
+                gateway: StackGatewaySpec::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let inner = controller.inner.lock().await;
+    assert_eq!(inner.state.services["demo.web"].revision, 1);
+    assert!(inner.state.unclaimed_tasks.contains_key("revision-zero"));
+    assert!(inner.state.unclaimed_tasks.contains_key("revision-max"));
+    assert!(!inner.state.tasks.contains_key("revision-zero"));
+    assert!(!inner.state.tasks.contains_key("revision-max"));
 }
 
 fn draining_task() -> TaskRecord {

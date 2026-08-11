@@ -157,6 +157,7 @@ impl Controller {
             .keys()
             .map(|name| service_id(stack_name, name))
             .collect();
+        let mut new_service_ids = BTreeSet::new();
         for service in inner
             .state
             .services
@@ -177,12 +178,20 @@ impl Controller {
                         && !revision_policy.forces(&name) => {}
                 Some(existing) => {
                     if !revision_policy.preserves(&name) {
-                        existing.revision += 1;
+                        let Some(revision) = existing.revision.checked_add(1) else {
+                            let service_id = existing.id.clone();
+                            inner.state = previous;
+                            return Err(ControllerError::Invalid(format!(
+                                "service {service_id:?} revision overflow"
+                            )));
+                        };
+                        existing.revision = revision;
                     }
                     existing.spec = spec;
                     existing.deleted = false;
                 }
                 None => {
+                    new_service_ids.insert(id.clone());
                     inner.state.services.insert(
                         id.clone(),
                         ServiceRecord {
@@ -213,6 +222,7 @@ impl Controller {
                 }),
             },
         );
+        restore_unclaimed_service_revisions(&mut inner.state, &new_service_ids);
         adopt_unclaimed_tasks(&mut inner.state, stack_name);
         let live = current_live_nodes(&inner, self.config.node_timeout_seconds);
         scheduler::reconcile(&mut inner.state, &live);

@@ -466,9 +466,12 @@ token, then deploy the same stack name and file:
 swarmlite deploy --compose-file stack.yaml demo
 ```
 
-Matching containers are adopted by cluster ID, stack, service, slot, and spec hash. Running
-containers stay running; matching stopped containers are started in place. Unmatched containers
-remain unclaimed. `swarmlite status` reports `recovery.awaiting_adoption` and
+Matching containers are adopted by cluster ID, stack, service, slot, spec hash, ports, and Service
+revision. A newly recovered Service first restores the highest valid revision among its eligible
+containers, then adopts only containers at that revision. This completes an interrupted rolling
+update instead of adopting an older replica and replacing it immediately. Running containers stay
+running; matching stopped containers are started in place. Older revisions and other unmatched
+containers remain unclaimed. `swarmlite status` reports `recovery.awaiting_adoption` and
 `recovery.conflicting_slots`.
 
 ## Runtime and networking
