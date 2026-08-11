@@ -71,6 +71,7 @@ impl Controller {
             &versioned.cluster.gateway.listen,
             config.advertise_url.clone(),
         );
+        let (status_changes, _) = tokio::sync::watch::channel(versioned.generation);
 
         info!(%controller_id, "single controller started");
         Ok(Self {
@@ -79,8 +80,10 @@ impl Controller {
             repository,
             kv_repository,
             deploying_stacks: std::sync::Mutex::new(BTreeSet::new()),
+            status_changes,
             inner: Mutex::new(Inner {
                 generation: versioned.generation,
+                status_revision: versioned.generation,
                 cluster: versioned.cluster,
                 state: versioned.state,
                 live_nodes,
@@ -109,6 +112,11 @@ impl Controller {
         let previous = inner.state.clone();
         let mut changed = scheduler::finish_drains(&mut inner.state, unix_ms());
         changed |= scheduler::reconcile(&mut inner.state, &live);
+        changed |= refresh_stack_deployments(
+            &mut inner.state,
+            unix_ms(),
+            self.config.deployment_timeout_seconds,
+        );
         if changed && let Err(error) = self.commit_locked(&mut inner).await {
             inner.state = previous;
             return Err(error);
@@ -125,6 +133,7 @@ impl Controller {
         inner.generation = generation;
         inner.gateway_generation = gateway_generation;
         inner.gateway_config = gateway_config;
+        self.notify_status_locked(inner);
         Ok(())
     }
 
@@ -137,6 +146,12 @@ impl Controller {
             .replace(inner.generation, &inner.cluster, &inner.state)
             .await?;
         inner.generation = generation;
+        self.notify_status_locked(inner);
         Ok(())
+    }
+
+    pub(super) fn notify_status_locked(&self, inner: &mut Inner) {
+        inner.status_revision = inner.status_revision.saturating_add(1);
+        self.status_changes.send_replace(inner.status_revision);
     }
 }

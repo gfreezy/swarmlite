@@ -278,6 +278,8 @@ fn schedule_task(
         ports,
         container_id: None,
         drain_until_unix_ms: None,
+        applied_generation: None,
+        reconcile_error: None,
     })
 }
 
@@ -678,6 +680,7 @@ mod tests {
                     }],
                     ..Default::default()
                 },
+                deployment: None,
             },
         );
     }

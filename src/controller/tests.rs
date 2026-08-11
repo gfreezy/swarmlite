@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use swarmlite_stack::{ParsedStack, parse_stack};
 
 use crate::{
-    config::DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS,
+    config::{DEFAULT_DEPLOYMENT_TIMEOUT_SECONDS, DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS},
     model::{
         CLUSTER_SCHEMA_VERSION, ClusterGatewayConfig, KvLockStatus, NodeRecord, PortBinding,
         ServicePort, ServiceSpec, StackGatewaySpec, TaskRecord, TaskReport,
@@ -31,6 +31,7 @@ fn test_controller_config(cluster: &ClusterSettings) -> ControllerConfig {
         node_timeout_seconds: 20,
         reconcile_interval_seconds: 1,
         gateway_drain_timeout_seconds: DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS,
+        deployment_timeout_seconds: DEFAULT_DEPLOYMENT_TIMEOUT_SECONDS,
         cluster: cluster.clone(),
     }
 }
@@ -63,6 +64,149 @@ async fn allows_only_one_inflight_deployment_per_stack() {
     drop(other);
     drop(first);
     assert!(controller.begin_stack_deployment("demo").is_ok());
+}
+
+async fn register_live_node(controller: &Controller) {
+    controller
+        .join_node("node-a", test_join_request("node-a", "127.0.0.1"))
+        .await
+        .unwrap();
+    controller
+        .heartbeat(
+            "node-a",
+            NodeHeartbeat {
+                node: test_node(),
+                tasks: Vec::new(),
+                task_inventory_error: None,
+                task_results: Vec::new(),
+                gateway: GatewayReport::default(),
+            },
+        )
+        .await
+        .unwrap();
+}
+
+fn parsed_test_stack() -> ParsedStack {
+    ParsedStack {
+        services: BTreeMap::from([("web".into(), test_service().spec)]),
+        gateway: StackGatewaySpec::default(),
+    }
+}
+
+#[tokio::test]
+async fn deployment_waits_for_agent_application_and_health() {
+    let (controller, _, _directory) = test_controller("deployment-success-test").await;
+    register_live_node(&controller).await;
+    let accepted = controller.apply("demo", parsed_test_stack()).await.unwrap();
+    assert_eq!(accepted.status, StackDeploymentStatus::Deploying);
+    assert_eq!(accepted.services[0].healthy, 0);
+
+    let task = {
+        let inner = controller.inner.lock().await;
+        inner.state.tasks.values().next().unwrap().clone()
+    };
+    let service = test_service();
+    controller
+        .heartbeat(
+            "node-a",
+            NodeHeartbeat {
+                node: test_node(),
+                tasks: vec![TaskReport {
+                    id: task.id.clone(),
+                    observed: ObservedTaskState::Healthy,
+                    container_id: Some("container-new".into()),
+                    cluster_id: Some("deployment-success-test".into()),
+                    stack: Some("demo".into()),
+                    service: Some("web".into()),
+                    slot: Some(task.slot),
+                    revision: Some(task.revision),
+                    spec_hash: Some(service_spec_hash(&service.spec)),
+                    ports: task.ports,
+                }],
+                task_inventory_error: None,
+                task_results: vec![TaskReconcileReport {
+                    task_id: task.id,
+                    desired_generation: accepted.generation,
+                    applied_generation: Some(accepted.generation),
+                    phase: crate::model::TaskReconcilePhase::Create,
+                    error: None,
+                }],
+                gateway: GatewayReport::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let completed = controller
+        .wait_for_deployment("demo", accepted.generation, None, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(completed.status, StackDeploymentStatus::Healthy);
+    assert_eq!(completed.services[0].applied, 1);
+    assert_eq!(completed.services[0].healthy, 1);
+}
+
+#[tokio::test]
+async fn deployment_failure_is_persisted_and_releases_stack_name() {
+    let (controller, repository, _directory) = test_controller("deployment-failure-test").await;
+    register_live_node(&controller).await;
+    let accepted = controller.apply("demo", parsed_test_stack()).await.unwrap();
+    let task_id = controller
+        .inner
+        .lock()
+        .await
+        .state
+        .tasks
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+
+    assert!(matches!(
+        controller.apply("demo", parsed_test_stack()).await,
+        Err(ControllerError::Conflict(_))
+    ));
+    controller
+        .heartbeat(
+            "node-a",
+            NodeHeartbeat {
+                node: test_node(),
+                tasks: Vec::new(),
+                task_inventory_error: None,
+                task_results: vec![TaskReconcileReport {
+                    task_id,
+                    desired_generation: accepted.generation,
+                    applied_generation: None,
+                    phase: crate::model::TaskReconcilePhase::Create,
+                    error: Some("image pull denied".into()),
+                }],
+                gateway: GatewayReport::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let failed = controller
+        .wait_for_deployment(
+            "demo",
+            accepted.generation,
+            Some(accepted.revision),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed.status, StackDeploymentStatus::Failed);
+    assert_eq!(failed.errors[0].message, "image pull denied");
+    let persisted = repository.load().await.unwrap();
+    assert_eq!(
+        persisted.state.stacks["demo"]
+            .deployment
+            .as_ref()
+            .unwrap()
+            .status,
+        StackDeploymentStatus::Failed
+    );
+    assert!(controller.apply("demo", parsed_test_stack()).await.is_ok());
 }
 
 fn test_join_request(node_id: &str, address: &str) -> JoinRequest {
@@ -111,6 +255,7 @@ x-swarmlite:
             applied_at_unix_ms: 1,
             services: vec!["first.web".into()],
             gateway: gateway.clone(),
+            deployment: None,
         },
     );
     let error = validate_gateway_hostname_ownership(&state, "second", &gateway).unwrap_err();
@@ -244,6 +389,8 @@ async fn node_labels_are_authoritative_and_persisted() {
             NodeHeartbeat {
                 node: reported,
                 tasks: Vec::new(),
+                task_inventory_error: None,
+                task_results: Vec::new(),
                 gateway: GatewayReport::default(),
             },
         )
@@ -315,6 +462,8 @@ async fn caddy_acknowledgement_starts_drain_deadline() {
             NodeHeartbeat {
                 node: test_node(),
                 tasks: vec![report.clone()],
+                task_inventory_error: None,
+                task_results: Vec::new(),
                 gateway: GatewayReport::default(),
             },
         )
@@ -339,6 +488,8 @@ async fn caddy_acknowledgement_starts_drain_deadline() {
             NodeHeartbeat {
                 node: test_node(),
                 tasks: vec![report],
+                task_inventory_error: None,
+                task_results: Vec::new(),
                 gateway: GatewayReport {
                     applied_generation: Some(desired.generation),
                     error: None,
@@ -438,6 +589,8 @@ async fn heartbeat_then_deploy_adopts_the_existing_container() {
                         protocol: "tcp".into(),
                     }],
                 }],
+                task_inventory_error: None,
+                task_results: Vec::new(),
                 gateway: GatewayReport::default(),
             },
         )
@@ -477,5 +630,7 @@ fn draining_task() -> TaskRecord {
         }],
         container_id: Some("container-old".into()),
         drain_until_unix_ms: None,
+        applied_generation: None,
+        reconcile_error: None,
     }
 }

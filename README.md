@@ -148,9 +148,17 @@ swarmlite deploy --name demo --file examples/stack.yaml
 swarmlite status
 ```
 
-The controller accepts only one in-progress deployment for a given Stack name. A concurrent
-deployment of the same Stack returns `409 Conflict`; deployments using different Stack names may
-be submitted independently.
+`deploy` waits until every desired replica has been applied by its Agent and reports healthy, and
+obsolete tasks have been removed. An image-pull, container-create, start, remove, or
+runtime-inspection failure is returned with its service, node, task, and execution phase; the
+command exits non-zero. Use `--detach` to return as soon as the controller has durably accepted the
+desired state.
+
+The CLI waits through the controller's long-poll deployment endpoint rather than polling rapidly.
+Deployments that do not become healthy within five minutes are marked `timed_out`. The controller
+accepts only one non-terminal deployment for a given Stack name. A concurrent deployment of the
+same Stack returns `409 Conflict`; deployments using different Stack names may be submitted
+independently.
 
 ## Join nodes and configure gateways
 
@@ -373,10 +381,10 @@ Request and response bodies are documented in [docs/kv-api.md](docs/kv-api.md).
 ## Persistence and extreme recovery
 
 On the controller, `swarmlite.sqlite` persists local node settings together with cluster settings,
-member Gateway switches and labels, stacks, service specifications, desired task assignments, ports, drain
-deadlines, and dedicated KV object and lock tables. KV writes do not advance the orchestration
-generation. Heartbeat liveness, resources, and observed container state are rebuilt from agent
-heartbeats.
+member Gateway switches and labels, stacks, deployment outcomes and errors, service
+specifications, desired task assignments, ports, drain deadlines, and dedicated KV object and lock
+tables. KV writes do not advance the orchestration generation. Heartbeat liveness, resources,
+per-task applied generations, and observed container state are rebuilt from agent heartbeats.
 
 Every managed workload container carries the minimal labels needed to collect it after total
 control-plane loss: cluster, task, stack, service, slot, revision, normalized spec hash, and

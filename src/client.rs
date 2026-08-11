@@ -1,6 +1,40 @@
-use anyhow::{Context, Result, bail};
 use reqwest::{Method, RequestBuilder};
 use serde::{Serialize, de::DeserializeOwned};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum ControllerClientError {
+    #[error("request to controller {endpoint} failed: {source}")]
+    Transport {
+        endpoint: String,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("controller {endpoint} returned {status}: {body}")]
+    Http {
+        endpoint: String,
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    #[error("controller {endpoint} returned an invalid response: {source}")]
+    InvalidResponse {
+        endpoint: String,
+        #[source]
+        source: reqwest::Error,
+    },
+}
+
+impl ControllerClientError {
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Transport { .. } => true,
+            Self::Http { status, .. } => status.is_server_error(),
+            Self::InvalidResponse { source, .. } => {
+                source.is_body() || source.is_connect() || source.is_timeout()
+            }
+        }
+    }
+}
 
 /// Authenticated client for the single Swarmlite controller.
 #[derive(Clone)]
@@ -19,7 +53,10 @@ impl ControllerClient {
         }
     }
 
-    pub async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+    pub async fn get_json<T: DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<T, ControllerClientError> {
         self.send_json::<T, ()>(Method::GET, path, None).await
     }
 
@@ -28,7 +65,7 @@ impl ControllerClient {
         method: Method,
         path: &str,
         body: Option<&B>,
-    ) -> Result<T> {
+    ) -> Result<T, ControllerClientError> {
         let mut request = self.request(method, path);
         if let Some(body) = body {
             request = request.json(body);
@@ -37,7 +74,10 @@ impl ControllerClient {
         response
             .json()
             .await
-            .with_context(|| format!("controller {} returned invalid JSON", self.endpoint(path)))
+            .map_err(|source| ControllerClientError::InvalidResponse {
+                endpoint: self.endpoint(path),
+                source,
+            })
     }
 
     pub async fn send_text(
@@ -46,7 +86,7 @@ impl ControllerClient {
         path: &str,
         content_type: Option<&str>,
         body: Option<String>,
-    ) -> Result<String> {
+    ) -> Result<String, ControllerClientError> {
         let mut request = self.request(method, path);
         if let Some(content_type) = content_type {
             request = request.header(reqwest::header::CONTENT_TYPE, content_type);
@@ -58,7 +98,10 @@ impl ControllerClient {
             .await?
             .text()
             .await
-            .map_err(Into::into)
+            .map_err(|source| ControllerClientError::InvalidResponse {
+                endpoint: self.endpoint(path),
+                source,
+            })
     }
 
     fn request(&self, method: Method, path: &str) -> RequestBuilder {
@@ -67,17 +110,29 @@ impl ControllerClient {
             .bearer_auth(&self.token)
     }
 
-    async fn checked(&self, request: RequestBuilder, path: &str) -> Result<reqwest::Response> {
-        let response = request.send().await?;
+    async fn checked(
+        &self,
+        request: RequestBuilder,
+        path: &str,
+    ) -> Result<reqwest::Response, ControllerClientError> {
+        let endpoint = self.endpoint(path);
+        let response = request
+            .send()
+            .await
+            .map_err(|source| ControllerClientError::Transport {
+                endpoint: endpoint.clone(),
+                source,
+            })?;
         let status = response.status();
         if status.is_success() {
             return Ok(response);
         }
         let body = response.text().await.unwrap_or_default();
-        bail!(
-            "controller {} returned {status}: {body}",
-            self.endpoint(path)
-        )
+        Err(ControllerClientError::Http {
+            endpoint,
+            status,
+            body,
+        })
     }
 
     fn endpoint(&self, path: &str) -> String {

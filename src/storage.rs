@@ -461,6 +461,8 @@ impl PersistedTaskRecord {
             ports: self.ports,
             container_id: None,
             drain_until_unix_ms: self.drain_until_unix_ms,
+            applied_generation: None,
+            reconcile_error: None,
         }
     }
 }
@@ -551,6 +553,8 @@ mod tests {
                 ports: Vec::new(),
                 container_id: Some("container-1".into()),
                 drain_until_unix_ms: None,
+                applied_generation: Some(2),
+                reconcile_error: None,
             },
         );
 

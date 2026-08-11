@@ -149,6 +149,43 @@ pub struct StackRecord {
     pub services: Vec<String>,
     #[serde(default)]
     pub gateway: StackGatewaySpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment: Option<StackDeploymentRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StackDeploymentRecord {
+    pub generation: u64,
+    pub status: StackDeploymentStatus,
+    pub started_at_unix_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at_unix_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<StackDeploymentError>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StackDeploymentStatus {
+    Deploying,
+    Healthy,
+    Failed,
+    TimedOut,
+}
+
+impl StackDeploymentStatus {
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, Self::Deploying)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StackDeploymentError {
+    pub task_id: String,
+    pub service: String,
+    pub node_id: String,
+    pub phase: TaskReconcilePhase,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,6 +238,10 @@ pub struct TaskRecord {
     pub ports: Vec<PortBinding>,
     pub container_id: Option<String>,
     pub drain_until_unix_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconcile_error: Option<TaskReconcileError>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -231,8 +272,40 @@ pub struct UnclaimedTask {
 pub struct NodeHeartbeat {
     pub node: NodeRecord,
     pub tasks: Vec<TaskReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_inventory_error: Option<String>,
+    #[serde(default)]
+    pub task_results: Vec<TaskReconcileReport>,
     #[serde(default)]
     pub gateway: GatewayReport,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskReconcileReport {
+    pub task_id: String,
+    pub desired_generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_generation: Option<u64>,
+    pub phase: TaskReconcilePhase,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskReconcilePhase {
+    Inspect,
+    Create,
+    Replace,
+    Start,
+    Remove,
+    Verify,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskReconcileError {
+    pub phase: TaskReconcilePhase,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -256,9 +329,15 @@ pub struct HeartbeatResponse {
     pub assignments: Vec<TaskAssignment>,
     pub gateway_enabled: bool,
     pub labels: BTreeMap<String, String>,
-    pub remove_tasks: Vec<String>,
+    pub remove_tasks: Vec<TaskRemovalAssignment>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway_config: Option<GatewayAssignment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskRemovalAssignment {
+    pub id: String,
+    pub deployment_generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -342,10 +421,34 @@ pub struct TaskAssignment {
     pub service_id: String,
     pub revision: u64,
     pub slot: u32,
+    pub desired: DesiredTaskState,
     pub spec: ServiceSpec,
     pub ports: Vec<PortBinding>,
     pub generation: u64,
+    pub deployment_generation: u64,
     pub spec_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StackDeploymentResponse {
+    pub stack: String,
+    pub generation: u64,
+    pub revision: u64,
+    pub status: StackDeploymentStatus,
+    pub started_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at_unix_ms: Option<i64>,
+    pub services: Vec<StackDeploymentServiceProgress>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<StackDeploymentError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StackDeploymentServiceProgress {
+    pub service: String,
+    pub replicas: u32,
+    pub applied: u32,
+    pub healthy: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -9,6 +9,8 @@ impl Controller {
         let NodeHeartbeat {
             mut node,
             tasks,
+            task_inventory_error,
+            task_results,
             gateway: gateway_report,
         } = heartbeat;
         if node_id != node.id {
@@ -19,6 +21,7 @@ impl Controller {
         let mut inner = self.inner.lock().await;
         let previous = inner.state.clone();
         let mut changed = false;
+        let mut soft_changed = false;
         let (gateway_enabled, desired_labels) = {
             let member = inner.state.members.get_mut(node_id).ok_or_else(|| {
                 ControllerError::Invalid("node must join before sending heartbeats".to_owned())
@@ -32,11 +35,12 @@ impl Controller {
         node.gateway_enabled = gateway_enabled;
         node.labels.clone_from(&desired_labels);
         if gateway_enabled {
+            soft_changed |= inner.gateway_reports.get(node_id) != Some(&gateway_report);
             inner
                 .gateway_reports
                 .insert(node_id.to_owned(), gateway_report);
         } else {
-            inner.gateway_reports.remove(node_id);
+            soft_changed |= inner.gateway_reports.remove(node_id).is_some();
         }
         inner.live_nodes.insert(node_id.to_owned(), Instant::now());
         inner.state.nodes.insert(node_id.to_owned(), node);
@@ -46,10 +50,12 @@ impl Controller {
             .map(|report| (report.id.clone(), report))
             .collect();
         let reported_ids = reports.keys().cloned().collect::<BTreeSet<_>>();
-        inner
-            .state
-            .unclaimed_tasks
-            .retain(|task_id, task| task.node_id != node_id || reported_ids.contains(task_id));
+        if task_inventory_error.is_none() {
+            inner
+                .state
+                .unclaimed_tasks
+                .retain(|task_id, task| task.node_id != node_id || reported_ids.contains(task_id));
+        }
         for report in reports.values() {
             if inner.state.tasks.contains_key(&report.id) {
                 inner.state.unclaimed_tasks.remove(&report.id);
@@ -90,6 +96,7 @@ impl Controller {
             .map(|task| task.id.clone())
             .collect();
         let mut remove = Vec::new();
+        let mut observed_failures = Vec::new();
         for id in assigned_ids {
             let task = inner.state.tasks.get_mut(&id).unwrap();
             match reports.get(&id) {
@@ -98,8 +105,13 @@ impl Controller {
                     {
                         task.observed = report.observed.clone();
                         task.container_id = report.container_id.clone();
+                        soft_changed = true;
+                    }
+                    if report.observed == ObservedTaskState::Failed {
+                        observed_failures.push((id.clone(), "container reported failed"));
                     }
                 }
+                None if task_inventory_error.is_some() => {}
                 None if task.desired == DesiredTaskState::Stopped => {
                     remove.push(id);
                 }
@@ -111,9 +123,42 @@ impl Controller {
                 ) =>
                 {
                     task.observed = ObservedTaskState::Failed;
+                    soft_changed = true;
+                    observed_failures.push((id.clone(), "container disappeared from the runtime"));
                 }
                 None => {}
             }
+        }
+        for report in &task_results {
+            let (task_changed, deployment_changed) =
+                apply_task_result(&mut inner.state, node_id, report);
+            soft_changed |= task_changed;
+            changed |= deployment_changed;
+        }
+        let reported_failures = task_results
+            .iter()
+            .filter(|report| report.error.is_some())
+            .map(|report| report.task_id.as_str())
+            .collect::<BTreeSet<_>>();
+        for (task_id, message) in observed_failures {
+            if reported_failures.contains(task_id.as_str()) {
+                continue;
+            }
+            let Some(desired_generation) = task_deployment_generation(&inner.state, &task_id)
+            else {
+                continue;
+            };
+            let report = TaskReconcileReport {
+                task_id,
+                desired_generation,
+                applied_generation: None,
+                phase: crate::model::TaskReconcilePhase::Verify,
+                error: Some(message.to_owned()),
+            };
+            let (task_changed, deployment_changed) =
+                apply_task_result(&mut inner.state, node_id, &report);
+            soft_changed |= task_changed;
+            changed |= deployment_changed;
         }
         for id in remove {
             inner.state.tasks.remove(&id);
@@ -122,12 +167,20 @@ impl Controller {
 
         let live = current_live_nodes(&inner, self.config.node_timeout_seconds);
         changed |= scheduler::reconcile(&mut inner.state, &live);
+        changed |= refresh_stack_deployments(
+            &mut inner.state,
+            unix_ms(),
+            self.config.deployment_timeout_seconds,
+        );
         if changed && let Err(error) = self.commit_locked(&mut inner).await {
             inner.state = previous;
             return Err(error.into());
         }
         if !changed {
             self.refresh_gateway_snapshot(&mut inner)?;
+            if soft_changed {
+                self.notify_status_locked(&mut inner);
+            }
         }
         self.acknowledge_gateway_drains(&mut inner).await?;
 
@@ -145,6 +198,12 @@ impl Controller {
             })
             .filter_map(|task| {
                 let service = inner.state.services.get(&task.service_id)?;
+                let deployment_generation = inner
+                    .state
+                    .stacks
+                    .get(&service.stack)
+                    .and_then(|stack| stack.deployment.as_ref())
+                    .map_or(0, |deployment| deployment.generation);
                 Some(TaskAssignment {
                     id: task.id.clone(),
                     cluster_id: self.config.cluster.cluster_id.clone(),
@@ -153,9 +212,11 @@ impl Controller {
                     service_id: task.service_id.clone(),
                     revision: task.revision,
                     slot: task.slot,
+                    desired: task.desired.clone(),
                     spec: service.spec.clone(),
                     ports: task.ports.clone(),
                     generation,
+                    deployment_generation,
                     spec_hash: service_spec_hash(&service.spec),
                 })
             })
@@ -165,7 +226,19 @@ impl Controller {
             .tasks
             .values()
             .filter(|task| task.node_id == node_id && task.desired == DesiredTaskState::Stopped)
-            .map(|task| task.id.clone())
+            .filter_map(|task| {
+                let service = inner.state.services.get(&task.service_id)?;
+                let deployment_generation = inner
+                    .state
+                    .stacks
+                    .get(&service.stack)
+                    .and_then(|stack| stack.deployment.as_ref())
+                    .map_or(0, |deployment| deployment.generation);
+                Some(TaskRemovalAssignment {
+                    id: task.id.clone(),
+                    deployment_generation,
+                })
+            })
             .collect();
         let gateway_config = self.gateway_assignment(&inner, gateway_enabled);
         Ok(HeartbeatResponse {
@@ -222,4 +295,15 @@ impl Controller {
             state,
         }
     }
+}
+
+fn task_deployment_generation(state: &ClusterState, task_id: &str) -> Option<u64> {
+    let task = state.tasks.get(task_id)?;
+    let service = state.services.get(&task.service_id)?;
+    state
+        .stacks
+        .get(&service.stack)?
+        .deployment
+        .as_ref()
+        .map(|deployment| deployment.generation)
 }

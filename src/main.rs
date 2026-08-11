@@ -8,7 +8,8 @@ use swarmlite::{
     model::{
         CLUSTER_SCHEMA_VERSION, ClusterConfigResponse, ClusterConfigUpdate, ClusterGatewayConfig,
         ClusterSettings, DEFAULT_GATEWAY_IMAGE, NodeGatewayResponse, NodeGatewayUpdate,
-        NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse,
+        NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, StackDeploymentResponse,
+        StackDeploymentStatus,
     },
     node,
 };
@@ -85,6 +86,9 @@ enum Command {
         file: PathBuf,
         #[arg(long, env = "SWARMLITE_TOKEN")]
         token: Option<String>,
+        /// Return after the controller accepts the desired state.
+        #[arg(long)]
+        detach: bool,
     },
     /// Display the current cluster state.
     Status {
@@ -380,10 +384,11 @@ async fn main() -> Result<()> {
             name,
             file,
             token,
+            detach,
         } => {
             let (controller, token) =
                 node::resolve_connection(&data_dir, controller, token).await?;
-            deploy(controller, name, file, token).await
+            deploy(controller, name, file, token, detach).await
         }
         Command::Status { controller, token } => {
             let (controller, token) =
@@ -400,9 +405,9 @@ async fn node_labels(
     method: reqwest::Method,
     body: Option<&serde_json::Value>,
 ) -> Result<NodeLabelsResponse> {
-    ControllerClient::new(controller, token)
+    Ok(ControllerClient::new(controller, token)
         .send_json(method, &format!("/v1/nodes/{node_id}/labels"), body)
-        .await
+        .await?)
 }
 
 async fn node_gateway(
@@ -417,13 +422,13 @@ async fn node_gateway(
     } else {
         reqwest::Method::GET
     };
-    ControllerClient::new(controller, token)
+    Ok(ControllerClient::new(controller, token)
         .send_json(
             method,
             &format!("/v1/nodes/{node_id}/gateway"),
             update.as_ref(),
         )
-        .await
+        .await?)
 }
 
 async fn cluster_config(
@@ -436,14 +441,21 @@ async fn cluster_config(
     } else {
         reqwest::Method::GET
     };
-    ControllerClient::new(controller, token)
+    Ok(ControllerClient::new(controller, token)
         .send_json(method, "/v1/config", update)
-        .await
+        .await?)
 }
 
-async fn deploy(controller: String, name: String, file: PathBuf, token: String) -> Result<()> {
+async fn deploy(
+    controller: String,
+    name: String,
+    file: PathBuf,
+    token: String,
+    detach: bool,
+) -> Result<()> {
     let stack = tokio::fs::read_to_string(file).await?;
-    let body = ControllerClient::new(controller, token)
+    let client = ControllerClient::new(controller, token);
+    let body = client
         .send_text(
             reqwest::Method::PUT,
             &format!("/v1/stacks/{name}"),
@@ -451,8 +463,84 @@ async fn deploy(controller: String, name: String, file: PathBuf, token: String) 
             Some(stack),
         )
         .await?;
-    println!("{body}");
+    let mut deployment: StackDeploymentResponse = serde_json::from_str(&body)?;
+    if !detach {
+        deployment = wait_for_deployment(&client, &name, deployment).await?;
+    }
+    println!("{}", serde_json::to_string_pretty(&deployment)?);
+    if matches!(
+        deployment.status,
+        StackDeploymentStatus::Failed | StackDeploymentStatus::TimedOut
+    ) {
+        let details = deployment
+            .errors
+            .iter()
+            .map(|error| {
+                format!(
+                    "{} on {} during {:?}: {}",
+                    error.service, error.node_id, error.phase, error.message
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!(
+            "stack {:?} deployment {}: {}",
+            name,
+            match deployment.status {
+                StackDeploymentStatus::Failed => "failed",
+                StackDeploymentStatus::TimedOut => "timed out",
+                _ => unreachable!(),
+            },
+            if details.is_empty() {
+                "no task reached the required healthy state".to_owned()
+            } else {
+                details
+            }
+        );
+    }
     Ok(())
+}
+
+async fn wait_for_deployment(
+    client: &ControllerClient,
+    stack_name: &str,
+    mut deployment: StackDeploymentResponse,
+) -> Result<StackDeploymentResponse> {
+    const CLIENT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(330);
+    const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
+    let deadline = tokio::time::Instant::now() + CLIENT_WAIT_TIMEOUT;
+    let mut last_error: Option<anyhow::Error> = None;
+    while deployment.status == StackDeploymentStatus::Deploying {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(last_error.unwrap_or_else(|| {
+                anyhow::anyhow!("timed out waiting for stack {stack_name:?} deployment")
+            }));
+        }
+        let path = format!(
+            "/v1/stacks/{stack_name}/deployment?generation={}&after_revision={}&wait_seconds=25",
+            deployment.generation, deployment.revision
+        );
+        match tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            client.get_json::<StackDeploymentResponse>(&path),
+        )
+        .await
+        {
+            Ok(Ok(next)) => {
+                deployment = next;
+                last_error = None;
+            }
+            Ok(Err(error)) if error.is_retryable() => {
+                last_error = Some(error.into());
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => {
+                last_error = Some(anyhow::anyhow!("controller deployment watch timed out"));
+            }
+        }
+    }
+    Ok(deployment)
 }
 
 async fn status(controller: String, token: String) -> Result<()> {
@@ -467,11 +555,35 @@ async fn status(controller: String, token: String) -> Result<()> {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::Cli;
+    use super::{Cli, Command};
 
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn deploy_waits_by_default_and_supports_detach() {
+        let parse = |extra: &[&str]| {
+            let mut arguments = vec![
+                "swarmlite",
+                "deploy",
+                "--name",
+                "demo",
+                "--file",
+                "stack.yaml",
+            ];
+            arguments.extend_from_slice(extra);
+            Cli::try_parse_from(arguments).unwrap()
+        };
+        assert!(matches!(
+            parse(&[]).command,
+            Command::Deploy { detach: false, .. }
+        ));
+        assert!(matches!(
+            parse(&["--detach"]).command,
+            Command::Deploy { detach: true, .. }
+        ));
     }
 
     #[test]

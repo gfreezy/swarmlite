@@ -73,6 +73,8 @@ pub(super) fn adopt_unclaimed_tasks(state: &mut ClusterState, stack_name: &str) 
                     ports: candidate.ports,
                     container_id: candidate.container_id,
                     drain_until_unix_ms: None,
+                    applied_generation: None,
+                    reconcile_error: None,
                 },
             );
             state.unclaimed_tasks.remove(&candidate.id);

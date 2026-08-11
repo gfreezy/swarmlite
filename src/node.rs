@@ -16,8 +16,8 @@ use crate::{
     agent,
     client::ControllerClient,
     config::{
-        AgentConfig, ControllerConfig, DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS, PortRangeConfig,
-        RuntimeConfig, RuntimeKind,
+        AgentConfig, ControllerConfig, DEFAULT_DEPLOYMENT_TIMEOUT_SECONDS,
+        DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS, PortRangeConfig, RuntimeConfig, RuntimeKind,
     },
     controller,
     local_state::{AgentFence, DATABASE_FILE, FENCE_KEY, LocalState, NODE_KEY},
@@ -451,6 +451,7 @@ async fn start_controller(
         node_timeout_seconds: 20,
         reconcile_interval_seconds: 1,
         gateway_drain_timeout_seconds: DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS,
+        deployment_timeout_seconds: DEFAULT_DEPLOYMENT_TIMEOUT_SECONDS,
         cluster,
     };
     let token = settings.token.clone();
@@ -693,19 +694,19 @@ fn load_node_settings_from(local_state: &LocalState) -> Result<NodeSettings> {
 }
 
 async fn fetch_bootstrap(controller: &str, token: &str) -> Result<BootstrapResponse> {
-    ControllerClient::new(controller, token)
+    Ok(ControllerClient::new(controller, token)
         .get_json("/v1/cluster")
-        .await
+        .await?)
 }
 
 async fn send_join(controller: &str, token: &str, request: &JoinRequest) -> Result<JoinResponse> {
-    ControllerClient::new(controller, token)
+    Ok(ControllerClient::new(controller, token)
         .send_json(
             reqwest::Method::PUT,
             &format!("/v1/nodes/{}/join", request.node_id),
             Some(request),
         )
-        .await
+        .await?)
 }
 
 fn validate_cluster(cluster: &ClusterSettings) -> Result<()> {

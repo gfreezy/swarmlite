@@ -7,7 +7,10 @@ use std::{
 
 use anyhow::{Context, Result};
 use axum::extract::DefaultBodyLimit;
-use tokio::{net::TcpListener, sync::Mutex};
+use tokio::{
+    net::TcpListener,
+    sync::{Mutex, watch},
+};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
@@ -25,8 +28,10 @@ use crate::{
         KvLockAcquireRequest, KvLockAcquireResponse, KvLockMutationRequest, KvObjectResponse,
         KvPutRequest, KvStatResponse, NodeGatewayResponse, NodeGatewayUpdate, NodeHeartbeat,
         NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, NodeMember,
-        ObservedTaskState, ServiceRecord, StackRecord, StatusResponse, TaskAssignment,
-        UnclaimedTask, service_spec_hash, valid_gateway_image,
+        ObservedTaskState, ServiceRecord, StackDeploymentError, StackDeploymentRecord,
+        StackDeploymentResponse, StackDeploymentServiceProgress, StackDeploymentStatus,
+        StackRecord, StatusResponse, TaskAssignment, TaskReconcileError, TaskReconcileReport,
+        TaskRemovalAssignment, UnclaimedTask, service_spec_hash, valid_gateway_image,
     },
     scheduler,
     storage::{StateRepository, StorageError},
@@ -45,6 +50,7 @@ mod nodes;
 mod recovery;
 mod stacks;
 
+use deployment::{apply_task_result, refresh_stack_deployments};
 use membership::*;
 use recovery::*;
 use stacks::*;
@@ -82,6 +88,7 @@ where
 
 struct Inner {
     generation: u64,
+    status_revision: u64,
     cluster: ClusterSettings,
     state: ClusterState,
     live_nodes: HashMap<String, Instant>,
@@ -96,6 +103,7 @@ pub struct Controller {
     repository: StateRepository,
     kv_repository: kv::KvRepository,
     deploying_stacks: std::sync::Mutex<BTreeSet<String>>,
+    status_changes: watch::Sender<u64>,
     inner: Mutex<Inner>,
 }
 

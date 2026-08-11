@@ -932,6 +932,7 @@ mod tests {
             service_id: "demo.web".into(),
             revision: 2,
             slot: 0,
+            desired: crate::model::DesiredTaskState::Running,
             spec: ServiceSpec {
                 image: "nginx:alpine".into(),
                 command: Vec::new(),
@@ -949,6 +950,7 @@ mod tests {
             },
             ports: Vec::new(),
             generation: 4,
+            deployment_generation: 4,
             spec_hash: "abc123".into(),
         };
 

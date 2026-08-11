@@ -109,6 +109,7 @@ x-swarmlite:
                 applied_at_unix_ms: 1,
                 services: vec!["demo.web".into()],
                 gateway: parsed.gateway,
+                deployment: None,
             },
         );
         state.services.insert("demo.web".into(), service());
@@ -217,6 +218,8 @@ x-swarmlite:
             }],
             container_id: None,
             drain_until_unix_ms: None,
+            applied_generation: None,
+            reconcile_error: None,
         }
     }
 }

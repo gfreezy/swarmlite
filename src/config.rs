@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::model::ClusterSettings;
 
 pub const DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS: u64 = 10;
+pub const DEFAULT_DEPLOYMENT_TIMEOUT_SECONDS: u64 = 300;
 
 #[derive(Debug, Clone)]
 pub struct ControllerConfig {
@@ -17,6 +18,7 @@ pub struct ControllerConfig {
     pub node_timeout_seconds: u64,
     pub reconcile_interval_seconds: u64,
     pub gateway_drain_timeout_seconds: u64,
+    pub deployment_timeout_seconds: u64,
     pub cluster: ClusterSettings,
 }
 

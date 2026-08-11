@@ -17,7 +17,7 @@ use crate::model::{
     JoinResponse, KvDeleteRequest, KvListResponse, KvLockAcquireRequest, KvLockAcquireResponse,
     KvLockMutationRequest, KvObjectResponse, KvPutRequest, KvStatResponse, NodeGatewayResponse,
     NodeGatewayUpdate, NodeHeartbeat, NodeLabelRemoveRequest, NodeLabelSetRequest,
-    NodeLabelsResponse, StatusResponse,
+    NodeLabelsResponse, StackDeploymentResponse, StatusResponse,
 };
 use swarmlite_stack::parse_stack;
 
@@ -33,6 +33,7 @@ pub(super) fn router(controller: Arc<Controller>) -> Router {
             get(get_cluster_config).patch(update_cluster_config),
         )
         .route("/v1/stacks/{name}", put(apply_stack))
+        .route("/v1/stacks/{name}/deployment", get(stack_deployment))
         .route("/v1/nodes/{node_id}/join", put(join_node))
         .route("/v1/nodes/{node_id}/heartbeat", post(heartbeat))
         .route(
@@ -162,17 +163,44 @@ async fn apply_stack(
     Path(name): Path<String>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<serde_json::Value>, ControllerError> {
+) -> Result<Json<StackDeploymentResponse>, ControllerError> {
     require_auth(&controller, &headers)?;
     let yaml =
         std::str::from_utf8(&body).map_err(|error| ControllerError::Invalid(error.to_string()))?;
     let parsed = parse_stack(yaml).map_err(|error| ControllerError::Invalid(error.to_string()))?;
-    let generation = controller.apply(&name, parsed).await?;
-    Ok(Json(json!({
-        "stack": name,
-        "generation": generation,
-        "status": "accepted"
-    })))
+    controller.apply(&name, parsed).await.map(Json)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StackDeploymentQuery {
+    generation: u64,
+    #[serde(default)]
+    after_revision: Option<u64>,
+    #[serde(default = "default_deployment_wait_seconds")]
+    wait_seconds: u64,
+}
+
+fn default_deployment_wait_seconds() -> u64 {
+    25
+}
+
+async fn stack_deployment(
+    State(controller): State<Arc<Controller>>,
+    Path(name): Path<String>,
+    Query(query): Query<StackDeploymentQuery>,
+    headers: HeaderMap,
+) -> Result<Json<StackDeploymentResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller
+        .wait_for_deployment(
+            &name,
+            query.generation,
+            query.after_revision,
+            std::time::Duration::from_secs(query.wait_seconds.min(30)),
+        )
+        .await
+        .map(Json)
 }
 
 async fn heartbeat(
