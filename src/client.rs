@@ -1,6 +1,15 @@
+use anyhow::Context;
 use reqwest::{Method, RequestBuilder};
 use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
+use tokio::net::TcpStream;
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async,
+    tungstenite::{
+        client::IntoClientRequest,
+        http::{HeaderValue, header::AUTHORIZATION},
+    },
+};
 
 #[derive(Debug, Error)]
 pub enum ControllerClientError {
@@ -102,6 +111,36 @@ impl ControllerClient {
                 endpoint: self.endpoint(path),
                 source,
             })
+    }
+
+    pub async fn connect_data_websocket(
+        &self,
+        path: &str,
+        token: &str,
+    ) -> anyhow::Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+        let mut endpoint = url::Url::parse(&self.endpoint(path))
+            .with_context(|| format!("invalid controller data endpoint {path:?}"))?;
+        let websocket_scheme = match endpoint.scheme() {
+            "http" => "ws",
+            "https" => "wss",
+            scheme => anyhow::bail!("controller URL scheme {scheme:?} does not support WebSocket"),
+        };
+        endpoint
+            .set_scheme(websocket_scheme)
+            .map_err(|_| anyhow::anyhow!("failed to construct controller WebSocket URL"))?;
+        let mut request = endpoint
+            .as_str()
+            .into_client_request()
+            .context("failed to build controller WebSocket request")?;
+        request.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}"))
+                .context("invalid data session token")?,
+        );
+        let (socket, _) = connect_async(request)
+            .await
+            .with_context(|| format!("failed to connect to data endpoint {endpoint}"))?;
+        Ok(socket)
     }
 
     fn request(&self, method: Method, path: &str) -> RequestBuilder {

@@ -14,6 +14,8 @@ use swarmlite::{
     node,
 };
 
+mod cluster_cli;
+
 #[derive(Debug, Parser)]
 #[command(name = "swarmlite", version, about)]
 struct Cli {
@@ -76,19 +78,45 @@ enum Command {
         #[command(subcommand)]
         action: NodeCommand,
     },
-    /// Deploy or update a Swarm-style stack file.
+    /// Deploy a new Stack or update an existing Stack.
     Deploy {
-        #[arg(short = 'u', long)]
-        controller: Option<String>,
-        #[arg(short = 'n', long)]
-        name: String,
-        #[arg(short = 'c', long)]
-        file: PathBuf,
-        #[arg(long, env = "SWARMLITE_TOKEN")]
-        token: Option<String>,
-        /// Return after the controller accepts the desired state.
-        #[arg(long)]
-        detach: bool,
+        #[command(flatten)]
+        options: cluster_cli::DeployArgs,
+    },
+    /// List cluster services, optionally limited to one Stack.
+    Ls {
+        #[command(flatten)]
+        options: cluster_cli::ListArgs,
+    },
+    /// List tasks belonging to a Stack or Service.
+    Ps {
+        #[command(flatten)]
+        options: cluster_cli::PsArgs,
+    },
+    /// Display detailed information about a Service.
+    Inspect {
+        #[command(flatten)]
+        options: cluster_cli::InspectArgs,
+    },
+    /// Fetch logs from a Service or Task.
+    Logs {
+        #[command(flatten)]
+        options: cluster_cli::LogsArgs,
+    },
+    /// Scale one or more Services.
+    Scale {
+        #[command(flatten)]
+        options: cluster_cli::ScaleArgs,
+    },
+    /// Perform a rolling restart of a Service.
+    Restart {
+        #[command(flatten)]
+        options: cluster_cli::RestartArgs,
+    },
+    /// Remove one or more Stacks.
+    Rm {
+        #[command(flatten)]
+        options: cluster_cli::RemoveArgs,
     },
     /// Display the current cluster state.
     Status {
@@ -379,23 +407,67 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
-        Command::Deploy {
-            controller,
-            name,
-            file,
-            token,
-            detach,
-        } => {
-            let (controller, token) =
-                node::resolve_connection(&data_dir, controller, token).await?;
-            deploy(controller, name, file, token, detach).await
-        }
+        Command::Deploy { options } => cluster_cli::run_deploy(&data_dir, options).await,
+        Command::Ls { options } => cluster_cli::run_list(&data_dir, options).await,
+        Command::Ps { options } => cluster_cli::run_ps(&data_dir, options).await,
+        Command::Inspect { options } => cluster_cli::run_inspect(&data_dir, options).await,
+        Command::Logs { options } => cluster_cli::run_logs(&data_dir, options).await,
+        Command::Scale { options } => cluster_cli::run_scale(&data_dir, options).await,
+        Command::Restart { options } => cluster_cli::run_restart(&data_dir, options).await,
+        Command::Rm { options } => cluster_cli::run_remove(&data_dir, options).await,
         Command::Status { controller, token } => {
             let (controller, token) =
                 node::resolve_connection(&data_dir, controller, token).await?;
             status(controller, token).await
         }
     }
+}
+
+async fn finish_deployment(
+    client: &ControllerClient,
+    mut deployment: StackDeploymentResponse,
+    detach: bool,
+) -> Result<StackDeploymentResponse> {
+    if !detach {
+        let stack = deployment.stack.clone();
+        deployment = wait_for_deployment(client, &stack, deployment).await?;
+        ensure_deployment_succeeded(&deployment)?;
+    }
+    Ok(deployment)
+}
+
+fn ensure_deployment_succeeded(deployment: &StackDeploymentResponse) -> Result<()> {
+    if !matches!(
+        deployment.status,
+        StackDeploymentStatus::Failed | StackDeploymentStatus::TimedOut
+    ) {
+        return Ok(());
+    }
+    let details = deployment
+        .errors
+        .iter()
+        .map(|error| {
+            format!(
+                "{} on {} during {:?}: {}",
+                error.service, error.node_id, error.phase, error.message
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    anyhow::bail!(
+        "stack {:?} deployment {}: {}",
+        deployment.stack,
+        match deployment.status {
+            StackDeploymentStatus::Failed => "failed",
+            StackDeploymentStatus::TimedOut => "timed out",
+            _ => unreachable!(),
+        },
+        if details.is_empty() {
+            "no task reached the required healthy state".to_owned()
+        } else {
+            details
+        }
+    )
 }
 
 async fn node_labels(
@@ -463,41 +535,9 @@ async fn deploy(
             Some(stack),
         )
         .await?;
-    let mut deployment: StackDeploymentResponse = serde_json::from_str(&body)?;
-    if !detach {
-        deployment = wait_for_deployment(&client, &name, deployment).await?;
-    }
+    let deployment: StackDeploymentResponse = serde_json::from_str(&body)?;
+    let deployment = finish_deployment(&client, deployment, detach).await?;
     println!("{}", serde_json::to_string_pretty(&deployment)?);
-    if matches!(
-        deployment.status,
-        StackDeploymentStatus::Failed | StackDeploymentStatus::TimedOut
-    ) {
-        let details = deployment
-            .errors
-            .iter()
-            .map(|error| {
-                format!(
-                    "{} on {} during {:?}: {}",
-                    error.service, error.node_id, error.phase, error.message
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        anyhow::bail!(
-            "stack {:?} deployment {}: {}",
-            name,
-            match deployment.status {
-                StackDeploymentStatus::Failed => "failed",
-                StackDeploymentStatus::TimedOut => "timed out",
-                _ => unreachable!(),
-            },
-            if details.is_empty() {
-                "no task reached the required healthy state".to_owned()
-            } else {
-                details
-            }
-        );
-    }
     Ok(())
 }
 
@@ -565,25 +605,32 @@ mod tests {
     #[test]
     fn deploy_waits_by_default_and_supports_detach() {
         let parse = |extra: &[&str]| {
-            let mut arguments = vec![
-                "swarmlite",
-                "deploy",
-                "--name",
-                "demo",
-                "--file",
-                "stack.yaml",
-            ];
+            let mut arguments = vec!["swarmlite", "deploy", "-c", "stack.yaml", "demo"];
             arguments.extend_from_slice(extra);
             Cli::try_parse_from(arguments).unwrap()
         };
-        assert!(matches!(
-            parse(&[]).command,
-            Command::Deploy { detach: false, .. }
-        ));
+        assert!(matches!(parse(&[]).command, Command::Deploy { .. }));
         assert!(matches!(
             parse(&["--detach"]).command,
-            Command::Deploy { detach: true, .. }
+            Command::Deploy { .. }
         ));
+    }
+
+    #[test]
+    fn exposes_flat_cluster_commands() {
+        assert!(Cli::try_parse_from(["swarmlite", "ls"]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "ls", "demo"]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "ps", "demo"]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "ps", "demo.web"]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "inspect", "demo.web"]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "logs", "--tail", "20", "demo.web",]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "logs", "--follow", "demo.web",]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "logs", "--raw", "task-id",]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "scale", "--detach", "demo.web=3",]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "restart", "demo.web",]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "rm", "demo", "other",]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "stack", "ls"]).is_err());
+        assert!(Cli::try_parse_from(["swarmlite", "service", "ls"]).is_err());
     }
 
     #[test]
@@ -599,6 +646,13 @@ mod tests {
         assert!(names.contains(&"config"));
         assert!(names.contains(&"gateway"));
         assert!(names.contains(&"node"));
+        for name in [
+            "deploy", "ls", "ps", "inspect", "logs", "scale", "restart", "rm",
+        ] {
+            assert!(names.contains(&name));
+        }
+        assert!(!names.contains(&"stack"));
+        assert!(!names.contains(&"service"));
         assert!(!names.contains(&"role"));
         assert!(!names.contains(&"controller"));
         assert!(!names.contains(&"agent"));

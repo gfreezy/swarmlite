@@ -7,9 +7,10 @@ description = "A small single-controller container orchestrator for one LAN or r
 
 [dependencies]
 anyhow = "1.0"
-axum = { version = "0.8", features = ["json"] }
+axum = { version = "0.8", features = ["json", "ws"] }
 base64 = "0.22"
 bollard = "0.21"
+bytes = "1.10"
 clap = { version = "4.5", features = ["derive", "env"] }
 futures-util = "0.3"
 reqwest = { version = "0.13", features = ["json"] }
@@ -20,6 +21,7 @@ sha2 = "0.10"
 swarmlite-stack = { path = "crates/swarmlite-stack" }
 thiserror = "2.0"
 tokio = { version = "1.49", features = ["full"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

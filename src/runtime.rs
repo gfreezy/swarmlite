@@ -6,17 +6,21 @@ use std::{
 use anyhow::{Context, Result, bail};
 use bollard::{
     API_DEFAULT_VERSION, Docker,
+    container::LogOutput,
     models::{
         ContainerCreateBody, ContainerSummaryStateEnum, HealthConfig, HealthStatusEnum, HostConfig,
         PortBinding as DockerPortBinding, RestartPolicy, RestartPolicyNameEnum,
     },
     query_parameters::{
         CreateContainerOptionsBuilder, CreateImageOptionsBuilder, ListContainersOptionsBuilder,
-        RemoveContainerOptionsBuilder, RemoveVolumeOptionsBuilder, StopContainerOptionsBuilder,
+        LogsOptionsBuilder, RemoveContainerOptionsBuilder, RemoveVolumeOptionsBuilder,
+        StopContainerOptionsBuilder,
     },
 };
+use bytes::Bytes;
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::{
@@ -73,6 +77,20 @@ pub struct ManagedContainer {
     pub ports: Vec<PortBinding>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeLogChannel {
+    Stdout,
+    Stderr,
+    Stdin,
+    Console,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeLogChunk {
+    pub channel: RuntimeLogChannel,
+    pub payload: Bytes,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ManagedClusterInventory {
     pub cluster_ids: BTreeSet<String>,
@@ -123,6 +141,14 @@ pub trait ContainerRuntime: Send + Sync + 'static {
     fn start_task(&self, container: &ManagedContainer) -> impl Future<Output = Result<()>> + Send;
 
     fn remove_task(&self, container: &ManagedContainer) -> impl Future<Output = Result<()>> + Send;
+
+    fn stream_task_logs(
+        &self,
+        container: &ManagedContainer,
+        tail: u32,
+        follow: bool,
+        output: mpsc::Sender<RuntimeLogChunk>,
+    ) -> impl Future<Output = Result<()>> + Send;
 }
 
 #[derive(Clone)]
@@ -733,6 +759,43 @@ impl ContainerRuntime for DockerCompatibleRuntime {
             .start_container(&container.id, None)
             .await
             .with_context(|| format!("failed to start recovered task {}", container.task_id))
+    }
+
+    async fn stream_task_logs(
+        &self,
+        container: &ManagedContainer,
+        tail: u32,
+        follow: bool,
+        output: mpsc::Sender<RuntimeLogChunk>,
+    ) -> Result<()> {
+        let options = LogsOptionsBuilder::default()
+            .follow(follow)
+            .stdout(true)
+            .stderr(true)
+            .tail(&tail.to_string())
+            .build();
+        let mut stream = self.client.logs(&container.id, Some(options));
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk
+                .with_context(|| format!("failed to read logs for task {}", container.task_id))?;
+            let channel = match &chunk {
+                LogOutput::StdOut { .. } => RuntimeLogChannel::Stdout,
+                LogOutput::StdErr { .. } => RuntimeLogChannel::Stderr,
+                LogOutput::StdIn { .. } => RuntimeLogChannel::Stdin,
+                LogOutput::Console { .. } => RuntimeLogChannel::Console,
+            };
+            if output
+                .send(RuntimeLogChunk {
+                    channel,
+                    payload: chunk.into_bytes(),
+                })
+                .await
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
+        Ok(())
     }
 }
 

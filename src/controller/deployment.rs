@@ -1,5 +1,22 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+enum RevisionPolicy<'a> {
+    DetectChanges,
+    Force(&'a str),
+    Preserve(&'a str),
+}
+
+impl RevisionPolicy<'_> {
+    fn forces(self, service: &str) -> bool {
+        matches!(self, Self::Force(target) if target == service)
+    }
+
+    fn preserves(self, service: &str) -> bool {
+        matches!(self, Self::Preserve(target) if target == service)
+    }
+}
+
 pub(super) struct StackDeployment<'a> {
     active: &'a std::sync::Mutex<BTreeSet<String>>,
     stack_name: String,
@@ -22,6 +39,82 @@ impl Controller {
     ) -> Result<StackDeploymentResponse, ControllerError> {
         validate_stack_name(stack_name)?;
         let _deployment = self.begin_stack_deployment(stack_name)?;
+        self.apply_guarded(stack_name, parsed, RevisionPolicy::DetectChanges)
+            .await
+    }
+
+    pub(super) async fn scale_service(
+        &self,
+        target: &str,
+        replicas: u32,
+    ) -> Result<StackDeploymentResponse, ControllerError> {
+        let service = {
+            let inner = self.inner.lock().await;
+            resolve_service(&inner.state, target)?
+        };
+        let stack_name = service.stack.clone();
+        let _deployment = self.begin_stack_deployment(&stack_name)?;
+        let mut parsed = {
+            let inner = self.inner.lock().await;
+            current_stack(&inner.state, &stack_name)?
+        };
+        parsed
+            .services
+            .get_mut(&service.name)
+            .expect("resolved service must be present")
+            .replicas = replicas;
+        self.apply_guarded(&stack_name, parsed, RevisionPolicy::Preserve(&service.name))
+            .await
+    }
+
+    pub(super) async fn force_update_service(
+        &self,
+        target: &str,
+    ) -> Result<StackDeploymentResponse, ControllerError> {
+        let service = {
+            let inner = self.inner.lock().await;
+            resolve_service(&inner.state, target)?
+        };
+        let _deployment = self.begin_stack_deployment(&service.stack)?;
+        let parsed = {
+            let inner = self.inner.lock().await;
+            current_stack(&inner.state, &service.stack)?
+        };
+        self.apply_guarded(&service.stack, parsed, RevisionPolicy::Force(&service.name))
+            .await
+    }
+
+    pub(super) async fn remove_stack(
+        &self,
+        stack_name: &str,
+    ) -> Result<StackDeploymentResponse, ControllerError> {
+        validate_stack_name(stack_name)?;
+        {
+            let inner = self.inner.lock().await;
+            if !stack_is_active(&inner.state, stack_name) {
+                return Err(ControllerError::NotFound(format!(
+                    "stack {stack_name:?} not found"
+                )));
+            }
+        }
+        let _deployment = self.begin_stack_deployment(stack_name)?;
+        self.apply_guarded(
+            stack_name,
+            ParsedStack {
+                services: Default::default(),
+                gateway: Default::default(),
+            },
+            RevisionPolicy::DetectChanges,
+        )
+        .await
+    }
+
+    async fn apply_guarded(
+        &self,
+        stack_name: &str,
+        parsed: ParsedStack,
+        revision_policy: RevisionPolicy<'_>,
+    ) -> Result<StackDeploymentResponse, ControllerError> {
         let ParsedStack {
             services,
             gateway: stack_gateway,
@@ -78,9 +171,14 @@ impl Controller {
                 != gateway::routed_service_ports(&stack_gateway, &name);
             match inner.state.services.get_mut(&id) {
                 Some(existing)
-                    if existing.spec == spec && !existing.deleted && !routing_ports_changed => {}
+                    if existing.spec == spec
+                        && !existing.deleted
+                        && !routing_ports_changed
+                        && !revision_policy.forces(&name) => {}
                 Some(existing) => {
-                    existing.revision += 1;
+                    if !revision_policy.preserves(&name) {
+                        existing.revision += 1;
+                    }
                     existing.spec = spec;
                     existing.deleted = false;
                 }

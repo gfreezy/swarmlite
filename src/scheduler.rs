@@ -384,7 +384,7 @@ mod tests {
 
     fn service(revision: u64, replicas: u32) -> ServiceRecord {
         ServiceRecord {
-            id: "demo_web".into(),
+            id: "demo.web".into(),
             stack: "demo".into(),
             name: "web".into(),
             revision,

@@ -452,6 +452,148 @@ pub struct StackDeploymentServiceProgress {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskListResponse {
+    pub tasks: Vec<TaskSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StackListResponse {
+    pub stacks: Vec<StackSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StackSummary {
+    pub name: String,
+    pub services: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<StackDeploymentStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceListResponse {
+    pub services: Vec<ServiceSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceSummary {
+    pub id: String,
+    pub stack: String,
+    pub name: String,
+    pub image: String,
+    pub replicas: u32,
+    pub running_replicas: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskSummary {
+    pub id: String,
+    pub stack: String,
+    pub service: String,
+    pub slot: u32,
+    pub node_id: String,
+    pub desired: DesiredTaskState,
+    pub observed: ObservedTaskState,
+    pub image: String,
+    pub ports: Vec<PortBinding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceInspectResponse {
+    pub service: ServiceRecord,
+    pub stack: StackRecord,
+    pub tasks: Vec<TaskRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DataSessionOperation {
+    Logs {
+        target: String,
+        tail: u32,
+        #[serde(default)]
+        follow: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataSessionCreateResponse {
+    pub session_id: String,
+    pub attach_token: String,
+    pub streams: Vec<DataSessionStream>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataSessionStream {
+    pub stream_id: u32,
+    pub task_id: String,
+    pub node_id: String,
+    pub stack: String,
+    pub service: String,
+    pub slot: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentDataStream {
+    pub stream_id: u32,
+    pub task_id: String,
+    #[serde(flatten)]
+    pub operation: AgentDataStreamOperation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "stream_operation", rename_all = "snake_case")]
+pub enum AgentDataStreamOperation {
+    Logs {
+        tail: u32,
+        #[serde(default)]
+        follow: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentCommand {
+    pub id: String,
+    #[serde(flatten)]
+    pub operation: AgentCommandOperation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum AgentCommandOperation {
+    OpenDataSession {
+        session_id: String,
+        upload_token: String,
+        streams: Vec<AgentDataStream>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentCommandPollResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<AgentCommand>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCommandResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentCommandAck {
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceScaleRequest {
+    pub replicas: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub cluster_id: String,
     pub generation: u64,

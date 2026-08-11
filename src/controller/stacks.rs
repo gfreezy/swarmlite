@@ -1,11 +1,55 @@
 use std::collections::BTreeSet;
 
-use crate::model::{ClusterState, StackGatewaySpec};
+use crate::model::{ClusterState, ServiceRecord, StackGatewaySpec};
+use swarmlite_stack::ParsedStack;
 
 use super::ControllerError;
 
 pub(super) fn service_id(stack: &str, service: &str) -> String {
     format!("{stack}.{service}")
+}
+
+pub(super) fn resolve_service(
+    state: &ClusterState,
+    target: &str,
+) -> Result<ServiceRecord, ControllerError> {
+    state
+        .services
+        .get(target)
+        .filter(|service| !service.deleted)
+        .cloned()
+        .ok_or_else(|| ControllerError::NotFound(format!("service {target:?} not found")))
+}
+
+pub(super) fn current_stack(
+    state: &ClusterState,
+    stack_name: &str,
+) -> Result<ParsedStack, ControllerError> {
+    let stack = state
+        .stacks
+        .get(stack_name)
+        .ok_or_else(|| ControllerError::NotFound(format!("stack {stack_name:?} not found")))?;
+    let services = state
+        .services
+        .values()
+        .filter(|service| service.stack == stack_name && !service.deleted)
+        .map(|service| (service.name.clone(), service.spec.clone()))
+        .collect();
+    Ok(ParsedStack {
+        services,
+        gateway: stack.gateway.clone(),
+    })
+}
+
+pub(super) fn stack_is_active(state: &ClusterState, stack_name: &str) -> bool {
+    state
+        .services
+        .values()
+        .any(|service| service.stack == stack_name && !service.deleted)
+        || state
+            .stacks
+            .get(stack_name)
+            .is_some_and(|stack| !stack.gateway.http_routes.is_empty())
 }
 
 pub(super) fn validate_gateway_hostname_ownership(

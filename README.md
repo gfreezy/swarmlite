@@ -101,7 +101,14 @@ gateway status|enable|disable
                      read or update one node's gateway switch
 node label get|set|remove
                      read or update one node's placement labels
-deploy               deploy or update a stack
+deploy               deploy or update a Stack
+ls [STACK]           list cluster Services
+ps TARGET            list tasks for a Stack or Service
+inspect SERVICE      inspect a Service
+logs SERVICE|TASK    stream container logs
+scale SERVICE=N      scale replicated Services
+restart SERVICE      roll a Service
+rm STACK             remove Stacks
 status               inspect cluster state
 ```
 
@@ -144,14 +151,15 @@ swarmlite --data-dir /var/lib/swarmlite serve
 Deploy and inspect a stack using the saved controller URL and token:
 
 ```bash
-swarmlite deploy --name demo --file examples/stack.yaml
-swarmlite status
+swarmlite deploy --compose-file examples/stack.yaml demo
+swarmlite ps demo
+swarmlite ls demo
 ```
 
 `deploy` waits until every desired replica has been applied by its Agent and reports healthy, and
 obsolete tasks have been removed. An image-pull, container-create, start, remove, or
 runtime-inspection failure is returned with its service, node, task, and execution phase; the
-command exits non-zero. Use `--detach` to return as soon as the controller has durably accepted the
+command exits non-zero. Use `--detach` to return as soon as the Controller has durably accepted the
 desired state.
 
 The CLI waits through the controller's long-poll deployment endpoint rather than polling rapidly.
@@ -159,6 +167,39 @@ Deployments that do not become healthy within five minutes are marked `timed_out
 accepts only one non-terminal deployment for a given Stack name. A concurrent deployment of the
 same Stack returns `409 Conflict`; deployments using different Stack names may be submitted
 independently.
+
+All workload commands are cluster-scoped, so the CLI uses flat action commands instead of separate
+Stack and Service namespaces. A Service deployed as `web` in Stack `demo` is addressed as
+`demo.web`:
+
+```bash
+swarmlite ls
+swarmlite ps demo
+swarmlite ps demo.web
+swarmlite inspect demo.web
+swarmlite logs --tail 200 demo.web
+swarmlite logs --follow demo.web
+swarmlite scale demo.web=3
+swarmlite restart demo.web
+swarmlite rm demo
+```
+
+`scale`, `restart`, and `rm` change desired state through the same deployment scheduler as
+`deploy`; they do not stop or remove an arbitrary container behind the scheduler. They wait for
+convergence by default and support `--detach`. `restart` increments the Service revision and
+performs the configured rolling replacement.
+
+Agents keep an independent authenticated long-poll open for data-session control commands. This
+outbound-only control channel lets `logs` reach the assigned node immediately without waiting for
+the next heartbeat or opening a listener on an Agent. Commands contain only small JSON metadata,
+have IDs and acknowledgements, and use a delivery lease so a lost HTTP response can be redelivered.
+
+Bulk data uses a separate WebSocket connection to the same Controller address. The Controller
+issues short-lived, session-scoped tokens to the CLI and each selected node, validates assigned
+stream IDs and frame sequence numbers, and relays bounded binary frames without converting their
+payloads to UTF-8. Closing the CLI connection cancels the Agent streams. Multiple Tasks are
+multiplexed by numeric stream ID; a single raw stream preserves arbitrary bytes. `logs` supports
+snapshots and `--follow`, with `--tail` limited to 10,000 lines and at most 64 selected Tasks.
 
 ## Join nodes and configure gateways
 
@@ -422,7 +463,7 @@ switch automatically. Rejoin and serve other nodes using the new
 token, then deploy the same stack name and file:
 
 ```bash
-swarmlite deploy --name demo --file stack.yaml
+swarmlite deploy --compose-file stack.yaml demo
 ```
 
 Matching containers are adopted by cluster ID, stack, service, slot, and spec hash. Running
@@ -450,6 +491,8 @@ host ports and gateways connect to `node-advertise-address:allocated-host-port`.
 - Only replicated services are supported; `deploy.mode: global` is rejected.
 - No Compose `build`, `configs`, `secrets`, resource reservations, or autoscaling.
 - Named volumes and bind mounts remain node-local.
+- `stats` and interactive `exec` are not implemented yet; the binary data-session transport is
+  designed for them.
 - Gateway routing intentionally supports the documented host/path/rewrite/backend model, not
   arbitrary Caddy handlers.
 - The controller API is HTTP; use a trusted private network or terminate TLS in front of it.

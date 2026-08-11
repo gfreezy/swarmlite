@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, WebSocketUpgrade},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -13,11 +13,14 @@ use serde_json::json;
 use tracing::error;
 
 use crate::model::{
-    BootstrapResponse, ClusterConfigResponse, ClusterConfigUpdate, HeartbeatResponse, JoinRequest,
-    JoinResponse, KvDeleteRequest, KvListResponse, KvLockAcquireRequest, KvLockAcquireResponse,
-    KvLockMutationRequest, KvObjectResponse, KvPutRequest, KvStatResponse, NodeGatewayResponse,
-    NodeGatewayUpdate, NodeHeartbeat, NodeLabelRemoveRequest, NodeLabelSetRequest,
-    NodeLabelsResponse, StackDeploymentResponse, StatusResponse,
+    AgentCommandAck, AgentCommandPollResponse, AgentCommandResult, BootstrapResponse,
+    ClusterConfigResponse, ClusterConfigUpdate, DataSessionCreateResponse, DataSessionOperation,
+    HeartbeatResponse, JoinRequest, JoinResponse, KvDeleteRequest, KvListResponse,
+    KvLockAcquireRequest, KvLockAcquireResponse, KvLockMutationRequest, KvObjectResponse,
+    KvPutRequest, KvStatResponse, NodeGatewayResponse, NodeGatewayUpdate, NodeHeartbeat,
+    NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, ServiceInspectResponse,
+    ServiceListResponse, ServiceScaleRequest, StackDeploymentResponse, StackListResponse,
+    StatusResponse, TaskListResponse,
 };
 use swarmlite_stack::parse_stack;
 
@@ -32,10 +35,35 @@ pub(super) fn router(controller: Arc<Controller>) -> Router {
             "/v1/config",
             get(get_cluster_config).patch(update_cluster_config),
         )
-        .route("/v1/stacks/{name}", put(apply_stack))
+        .route("/v1/stacks", get(list_stacks))
+        .route("/v1/stacks/{name}", put(apply_stack).delete(remove_stack))
+        .route("/v1/stacks/{name}/tasks", get(stack_tasks))
         .route("/v1/stacks/{name}/deployment", get(stack_deployment))
+        .route("/v1/services", get(list_services))
+        .route("/v1/services/{target}", get(inspect_service))
+        .route("/v1/services/{target}/tasks", get(service_tasks))
+        .route("/v1/services/{target}/scale", post(scale_service))
+        .route(
+            "/v1/services/{target}/force-update",
+            post(force_update_service),
+        )
+        .route("/v1/tasks", get(target_tasks))
+        .route("/v1/data-sessions", post(create_data_session))
+        .route(
+            "/v1/data-sessions/{session_id}/client",
+            get(attach_data_client),
+        )
+        .route(
+            "/v1/data-sessions/{session_id}/nodes/{node_id}",
+            get(attach_data_agent),
+        )
         .route("/v1/nodes/{node_id}/join", put(join_node))
         .route("/v1/nodes/{node_id}/heartbeat", post(heartbeat))
+        .route("/v1/nodes/{node_id}/commands", get(next_agent_command))
+        .route(
+            "/v1/nodes/{node_id}/commands/{command_id}/result",
+            post(agent_command_result),
+        )
         .route(
             "/v1/nodes/{node_id}/gateway",
             get(get_node_gateway).put(update_node_gateway),
@@ -169,6 +197,182 @@ async fn apply_stack(
         std::str::from_utf8(&body).map_err(|error| ControllerError::Invalid(error.to_string()))?;
     let parsed = parse_stack(yaml).map_err(|error| ControllerError::Invalid(error.to_string()))?;
     controller.apply(&name, parsed).await.map(Json)
+}
+
+async fn list_stacks(
+    State(controller): State<Arc<Controller>>,
+    headers: HeaderMap,
+) -> Result<Json<StackListResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    Ok(Json(controller.list_stacks().await))
+}
+
+async fn remove_stack(
+    State(controller): State<Arc<Controller>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<StackDeploymentResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.remove_stack(&name).await.map(Json)
+}
+
+async fn stack_tasks(
+    State(controller): State<Arc<Controller>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<TaskListResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.stack_tasks(&name).await.map(Json)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceListQuery {
+    #[serde(default)]
+    stack: Option<String>,
+}
+
+async fn list_services(
+    State(controller): State<Arc<Controller>>,
+    Query(query): Query<ServiceListQuery>,
+    headers: HeaderMap,
+) -> Result<Json<ServiceListResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller
+        .list_services(query.stack.as_deref())
+        .await
+        .map(Json)
+}
+
+async fn inspect_service(
+    State(controller): State<Arc<Controller>>,
+    Path(target): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<ServiceInspectResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.inspect_service(&target).await.map(Json)
+}
+
+async fn service_tasks(
+    State(controller): State<Arc<Controller>>,
+    Path(target): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<TaskListResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.service_tasks(&target).await.map(Json)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskTargetQuery {
+    target: String,
+}
+
+async fn target_tasks(
+    State(controller): State<Arc<Controller>>,
+    Query(query): Query<TaskTargetQuery>,
+    headers: HeaderMap,
+) -> Result<Json<TaskListResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.target_tasks(&query.target).await.map(Json)
+}
+
+async fn scale_service(
+    State(controller): State<Arc<Controller>>,
+    Path(target): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ServiceScaleRequest>,
+) -> Result<Json<StackDeploymentResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller
+        .scale_service(&target, body.replicas)
+        .await
+        .map(Json)
+}
+
+async fn force_update_service(
+    State(controller): State<Arc<Controller>>,
+    Path(target): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<StackDeploymentResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.force_update_service(&target).await.map(Json)
+}
+
+async fn create_data_session(
+    State(controller): State<Arc<Controller>>,
+    headers: HeaderMap,
+    Json(operation): Json<DataSessionOperation>,
+) -> Result<Json<DataSessionCreateResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.create_data_session(operation).await.map(Json)
+}
+
+async fn attach_data_client(
+    State(controller): State<Arc<Controller>>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    websocket: WebSocketUpgrade,
+) -> Result<Response, ControllerError> {
+    let token = bearer_token(&headers).ok_or(ControllerError::Unauthorized)?;
+    let attachment = controller.sessions.attach_client(&session_id, token)?;
+    Ok(websocket
+        .max_message_size(crate::data_plane::MAX_DATA_FRAME_BYTES)
+        .on_upgrade(move |socket| attachment.serve(socket)))
+}
+
+async fn attach_data_agent(
+    State(controller): State<Arc<Controller>>,
+    Path((session_id, node_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    websocket: WebSocketUpgrade,
+) -> Result<Response, ControllerError> {
+    let token = bearer_token(&headers).ok_or(ControllerError::Unauthorized)?;
+    let attachment = controller
+        .sessions
+        .attach_agent(&session_id, &node_id, token)?;
+    Ok(websocket
+        .max_message_size(crate::data_plane::MAX_DATA_FRAME_BYTES)
+        .on_upgrade(move |socket| attachment.serve(socket)))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentCommandQuery {
+    #[serde(default = "default_command_wait_seconds")]
+    wait_seconds: u64,
+}
+
+fn default_command_wait_seconds() -> u64 {
+    20
+}
+
+async fn next_agent_command(
+    State(controller): State<Arc<Controller>>,
+    Path(node_id): Path<String>,
+    Query(query): Query<AgentCommandQuery>,
+    headers: HeaderMap,
+) -> Result<Json<AgentCommandPollResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    let command = controller
+        .commands
+        .next(
+            &node_id,
+            std::time::Duration::from_secs(query.wait_seconds.min(25)),
+        )
+        .await;
+    Ok(Json(AgentCommandPollResponse { command }))
+}
+
+async fn agent_command_result(
+    State(controller): State<Arc<Controller>>,
+    Path((node_id, command_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<AgentCommandResult>,
+) -> Result<Json<AgentCommandAck>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    let accepted = controller.commands.complete(&node_id, &command_id, body);
+    Ok(Json(AgentCommandAck { accepted }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -313,6 +517,14 @@ fn require_auth(controller: &Controller, headers: &HeaderMap) -> Result<(), Cont
     } else {
         Err(ControllerError::Unauthorized)
     }
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
 }
 
 impl IntoResponse for ControllerError {

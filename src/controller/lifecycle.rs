@@ -79,6 +79,8 @@ impl Controller {
             token,
             repository,
             kv_repository,
+            commands: commands::AgentCommandBroker::new(),
+            sessions: sessions::DataSessionBroker::new(),
             deploying_stacks: std::sync::Mutex::new(BTreeSet::new()),
             status_changes,
             inner: Mutex::new(Inner {

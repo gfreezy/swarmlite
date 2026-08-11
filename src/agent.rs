@@ -5,17 +5,26 @@ use std::{
 };
 
 use anyhow::{Result, bail};
+use futures_util::{SinkExt, StreamExt};
+use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
 use crate::{
     client::ControllerClient,
     config::AgentConfig,
+    data_plane::{DataChannel, DataFrame, MAX_DATA_PAYLOAD_BYTES},
     local_state::{AgentFence, FENCE_KEY, LocalState},
     model::{
-        GatewayReport, HeartbeatResponse, NodeControl, NodeHeartbeat, NodeRecord,
-        ObservedTaskState, TaskReconcilePhase, TaskReconcileReport, TaskReport,
+        AgentCommand, AgentCommandAck, AgentCommandOperation, AgentCommandPollResponse,
+        AgentCommandResult, AgentDataStream, AgentDataStreamOperation, GatewayReport,
+        HeartbeatResponse, NodeControl, NodeHeartbeat, NodeRecord, ObservedTaskState,
+        TaskReconcilePhase, TaskReconcileReport, TaskReport,
     },
-    runtime::{ContainerRuntime, DockerCompatibleRuntime, ManagedContainer},
+    runtime::{
+        ContainerRuntime, DockerCompatibleRuntime, ManagedContainer, RuntimeLogChannel,
+        RuntimeLogChunk,
+    },
 };
 
 pub(crate) async fn run_with_token_and_updates(
@@ -67,6 +76,19 @@ async fn run_with_runtime<R: ContainerRuntime>(
             reconcile_cluster_id,
             loop_results,
             reconcile_events_tx,
+        )
+        .await;
+    });
+    let command_runtime = Arc::clone(&runtime);
+    let command_client = client.clone();
+    let command_node_id = config.node_id.clone();
+    let command_cluster_id = config.cluster_id.clone();
+    tokio::spawn(async move {
+        command_loop(
+            command_runtime,
+            command_client,
+            command_node_id,
+            command_cluster_id,
         )
         .await;
     });
@@ -169,6 +191,248 @@ async fn run_with_runtime<R: ContainerRuntime>(
         }
         if assignments_tx.send(Some(response)).is_err() {
             bail!("container reconciliation loop stopped unexpectedly");
+        }
+    }
+}
+
+async fn command_loop<R: ContainerRuntime>(
+    runtime: Arc<R>,
+    client: ControllerClient,
+    node_id: String,
+    cluster_id: String,
+) {
+    loop {
+        let path = format!("/v1/nodes/{node_id}/commands?wait_seconds=20");
+        let poll = match client.get_json::<AgentCommandPollResponse>(&path).await {
+            Ok(poll) => poll,
+            Err(error) => {
+                warn!(%error, "failed to poll controller command channel");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+        let Some(command) = poll.command else {
+            continue;
+        };
+        let result = execute_command(
+            Arc::clone(&runtime),
+            &client,
+            &node_id,
+            &cluster_id,
+            &command,
+        )
+        .await;
+        publish_command_result(&client, &node_id, &command.id, &result).await;
+    }
+}
+
+async fn execute_command<R: ContainerRuntime>(
+    runtime: Arc<R>,
+    client: &ControllerClient,
+    node_id: &str,
+    cluster_id: &str,
+    command: &AgentCommand,
+) -> AgentCommandResult {
+    let result: Result<()> = async {
+        match &command.operation {
+            AgentCommandOperation::OpenDataSession {
+                session_id,
+                upload_token,
+                streams,
+            } => {
+                let path = format!(
+                    "/v1/data-sessions/{}/nodes/{}",
+                    encode_path_segment(session_id),
+                    encode_path_segment(node_id)
+                );
+                let socket = client.connect_data_websocket(&path, upload_token).await?;
+                let runtime = Arc::clone(&runtime);
+                let cluster_id = cluster_id.to_owned();
+                let streams = streams.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = run_data_session(runtime, cluster_id, streams, socket).await
+                    {
+                        warn!(%error, "data session stopped with an error");
+                    }
+                });
+                Ok(())
+            }
+        }
+    }
+    .await;
+    match result {
+        Ok(()) => AgentCommandResult { error: None },
+        Err(error) => AgentCommandResult {
+            error: Some(format!("{error:#}")),
+        },
+    }
+}
+
+async fn run_data_session<R: ContainerRuntime>(
+    runtime: Arc<R>,
+    cluster_id: String,
+    streams: Vec<AgentDataStream>,
+    socket: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Result<()> {
+    let containers = runtime.list_managed(&cluster_id).await;
+    let (frame_sender, mut frame_receiver) = mpsc::channel::<Vec<u8>>(128);
+    let mut tasks = tokio::task::JoinSet::new();
+
+    match containers {
+        Ok(containers) => {
+            for stream in streams {
+                let Some(container) = containers.get(&stream.task_id).cloned() else {
+                    send_data_frame(
+                        &frame_sender,
+                        DataFrame::error(
+                            stream.stream_id,
+                            0,
+                            format!("task {:?} is not present on this node", stream.task_id),
+                        ),
+                    )
+                    .await?;
+                    send_data_frame(&frame_sender, DataFrame::end(stream.stream_id, 1)).await?;
+                    continue;
+                };
+                let stream_runtime = Arc::clone(&runtime);
+                let stream_sender = frame_sender.clone();
+                tasks.spawn(async move {
+                    stream_agent_data(stream_runtime, container, stream, stream_sender).await
+                });
+            }
+        }
+        Err(error) => {
+            for stream in streams {
+                send_data_frame(
+                    &frame_sender,
+                    DataFrame::error(stream.stream_id, 0, format!("{error:#}")),
+                )
+                .await?;
+                send_data_frame(&frame_sender, DataFrame::end(stream.stream_id, 1)).await?;
+            }
+        }
+    }
+    drop(frame_sender);
+
+    let (mut sink, mut source) = socket.split();
+    let transfer = async {
+        loop {
+            tokio::select! {
+                frame = frame_receiver.recv() => {
+                    let Some(frame) = frame else { break; };
+                    sink.send(Message::Binary(frame.into())).await?;
+                }
+                incoming = source.next() => {
+                    match incoming {
+                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        anyhow::Ok(())
+    }
+    .await;
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    let _ = sink.close().await;
+    transfer
+}
+
+async fn stream_agent_data<R: ContainerRuntime>(
+    runtime: Arc<R>,
+    container: ManagedContainer,
+    stream: AgentDataStream,
+    frame_sender: mpsc::Sender<Vec<u8>>,
+) -> Result<()> {
+    match stream.operation {
+        AgentDataStreamOperation::Logs { tail, follow } => {
+            let (log_sender, mut log_receiver) = mpsc::channel::<RuntimeLogChunk>(16);
+            let log_future = runtime.stream_task_logs(&container, tail, follow, log_sender);
+            tokio::pin!(log_future);
+            let mut result = None;
+            let mut sequence = 0_u64;
+            loop {
+                tokio::select! {
+                    chunk = log_receiver.recv() => {
+                        let Some(chunk) = chunk else { break; };
+                        let channel = match chunk.channel {
+                            RuntimeLogChannel::Stdout => DataChannel::Stdout,
+                            RuntimeLogChannel::Stderr => DataChannel::Stderr,
+                            RuntimeLogChannel::Stdin => DataChannel::Stdin,
+                            RuntimeLogChannel::Console => DataChannel::Console,
+                        };
+                        for payload in chunk.payload.chunks(MAX_DATA_PAYLOAD_BYTES) {
+                            send_data_frame(
+                                &frame_sender,
+                                DataFrame::data(
+                                    stream.stream_id,
+                                    sequence,
+                                    channel,
+                                    bytes::Bytes::copy_from_slice(payload),
+                                ),
+                            )
+                            .await?;
+                            sequence = sequence.saturating_add(1);
+                        }
+                    }
+                    completed = &mut log_future, if result.is_none() => {
+                        result = Some(completed);
+                    }
+                }
+            }
+            let result = match result {
+                Some(result) => result,
+                None => log_future.await,
+            };
+            if let Err(error) = result {
+                send_data_frame(
+                    &frame_sender,
+                    DataFrame::error(stream.stream_id, sequence, format!("{error:#}")),
+                )
+                .await?;
+                sequence = sequence.saturating_add(1);
+            }
+            send_data_frame(&frame_sender, DataFrame::end(stream.stream_id, sequence)).await
+        }
+    }
+}
+
+async fn send_data_frame(sender: &mpsc::Sender<Vec<u8>>, frame: DataFrame) -> Result<()> {
+    let encoded = frame.encode().map_err(anyhow::Error::msg)?;
+    sender
+        .send(encoded)
+        .await
+        .map_err(|_| anyhow::anyhow!("data session closed"))
+}
+
+fn encode_path_segment(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+async fn publish_command_result(
+    client: &ControllerClient,
+    node_id: &str,
+    command_id: &str,
+    result: &AgentCommandResult,
+) {
+    let path = format!("/v1/nodes/{node_id}/commands/{command_id}/result");
+    loop {
+        match client
+            .send_json::<AgentCommandAck, _>(reqwest::Method::POST, &path, Some(result))
+            .await
+        {
+            Ok(_) => return,
+            Err(error) if error.is_retryable() => {
+                warn!(%error, command_id, "failed to publish agent command result; retrying");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(error) => {
+                warn!(%error, command_id, "controller rejected agent command result");
+                return;
+            }
         }
     }
 }
@@ -290,9 +554,9 @@ async fn reconcile_containers<R: ContainerRuntime>(
         }
         let (phase, result) = match existing.get(&assignment.id) {
             Some(container)
-                if container.spec_hash.as_deref().map_or_else(
-                    || container.revision != Some(assignment.revision),
-                    |hash| hash != assignment.spec_hash,
+                if container.revision.map_or_else(
+                    || container.spec_hash.as_deref() != Some(&assignment.spec_hash),
+                    |revision| revision != assignment.revision,
                 ) =>
             {
                 let result = async {
@@ -377,6 +641,7 @@ mod tests {
     struct FakeRuntime {
         removed: Arc<Mutex<Vec<String>>>,
         started: Arc<Mutex<Vec<String>>>,
+        log_output: Arc<Mutex<Vec<u8>>>,
         fail_create: bool,
     }
 
@@ -423,6 +688,28 @@ mod tests {
             self.removed.lock().unwrap().push(container.task_id.clone());
             Ok(())
         }
+
+        async fn stream_task_logs(
+            &self,
+            container: &ManagedContainer,
+            tail: u32,
+            _follow: bool,
+            output: mpsc::Sender<RuntimeLogChunk>,
+        ) -> Result<()> {
+            let configured = self.log_output.lock().unwrap().clone();
+            let payload = if configured.is_empty() {
+                bytes::Bytes::from(format!("{}:{tail}", container.task_id))
+            } else {
+                bytes::Bytes::from(configured)
+            };
+            let _ = output
+                .send(RuntimeLogChunk {
+                    channel: RuntimeLogChannel::Stdout,
+                    payload,
+                })
+                .await;
+            Ok(())
+        }
     }
 
     fn managed(task_id: &str) -> ManagedContainer {
@@ -440,6 +727,41 @@ mod tests {
             spec_hash: Some("hash".into()),
             ports: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn data_session_frames_preserve_binary_log_bytes() {
+        let payload = vec![0, 255, b'\n', 128, 0];
+        let runtime = Arc::new(FakeRuntime {
+            log_output: Arc::new(Mutex::new(payload.clone())),
+            ..FakeRuntime::default()
+        });
+        let (sender, mut receiver) = mpsc::channel(4);
+
+        stream_agent_data(
+            runtime,
+            managed("task-a"),
+            AgentDataStream {
+                stream_id: 7,
+                task_id: "task-a".into(),
+                operation: AgentDataStreamOperation::Logs {
+                    tail: 10,
+                    follow: false,
+                },
+            },
+            sender,
+        )
+        .await
+        .unwrap();
+
+        let data = DataFrame::decode(&receiver.recv().await.unwrap()).unwrap();
+        assert_eq!(data.kind, crate::data_plane::DataFrameKind::Data);
+        assert_eq!(data.stream_id, 7);
+        assert_eq!(data.sequence, 0);
+        assert_eq!(data.payload.as_ref(), payload);
+        let end = DataFrame::decode(&receiver.recv().await.unwrap()).unwrap();
+        assert_eq!(end.kind, crate::data_plane::DataFrameKind::End);
+        assert_eq!(end.sequence, 1);
     }
 
     fn test_cluster() -> ClusterSettings {
@@ -532,6 +854,54 @@ mod tests {
         assert!(runtime.removed.lock().unwrap().is_empty());
         assert_eq!(reports[0].phase, TaskReconcilePhase::Start);
         assert_eq!(reports[0].applied_generation, Some(1));
+    }
+
+    #[tokio::test]
+    async fn keeps_a_running_task_when_only_the_service_scale_hash_changes() {
+        let runtime = FakeRuntime::default();
+        let existing = HashMap::from([("task-1".into(), managed("task-1"))]);
+        let response = HeartbeatResponse {
+            generation: 2,
+            cluster: test_cluster(),
+            assignments: vec![crate::model::TaskAssignment {
+                id: "task-1".into(),
+                cluster_id: "cluster-test".into(),
+                stack: "demo".into(),
+                service: "web".into(),
+                service_id: "demo.web".into(),
+                revision: 1,
+                slot: 0,
+                desired: crate::model::DesiredTaskState::Running,
+                spec: crate::model::ServiceSpec {
+                    image: "nginx:alpine".into(),
+                    command: Vec::new(),
+                    entrypoint: Vec::new(),
+                    environment: Vec::new(),
+                    ports: Vec::new(),
+                    volumes: Vec::new(),
+                    container_labels: Default::default(),
+                    service_labels: Default::default(),
+                    healthcheck: None,
+                    replicas: 3,
+                    constraints: Vec::new(),
+                    max_surge: 1,
+                    stop_grace_period_seconds: 10,
+                },
+                ports: Vec::new(),
+                generation: 2,
+                deployment_generation: 2,
+                spec_hash: "new-scale-hash".into(),
+            }],
+            gateway_enabled: false,
+            labels: Default::default(),
+            remove_tasks: Vec::new(),
+            gateway_config: None,
+        };
+
+        let reports = reconcile_containers(&runtime, &existing, &response).await;
+        assert!(runtime.removed.lock().unwrap().is_empty());
+        assert_eq!(reports[0].phase, TaskReconcilePhase::Verify);
+        assert_eq!(reports[0].applied_generation, Some(2));
     }
 
     #[tokio::test]

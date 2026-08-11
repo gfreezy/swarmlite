@@ -2,6 +2,7 @@ mod agent;
 pub mod client;
 pub mod config;
 mod controller;
+pub mod data_plane;
 mod database;
 pub mod gateway;
 mod kv;

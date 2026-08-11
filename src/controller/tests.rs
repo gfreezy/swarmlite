@@ -1,4 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use futures_util::{SinkExt, StreamExt};
 use std::collections::BTreeMap;
 use swarmlite_stack::{ParsedStack, parse_stack};
 
@@ -64,6 +65,253 @@ async fn allows_only_one_inflight_deployment_per_stack() {
     drop(other);
     drop(first);
     assert!(controller.begin_stack_deployment("demo").is_ok());
+}
+
+#[tokio::test]
+async fn swarm_style_mutations_reuse_the_stack_deployment_state_machine() {
+    let (controller, _, _directory) = test_controller("service-mutation-test").await;
+    register_live_node(&controller).await;
+    controller.apply("demo", parsed_test_stack()).await.unwrap();
+    assert_eq!(
+        controller.target_tasks("demo").await.unwrap().tasks.len(),
+        1
+    );
+    assert_eq!(
+        controller
+            .target_tasks("demo.web")
+            .await
+            .unwrap()
+            .tasks
+            .len(),
+        1
+    );
+    let initial_task_id = {
+        let mut inner = controller.inner.lock().await;
+        inner
+            .state
+            .stacks
+            .get_mut("demo")
+            .unwrap()
+            .deployment
+            .as_mut()
+            .unwrap()
+            .status = StackDeploymentStatus::Healthy;
+        inner.state.tasks.values().next().unwrap().id.clone()
+    };
+
+    let initial_revision = controller
+        .inner
+        .lock()
+        .await
+        .state
+        .services
+        .get("demo.web")
+        .unwrap()
+        .revision;
+    let scaled = controller.scale_service("demo.web", 3).await.unwrap();
+    assert_eq!(scaled.stack, "demo");
+    assert_eq!(scaled.services[0].replicas, 3);
+    let scaled_revision = {
+        let mut inner = controller.inner.lock().await;
+        let service = inner.state.services.get("demo.web").unwrap();
+        assert_eq!(service.spec.replicas, 3);
+        assert_eq!(service.revision, initial_revision);
+        assert_eq!(inner.state.tasks.len(), 3);
+        assert_eq!(
+            inner.state.tasks.get(&initial_task_id).unwrap().desired,
+            DesiredTaskState::Running
+        );
+        let revision = service.revision;
+        inner
+            .state
+            .stacks
+            .get_mut("demo")
+            .unwrap()
+            .deployment
+            .as_mut()
+            .unwrap()
+            .status = StackDeploymentStatus::Healthy;
+        revision
+    };
+
+    controller.force_update_service("demo.web").await.unwrap();
+    {
+        let mut inner = controller.inner.lock().await;
+        assert_eq!(
+            inner.state.services.get("demo.web").unwrap().revision,
+            scaled_revision + 1
+        );
+        inner
+            .state
+            .stacks
+            .get_mut("demo")
+            .unwrap()
+            .deployment
+            .as_mut()
+            .unwrap()
+            .status = StackDeploymentStatus::Healthy;
+    }
+
+    let removed = controller.remove_stack("demo").await.unwrap();
+    assert!(removed.services.is_empty());
+    assert!(controller.list_stacks().await.stacks.is_empty());
+    let inner = controller.inner.lock().await;
+    assert!(inner.state.services.get("demo.web").unwrap().deleted);
+}
+
+#[tokio::test]
+async fn task_target_rejects_a_stack_and_service_name_collision() {
+    let (controller, _, _directory) = test_controller("task-target-conflict-test").await;
+    register_live_node(&controller).await;
+    controller.apply("demo", parsed_test_stack()).await.unwrap();
+    controller
+        .apply("demo.web", parsed_test_stack())
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        controller.target_tasks("demo.web").await,
+        Err(ControllerError::Conflict(message))
+            if message == "target \"demo.web\" matches both a Stack and a Service"
+    ));
+}
+
+#[tokio::test]
+async fn log_data_session_is_dispatched_over_the_agent_command_channel() {
+    let (controller, _, _directory) = test_controller("command-log-test").await;
+    register_live_node(&controller).await;
+    controller.apply("demo", parsed_test_stack()).await.unwrap();
+
+    let session = controller
+        .create_data_session(crate::model::DataSessionOperation::Logs {
+            target: "demo.web".into(),
+            tail: 25,
+            follow: true,
+        })
+        .await
+        .unwrap();
+    let command = controller
+        .commands
+        .next("node-a", std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(matches!(
+        &command.operation,
+        crate::model::AgentCommandOperation::OpenDataSession {
+            session_id,
+            streams,
+            ..
+        } if session_id == &session.session_id
+            && matches!(
+                streams.as_slice(),
+                [crate::model::AgentDataStream {
+                    operation: crate::model::AgentDataStreamOperation::Logs {
+                        tail: 25,
+                        follow: true,
+                    },
+                    ..
+                }]
+            )
+    ));
+    assert!(controller.commands.complete(
+        "node-a",
+        &command.id,
+        crate::model::AgentCommandResult { error: None },
+    ));
+    assert_eq!(session.streams.len(), 1);
+}
+
+#[tokio::test]
+async fn websocket_data_session_relays_binary_frames_without_conversion() {
+    let (controller, _, _directory) = test_controller("binary-relay-test").await;
+    register_live_node(&controller).await;
+    controller.apply("demo", parsed_test_stack()).await.unwrap();
+    let controller = std::sync::Arc::new(controller);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server_controller = controller.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, api::router(server_controller))
+            .await
+            .unwrap();
+    });
+    let client =
+        crate::client::ControllerClient::new(format!("http://{address}"), "0123456789abcdef");
+    let session: crate::model::DataSessionCreateResponse = client
+        .send_json(
+            reqwest::Method::POST,
+            "/v1/data-sessions",
+            Some(&crate::model::DataSessionOperation::Logs {
+                target: "demo.web".into(),
+                tail: 10,
+                follow: false,
+            }),
+        )
+        .await
+        .unwrap();
+    let command = controller
+        .commands
+        .next("node-a", std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+    let (upload_token, stream_id) = match &command.operation {
+        crate::model::AgentCommandOperation::OpenDataSession {
+            upload_token,
+            streams,
+            ..
+        } => (upload_token.clone(), streams[0].stream_id),
+    };
+    let mut agent = client
+        .connect_data_websocket(
+            &format!("/v1/data-sessions/{}/nodes/node-a", session.session_id),
+            &upload_token,
+        )
+        .await
+        .unwrap();
+    let mut cli = client
+        .connect_data_websocket(
+            &format!("/v1/data-sessions/{}/client", session.session_id),
+            &session.attach_token,
+        )
+        .await
+        .unwrap();
+    assert!(controller.commands.complete(
+        "node-a",
+        &command.id,
+        crate::model::AgentCommandResult { error: None },
+    ));
+
+    let payload = bytes::Bytes::from_static(&[0, 255, b'\n', 128, 0]);
+    let frame = crate::data_plane::DataFrame::data(
+        stream_id,
+        0,
+        crate::data_plane::DataChannel::Stdout,
+        payload.clone(),
+    );
+    agent
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            frame.encode().unwrap().into(),
+        ))
+        .await
+        .unwrap();
+
+    let relayed = match cli.next().await.unwrap().unwrap() {
+        tokio_tungstenite::tungstenite::Message::Binary(encoded) => {
+            crate::data_plane::DataFrame::decode(&encoded).unwrap()
+        }
+        message => panic!("expected binary frame, got {message:?}"),
+    };
+    assert_eq!(relayed.payload, payload);
+
+    let _ = cli.close(None).await;
+    let agent_closed = tokio::time::timeout(std::time::Duration::from_secs(1), agent.next())
+        .await
+        .expect("client disconnect should cancel the Agent data stream");
+    assert!(matches!(
+        agent_closed,
+        None | Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | Some(Err(_))
+    ));
+    server.abort();
 }
 
 async fn register_live_node(controller: &Controller) {

@@ -23,15 +23,18 @@ use crate::{
     gateway, kv,
     model::{
         BootstrapResponse, ClusterConfigResponse, ClusterConfigUpdate, ClusterSettings,
-        ClusterState, DesiredTaskState, GatewayAssignment, GatewayReport, GatewayStatus,
-        HeartbeatResponse, JoinRequest, JoinResponse, KvDeleteRequest, KvListResponse,
-        KvLockAcquireRequest, KvLockAcquireResponse, KvLockMutationRequest, KvObjectResponse,
-        KvPutRequest, KvStatResponse, NodeGatewayResponse, NodeGatewayUpdate, NodeHeartbeat,
+        ClusterState, DataSessionCreateResponse, DataSessionOperation, DataSessionStream,
+        DesiredTaskState, GatewayAssignment, GatewayReport, GatewayStatus, HeartbeatResponse,
+        JoinRequest, JoinResponse, KvDeleteRequest, KvListResponse, KvLockAcquireRequest,
+        KvLockAcquireResponse, KvLockMutationRequest, KvObjectResponse, KvPutRequest,
+        KvStatResponse, NodeGatewayResponse, NodeGatewayUpdate, NodeHeartbeat,
         NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, NodeMember,
-        ObservedTaskState, ServiceRecord, StackDeploymentError, StackDeploymentRecord,
-        StackDeploymentResponse, StackDeploymentServiceProgress, StackDeploymentStatus,
-        StackRecord, StatusResponse, TaskAssignment, TaskReconcileError, TaskReconcileReport,
-        TaskRemovalAssignment, UnclaimedTask, service_spec_hash, valid_gateway_image,
+        ObservedTaskState, ServiceInspectResponse, ServiceListResponse, ServiceRecord,
+        ServiceSummary, StackDeploymentError, StackDeploymentRecord, StackDeploymentResponse,
+        StackDeploymentServiceProgress, StackDeploymentStatus, StackListResponse, StackRecord,
+        StackSummary, StatusResponse, TaskAssignment, TaskListResponse, TaskReconcileError,
+        TaskReconcileReport, TaskRecord, TaskRemovalAssignment, TaskSummary, UnclaimedTask,
+        service_spec_hash, valid_gateway_image,
     },
     scheduler,
     storage::{StateRepository, StorageError},
@@ -40,6 +43,7 @@ use swarmlite_stack::ParsedStack;
 
 mod api;
 mod cluster;
+mod commands;
 mod deployment;
 mod gateway_control;
 mod heartbeat;
@@ -48,6 +52,8 @@ mod lifecycle;
 mod membership;
 mod nodes;
 mod recovery;
+mod resources;
+mod sessions;
 mod stacks;
 
 use deployment::{apply_task_result, refresh_stack_deployments};
@@ -102,6 +108,8 @@ pub struct Controller {
     token: String,
     repository: StateRepository,
     kv_repository: kv::KvRepository,
+    commands: commands::AgentCommandBroker,
+    sessions: sessions::DataSessionBroker,
     deploying_stacks: std::sync::Mutex<BTreeSet<String>>,
     status_changes: watch::Sender<u64>,
     inner: Mutex<Inner>,
