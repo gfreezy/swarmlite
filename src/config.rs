@@ -20,24 +20,12 @@ pub struct ControllerConfig {
 
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
-    pub admin_port: u16,
-    pub server_name: String,
-    pub listen: Vec<String>,
-    pub request_timeout_seconds: u64,
-    pub resync_interval_seconds: u64,
-    pub retry_interval_seconds: u64,
     pub drain_timeout_seconds: u64,
 }
 
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
-            admin_port: 2019,
-            server_name: default_gateway_server_name(),
-            listen: default_gateway_listen(),
-            request_timeout_seconds: default_gateway_request_timeout(),
-            resync_interval_seconds: default_gateway_resync_interval(),
-            retry_interval_seconds: default_gateway_retry_interval(),
             drain_timeout_seconds: default_gateway_drain_timeout(),
         }
     }
@@ -137,21 +125,6 @@ impl Default for PortRangeConfig {
     }
 }
 
-fn default_gateway_server_name() -> String {
-    "swarmlite".to_owned()
-}
-fn default_gateway_listen() -> Vec<String> {
-    vec![":80".to_owned(), ":443".to_owned()]
-}
-const fn default_gateway_request_timeout() -> u64 {
-    5
-}
-const fn default_gateway_resync_interval() -> u64 {
-    30
-}
-const fn default_gateway_retry_interval() -> u64 {
-    2
-}
 const fn default_gateway_drain_timeout() -> u64 {
     10
 }

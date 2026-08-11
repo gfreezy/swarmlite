@@ -1,43 +1,25 @@
 use super::*;
 
 impl Controller {
-    pub(super) async fn put_kv(
-        &self,
-        request: KvPutRequest,
-    ) -> Result<KvPutResponse, ControllerError> {
-        let mut inner = self.inner.lock().await;
-        let previous = inner.kv.clone();
-        let response = kv::apply_put(&mut inner.kv, request).map_err(ControllerError::Invalid)?;
-        if response.applied
-            && let Err(error) = self.commit_kv_locked(&mut inner).await
-        {
-            inner.kv = previous;
-            return Err(error.into());
-        }
-        Ok(response)
+    pub(super) async fn put_kv(&self, request: KvPutRequest) -> Result<(), ControllerError> {
+        let value = kv::decode_put(&request.key, &request.value_base64)
+            .map_err(ControllerError::Invalid)?;
+        self.kv_repository
+            .put(&request.key, &value, unix_ms())
+            .map_err(Into::into)
     }
 
-    pub(super) async fn delete_kv(
-        &self,
-        request: KvDeleteRequest,
-    ) -> Result<KvPutResponse, ControllerError> {
-        let mut inner = self.inner.lock().await;
-        let previous = inner.kv.clone();
-        let response =
-            kv::apply_delete(&mut inner.kv, request).map_err(ControllerError::Invalid)?;
-        if response.applied
-            && let Err(error) = self.commit_kv_locked(&mut inner).await
-        {
-            inner.kv = previous;
-            return Err(error.into());
-        }
-        Ok(response)
+    pub(super) async fn delete_kv(&self, request: KvDeleteRequest) -> Result<(), ControllerError> {
+        kv::validate_key(&request.key).map_err(ControllerError::Invalid)?;
+        self.kv_repository
+            .delete(&request.key, request.recursive)
+            .map_err(Into::into)
     }
 
     pub(super) async fn kv_object(&self, key: &str) -> Result<KvObjectResponse, ControllerError> {
-        let inner = self.inner.lock().await;
-        kv::get(&inner.kv, key)
-            .map_err(ControllerError::Invalid)?
+        kv::validate_key(key).map_err(ControllerError::Invalid)?;
+        self.kv_repository
+            .get(key)?
             .ok_or_else(|| ControllerError::NotFound(format!("KV key {key} was not found")))
     }
 
@@ -46,16 +28,16 @@ impl Controller {
         path: &str,
         recursive: bool,
     ) -> Result<KvListResponse, ControllerError> {
-        let inner = self.inner.lock().await;
-        kv::list(&inner.kv, path, recursive)
-            .map_err(ControllerError::Invalid)?
+        kv::validate_query_path(path).map_err(ControllerError::Invalid)?;
+        self.kv_repository
+            .list(path, recursive)?
             .ok_or_else(|| ControllerError::NotFound(format!("KV path {path} was not found")))
     }
 
     pub(super) async fn stat_kv(&self, key: &str) -> Result<KvStatResponse, ControllerError> {
-        let inner = self.inner.lock().await;
-        kv::stat(&inner.kv, key)
-            .map_err(ControllerError::Invalid)?
+        kv::validate_query_path(key).map_err(ControllerError::Invalid)?;
+        self.kv_repository
+            .stat(key)?
             .ok_or_else(|| ControllerError::NotFound(format!("KV key {key} was not found")))
     }
 
@@ -65,60 +47,11 @@ impl Controller {
     ) -> Result<KvLockAcquireResponse, ControllerError> {
         validate_kv_lock_identity(&request.name, &request.owner_id)?;
         validate_kv_lock_lease(request.lease_millis)?;
-        let mut inner = self.inner.lock().await;
-
         let now = unix_ms();
-        if let Some(lock) = inner.kv.locks.get(&request.name)
-            && lock.lease_until_unix_ms > now
-            && lock.owner_id != request.owner_id
-        {
-            return Ok(KvLockAcquireResponse {
-                status: KvLockStatus::Busy,
-                fencing_token: None,
-                lease_until_unix_ms: Some(lock.lease_until_unix_ms),
-                retry_after_millis: Some(
-                    u64::try_from(lock.lease_until_unix_ms - now)
-                        .unwrap_or(1_000)
-                        .clamp(100, 1_000),
-                ),
-            });
-        }
-
-        let previous = inner.kv.clone();
-        let lease_until_unix_ms = lease_deadline(now, request.lease_millis)?;
-        let fencing_token = if let Some(lock) = inner.kv.locks.get_mut(&request.name)
-            && lock.lease_until_unix_ms > now
-            && lock.owner_id == request.owner_id
-        {
-            lock.lease_until_unix_ms = lease_until_unix_ms;
-            lock.fencing_token
-        } else {
-            inner.kv.next_fencing_token = inner
-                .kv
-                .next_fencing_token
-                .checked_add(1)
-                .ok_or_else(|| ControllerError::Invalid("KV lock token overflow".to_owned()))?;
-            let token = inner.kv.next_fencing_token;
-            inner.kv.locks.insert(
-                request.name,
-                KvLock {
-                    owner_id: request.owner_id,
-                    fencing_token: token,
-                    lease_until_unix_ms,
-                },
-            );
-            token
-        };
-        if let Err(error) = self.commit_kv_locked(&mut inner).await {
-            inner.kv = previous;
-            return Err(error.into());
-        }
-        Ok(KvLockAcquireResponse {
-            status: KvLockStatus::Acquired,
-            fencing_token: Some(fencing_token),
-            lease_until_unix_ms: Some(lease_until_unix_ms),
-            retry_after_millis: None,
-        })
+        let deadline = lease_deadline(now, request.lease_millis)?;
+        self.kv_repository
+            .acquire_lock(&request.name, &request.owner_id, now, deadline)
+            .map_err(Into::into)
     }
 
     pub(super) async fn renew_kv_lock(
@@ -130,27 +63,21 @@ impl Controller {
             .lease_millis
             .ok_or_else(|| ControllerError::Invalid("lease_millis is required".to_owned()))?;
         validate_kv_lock_lease(lease_millis)?;
-        let mut inner = self.inner.lock().await;
         let now = unix_ms();
-        let previous = inner.kv.clone();
-        let lock = inner
-            .kv
-            .locks
-            .get_mut(&request.name)
-            .filter(|lock| {
-                lock.owner_id == request.owner_id
-                    && lock.fencing_token == request.fencing_token
-                    && lock.lease_until_unix_ms > now
-            })
-            .ok_or_else(|| {
-                ControllerError::Conflict("the KV lock is no longer owned".to_owned())
-            })?;
-        lock.lease_until_unix_ms = lease_deadline(now, lease_millis)?;
-        if let Err(error) = self.commit_kv_locked(&mut inner).await {
-            inner.kv = previous;
-            return Err(error.into());
+        let deadline = lease_deadline(now, lease_millis)?;
+        if self.kv_repository.renew_lock(
+            &request.name,
+            &request.owner_id,
+            request.fencing_token,
+            now,
+            deadline,
+        )? {
+            Ok(())
+        } else {
+            Err(ControllerError::Conflict(
+                "the KV lock is no longer owned".to_owned(),
+            ))
         }
-        Ok(())
     }
 
     pub(super) async fn release_kv_lock(
@@ -158,22 +85,17 @@ impl Controller {
         request: KvLockMutationRequest,
     ) -> Result<(), ControllerError> {
         validate_kv_lock_identity(&request.name, &request.owner_id)?;
-        let mut inner = self.inner.lock().await;
-        let Some(lock) = inner.kv.locks.get(&request.name) else {
-            return Ok(());
-        };
-        if lock.owner_id != request.owner_id || lock.fencing_token != request.fencing_token {
-            return Err(ControllerError::Conflict(
+        if self.kv_repository.release_lock(
+            &request.name,
+            &request.owner_id,
+            request.fencing_token,
+        )? {
+            Ok(())
+        } else {
+            Err(ControllerError::Conflict(
                 "the KV lock is owned by another writer".to_owned(),
-            ));
+            ))
         }
-        let previous = inner.kv.clone();
-        inner.kv.locks.remove(&request.name);
-        if let Err(error) = self.commit_kv_locked(&mut inner).await {
-            inner.kv = previous;
-            return Err(error.into());
-        }
-        Ok(())
     }
 }
 

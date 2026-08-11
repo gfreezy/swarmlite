@@ -20,37 +20,21 @@ var (
 
 const kvNamespace = "caddy"
 
-type cacheVersion struct {
-	PhysicalUnixMS int64  `json:"physical_unix_ms"`
-	Logical        uint64 `json:"logical"`
-	ReplicaID      string `json:"replica_id"`
-}
-
 type putRequest struct {
-	Key              string       `json:"key"`
-	ValueBase64      string       `json:"value_base64"`
-	Version          cacheVersion `json:"version"`
-	ModifiedAtUnixMS int64        `json:"modified_at_unix_ms"`
+	Key         string `json:"key"`
+	ValueBase64 string `json:"value_base64"`
 }
 
 type deleteRequest struct {
-	Key              string       `json:"key"`
-	Version          cacheVersion `json:"version"`
-	ModifiedAtUnixMS int64        `json:"modified_at_unix_ms"`
-	Recursive        bool         `json:"recursive"`
-}
-
-type putResponse struct {
-	Applied bool         `json:"applied"`
-	Version cacheVersion `json:"version"`
+	Key       string `json:"key"`
+	Recursive bool   `json:"recursive"`
 }
 
 type objectResponse struct {
-	Key              string       `json:"key"`
-	ValueBase64      string       `json:"value_base64"`
-	Version          cacheVersion `json:"version"`
-	ModifiedAtUnixMS int64        `json:"modified_at_unix_ms"`
-	Size             int64        `json:"size"`
+	Key              string `json:"key"`
+	ValueBase64      string `json:"value_base64"`
+	ModifiedAtUnixMS int64  `json:"modified_at_unix_ms"`
+	Size             int64  `json:"size"`
 }
 
 type listResponse struct {
@@ -110,18 +94,14 @@ func (c *coordinator) configured() bool {
 	return c != nil && c.controller != "" && c.token != ""
 }
 
-func (c *coordinator) put(ctx context.Context, request putRequest) (putResponse, error) {
+func (c *coordinator) put(ctx context.Context, request putRequest) error {
 	request.Key = namespacedKey(request.Key)
-	var response putResponse
-	err := c.doJSON(ctx, http.MethodPut, "/v1/kv", nil, request, &response)
-	return response, err
+	return c.doJSON(ctx, http.MethodPut, "/v1/kv", nil, request, nil)
 }
 
-func (c *coordinator) delete(ctx context.Context, request deleteRequest) (putResponse, error) {
+func (c *coordinator) delete(ctx context.Context, request deleteRequest) error {
 	request.Key = namespacedKey(request.Key)
-	var response putResponse
-	err := c.doJSON(ctx, http.MethodDelete, "/v1/kv", nil, request, &response)
-	return response, err
+	return c.doJSON(ctx, http.MethodDelete, "/v1/kv", nil, request, nil)
 }
 
 func (c *coordinator) object(ctx context.Context, key string) (objectResponse, error) {

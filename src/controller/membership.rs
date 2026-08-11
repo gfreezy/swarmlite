@@ -3,8 +3,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::model::ClusterState;
-
 use super::{ControllerError, Inner};
 
 pub(super) fn current_live_nodes(inner: &Inner, timeout_seconds: u64) -> BTreeSet<String> {
@@ -42,23 +40,4 @@ pub(super) fn validate_node_label(key: &str, value: &str) -> Result<(), Controll
         ));
     }
     Ok(())
-}
-
-pub(super) fn gateway_endpoints(state: &ClusterState, admin_port: u16) -> Vec<String> {
-    state
-        .nodes
-        .values()
-        .filter(|node| node.gateway_enabled)
-        .map(|node| format!("http://{}:{admin_port}", format_host(&node.address)))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-fn format_host(host: &str) -> String {
-    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
-        format!("[{host}]")
-    } else {
-        host.to_owned()
-    }
 }

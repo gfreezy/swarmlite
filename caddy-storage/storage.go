@@ -21,7 +21,6 @@ type storage struct {
 	timeout     time.Duration
 	lockLease   time.Duration
 	ownerID     string
-	clock       hybridClock
 
 	locksMu sync.Mutex
 	locks   map[string]*heldLock
@@ -34,13 +33,6 @@ type heldLock struct {
 	stopOnce     sync.Once
 }
 
-type hybridClock struct {
-	mu         sync.Mutex
-	physicalMS int64
-	logical    uint64
-	replicaID  string
-}
-
 func newStorage(root string, controller string, token string, timeout, lockLease time.Duration) *storage {
 	ownerID := randomID()
 	return &storage{
@@ -49,7 +41,6 @@ func newStorage(root string, controller string, token string, timeout, lockLease
 		timeout:     timeout,
 		lockLease:   lockLease,
 		ownerID:     ownerID,
-		clock:       hybridClock{replicaID: ownerID},
 		locks:       make(map[string]*heldLock),
 	}
 }
@@ -58,18 +49,13 @@ func (s *storage) Store(ctx context.Context, key string, value []byte) error {
 	if err := s.local.Store(ctx, key, value); err != nil {
 		return err
 	}
-	version := s.clock.next()
 	request := putRequest{
-		Key:              key,
-		ValueBase64:      base64.StdEncoding.EncodeToString(value),
-		Version:          version,
-		ModifiedAtUnixMS: time.Now().UnixMilli(),
+		Key:         key,
+		ValueBase64: base64.StdEncoding.EncodeToString(value),
 	}
 	remoteCtx, cancel := s.remoteContext()
 	defer cancel()
-	if response, err := s.coordinator.put(remoteCtx, request); err == nil {
-		s.clock.observe(response.Version)
-	}
+	_ = s.coordinator.put(remoteCtx, request)
 	return nil
 }
 
@@ -88,7 +74,6 @@ func (s *storage) Load(ctx context.Context, key string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode Swarmlite cache value: %w", err)
 	}
-	s.clock.observe(object.Version)
 	if err := s.local.Store(ctx, key, value); err != nil {
 		return nil, err
 	}
@@ -99,18 +84,12 @@ func (s *storage) Delete(ctx context.Context, key string) error {
 	if err := s.local.Delete(ctx, key); err != nil {
 		return err
 	}
-	version := s.clock.next()
 	remoteCtx, cancel := s.remoteContext()
 	defer cancel()
-	response, err := s.coordinator.delete(remoteCtx, deleteRequest{
-		Key:              key,
-		Version:          version,
-		ModifiedAtUnixMS: time.Now().UnixMilli(),
-		Recursive:        true,
+	_ = s.coordinator.delete(remoteCtx, deleteRequest{
+		Key:       key,
+		Recursive: true,
 	})
-	if err == nil {
-		s.clock.observe(response.Version)
-	}
 	return nil
 }
 
@@ -317,34 +296,6 @@ func (s *storage) remoteContext() (context.Context, context.CancelFunc) {
 
 func (s *storage) remoteContextFrom(parent context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(parent, s.timeout)
-}
-
-func (c *hybridClock) next() cacheVersion {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	now := time.Now().UnixMilli()
-	if now > c.physicalMS {
-		c.physicalMS = now
-		c.logical = 0
-	} else {
-		c.logical++
-	}
-	return cacheVersion{
-		PhysicalUnixMS: c.physicalMS,
-		Logical:        c.logical,
-		ReplicaID:      c.replicaID,
-	}
-}
-
-func (c *hybridClock) observe(version cacheVersion) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if version.PhysicalUnixMS > c.physicalMS {
-		c.physicalMS = version.PhysicalUnixMS
-		c.logical = version.Logical
-	} else if version.PhysicalUnixMS == c.physicalMS && version.Logical >= c.logical {
-		c.logical = version.Logical + 1
-	}
 }
 
 func randomID() string {

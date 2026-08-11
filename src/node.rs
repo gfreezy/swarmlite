@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     env,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
 };
 
@@ -14,14 +14,15 @@ use uuid::Uuid;
 
 use crate::{
     agent,
+    client::ControllerClient,
     config::{
         AgentConfig, ControllerConfig, GatewayConfig, PortRangeConfig, RuntimeConfig, RuntimeKind,
     },
     controller,
     local_state::{AgentFence, DATABASE_FILE, FENCE_KEY, LocalState, NODE_KEY},
     model::{
-        BootstrapResponse, CLUSTER_SCHEMA_VERSION, ClusterGatewayConfig, ClusterSettings,
-        JoinRequest, JoinResponse, NodeControl, valid_gateway_image,
+        BootstrapResponse, CLUSTER_SCHEMA_VERSION, ClusterSettings, GatewayReport, JoinRequest,
+        JoinResponse, NodeControl, valid_gateway_image,
     },
     runtime::{
         ContainerRuntime, DockerCompatibleRuntime, GatewayContainerSpec, ManagedClusterInventory,
@@ -71,44 +72,13 @@ pub struct JoinOptions {
 struct NodeSettings {
     schema_version: u32,
     gateway_enabled: bool,
-    cluster: LocalClusterSettings,
+    cluster: ClusterSettings,
     node_id: String,
     token: String,
     controller_url: String,
     advertise_address: Option<String>,
     runtime: Option<RuntimeConfig>,
     labels: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct LocalClusterSettings {
-    schema_version: u32,
-    cluster_id: String,
-    controller_id: String,
-    controller_port: u16,
-    gateway: ClusterGatewayConfig,
-}
-
-impl LocalClusterSettings {
-    fn from_cluster(cluster: &ClusterSettings) -> Self {
-        Self {
-            schema_version: cluster.schema_version,
-            cluster_id: cluster.cluster_id.clone(),
-            controller_id: cluster.controller_id.clone(),
-            controller_port: cluster.controller_port,
-            gateway: cluster.gateway.clone(),
-        }
-    }
-
-    fn to_cluster(&self) -> ClusterSettings {
-        ClusterSettings {
-            schema_version: self.schema_version,
-            cluster_id: self.cluster_id.clone(),
-            controller_id: self.controller_id.clone(),
-            controller_port: self.controller_port,
-            gateway: self.gateway.clone(),
-        }
-    }
 }
 
 enum NodeEvent {
@@ -179,7 +149,7 @@ pub async fn init(mut options: InitOptions) -> Result<String> {
     let settings = NodeSettings {
         schema_version: 8,
         gateway_enabled: options.gateway_enabled,
-        cluster: LocalClusterSettings::from_cluster(&options.cluster),
+        cluster: options.cluster.clone(),
         node_id,
         token: token.clone(),
         controller_url: String::new(),
@@ -257,19 +227,26 @@ pub async fn run(options: ServeOptions) -> Result<()> {
         gateway_enabled: settings.gateway_enabled,
     };
     let initial_control = NodeControl {
-        cluster: settings.cluster.to_cluster(),
+        cluster: settings.cluster.clone(),
         gateway_enabled: settings.gateway_enabled,
         labels: settings.labels.clone(),
+        gateway_config: None,
     };
     let (control_tx, control_rx) = watch::channel(initial_control);
+    let (gateway_report_tx, gateway_report_rx) = watch::channel(GatewayReport::default());
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let token = settings.token.clone();
     let agent_events = events_tx.clone();
     let agent_local_state = local_state.clone();
     let agent_handle = tokio::spawn(async move {
-        let result =
-            agent::run_with_token_and_updates(agent_config, token, control_tx, agent_local_state)
-                .await;
+        let result = agent::run_with_token_and_updates(
+            agent_config,
+            token,
+            control_tx,
+            gateway_report_rx,
+            agent_local_state,
+        )
+        .await;
         let _ = agent_events.send(NodeEvent::Agent(result));
     });
 
@@ -290,6 +267,7 @@ pub async fn run(options: ServeOptions) -> Result<()> {
         events_rx,
         agent_handle,
         gateway_runtime,
+        gateway_report_tx,
         advertise_address,
     )
     .await
@@ -306,6 +284,7 @@ async fn supervise(
     mut events_rx: mpsc::UnboundedReceiver<NodeEvent>,
     agent_handle: tokio::task::JoinHandle<()>,
     gateway_runtime: DockerCompatibleRuntime,
+    gateway_report_tx: watch::Sender<GatewayReport>,
     advertise_address: String,
 ) -> Result<()> {
     let has_controller = is_controller(&settings);
@@ -342,7 +321,7 @@ async fn supervise(
                 }
                 settings.gateway_enabled = control.gateway_enabled;
                 settings.labels = control.labels;
-                settings.cluster = LocalClusterSettings::from_cluster(&control.cluster);
+                settings.cluster = control.cluster;
                 local_state.put(NODE_KEY, &settings)?;
                 let has_gateway = settings.gateway_enabled;
                 if has_gateway {
@@ -356,6 +335,23 @@ async fn supervise(
                             true,
                         )
                         .await?;
+                    if let Some(assignment) = &control.gateway_config {
+                        let report = match gateway_runtime.apply_gateway_config(assignment).await {
+                            Ok(()) => GatewayReport {
+                                applied_generation: Some(assignment.generation),
+                                error: None,
+                            },
+                            Err(error) => {
+                                let error = format!("{error:#}");
+                                warn!(%error, "failed to apply local gateway configuration");
+                                GatewayReport {
+                                    applied_generation: None,
+                                    error: Some(error),
+                                }
+                            }
+                        };
+                        gateway_report_tx.send_replace(report);
+                    }
                     if !had_gateway {
                         info!("gateway enabled; started independent Caddy container");
                     }
@@ -371,6 +367,7 @@ async fn supervise(
                         )
                         .await?;
                     info!("gateway disabled; removed independent Caddy container");
+                    gateway_report_tx.send_replace(GatewayReport::default());
                 }
             }
             event = events_rx.recv() => {
@@ -406,28 +403,11 @@ fn gateway_container_spec(
     Ok(GatewayContainerSpec {
         cluster_id: settings.cluster.cluster_id.clone(),
         advertise_address: advertise_address.to_owned(),
-        admin_bind_address: resolve_gateway_bind_address(advertise_address)?,
         listen: settings.cluster.gateway.listen.clone(),
         controller,
         token: settings.token.clone(),
         image: settings.cluster.gateway.image.clone(),
     })
-}
-
-fn resolve_gateway_bind_address(advertise_address: &str) -> Result<String> {
-    if let Ok(address) = advertise_address.parse::<IpAddr>() {
-        return Ok(address.to_string());
-    }
-    (advertise_address, 0)
-        .to_socket_addrs()
-        .with_context(|| {
-            format!("failed to resolve advertise address {advertise_address:?} for Caddy")
-        })?
-        .next()
-        .map(|address| address.ip().to_string())
-        .with_context(|| {
-            format!("advertise address {advertise_address:?} resolved to no IP addresses")
-        })
 }
 
 async fn start_controller(
@@ -436,17 +416,10 @@ async fn start_controller(
     public_controller: &str,
     events: mpsc::UnboundedSender<NodeEvent>,
 ) -> Result<oneshot::Sender<()>> {
-    let cluster = settings.cluster.to_cluster();
+    let cluster = settings.cluster.clone();
     let repository =
         StateRepository::open(data_dir, cluster.clone()).map_err(anyhow::Error::msg)?;
-    let gateway = GatewayConfig {
-        listen: if settings.cluster.gateway.listen.is_empty() {
-            vec![":80".to_owned(), ":443".to_owned()]
-        } else {
-            settings.cluster.gateway.listen.clone()
-        },
-        ..GatewayConfig::default()
-    };
+    let gateway = GatewayConfig::default();
     let config = ControllerConfig {
         gateway_enabled: settings.gateway_enabled,
         labels: settings.labels.clone(),
@@ -548,7 +521,7 @@ pub async fn join(options: JoinOptions) -> Result<String> {
     let settings = NodeSettings {
         schema_version: 8,
         gateway_enabled: response.gateway_enabled,
-        cluster: LocalClusterSettings::from_cluster(&response.cluster),
+        cluster: response.cluster,
         node_id: node_id.clone(),
         token: options.token.clone(),
         controller_url: seed,
@@ -700,47 +673,19 @@ fn load_node_settings_from(local_state: &LocalState) -> Result<NodeSettings> {
 }
 
 async fn fetch_bootstrap(controller: &str, token: &str) -> Result<BootstrapResponse> {
-    request_json(
-        reqwest::Method::GET,
-        format!("{controller}/v1/cluster"),
-        token,
-        None::<&JoinRequest>,
-    )
-    .await
+    ControllerClient::new(controller, token)
+        .get_json("/v1/cluster")
+        .await
 }
 
 async fn send_join(controller: &str, token: &str, request: &JoinRequest) -> Result<JoinResponse> {
-    request_json(
-        reqwest::Method::PUT,
-        format!("{controller}/v1/nodes/{}/join", request.node_id),
-        token,
-        Some(request),
-    )
-    .await
-}
-
-async fn request_json<T, B>(
-    method: reqwest::Method,
-    initial_url: String,
-    token: &str,
-    body: Option<&B>,
-) -> Result<T>
-where
-    T: for<'de> Deserialize<'de>,
-    B: Serialize + ?Sized,
-{
-    let client = reqwest::Client::new();
-    let mut request = client.request(method, initial_url).bearer_auth(token);
-    if let Some(body) = body {
-        request = request.json(body);
-    }
-    let response = request.send().await?;
-    let status = response.status();
-    let body = response.text().await?;
-    if !status.is_success() {
-        bail!("controller returned {status}: {body}");
-    }
-    serde_json::from_str(&body).context("controller returned invalid JSON")
+    ControllerClient::new(controller, token)
+        .send_json(
+            reqwest::Method::PUT,
+            &format!("/v1/nodes/{}/join", request.node_id),
+            Some(request),
+        )
+        .await
 }
 
 fn validate_cluster(cluster: &ClusterSettings) -> Result<()> {
@@ -1616,10 +1561,7 @@ mod tests {
         .unwrap();
         assert!(result.contains("gateway disabled"));
         let settings = load_node_settings(directory.path()).await.unwrap();
-        assert_eq!(
-            settings.cluster,
-            LocalClusterSettings::from_cluster(&cluster)
-        );
+        assert_eq!(settings.cluster, cluster.clone());
         assert!(!settings.gateway_enabled);
         assert_eq!(
             settings.labels,
@@ -1711,7 +1653,7 @@ mod tests {
                 &NodeSettings {
                     schema_version: 4,
                     gateway_enabled: false,
-                    cluster: LocalClusterSettings {
+                    cluster: ClusterSettings {
                         schema_version: CLUSTER_SCHEMA_VERSION,
                         cluster_id: "unsupported-test".into(),
                         controller_id: "controller-a".into(),

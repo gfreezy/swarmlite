@@ -1,201 +1,428 @@
 use std::collections::BTreeSet;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
-use crate::model::{
-    KvDeleteRequest, KvListResponse, KvObject, KvObjectResponse, KvPutRequest, KvPutResponse,
-    KvStatResponse, KvState, KvVersion,
+use crate::{
+    database::Database,
+    model::{
+        KvListResponse, KvLockAcquireResponse, KvLockStatus, KvObjectResponse, KvStatResponse,
+    },
+    storage::{StorageError, StorageResult},
 };
 
 const MAX_KEY_BYTES: usize = 1_024;
 const MAX_OBJECT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_REPLICA_ID_BYTES: usize = 256;
 
-pub(crate) fn apply_put(
-    state: &mut KvState,
-    request: KvPutRequest,
-) -> Result<KvPutResponse, String> {
-    validate_key(&request.key)?;
-    validate_version(&request.version)?;
-    validate_modified_at(request.modified_at_unix_ms)?;
-    let size = STANDARD
-        .decode(&request.value_base64)
-        .map_err(|_| "value_base64 must contain valid base64".to_owned())?
-        .len();
-    if size > MAX_OBJECT_BYTES {
+#[derive(Debug)]
+pub(crate) struct LegacyKvObject {
+    pub key: String,
+    pub value_base64: String,
+    pub modified_at_unix_ms: i64,
+}
+
+#[derive(Debug)]
+pub(crate) struct LegacyKvLock {
+    pub name: String,
+    pub owner_id: String,
+    pub fencing_token: u64,
+    pub lease_until_unix_ms: i64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct LegacyKvImport {
+    pub objects: Vec<LegacyKvObject>,
+    pub locks: Vec<LegacyKvLock>,
+    pub next_fencing_token: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct KvRepository {
+    database: Database,
+}
+
+impl KvRepository {
+    pub(crate) fn open(database: Database) -> StorageResult<Self> {
+        let repository = Self { database };
+        let connection = repository.database.connect().map_err(backend)?;
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS kv_objects (
+                    key TEXT PRIMARY KEY,
+                    value BLOB NOT NULL,
+                    modified_at_unix_ms INTEGER NOT NULL CHECK (modified_at_unix_ms >= 0)
+                 ) STRICT;
+                 CREATE TABLE IF NOT EXISTS kv_locks (
+                    name TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    fencing_token INTEGER NOT NULL CHECK (fencing_token > 0),
+                    lease_until_unix_ms INTEGER NOT NULL CHECK (lease_until_unix_ms >= 0)
+                 ) STRICT;
+                 CREATE TABLE IF NOT EXISTS kv_meta (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    next_fencing_token INTEGER NOT NULL CHECK (next_fencing_token >= 0)
+                 ) STRICT;
+                 INSERT OR IGNORE INTO kv_meta(singleton, next_fencing_token) VALUES (1, 0);",
+            )
+            .map_err(backend)?;
+        Ok(repository)
+    }
+
+    pub(crate) fn put(
+        &self,
+        key: &str,
+        value: &[u8],
+        modified_at_unix_ms: i64,
+    ) -> StorageResult<()> {
+        let connection = self.database.connect().map_err(backend)?;
+        connection
+            .execute(
+                "INSERT INTO kv_objects(key, value, modified_at_unix_ms) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    modified_at_unix_ms = excluded.modified_at_unix_ms",
+                params![key, value, modified_at_unix_ms],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    pub(crate) fn delete(&self, key: &str, recursive: bool) -> StorageResult<()> {
+        let connection = self.database.connect().map_err(backend)?;
+        if recursive {
+            connection
+                .execute(
+                    "DELETE FROM kv_objects
+                     WHERE key = ?1 OR substr(key, 1, length(?1) + 1) = ?1 || '/'",
+                    [key],
+                )
+                .map_err(backend)?;
+        } else {
+            connection
+                .execute("DELETE FROM kv_objects WHERE key = ?1", [key])
+                .map_err(backend)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn get(&self, key: &str) -> StorageResult<Option<KvObjectResponse>> {
+        let connection = self.database.connect().map_err(backend)?;
+        connection
+            .query_row(
+                "SELECT value, modified_at_unix_ms FROM kv_objects WHERE key = ?1",
+                [key],
+                |row| {
+                    let value: Vec<u8> = row.get(0)?;
+                    Ok(KvObjectResponse {
+                        key: key.to_owned(),
+                        value_base64: STANDARD.encode(&value),
+                        modified_at_unix_ms: row.get(1)?,
+                        size: value.len() as u64,
+                    })
+                },
+            )
+            .optional()
+            .map_err(backend)
+    }
+
+    pub(crate) fn list(
+        &self,
+        path: &str,
+        recursive: bool,
+    ) -> StorageResult<Option<KvListResponse>> {
+        let keys = self.keys()?;
+        if !keys
+            .iter()
+            .any(|key| key == path || is_component_descendant(key, path))
+        {
+            return Ok(None);
+        }
+        let mut result = BTreeSet::new();
+        for key in keys.iter().filter(|key| is_component_descendant(key, path)) {
+            let relative = if path.is_empty() {
+                key.as_str()
+            } else {
+                &key[path.len() + 1..]
+            };
+            if recursive {
+                let mut current = String::new();
+                for component in relative.split('/') {
+                    if !current.is_empty() {
+                        current.push('/');
+                    }
+                    current.push_str(component);
+                    result.insert(join_path(path, &current));
+                }
+            } else if let Some((first, _)) = relative.split_once('/') {
+                result.insert(join_path(path, first));
+            } else {
+                result.insert(join_path(path, relative));
+            }
+        }
+        Ok(Some(KvListResponse {
+            keys: result.into_iter().collect(),
+        }))
+    }
+
+    pub(crate) fn stat(&self, key: &str) -> StorageResult<Option<KvStatResponse>> {
+        if !key.is_empty()
+            && let Some(object) = self.get(key)?
+        {
+            return Ok(Some(KvStatResponse {
+                key: key.to_owned(),
+                modified_at_unix_ms: object.modified_at_unix_ms,
+                size: object.size,
+                is_value: true,
+            }));
+        }
+        let connection = self.database.connect().map_err(backend)?;
+        let modified_at_unix_ms = connection
+            .query_row(
+                "SELECT MAX(modified_at_unix_ms) FROM kv_objects
+                 WHERE ?1 = '' OR substr(key, 1, length(?1) + 1) = ?1 || '/'",
+                [key],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(backend)?;
+        Ok(
+            modified_at_unix_ms.map(|modified_at_unix_ms| KvStatResponse {
+                key: key.to_owned(),
+                modified_at_unix_ms,
+                size: 0,
+                is_value: false,
+            }),
+        )
+    }
+
+    pub(crate) fn acquire_lock(
+        &self,
+        name: &str,
+        owner_id: &str,
+        now: i64,
+        lease_until_unix_ms: i64,
+    ) -> StorageResult<KvLockAcquireResponse> {
+        let mut connection = self.database.connect().map_err(backend)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(backend)?;
+        let existing = transaction
+            .query_row(
+                "SELECT owner_id, fencing_token, lease_until_unix_ms
+                 FROM kv_locks WHERE name = ?1",
+                [name],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(backend)?;
+        if let Some((existing_owner, _, existing_deadline)) = &existing
+            && *existing_deadline > now
+            && existing_owner != owner_id
+        {
+            return Ok(KvLockAcquireResponse {
+                status: KvLockStatus::Busy,
+                fencing_token: None,
+                lease_until_unix_ms: Some(*existing_deadline),
+                retry_after_millis: Some(
+                    u64::try_from(*existing_deadline - now)
+                        .unwrap_or(1_000)
+                        .clamp(100, 1_000),
+                ),
+            });
+        }
+
+        let fencing_token = if let Some((existing_owner, token, existing_deadline)) = existing
+            && existing_deadline > now
+            && existing_owner == owner_id
+        {
+            transaction
+                .execute(
+                    "UPDATE kv_locks SET lease_until_unix_ms = ?1 WHERE name = ?2",
+                    params![lease_until_unix_ms, name],
+                )
+                .map_err(backend)?;
+            u64::try_from(token).map_err(|_| invalid("negative KV fencing token"))?
+        } else {
+            let token = transaction
+                .query_row(
+                    "UPDATE kv_meta SET next_fencing_token = next_fencing_token + 1
+                     WHERE singleton = 1 RETURNING next_fencing_token",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(backend)?;
+            transaction
+                .execute(
+                    "INSERT INTO kv_locks(name, owner_id, fencing_token, lease_until_unix_ms)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(name) DO UPDATE SET
+                        owner_id = excluded.owner_id,
+                        fencing_token = excluded.fencing_token,
+                        lease_until_unix_ms = excluded.lease_until_unix_ms",
+                    params![name, owner_id, token, lease_until_unix_ms],
+                )
+                .map_err(backend)?;
+            u64::try_from(token).map_err(|_| invalid("negative KV fencing token"))?
+        };
+        transaction.commit().map_err(backend)?;
+        Ok(KvLockAcquireResponse {
+            status: KvLockStatus::Acquired,
+            fencing_token: Some(fencing_token),
+            lease_until_unix_ms: Some(lease_until_unix_ms),
+            retry_after_millis: None,
+        })
+    }
+
+    pub(crate) fn renew_lock(
+        &self,
+        name: &str,
+        owner_id: &str,
+        fencing_token: u64,
+        now: i64,
+        lease_until_unix_ms: i64,
+    ) -> StorageResult<bool> {
+        let token = i64::try_from(fencing_token)
+            .map_err(|_| invalid("KV fencing token exceeds SQLite integer range"))?;
+        let connection = self.database.connect().map_err(backend)?;
+        let changed = connection
+            .execute(
+                "UPDATE kv_locks SET lease_until_unix_ms = ?1
+                 WHERE name = ?2 AND owner_id = ?3 AND fencing_token = ?4
+                   AND lease_until_unix_ms > ?5",
+                params![lease_until_unix_ms, name, owner_id, token, now],
+            )
+            .map_err(backend)?;
+        Ok(changed == 1)
+    }
+
+    pub(crate) fn release_lock(
+        &self,
+        name: &str,
+        owner_id: &str,
+        fencing_token: u64,
+    ) -> StorageResult<bool> {
+        let token = i64::try_from(fencing_token)
+            .map_err(|_| invalid("KV fencing token exceeds SQLite integer range"))?;
+        let mut connection = self.database.connect().map_err(backend)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(backend)?;
+        let existing = transaction
+            .query_row(
+                "SELECT owner_id, fencing_token FROM kv_locks WHERE name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(backend)?;
+        let matched = existing
+            .as_ref()
+            .is_none_or(|(existing_owner, existing_token)| {
+                existing_owner == owner_id && *existing_token == token
+            });
+        if matched && existing.is_some() {
+            transaction
+                .execute("DELETE FROM kv_locks WHERE name = ?1", [name])
+                .map_err(backend)?;
+        }
+        transaction.commit().map_err(backend)?;
+        Ok(matched)
+    }
+
+    pub(crate) fn import_legacy(&self, import: LegacyKvImport) -> StorageResult<()> {
+        if import.objects.is_empty() && import.locks.is_empty() && import.next_fencing_token == 0 {
+            return Ok(());
+        }
+        let mut connection = self.database.connect().map_err(backend)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(backend)?;
+        for object in import.objects {
+            let value = STANDARD.decode(&object.value_base64).map_err(invalid)?;
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO kv_objects(key, value, modified_at_unix_ms)
+                     VALUES (?1, ?2, ?3)",
+                    params![object.key, value, object.modified_at_unix_ms],
+                )
+                .map_err(backend)?;
+        }
+        for lock in import.locks {
+            let token = i64::try_from(lock.fencing_token)
+                .map_err(|_| invalid("legacy KV fencing token exceeds SQLite integer range"))?;
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO kv_locks(name, owner_id, fencing_token, lease_until_unix_ms)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![lock.name, lock.owner_id, token, lock.lease_until_unix_ms],
+                )
+                .map_err(backend)?;
+        }
+        let next = i64::try_from(import.next_fencing_token)
+            .map_err(|_| invalid("legacy KV fencing token exceeds SQLite integer range"))?;
+        transaction
+            .execute(
+                "UPDATE kv_meta SET next_fencing_token = MAX(next_fencing_token, ?1)
+                 WHERE singleton = 1",
+                [next],
+            )
+            .map_err(backend)?;
+        transaction.commit().map_err(backend)
+    }
+
+    fn keys(&self) -> StorageResult<Vec<String>> {
+        let connection = self.database.connect().map_err(backend)?;
+        let mut statement = connection
+            .prepare("SELECT key FROM kv_objects ORDER BY key")
+            .map_err(backend)?;
+        statement
+            .query_map([], |row| row.get(0))
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)
+    }
+}
+
+pub(crate) fn decode_put(key: &str, value_base64: &str) -> Result<Vec<u8>, String> {
+    validate_key(key)?;
+    let value = STANDARD
+        .decode(value_base64)
+        .map_err(|_| "value_base64 must contain valid base64".to_owned())?;
+    if value.len() > MAX_OBJECT_BYTES {
         return Err(format!(
             "KV objects may not exceed {MAX_OBJECT_BYTES} bytes"
         ));
     }
-
-    let existing = state.objects.get(&request.key);
-    let applied = existing.is_none_or(|object| request.version > object.version);
-    let version = if applied {
-        state.objects.insert(
-            request.key,
-            KvObject {
-                value_base64: request.value_base64,
-                version: request.version.clone(),
-                modified_at_unix_ms: request.modified_at_unix_ms,
-                tombstone: false,
-            },
-        );
-        request.version
-    } else {
-        existing.expect("checked above").version.clone()
-    };
-    Ok(KvPutResponse { applied, version })
+    Ok(value)
 }
 
-pub(crate) fn apply_delete(
-    state: &mut KvState,
-    request: KvDeleteRequest,
-) -> Result<KvPutResponse, String> {
-    validate_key(&request.key)?;
-    validate_version(&request.version)?;
-    validate_modified_at(request.modified_at_unix_ms)?;
-    if request.recursive {
-        let existing = state.prefix_tombstones.get(&request.key);
-        let applied = existing.is_none_or(|version| request.version > *version);
-        let version = if applied {
-            state
-                .prefix_tombstones
-                .insert(request.key, request.version.clone());
-            request.version
-        } else {
-            existing.expect("checked above").clone()
-        };
-        return Ok(KvPutResponse { applied, version });
-    }
-
-    let existing = state.objects.get(&request.key);
-    let applied = existing.is_none_or(|object| request.version > object.version);
-    let version = if applied {
-        state.objects.insert(
-            request.key,
-            KvObject {
-                value_base64: String::new(),
-                version: request.version.clone(),
-                modified_at_unix_ms: request.modified_at_unix_ms,
-                tombstone: true,
-            },
-        );
-        request.version
-    } else {
-        existing.expect("checked above").version.clone()
-    };
-    Ok(KvPutResponse { applied, version })
-}
-
-pub(crate) fn get(state: &KvState, key: &str) -> Result<Option<KvObjectResponse>, String> {
-    validate_key(key)?;
-    let Some(object) = visible_object(state, key) else {
-        return Ok(None);
-    };
-    let size = STANDARD
-        .decode(&object.value_base64)
-        .map_err(|_| "persisted KV value contains invalid base64".to_owned())?
-        .len() as u64;
-    Ok(Some(KvObjectResponse {
-        key: key.to_owned(),
-        value_base64: object.value_base64.clone(),
-        version: object.version.clone(),
-        modified_at_unix_ms: object.modified_at_unix_ms,
-        size,
-    }))
-}
-
-pub(crate) fn exists(state: &KvState, key: &str) -> Result<bool, String> {
+pub(crate) fn validate_key(key: &str) -> Result<(), String> {
     validate_query_path(key)?;
-    Ok(visible_keys(state)
-        .any(|candidate| candidate == key || is_component_descendant(candidate, key)))
-}
-
-pub(crate) fn list(
-    state: &KvState,
-    path: &str,
-    recursive: bool,
-) -> Result<Option<KvListResponse>, String> {
-    validate_query_path(path)?;
-    if !exists(state, path)? {
-        return Ok(None);
+    if key.is_empty() {
+        return Err("KV keys must not be empty".to_owned());
     }
+    Ok(())
+}
 
-    let mut keys = BTreeSet::new();
-    for key in visible_keys(state) {
-        if !is_component_descendant(key, path) {
-            continue;
-        }
-        let relative = if path.is_empty() {
-            key
-        } else {
-            &key[path.len() + 1..]
-        };
-        if recursive {
-            let mut current = String::new();
-            for component in relative.split('/') {
-                if !current.is_empty() {
-                    current.push('/');
-                }
-                current.push_str(component);
-                keys.insert(join_path(path, &current));
-            }
-        } else if let Some((first, _)) = relative.split_once('/') {
-            keys.insert(join_path(path, first));
-        } else {
-            keys.insert(join_path(path, relative));
-        }
+pub(crate) fn validate_query_path(path: &str) -> Result<(), String> {
+    if path.len() > MAX_KEY_BYTES {
+        return Err(format!("KV keys may not exceed {MAX_KEY_BYTES} bytes"));
     }
-    Ok(Some(KvListResponse {
-        keys: keys.into_iter().collect(),
-    }))
-}
-
-pub(crate) fn stat(state: &KvState, key: &str) -> Result<Option<KvStatResponse>, String> {
-    validate_query_path(key)?;
-    if !key.is_empty()
-        && let Some(object) = get(state, key)?
-    {
-        return Ok(Some(KvStatResponse {
-            key: key.to_owned(),
-            modified_at_unix_ms: object.modified_at_unix_ms,
-            size: object.size,
-            is_value: true,
-        }));
+    if path.is_empty() {
+        return Ok(());
     }
-
-    let modified_at_unix_ms = visible_keys(state)
-        .filter(|candidate| is_component_descendant(candidate, key))
-        .filter_map(|candidate| visible_object(state, candidate))
-        .map(|object| object.modified_at_unix_ms)
-        .max();
-    Ok(
-        modified_at_unix_ms.map(|modified_at_unix_ms| KvStatResponse {
-            key: key.to_owned(),
-            modified_at_unix_ms,
-            size: 0,
-            is_value: false,
-        }),
-    )
-}
-
-fn visible_keys(state: &KvState) -> impl Iterator<Item = &str> {
-    state.objects.iter().filter_map(|(key, object)| {
-        (!object.tombstone && !hidden_by_prefix_tombstone(state, key, &object.version))
-            .then_some(key.as_str())
-    })
-}
-
-fn visible_object<'a>(state: &'a KvState, key: &str) -> Option<&'a KvObject> {
-    let object = state.objects.get(key)?;
-    (!object.tombstone && !hidden_by_prefix_tombstone(state, key, &object.version))
-        .then_some(object)
-}
-
-fn hidden_by_prefix_tombstone(state: &KvState, key: &str, version: &KvVersion) -> bool {
-    state.prefix_tombstones.iter().any(|(prefix, tombstone)| {
-        (key == prefix || is_component_descendant(key, prefix)) && tombstone >= version
-    })
+    if path.starts_with('/') || path.ends_with('/') || path.split('/').any(str::is_empty) {
+        return Err(
+            "KV keys must use non-empty '/'-separated components without a leading or trailing slash"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn is_component_descendant(key: &str, prefix: &str) -> bool {
@@ -213,145 +440,52 @@ fn join_path(path: &str, relative: &str) -> String {
     }
 }
 
-fn validate_key(key: &str) -> Result<(), String> {
-    validate_query_path(key)?;
-    if key.is_empty() {
-        return Err("KV keys must not be empty".to_owned());
-    }
-    Ok(())
+fn backend(error: impl std::fmt::Display) -> StorageError {
+    StorageError::Backend(error.to_string())
 }
 
-fn validate_query_path(path: &str) -> Result<(), String> {
-    if path.len() > MAX_KEY_BYTES {
-        return Err(format!("KV keys may not exceed {MAX_KEY_BYTES} bytes"));
-    }
-    if path.is_empty() {
-        return Ok(());
-    }
-    if path.starts_with('/') || path.ends_with('/') || path.split('/').any(str::is_empty) {
-        return Err(
-            "KV keys must use non-empty '/'-separated components without a leading or trailing slash"
-                .to_owned(),
-        );
-    }
-    Ok(())
-}
-
-fn validate_version(version: &KvVersion) -> Result<(), String> {
-    if version.physical_unix_ms < 0 {
-        return Err("KV version time must not be negative".to_owned());
-    }
-    if version.replica_id.trim().is_empty() || version.replica_id.len() > MAX_REPLICA_ID_BYTES {
-        return Err(format!(
-            "KV replica_id must contain 1 to {MAX_REPLICA_ID_BYTES} bytes"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_modified_at(modified_at_unix_ms: i64) -> Result<(), String> {
-    if modified_at_unix_ms < 0 {
-        return Err("KV modified_at_unix_ms must not be negative".to_owned());
-    }
-    Ok(())
+fn invalid(error: impl std::fmt::Display) -> StorageError {
+    StorageError::InvalidData(error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn version(time: i64, replica: &str) -> KvVersion {
-        KvVersion {
-            physical_unix_ms: time,
-            logical: 0,
-            replica_id: replica.into(),
-        }
-    }
-
-    fn put(state: &mut KvState, key: &str, value: &str, time: i64) -> bool {
-        apply_put(
-            state,
-            KvPutRequest {
-                key: key.into(),
-                value_base64: STANDARD.encode(value),
-                version: version(time, "node-a"),
-                modified_at_unix_ms: time,
-            },
-        )
-        .unwrap()
-        .applied
+    fn repository() -> (KvRepository, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(directory.path()).unwrap();
+        (KvRepository::open(database).unwrap(), directory)
     }
 
     #[test]
-    fn last_write_wins_and_stale_updates_are_ignored() {
-        let mut state = KvState::default();
-        assert!(put(&mut state, "apps/demo/config", "new", 20));
-        assert!(!put(&mut state, "apps/demo/config", "old", 10));
+    fn stores_overwrites_and_recursively_deletes_objects() {
+        let (repository, _directory) = repository();
+        repository.put("a/cert", b"one", 10).unwrap();
+        repository.put("ab/cert", b"two", 11).unwrap();
+        repository.put("a/cert", b"new", 20).unwrap();
         assert_eq!(
             STANDARD
-                .decode(
-                    get(&state, "apps/demo/config")
-                        .unwrap()
-                        .unwrap()
-                        .value_base64
-                )
+                .decode(repository.get("a/cert").unwrap().unwrap().value_base64)
                 .unwrap(),
             b"new"
         );
+        repository.delete("a", true).unwrap();
+        assert!(repository.get("a/cert").unwrap().is_none());
+        assert!(repository.get("ab/cert").unwrap().is_some());
     }
 
     #[test]
-    fn recursive_tombstone_does_not_match_similar_component() {
-        let mut state = KvState::default();
-        put(&mut state, "a/cert", "one", 10);
-        put(&mut state, "ab/cert", "two", 10);
-        apply_delete(
-            &mut state,
-            KvDeleteRequest {
-                key: "a".into(),
-                version: version(20, "node-a"),
-                modified_at_unix_ms: 20,
-                recursive: true,
-            },
-        )
-        .unwrap();
-        assert!(get(&state, "a/cert").unwrap().is_none());
-        assert!(get(&state, "ab/cert").unwrap().is_some());
-        assert!(put(&mut state, "a/cert", "three", 30));
-        assert!(get(&state, "a/cert").unwrap().is_some());
-    }
-
-    #[test]
-    fn exact_delete_is_lww_and_allows_a_newer_write() {
-        let mut state = KvState::default();
-        put(&mut state, "apps/demo/config", "one", 10);
-        apply_delete(
-            &mut state,
-            KvDeleteRequest {
-                key: "apps/demo/config".into(),
-                version: version(20, "node-a"),
-                modified_at_unix_ms: 20,
-                recursive: false,
-            },
-        )
-        .unwrap();
-        assert!(get(&state, "apps/demo/config").unwrap().is_none());
-        assert!(!put(&mut state, "apps/demo/config", "stale", 15));
-        assert!(put(&mut state, "apps/demo/config", "two", 30));
-        assert!(get(&state, "apps/demo/config").unwrap().is_some());
-    }
-
-    #[test]
-    fn list_supports_direct_and_recursive_prefixes() {
-        let mut state = KvState::default();
-        put(&mut state, "apps/a/config", "a", 10);
-        put(&mut state, "apps/b", "b", 10);
+    fn lists_direct_and_recursive_prefixes() {
+        let (repository, _directory) = repository();
+        repository.put("apps/a/config", b"a", 10).unwrap();
+        repository.put("apps/b", b"b", 11).unwrap();
         assert_eq!(
-            list(&state, "apps", false).unwrap().unwrap().keys,
+            repository.list("apps", false).unwrap().unwrap().keys,
             ["apps/a", "apps/b"]
         );
         assert_eq!(
-            list(&state, "apps", true).unwrap().unwrap().keys,
+            repository.list("apps", true).unwrap().unwrap().keys,
             ["apps/a", "apps/a/config", "apps/b"]
         );
     }

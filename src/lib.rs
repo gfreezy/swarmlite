@@ -1,6 +1,8 @@
 mod agent;
+pub mod client;
 pub mod config;
 mod controller;
+mod database;
 pub mod gateway;
 mod kv;
 mod local_state;

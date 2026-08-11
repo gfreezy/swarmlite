@@ -18,7 +18,7 @@ use crate::{
         BootstrapResponse, ClusterConfigResponse, ClusterConfigUpdate, HeartbeatResponse,
         JoinRequest, JoinResponse, KvDeleteRequest, KvListResponse, KvLockAcquireRequest,
         KvLockAcquireResponse, KvLockMutationRequest, KvObjectResponse, KvPutRequest,
-        KvPutResponse, KvStatResponse, NodeGatewayResponse, NodeGatewayUpdate, NodeHeartbeat,
+        KvStatResponse, NodeGatewayResponse, NodeGatewayUpdate, NodeHeartbeat,
         NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, StatusResponse,
     },
 };
@@ -216,18 +216,20 @@ async fn put_kv(
     State(controller): State<Arc<Controller>>,
     headers: HeaderMap,
     Json(body): Json<KvPutRequest>,
-) -> Result<Json<KvPutResponse>, ControllerError> {
+) -> Result<StatusCode, ControllerError> {
     require_auth(&controller, &headers)?;
-    controller.put_kv(body).await.map(Json)
+    controller.put_kv(body).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn delete_kv(
     State(controller): State<Arc<Controller>>,
     headers: HeaderMap,
     Json(body): Json<KvDeleteRequest>,
-) -> Result<Json<KvPutResponse>, ControllerError> {
+) -> Result<StatusCode, ControllerError> {
     require_auth(&controller, &headers)?;
-    controller.delete_kv(body).await.map(Json)
+    controller.delete_kv(body).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn kv_object(

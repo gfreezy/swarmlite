@@ -1,14 +1,11 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub(crate) const DATABASE_FILE: &str = "swarmlite.sqlite";
+pub(crate) use crate::database::DATABASE_FILE;
+use crate::database::Database;
 pub(crate) const NODE_KEY: &str = "node";
 pub(crate) const FENCE_KEY: &str = "agent_fence";
 
@@ -21,41 +18,41 @@ pub(crate) struct AgentFence {
 /// CLI can read node defaults while `serve` is running.
 #[derive(Clone)]
 pub(crate) struct LocalState {
-    path: Arc<PathBuf>,
+    database: Database,
 }
 
 impl LocalState {
     pub(crate) fn open(data_dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(data_dir)
-            .with_context(|| format!("failed to create {}", data_dir.display()))?;
         let state = Self {
-            path: Arc::new(data_dir.join(DATABASE_FILE)),
+            database: Database::open(data_dir)?,
         };
         state.with_connection(|connection| {
             connection.execute_batch(
-                "PRAGMA journal_mode = WAL;
-                 PRAGMA synchronous = FULL;
-                 CREATE TABLE IF NOT EXISTS local_state (
+                "CREATE TABLE IF NOT EXISTS local_state (
                     key TEXT PRIMARY KEY,
                     value BLOB NOT NULL
                 ) STRICT;",
             )?;
             Ok(())
         })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(state.path.as_ref(), std::fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("failed to protect {}", state.path.display()))?;
-        }
         Ok(state)
     }
 
     pub(crate) fn open_existing(data_dir: &Path) -> Result<Option<Self>> {
-        data_dir
-            .join(DATABASE_FILE)
-            .exists()
-            .then(|| Self::open(data_dir))
+        Database::open_existing(data_dir)?
+            .map(|database| {
+                let state = Self { database };
+                state.with_connection(|connection| {
+                    connection.execute_batch(
+                        "CREATE TABLE IF NOT EXISTS local_state (
+                        key TEXT PRIMARY KEY,
+                        value BLOB NOT NULL
+                    ) STRICT;",
+                    )?;
+                    Ok(())
+                })?;
+                Ok(state)
+            })
             .transpose()
     }
 
@@ -125,9 +122,7 @@ impl LocalState {
     }
 
     fn with_connection<T>(&self, operation: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let connection = Connection::open(self.path.as_ref())
-            .with_context(|| format!("failed to open {}", self.path.display()))?;
-        connection.busy_timeout(Duration::from_secs(5))?;
+        let connection = self.database.connect()?;
         operation(&connection)
     }
 }

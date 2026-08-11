@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use swarmlite::{
+    client::ControllerClient,
     config::RuntimeKind,
     model::{
         CLUSTER_SCHEMA_VERSION, ClusterConfigResponse, ClusterConfigUpdate, ClusterGatewayConfig,
@@ -399,22 +400,9 @@ async fn node_labels(
     method: reqwest::Method,
     body: Option<&serde_json::Value>,
 ) -> Result<NodeLabelsResponse> {
-    let client = reqwest::Client::new();
-    let url = format!(
-        "{}/v1/nodes/{node_id}/labels",
-        controller.trim_end_matches('/')
-    );
-    let mut request = client.request(method, &url).bearer_auth(&token);
-    if let Some(body) = body {
-        request = request.json(body);
-    }
-    let response = request.send().await?;
-    let status = response.status();
-    let body = response.text().await?;
-    if !status.is_success() {
-        anyhow::bail!("controller returned {status}: {body}");
-    }
-    serde_json::from_str(&body).map_err(Into::into)
+    ControllerClient::new(controller, token)
+        .send_json(method, &format!("/v1/nodes/{node_id}/labels"), body)
+        .await
 }
 
 async fn node_gateway(
@@ -423,28 +411,19 @@ async fn node_gateway(
     node_id: &str,
     enabled: Option<bool>,
 ) -> Result<NodeGatewayResponse> {
-    let client = reqwest::Client::new();
-    let url = format!(
-        "{}/v1/nodes/{node_id}/gateway",
-        controller.trim_end_matches('/')
-    );
     let update = enabled.map(|enabled| NodeGatewayUpdate { enabled });
     let method = if update.is_some() {
         reqwest::Method::PUT
     } else {
         reqwest::Method::GET
     };
-    let mut request = client.request(method, &url).bearer_auth(&token);
-    if let Some(update) = &update {
-        request = request.json(update);
-    }
-    let response = request.send().await?;
-    let status = response.status();
-    let body = response.text().await?;
-    if !status.is_success() {
-        anyhow::bail!("controller returned {status}: {body}");
-    }
-    serde_json::from_str(&body).map_err(Into::into)
+    ControllerClient::new(controller, token)
+        .send_json(
+            method,
+            &format!("/v1/nodes/{node_id}/gateway"),
+            update.as_ref(),
+        )
+        .await
 }
 
 async fn cluster_config(
@@ -452,58 +431,34 @@ async fn cluster_config(
     token: String,
     update: Option<&ClusterConfigUpdate>,
 ) -> Result<ClusterConfigResponse> {
-    let client = reqwest::Client::new();
     let method = if update.is_some() {
         reqwest::Method::PATCH
     } else {
         reqwest::Method::GET
     };
-    let url = format!("{}/v1/config", controller.trim_end_matches('/'));
-    let mut request = client.request(method, &url).bearer_auth(&token);
-    if let Some(update) = update {
-        request = request.json(update);
-    }
-    let response = request.send().await?;
-    let status = response.status();
-    let body = response.text().await?;
-    if !status.is_success() {
-        anyhow::bail!("controller returned {status}: {body}");
-    }
-    serde_json::from_str(&body).map_err(Into::into)
+    ControllerClient::new(controller, token)
+        .send_json(method, "/v1/config", update)
+        .await
 }
 
 async fn deploy(controller: String, name: String, file: PathBuf, token: String) -> Result<()> {
     let stack = tokio::fs::read_to_string(file).await?;
-    let client = reqwest::Client::new();
-    let url = format!("{}/v1/stacks/{}", controller.trim_end_matches('/'), name);
-    let response = client
-        .put(&url)
-        .bearer_auth(&token)
-        .header(reqwest::header::CONTENT_TYPE, "application/x-yaml")
-        .body(stack)
-        .send()
+    let body = ControllerClient::new(controller, token)
+        .send_text(
+            reqwest::Method::PUT,
+            &format!("/v1/stacks/{name}"),
+            Some("application/x-yaml"),
+            Some(stack),
+        )
         .await?;
-    let status = response.status();
-    let body = response.text().await?;
-    if !status.is_success() {
-        anyhow::bail!("controller returned {status}: {body}");
-    }
     println!("{body}");
     Ok(())
 }
 
 async fn status(controller: String, token: String) -> Result<()> {
-    let response = reqwest::Client::new()
-        .get(format!("{}/v1/status", controller.trim_end_matches('/')))
-        .bearer_auth(token)
-        .send()
+    let value: serde_json::Value = ControllerClient::new(controller, token)
+        .get_json("/v1/status")
         .await?;
-    let status = response.status();
-    let body = response.text().await?;
-    if !status.is_success() {
-        anyhow::bail!("controller returned {status}: {body}");
-    }
-    let value: serde_json::Value = serde_json::from_str(&body)?;
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }

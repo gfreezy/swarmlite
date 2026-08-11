@@ -7,11 +7,8 @@ impl Controller {
         repository: StateRepository,
     ) -> Result<Self, StorageError> {
         let mut versioned = repository.initialize_with_cluster(&config.cluster).await?;
+        let kv_repository = repository.kv_repository();
         let controller_id = config.cluster.controller_id.clone();
-        let gateway_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(config.gateway.request_timeout_seconds))
-            .build()
-            .map_err(|error| StorageError::Backend(error.to_string()))?;
         let live_nodes = versioned
             .state
             .tasks
@@ -65,12 +62,7 @@ impl Controller {
         }
         if changed {
             versioned.generation = repository
-                .replace(
-                    versioned.generation,
-                    &versioned.cluster,
-                    &versioned.state,
-                    &versioned.kv,
-                )
+                .replace(versioned.generation, &versioned.cluster, &versioned.state)
                 .await?;
         }
 
@@ -79,16 +71,15 @@ impl Controller {
             config,
             token,
             repository,
+            kv_repository,
             inner: Mutex::new(Inner {
                 generation: versioned.generation,
                 cluster: versioned.cluster,
                 state: versioned.state,
-                kv: versioned.kv,
                 live_nodes,
+                gateway_generation: versioned.generation,
+                gateway_reports: HashMap::new(),
             }),
-            gateway_client,
-            gateway_notify: Notify::new(),
-            gateway_sync: Mutex::new(GatewaySyncState::default()),
         })
     }
 
@@ -118,19 +109,26 @@ impl Controller {
     }
 
     pub(super) async fn commit_locked(&self, inner: &mut Inner) -> Result<(), StorageError> {
+        let gateway_generation = inner
+            .gateway_generation
+            .checked_add(1)
+            .ok_or_else(|| StorageError::Backend("gateway generation overflow".to_owned()))?;
         let generation = self
             .repository
-            .replace(inner.generation, &inner.cluster, &inner.state, &inner.kv)
+            .replace(inner.generation, &inner.cluster, &inner.state)
             .await?;
         inner.generation = generation;
-        self.gateway_notify.notify_one();
+        inner.gateway_generation = gateway_generation;
         Ok(())
     }
 
-    pub(super) async fn commit_kv_locked(&self, inner: &mut Inner) -> Result<(), StorageError> {
+    pub(super) async fn commit_gateway_ack_locked(
+        &self,
+        inner: &mut Inner,
+    ) -> Result<(), StorageError> {
         let generation = self
             .repository
-            .replace(inner.generation, &inner.cluster, &inner.state, &inner.kv)
+            .replace(inner.generation, &inner.cluster, &inner.state)
             .await?;
         inner.generation = generation;
         Ok(())

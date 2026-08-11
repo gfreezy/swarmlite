@@ -64,12 +64,8 @@ func TestRemoteLoadPopulatesAuthoritativeLocalStorage(t *testing.T) {
 			t.Fatalf("unexpected namespaced key %q", key)
 		}
 		json.NewEncoder(response).Encode(objectResponse{
-			Key:         request.URL.Query().Get("key"),
-			ValueBase64: base64.StdEncoding.EncodeToString(value),
-			Version: cacheVersion{
-				PhysicalUnixMS: 100,
-				ReplicaID:      "remote-caddy",
-			},
+			Key:              request.URL.Query().Get("key"),
+			ValueBase64:      base64.StdEncoding.EncodeToString(value),
 			ModifiedAtUnixMS: 100,
 			Size:             int64(len(value)),
 		})

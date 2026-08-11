@@ -1,13 +1,15 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use tracing::{error, info, warn};
 
 use crate::{
+    client::ControllerClient,
     config::AgentConfig,
     local_state::{AgentFence, FENCE_KEY, LocalState},
     model::{
-        HeartbeatResponse, NodeControl, NodeHeartbeat, NodeRecord, ObservedTaskState, TaskReport,
+        GatewayReport, HeartbeatResponse, NodeControl, NodeHeartbeat, NodeRecord,
+        ObservedTaskState, TaskReport,
     },
     runtime::{ContainerRuntime, DockerCompatibleRuntime, ManagedContainer},
 };
@@ -16,17 +18,19 @@ pub(crate) async fn run_with_token_and_updates(
     config: AgentConfig,
     token: String,
     updates: tokio::sync::watch::Sender<NodeControl>,
+    gateway_report: tokio::sync::watch::Receiver<GatewayReport>,
     local_state: LocalState,
 ) -> Result<()> {
     let runtime_config = config.resolved_runtime()?;
     let runtime = DockerCompatibleRuntime::connect(&runtime_config)?;
-    run_with_runtime(config, token, updates, local_state, runtime).await
+    run_with_runtime(config, token, updates, gateway_report, local_state, runtime).await
 }
 
 async fn run_with_runtime<R: ContainerRuntime>(
     config: AgentConfig,
     token: String,
     updates: tokio::sync::watch::Sender<NodeControl>,
+    gateway_report: tokio::sync::watch::Receiver<GatewayReport>,
     local_state: LocalState,
     runtime: R,
 ) -> Result<()> {
@@ -45,7 +49,7 @@ async fn run_with_runtime<R: ContainerRuntime>(
         port_range_end: config.port_range.end,
         gateway_enabled: config.gateway_enabled,
     };
-    let client = reqwest::Client::new();
+    let client = ControllerClient::new(&config.controller, token);
     let (assignments_tx, assignments_rx) = tokio::sync::watch::channel(None);
     let runtime = Arc::new(runtime);
     let reconcile_runtime = Arc::clone(&runtime);
@@ -88,16 +92,9 @@ async fn run_with_runtime<R: ContainerRuntime>(
                     ports: container.ports.clone(),
                 })
                 .collect(),
+            gateway: gateway_report.borrow().clone(),
         };
-        let response = match send_heartbeat(
-            &client,
-            &config.controller,
-            &config.node_id,
-            &token,
-            &heartbeat,
-        )
-        .await
-        {
+        let response = match send_heartbeat(&client, &config.node_id, &heartbeat).await {
             Ok(response) => response,
             Err(error) => {
                 warn!(%error, "controller is unavailable; leaving current containers unchanged");
@@ -121,17 +118,27 @@ async fn run_with_runtime<R: ContainerRuntime>(
             cluster: response.cluster.clone(),
             gateway_enabled: response.gateway_enabled,
             labels: response.labels.clone(),
+            gateway_config: response.gateway_config.clone(),
         };
+        let gateway_needs_apply = response.gateway_enabled
+            && response.gateway_config.as_ref().is_some_and(|assignment| {
+                heartbeat.gateway.error.is_some()
+                    || heartbeat.gateway.applied_generation != Some(assignment.generation)
+            });
         node.gateway_enabled = response.gateway_enabled;
         node.labels.clone_from(&response.labels);
-        updates.send_if_modified(|current| {
-            if *current == next_control {
-                false
-            } else {
-                current.clone_from(&next_control);
-                true
-            }
-        });
+        if gateway_needs_apply {
+            updates.send_replace(next_control);
+        } else {
+            updates.send_if_modified(|current| {
+                if *current == next_control {
+                    false
+                } else {
+                    current.clone_from(&next_control);
+                    true
+                }
+            });
+        }
         if assignments_tx.send(Some(response)).is_err() {
             bail!("container reconciliation loop stopped unexpectedly");
         }
@@ -161,32 +168,17 @@ async fn reconciliation_loop<R: ContainerRuntime>(
 }
 
 async fn send_heartbeat(
-    client: &reqwest::Client,
-    controller: &str,
+    client: &ControllerClient,
     node_id: &str,
-    token: &str,
     heartbeat: &NodeHeartbeat,
 ) -> Result<HeartbeatResponse> {
-    let url = format!(
-        "{}/v1/nodes/{}/heartbeat",
-        controller.trim_end_matches('/'),
-        node_id
-    );
-    let response = client
-        .post(&url)
-        .bearer_auth(token)
-        .json(heartbeat)
-        .send()
-        .await?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        bail!("controller {url} returned {status}: {body}");
-    }
-    response
-        .json()
+    client
+        .send_json(
+            reqwest::Method::POST,
+            &format!("/v1/nodes/{node_id}/heartbeat"),
+            Some(heartbeat),
+        )
         .await
-        .with_context(|| format!("controller {url} returned invalid JSON"))
 }
 
 async fn reconcile_containers<R: ContainerRuntime>(
@@ -321,6 +313,7 @@ mod tests {
             gateway_enabled: false,
             labels: Default::default(),
             remove_tasks: Vec::new(),
+            gateway_config: None,
         };
 
         reconcile_containers(&runtime, &existing, &response)
@@ -375,6 +368,7 @@ mod tests {
             gateway_enabled: false,
             labels: Default::default(),
             remove_tasks: Vec::new(),
+            gateway_config: None,
         };
 
         reconcile_containers(&runtime, &existing, &response)

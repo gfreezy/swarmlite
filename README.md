@@ -134,8 +134,8 @@ swarmlite serve --advertise-address 10.0.0.21
 The override is persisted. All durable Swarmlite state on a node is stored in one
 `swarmlite.sqlite` database; Swarmlite does not maintain separate local and control-plane database
 files or JSON state files. Agent nodes use only the local-state table, while the controller also
-uses the control-plane table. The default data directory is `$XDG_STATE_HOME/swarmlite`, or
-`$HOME/.local/state/swarmlite`.
+uses the control-plane, KV object, and KV lock tables. The default data directory is
+`$XDG_STATE_HOME/swarmlite`, or `$HOME/.local/state/swarmlite`.
 
 ```bash
 swarmlite --data-dir /var/lib/swarmlite serve
@@ -330,17 +330,17 @@ The gateway image includes and automatically enables `caddy.storage.swarmlite`. 
 `FileStorage` remains authoritative, while certificate objects are copied to the generic KV API
 and certificate issuance uses its distributed locks. This normally lets additional gateway nodes
 reuse an existing certificate instead of applying for another one. The controller keeps its fixed
-URL current through Caddy's admin API; the cluster token is supplied only through the
-container environment and only its SHA-256 fingerprint is stored in a recovery label.
+URL current in the heartbeat-delivered Gateway configuration; the cluster token is supplied only
+through the container environment and only its SHA-256 fingerprint is stored in a recovery label.
 
 If Swarmlite or its KV state is unavailable, Caddy immediately falls back to its
 local certificate data and local lock. Existing HTTPS traffic continues; gateways may apply for
 duplicate certificates until coordination returns.
 
 The gateway admin API listens inside the container on `0.0.0.0:2019`, but host port 2019 is
-published only on this node's detected or explicitly configured `advertise-address`. The controller
-pushes routes to `http://<advertise-address>:2019`; restrict that port to the controller node on the
-trusted cluster network. Gateway traffic ports are published on all host interfaces.
+published only on `127.0.0.1`. The local Swarmlite node applies routing configuration received in
+its heartbeat response and reports the applied generation to the controller. Gateway traffic ports
+are published on all host interfaces.
 
 Disabling the Gateway intentionally stops the container and deletes both its container and
 persistent volumes. Enabling it again therefore starts with empty Caddy data. Container
@@ -355,7 +355,7 @@ active gateways acknowledge the new routing configuration.
 
 The authenticated controller KV API has no Caddy, certificate, or TLS semantics. Integrations
 choose their own keys and values. Values are opaque base64 data and mutations use last-write-wins
-ordering by `(physical_unix_ms, logical, replica_id)`.
+ordering from the single controller's SQLite transaction sequence.
 
 - `GET`, `PUT`, and `DELETE /v1/kv`
 - `GET /v1/kv/keys`
@@ -369,8 +369,9 @@ Request and response bodies are documented in [docs/kv-api.md](docs/kv-api.md).
 
 On the controller, `swarmlite.sqlite` persists local node settings together with cluster settings,
 member Gateway switches and labels, stacks, service specifications, desired task assignments, ports, drain
-deadlines, and KV state. Heartbeat liveness, resources, and observed container state are rebuilt
-from agent heartbeats.
+deadlines, and dedicated KV object and lock tables. KV writes do not advance the orchestration
+generation. Heartbeat liveness, resources, and observed container state are rebuilt from agent
+heartbeats.
 
 Every managed workload container carries the minimal labels needed to collect it after total
 control-plane loss: cluster, task, stack, service, slot, revision, normalized spec hash, and
@@ -383,7 +384,7 @@ It carries these labels:
 - `io.swarmlite.managed=true`
 - the stable `io.swarmlite.cluster_id`
 - `io.swarmlite.system=true` and `io.swarmlite.component=gateway`
-- `io.swarmlite.advertise_address` and `io.swarmlite.gateway_bind_address`
+- `io.swarmlite.advertise_address`
 - `io.swarmlite.gateway_image`, `io.swarmlite.gateway_listen`, and
   `io.swarmlite.gateway_schema`
 - `io.swarmlite.gateway_token_sha256`, never the token itself

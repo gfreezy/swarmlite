@@ -21,7 +21,7 @@ use tracing::{info, warn};
 
 use crate::{
     config::{ResolvedRuntimeConfig, RuntimeKind},
-    model::{ObservedTaskState, PortBinding, TaskAssignment},
+    model::{GatewayAssignment, ObservedTaskState, PortBinding, TaskAssignment},
 };
 
 #[cfg(test)]
@@ -33,13 +33,14 @@ pub(crate) const SYSTEM_LABEL: &str = "io.swarmlite.system";
 pub(crate) const COMPONENT_LABEL: &str = "io.swarmlite.component";
 pub(crate) const GATEWAY_COMPONENT: &str = "gateway";
 pub(crate) const GATEWAY_ADDRESS_LABEL: &str = "io.swarmlite.advertise_address";
-const GATEWAY_BIND_ADDRESS_LABEL: &str = "io.swarmlite.gateway_bind_address";
 const GATEWAY_SCHEMA_LABEL: &str = "io.swarmlite.gateway_schema";
 const GATEWAY_IMAGE_LABEL: &str = "io.swarmlite.gateway_image";
 const GATEWAY_LISTEN_LABEL: &str = "io.swarmlite.gateway_listen";
 const GATEWAY_TOKEN_HASH_LABEL: &str = "io.swarmlite.gateway_token_sha256";
-const GATEWAY_SCHEMA: &str = "3";
+const GATEWAY_SCHEMA: &str = "4";
 const GATEWAY_CONTAINER_NAME: &str = "swarmlite-gateway";
+const GATEWAY_ADMIN_URL: &str = "http://127.0.0.1:2019";
+const GATEWAY_SERVER_NAME: &str = "swarmlite";
 const TASK_LABEL: &str = "io.swarmlite.task_id";
 const SERVICE_LABEL: &str = "io.swarmlite.service_id";
 const STACK_LABEL: &str = "io.swarmlite.stack";
@@ -85,7 +86,6 @@ pub(crate) struct ManagedClusterInventory {
 pub(crate) struct GatewayContainerSpec {
     pub cluster_id: String,
     pub advertise_address: String,
-    pub admin_bind_address: String,
     pub listen: Vec<String>,
     pub controller: String,
     pub token: String,
@@ -97,7 +97,6 @@ struct ExistingGatewayContainer {
     id: String,
     cluster_id: Option<String>,
     advertise_address: Option<String>,
-    admin_bind_address: Option<String>,
     image: Option<String>,
     listen: Option<String>,
     token_hash: Option<String>,
@@ -272,6 +271,46 @@ impl DockerCompatibleRuntime {
         self.create_gateway(spec).await
     }
 
+    pub(crate) async fn apply_gateway_config(&self, assignment: &GatewayAssignment) -> Result<()> {
+        let client = reqwest::Client::new();
+        self.post_gateway_config(&client, "/config/storage", &assignment.storage)
+            .await?;
+        self.post_gateway_config(
+            &client,
+            &format!("/config/apps/http/servers/{GATEWAY_SERVER_NAME}"),
+            &assignment.server,
+        )
+        .await?;
+        info!(
+            generation = assignment.generation,
+            runtime = %self.kind,
+            "applied local gateway configuration"
+        );
+        Ok(())
+    }
+
+    async fn post_gateway_config(
+        &self,
+        client: &reqwest::Client,
+        path: &str,
+        value: &serde_json::Value,
+    ) -> Result<()> {
+        let url = format!("{GATEWAY_ADMIN_URL}{path}");
+        let response = client.post(&url).json(value).send().await?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(512)
+            .collect::<String>();
+        bail!("Caddy Admin API {url} returned {status}: {body}")
+    }
+
     async fn gateway_containers(&self) -> Result<Vec<ExistingGatewayContainer>> {
         let summaries = self.list_managed_summaries().await?;
         Ok(summaries
@@ -285,7 +324,6 @@ impl DockerCompatibleRuntime {
                     id: summary.id?,
                     cluster_id: labels.get(CLUSTER_LABEL).cloned(),
                     advertise_address: labels.get(GATEWAY_ADDRESS_LABEL).cloned(),
-                    admin_bind_address: labels.get(GATEWAY_BIND_ADDRESS_LABEL).cloned(),
                     image: labels.get(GATEWAY_IMAGE_LABEL).cloned(),
                     listen: labels.get(GATEWAY_LISTEN_LABEL).cloned(),
                     token_hash: labels.get(GATEWAY_TOKEN_HASH_LABEL).cloned(),
@@ -329,7 +367,7 @@ impl DockerCompatibleRuntime {
         port_bindings.insert(
             admin,
             Some(vec![DockerPortBinding {
-                host_ip: Some(spec.admin_bind_address.clone()),
+                host_ip: Some("127.0.0.1".to_owned()),
                 host_port: Some("2019".to_owned()),
             }]),
         );
@@ -451,10 +489,6 @@ fn gateway_labels(spec: &GatewayContainerSpec) -> HashMap<String, String> {
             GATEWAY_ADDRESS_LABEL.to_owned(),
             spec.advertise_address.clone(),
         ),
-        (
-            GATEWAY_BIND_ADDRESS_LABEL.to_owned(),
-            spec.admin_bind_address.clone(),
-        ),
         (GATEWAY_SCHEMA_LABEL.to_owned(), GATEWAY_SCHEMA.to_owned()),
         (GATEWAY_IMAGE_LABEL.to_owned(), spec.image.clone()),
         (GATEWAY_LISTEN_LABEL.to_owned(), spec.listen.join(",")),
@@ -476,7 +510,6 @@ fn gateway_volume_names(cluster_id: &str) -> [String; 2] {
 
 fn gateway_matches_spec(container: &ExistingGatewayContainer, spec: &GatewayContainerSpec) -> bool {
     container.advertise_address.as_deref() == Some(&spec.advertise_address)
-        && container.admin_bind_address.as_deref() == Some(&spec.admin_bind_address)
         && container.image.as_deref() == Some(&spec.image)
         && container.listen.as_deref() == Some(&spec.listen.join(","))
         && container.token_hash.as_deref() == Some(&gateway_token_hash(&spec.token))
@@ -820,7 +853,6 @@ mod tests {
         let spec = GatewayContainerSpec {
             cluster_id: "cluster-old".into(),
             advertise_address: "10.0.0.21".into(),
-            admin_bind_address: "10.0.0.21".into(),
             listen: vec![":80".into()],
             controller: "http://10.0.0.21:8080".into(),
             token: "0123456789abcdef".into(),
@@ -832,7 +864,6 @@ mod tests {
         assert_eq!(labels[SYSTEM_LABEL], "true");
         assert_eq!(labels[COMPONENT_LABEL], GATEWAY_COMPONENT);
         assert_eq!(labels[GATEWAY_ADDRESS_LABEL], "10.0.0.21");
-        assert_eq!(labels[GATEWAY_BIND_ADDRESS_LABEL], "10.0.0.21");
         assert_eq!(labels[GATEWAY_SCHEMA_LABEL], GATEWAY_SCHEMA);
         assert_eq!(labels[GATEWAY_IMAGE_LABEL], DEFAULT_GATEWAY_IMAGE);
         assert_eq!(labels[GATEWAY_LISTEN_LABEL], ":80");
@@ -850,7 +881,6 @@ mod tests {
             id: "gateway".into(),
             cluster_id: Some("cluster-old".into()),
             advertise_address: Some("10.0.0.21".into()),
-            admin_bind_address: Some("10.0.0.21".into()),
             image: Some("custom-caddy:v1".into()),
             listen: Some(":80".into()),
             token_hash: Some(gateway_token_hash("0123456789abcdef")),
@@ -860,7 +890,6 @@ mod tests {
         let mut spec = GatewayContainerSpec {
             cluster_id: "cluster-old".into(),
             advertise_address: "10.0.0.21".into(),
-            admin_bind_address: "10.0.0.21".into(),
             listen: vec![":80".into()],
             controller: "http://10.0.0.21:8080".into(),
             token: "0123456789abcdef".into(),
@@ -897,7 +926,6 @@ mod tests {
         let spec = GatewayContainerSpec {
             cluster_id: "cluster-old".into(),
             advertise_address: "10.0.0.21".into(),
-            admin_bind_address: "10.0.0.21".into(),
             listen: vec![":80".into()],
             controller: "http://10.0.0.21:8080".into(),
             token: "do-not-persist-this-token".into(),

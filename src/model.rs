@@ -25,67 +25,26 @@ impl Default for ClusterGatewayConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct KvState {
-    pub objects: BTreeMap<String, KvObject>,
-    pub prefix_tombstones: BTreeMap<String, KvVersion>,
-    pub locks: BTreeMap<String, KvLock>,
-    pub next_fencing_token: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct KvObject {
-    pub value_base64: String,
-    pub version: KvVersion,
-    pub modified_at_unix_ms: i64,
-    pub tombstone: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub struct KvVersion {
-    pub physical_unix_ms: i64,
-    pub logical: u64,
-    pub replica_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct KvLock {
-    pub owner_id: String,
-    pub fencing_token: u64,
-    pub lease_until_unix_ms: i64,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct KvPutRequest {
     pub key: String,
     pub value_base64: String,
-    pub version: KvVersion,
-    pub modified_at_unix_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct KvDeleteRequest {
     pub key: String,
-    pub version: KvVersion,
-    pub modified_at_unix_ms: i64,
     /// Deletes the key and all keys below it when true.
     #[serde(default)]
     pub recursive: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct KvPutResponse {
-    pub applied: bool,
-    pub version: KvVersion,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KvObjectResponse {
     pub key: String,
     pub value_base64: String,
-    pub version: KvVersion,
     pub modified_at_unix_ms: i64,
     pub size: u64,
 }
@@ -272,6 +231,8 @@ pub struct UnclaimedTask {
 pub struct NodeHeartbeat {
     pub node: NodeRecord,
     pub tasks: Vec<TaskReport>,
+    #[serde(default)]
+    pub gateway: GatewayReport,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,6 +257,8 @@ pub struct HeartbeatResponse {
     pub gateway_enabled: bool,
     pub labels: BTreeMap<String, String>,
     pub remove_tasks: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_config: Option<GatewayAssignment>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -303,6 +266,21 @@ pub struct NodeControl {
     pub cluster: ClusterSettings,
     pub gateway_enabled: bool,
     pub labels: BTreeMap<String, String>,
+    pub gateway_config: Option<GatewayAssignment>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayReport {
+    pub applied_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayAssignment {
+    pub generation: u64,
+    pub server: serde_json::Value,
+    pub storage: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -6,7 +6,11 @@ impl Controller {
         node_id: &str,
         heartbeat: NodeHeartbeat,
     ) -> Result<HeartbeatResponse, ControllerError> {
-        let NodeHeartbeat { mut node, tasks } = heartbeat;
+        let NodeHeartbeat {
+            mut node,
+            tasks,
+            gateway: gateway_report,
+        } = heartbeat;
         if node_id != node.id {
             return Err(ControllerError::Invalid(
                 "node ID in path and request body differ".to_owned(),
@@ -28,6 +32,13 @@ impl Controller {
         };
         node.gateway_enabled = gateway_enabled;
         node.labels.clone_from(&desired_labels);
+        if gateway_enabled {
+            inner
+                .gateway_reports
+                .insert(node_id.to_owned(), gateway_report);
+        } else {
+            inner.gateway_reports.remove(node_id);
+        }
         soft_changed |= inner.state.nodes.get(node_id).is_none_or(|existing| {
             serde_json::to_value(existing).ok() != serde_json::to_value(&node).ok()
         });
@@ -125,8 +136,12 @@ impl Controller {
             return Err(error.into());
         }
         if soft_changed && !changed {
-            self.gateway_notify.notify_one();
+            inner.gateway_generation =
+                inner.gateway_generation.checked_add(1).ok_or_else(|| {
+                    ControllerError::Invalid("gateway generation overflow".to_owned())
+                })?;
         }
+        self.acknowledge_gateway_drains(&mut inner).await?;
 
         let generation = inner.generation;
         let assignments = inner
@@ -164,6 +179,7 @@ impl Controller {
             .filter(|task| task.node_id == node_id && task.desired == DesiredTaskState::Stopped)
             .map(|task| task.id.clone())
             .collect();
+        let gateway_config = self.gateway_assignment(&inner, gateway_enabled)?;
         Ok(HeartbeatResponse {
             generation,
             cluster: inner.cluster.clone(),
@@ -171,6 +187,7 @@ impl Controller {
             gateway_enabled,
             labels: desired_labels,
             remove_tasks,
+            gateway_config,
         })
     }
 
@@ -179,17 +196,39 @@ impl Controller {
         let generation = inner.generation;
         let state = inner.state.clone();
         let recovery = recovery_status(&state);
-        drop(inner);
-        let gateway_sync = self.gateway_sync.lock().await;
+        let enabled = state
+            .members
+            .values()
+            .filter(|member| member.gateway_enabled)
+            .map(|member| member.id.as_str())
+            .collect::<Vec<_>>();
+        let applied_generation = (!enabled.is_empty()
+            && enabled.iter().all(|node_id| {
+                inner.gateway_reports.get(*node_id).is_some_and(|report| {
+                    report.error.is_none()
+                        && report.applied_generation == Some(inner.gateway_generation)
+                })
+            }))
+        .then_some(inner.gateway_generation);
+        let endpoint_errors = enabled
+            .iter()
+            .filter_map(|node_id| {
+                inner
+                    .gateway_reports
+                    .get(*node_id)
+                    .and_then(|report| report.error.clone())
+                    .map(|error| ((*node_id).to_owned(), error))
+            })
+            .collect();
         StatusResponse {
             cluster_id: self.config.cluster.cluster_id.clone(),
             generation,
             controller_id: self.config.cluster.controller_id.clone(),
             gateway: GatewayStatus {
                 enabled: state.members.values().any(|member| member.gateway_enabled),
-                desired_generation: generation,
-                applied_generation: gateway_sync.applied_generation,
-                endpoint_errors: gateway_sync.endpoint_errors.clone(),
+                desired_generation: inner.gateway_generation,
+                applied_generation,
+                endpoint_errors,
             },
             recovery,
             state,

@@ -1,14 +1,11 @@
-use std::{collections::BTreeMap, sync::Arc};
-
-use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use std::collections::BTreeMap;
 use swarmlite_stack::{ParsedStack, parse_stack};
-use tokio::{net::TcpListener, sync::Mutex};
 
 use crate::{
     config::GatewayConfig,
     model::{
-        CLUSTER_SCHEMA_VERSION, ClusterGatewayConfig, KvVersion, NodeRecord, PortBinding,
+        CLUSTER_SCHEMA_VERSION, ClusterGatewayConfig, KvLockStatus, NodeRecord, PortBinding,
         ServicePort, ServiceSpec, StackGatewaySpec, TaskRecord, TaskReport,
     },
 };
@@ -111,42 +108,36 @@ x-swarmlite:
 #[tokio::test]
 async fn persists_kv_and_fences_locks_in_sqlite() {
     let (controller, repository, _directory) = test_controller("kv-test").await;
-    let version = KvVersion {
-        physical_unix_ms: 20,
-        logical: 0,
-        replica_id: "writer-a".into(),
-    };
-    assert!(
-        controller
-            .put_kv(KvPutRequest {
-                key: "apps/demo/config".into(),
-                value_base64: STANDARD.encode("new"),
-                version: version.clone(),
-                modified_at_unix_ms: 20,
-            })
-            .await
-            .unwrap()
-            .applied
-    );
-    assert!(
-        !controller
-            .put_kv(KvPutRequest {
-                key: "apps/demo/config".into(),
-                value_base64: STANDARD.encode("old"),
-                version: KvVersion {
-                    physical_unix_ms: 10,
-                    logical: 0,
-                    replica_id: "writer-b".into(),
-                },
-                modified_at_unix_ms: 10,
-            })
-            .await
-            .unwrap()
-            .applied
+    let control_generation = repository.load().await.unwrap().generation;
+    controller
+        .put_kv(KvPutRequest {
+            key: "apps/demo/config".into(),
+            value_base64: STANDARD.encode("new"),
+        })
+        .await
+        .unwrap();
+    controller
+        .put_kv(KvPutRequest {
+            key: "apps/demo/config".into(),
+            value_base64: STANDARD.encode("latest"),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        STANDARD
+            .decode(
+                controller
+                    .kv_object("apps/demo/config")
+                    .await
+                    .unwrap()
+                    .value_base64
+            )
+            .unwrap(),
+        b"latest"
     );
     assert_eq!(
-        repository.load().await.unwrap().kv.objects["apps/demo/config"].version,
-        version
+        repository.load().await.unwrap().generation,
+        control_generation
     );
 
     let acquired = controller
@@ -237,6 +228,7 @@ async fn node_labels_are_authoritative_and_persisted() {
             NodeHeartbeat {
                 node: reported,
                 tasks: Vec::new(),
+                gateway: GatewayReport::default(),
             },
         )
         .await
@@ -262,33 +254,21 @@ async fn node_labels_are_authoritative_and_persisted() {
 
 #[tokio::test]
 async fn caddy_acknowledgement_starts_drain_deadline() {
-    let received = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
-    let app = Router::new()
-        .route("/config/storage", post(capture_gateway_config))
-        .route(
-            "/config/apps/http/servers/swarmlite",
-            post(capture_gateway_config),
-        )
-        .with_state(received.clone());
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-    let cluster = test_cluster("caddy-publisher-test");
+    let mut cluster = test_cluster("caddy-publisher-test");
+    cluster.gateway.listen = vec![":18089".into()];
     let directory = tempfile::tempdir().unwrap();
     let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
     let mut config = test_controller_config(&cluster);
-    config.gateway.admin_port = address.port();
-    config.gateway.listen = vec![":18089".into()];
+    config.gateway_enabled = false;
     config.gateway.drain_timeout_seconds = 3;
     let controller = Controller::new(config, "test-token".into(), repository)
         .await
         .unwrap();
+    let mut request = test_join_request("node-a", "127.0.0.1");
+    request.gateway_enabled = true;
+    controller.join_node("node-a", request).await.unwrap();
     {
         let mut inner = controller.inner.lock().await;
-        let mut node = test_node();
-        node.gateway_enabled = true;
-        inner.state.nodes.insert("node-a".into(), node);
         inner
             .state
             .services
@@ -296,25 +276,61 @@ async fn caddy_acknowledgement_starts_drain_deadline() {
         inner.state.tasks.insert("old-task".into(), draining_task());
         controller.commit_locked(&mut inner).await.unwrap();
     }
-    controller.sync_gateway_once().await.unwrap();
+
+    let report = TaskReport {
+        id: "old-task".into(),
+        observed: ObservedTaskState::Healthy,
+        container_id: Some("container-old".into()),
+        cluster_id: Some("caddy-publisher-test".into()),
+        stack: Some("demo".into()),
+        service: Some("web".into()),
+        slot: Some(0),
+        revision: Some(1),
+        spec_hash: Some(service_spec_hash(&test_service().spec)),
+        ports: vec![PortBinding {
+            target: 80,
+            published: 20_001,
+            protocol: "tcp".into(),
+        }],
+    };
+    let desired = controller
+        .heartbeat(
+            "node-a",
+            NodeHeartbeat {
+                node: test_node(),
+                tasks: vec![report.clone()],
+                gateway: GatewayReport::default(),
+            },
+        )
+        .await
+        .unwrap()
+        .gateway_config
+        .unwrap();
+    assert_eq!(desired.storage["controller"], "http://10.0.0.10:8080");
+    assert!(desired.storage.get("controllers").is_none());
+    assert_eq!(desired.server["listen"][0], ":18089");
+
+    controller
+        .heartbeat(
+            "node-a",
+            NodeHeartbeat {
+                node: test_node(),
+                tasks: vec![report],
+                gateway: GatewayReport {
+                    applied_generation: Some(desired.generation),
+                    error: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
 
     let inner = controller.inner.lock().await;
     assert!(inner.state.tasks["old-task"].drain_until_unix_ms.is_some());
-    drop(inner);
-    let requests = received.lock().await;
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0]["controller"], "http://10.0.0.10:8080");
-    assert!(requests[0].get("controllers").is_none());
-    assert_eq!(requests[1]["listen"][0], ":18089");
-    server.abort();
-}
-
-async fn capture_gateway_config(
-    State(received): State<Arc<Mutex<Vec<serde_json::Value>>>>,
-    Json(body): Json<serde_json::Value>,
-) -> StatusCode {
-    received.lock().await.push(body);
-    StatusCode::OK
+    assert_eq!(
+        inner.gateway_reports["node-a"].applied_generation,
+        Some(desired.generation)
+    );
 }
 
 fn test_service() -> ServiceRecord {
@@ -377,6 +393,7 @@ async fn heartbeat_then_deploy_adopts_the_existing_container() {
                         protocol: "tcp".into(),
                     }],
                 }],
+                gateway: GatewayReport::default(),
             },
         )
         .await

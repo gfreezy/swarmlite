@@ -1,8 +1,8 @@
 # Generic KV API
 
 Every request requires `Authorization: Bearer <cluster-token>`. The single controller serves all
-reads and writes from its SQLite database. Consumers may treat an unavailable response as a cache
-miss when KV is only an optimization.
+reads and writes from dedicated tables in its SQLite database. Consumers may treat an unavailable
+response as a cache miss when KV is only an optimization.
 
 ## Values
 
@@ -11,13 +11,7 @@ Write an opaque value with `PUT /v1/kv`:
 ```json
 {
   "key": "my-app/items/example",
-  "value_base64": "dmFsdWU=",
-  "version": {
-    "physical_unix_ms": 1785289000000,
-    "logical": 0,
-    "replica_id": "writer-7f22"
-  },
-  "modified_at_unix_ms": 1785289000000
+  "value_base64": "dmFsdWU="
 }
 ```
 
@@ -26,32 +20,25 @@ Delete an exact key, or a complete prefix when `recursive` is true, with `DELETE
 ```json
 {
   "key": "my-app/items",
-  "version": {
-    "physical_unix_ms": 1785289001000,
-    "logical": 0,
-    "replica_id": "writer-7f22"
-  },
-  "modified_at_unix_ms": 1785289001000,
   "recursive": true
 }
 ```
 
-Both mutations return the winning version and whether this mutation won:
+Successful mutations return `204 No Content`. Requests are serialized by the single controller;
+the last committed write to a key is authoritative.
+
+Read an exact key with `GET /v1/kv?key=my-app%2Fitems%2Fexample`. Missing values return `404`.
+The response includes the key, base64 value, controller-assigned modification time, and decoded
+size:
 
 ```json
 {
-  "applied": true,
-  "version": {
-    "physical_unix_ms": 1785289001000,
-    "logical": 0,
-    "replica_id": "writer-7f22"
-  }
+  "key": "my-app/items/example",
+  "value_base64": "dmFsdWU=",
+  "modified_at_unix_ms": 1785289000000,
+  "size": 5
 }
 ```
-
-Read an exact key with `GET /v1/kv?key=my-app%2Fitems%2Fexample`. Missing values return `404`.
-Versions are compared lexicographically by `(physical_unix_ms, logical, replica_id)`, so stale
-writes and stale tombstones cannot replace newer data.
 
 List keys with `GET /v1/kv/keys?prefix=my-app%2Fitems&recursive=true`. Direct listing returns
 only the next path component; recursive listing returns all descendant components. Read metadata
