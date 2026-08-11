@@ -12,10 +12,11 @@ remote keys use the fixed `caddy/` namespace as a best-effort cache and distribu
 ## Publish the gateway image
 
 Gateway nodes do not build Caddy locally. By default they pull
-`ghcr.io/gfreezy/swarmlite-caddy:latest`. CI builds the image for Linux AMD64 and ARM64 on pull
-requests and publishes a combined multi-platform image to GHCR for pushes. Every published image
-gets a `sha-<commit>` tag, the default branch also updates `latest`, and Git tag pushes publish the
-matching image tag. Build and publish it manually with:
+`ghcr.io/gfreezy/swarmlite-caddy:latest`. A path-filtered CI workflow builds the image for Linux
+AMD64 and ARM64 only when `caddy-storage/**` or its image workflow changes. Pull requests build
+without publishing; pushes publish a combined multi-platform image to GHCR. Every published image
+gets a `sha-<commit>` tag, and the default branch also updates `latest`. Build and publish it
+manually with:
 
 ```bash
 docker build -t ghcr.io/gfreezy/swarmlite-caddy:latest ./caddy-storage
