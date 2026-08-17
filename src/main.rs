@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use swarmlite::{
     client::ControllerClient,
-    config::RuntimeKind,
+    config::{InstalledNodeConfig, RuntimeKind, SYSTEM_CONFIG_PATH},
     model::{
         CLUSTER_SCHEMA_VERSION, ClusterConfigResponse, ClusterConfigUpdate, ClusterGatewayConfig,
         ClusterSettings, DEFAULT_GATEWAY_IMAGE, NodeGatewayResponse, NodeGatewayUpdate,
@@ -40,9 +40,9 @@ enum Command {
         /// Address other machines use to reach containers on this node.
         #[arg(long, env = "SWARMLITE_ADVERTISE_ADDRESS")]
         advertise_address: Option<String>,
-        #[arg(long, value_enum)]
+        #[arg(long, value_enum, env = "SWARMLITE_RUNTIME")]
         runtime: Option<RuntimeKind>,
-        #[arg(long)]
+        #[arg(long, env = "SWARMLITE_RUNTIME_SOCKET")]
         runtime_socket: Option<String>,
     },
     /// Pull cluster settings and configure this machine to join an existing cluster.
@@ -52,9 +52,9 @@ enum Command {
         token: String,
         #[arg(long, env = "SWARMLITE_ADVERTISE_ADDRESS")]
         advertise_address: Option<String>,
-        #[arg(long, value_enum)]
+        #[arg(long, value_enum, env = "SWARMLITE_RUNTIME")]
         runtime: Option<RuntimeKind>,
-        #[arg(long)]
+        #[arg(long, env = "SWARMLITE_RUNTIME_SOCKET")]
         runtime_socket: Option<String>,
         #[arg(long = "label")]
         labels: Vec<String>,
@@ -255,9 +255,9 @@ struct InitArgs {
     recover: bool,
     #[arg(long, env = "SWARMLITE_ADVERTISE_ADDRESS")]
     advertise_address: Option<String>,
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, env = "SWARMLITE_RUNTIME")]
     runtime: Option<RuntimeKind>,
-    #[arg(long)]
+    #[arg(long, env = "SWARMLITE_RUNTIME_SOCKET")]
     runtime_socket: Option<String>,
     #[arg(long = "label")]
     labels: Vec<String>,
@@ -282,9 +282,12 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let data_dir = node::resolve_data_dir(cli.data_dir)?;
+    let installed = InstalledNodeConfig::load_if_exists(SYSTEM_CONFIG_PATH)?;
+    let data_dir = node::resolve_data_dir(cli.data_dir.or_else(|| installed.data_dir.clone()))?;
     match cli.command {
         Command::Init { options } => {
+            let (runtime, runtime_socket) =
+                installed.runtime_options(options.runtime, options.runtime_socket);
             let gateway_image_explicit = options.gateway_image.is_some();
             let cluster = ClusterSettings {
                 schema_version: CLUSTER_SCHEMA_VERSION,
@@ -303,8 +306,8 @@ async fn main() -> Result<()> {
                 cluster,
                 token: options.token,
                 advertise_address: options.advertise_address,
-                runtime: options.runtime,
-                runtime_socket: options.runtime_socket,
+                runtime,
+                runtime_socket,
                 labels: node::parse_labels(options.labels)?,
                 recovery: options.recover,
                 gateway_image_explicit,
@@ -319,6 +322,7 @@ async fn main() -> Result<()> {
             runtime,
             runtime_socket,
         } => {
+            let (runtime, runtime_socket) = installed.runtime_options(runtime, runtime_socket);
             node::run(node::ServeOptions {
                 data_dir,
                 advertise_address,
@@ -336,6 +340,7 @@ async fn main() -> Result<()> {
             labels,
             gateway,
         } => {
+            let (runtime, runtime_socket) = installed.runtime_options(runtime, runtime_socket);
             let message = node::join(node::JoinOptions {
                 data_dir,
                 controller,

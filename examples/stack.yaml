@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=../crates/swarmlite-stack/schema/stack.schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/gfreezy/swarmlite/main/crates/swarmlite-stack/schema/stack.schema.json
 services:
   web:
     image: nginx:1.29-alpine

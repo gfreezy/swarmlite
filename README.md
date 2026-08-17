@@ -1,292 +1,314 @@
 # Swarmlite
 
-Swarmlite is a small Rust container orchestrator for one LAN or region. Every machine runs an
-Agent through the same `swarmlite serve` command. The initialized node also runs the cluster's
-single, immutable Controller. A per-node switch controls whether it also runs a Gateway.
+Swarmlite is a small Rust container orchestrator for machines in one LAN or region. It provides a
+single control plane, multi-node scheduling, rolling deployments, service logs, placement rules,
+and optional HTTPS routing without the operational weight of Kubernetes.
 
-This is an MVP, not a drop-in replacement for Docker Swarm or Kubernetes. It intentionally has
-no overlay network or routing mesh.
+> [!IMPORTANT]
+> Swarmlite is an MVP, not a drop-in replacement for Docker Swarm or Kubernetes. It has one fixed
+> Controller and intentionally has no overlay network, routing mesh, or automatic failover.
 
-## Install
+New here? Follow [Quick start](#quick-start). For an existing cluster, jump to
+[node management](#cluster-setup-and-node-management), [Stack operations](#deploying-and-operating-stacks),
+[HTTPS routing](#stack-files-and-https-routing), or [recovery](#persistence-backup-and-recovery).
 
-### Linux server
+## Quick start
 
-The one-command installer detects an existing Docker or Podman installation, installs Docker when
-neither is present, downloads and verifies the matching CLI, and installs the systemd service:
+This path creates a single-node Linux cluster and deploys Nginx on host port `8088`.
+
+### 1. Install
+
+Run the installer on a Linux server with systemd. It reuses Docker or Podman when available and
+installs Docker when neither is present.
 
 ```bash
 curl -fsSL https://github.com/gfreezy/swarmlite/releases/latest/download/install.sh | sudo sh
 ```
 
-`auto` reuses the runtime selected by an earlier installation, then prefers an installed Docker,
-then an installed Podman. A new machine gets Docker by default. Select rootful Podman explicitly
-with:
+### 2. Initialize the first node
+
+```bash
+sudo swarmlite init
+sudo systemctl start swarmlite
+sudo swarmlite status
+```
+
+The initialized node is permanently the cluster Controller. It also runs an Agent and has its
+Gateway enabled by default.
+
+### 3. Deploy an application
+
+Create `stack.yaml`:
+
+```yaml
+services:
+  web:
+    image: nginx:1.29-alpine
+    ports:
+      - "8088:80"
+    deploy:
+      replicas: 1
+```
+
+Deploy it and verify the result:
+
+```bash
+sudo swarmlite deploy --compose-file stack.yaml demo
+sudo swarmlite ps demo
+curl http://127.0.0.1:8088
+```
+
+`deploy` waits for the desired state to become healthy. Add `--detach` when you only want to wait
+until the Controller has accepted the deployment.
+
+### 4. Operate the application
+
+Services use the qualified name `STACK.SERVICE`, such as `demo.web`:
+
+```bash
+sudo swarmlite ls
+sudo swarmlite inspect demo.web
+sudo swarmlite logs --tail 200 demo.web
+sudo swarmlite scale demo.web=3
+sudo swarmlite restart demo.web
+sudo swarmlite rm demo
+```
+
+### 5. Add another node
+
+Install Swarmlite on the new machine. On the Controller, print its generated join command:
+
+```bash
+sudo swarmlite join-token
+```
+
+Run the printed command with `sudo` on the new machine, then start its service:
+
+```bash
+sudo swarmlite join http://10.0.0.21:8080 --token '<generated-token>'
+sudo systemctl start swarmlite
+```
+
+The new node runs an Agent. It is not a Controller or Gateway unless `--gateway` is supplied while
+joining or the Gateway is enabled later.
+
+## Is Swarmlite a good fit?
+
+Swarmlite is designed for small deployments where all machines can reach one another directly.
+It is a good fit when you want:
+
+- a compact orchestrator for one trusted LAN or region;
+- Compose-style application definitions;
+- replicated services, placement constraints, and rolling updates;
+- optional Caddy-based HTTP and HTTPS routing;
+- Docker or Podman nodes managed through one CLI.
+
+Choose a different orchestrator when you require control-plane high availability, an overlay
+network, service VIPs, cross-node DNS, autoscaling, or the broader Kubernetes ecosystem.
+
+## Architecture and core concepts
+
+Every machine runs the same `swarmlite serve` process. Its fixed cluster role determines which
+components are active:
+
+| Component | Runs where | Responsibility |
+| --- | --- | --- |
+| Controller | The node created with `init` | Stores desired state, schedules tasks, and exposes the API |
+| Agent | Every node | Reconciles assigned containers with Docker or Podman |
+| Gateway | Enabled per node | Runs Caddy and publishes HTTP/HTTPS routes |
+| Stack | Cluster-wide | Groups services from one Compose-style YAML file |
+| Service | Inside a Stack | Defines an image, replicas, placement, ports, and update behavior |
+
+The Controller identity is immutable for the lifetime of the cluster. Swarmlite has no promotion,
+demotion, election, or automatic failover path.
+
+There is no cross-node container network. The Controller allocates host ports, and Gateways reach
+tasks through `node-advertise-address:allocated-host-port`. Named volumes and bind mounts remain
+local to their node.
+
+## Installation and lifecycle
+
+### Linux server
+
+The one-command installer:
+
+- detects an existing Docker or Podman installation;
+- installs Docker when no supported runtime is present;
+- downloads and verifies the matching Swarmlite release;
+- installs the CLI, systemd unit, and runtime configuration;
+- enables the service for future boots without starting an uninitialized node.
+
+```bash
+curl -fsSL https://github.com/gfreezy/swarmlite/releases/latest/download/install.sh | sudo sh
+```
+
+Runtime selection defaults to `auto`: reuse the previous selection, then prefer installed Docker,
+then installed Podman, and finally install Docker. Select rootful Podman explicitly with:
 
 ```bash
 curl -fsSL https://github.com/gfreezy/swarmlite/releases/latest/download/install.sh \
   | sudo sh -s -- --runtime podman
 ```
 
-Podman is often the shorter package installation on Fedora and RHEL. Docker remains the default
-because Swarmlite talks to the Docker API directly, while Podman is reached through its
-Docker-compatible API and an additional systemd socket.
-
-The installer supports Docker's official repositories on Ubuntu, Debian, Fedora, RHEL, and CentOS.
+Docker installation uses the official repositories on Ubuntu, Debian, Fedora, RHEL, and CentOS.
 Podman installation uses the distribution package manager (`apt`, `dnf`, `yum`, `zypper`, or
-`pacman`). It enables Docker or the rootful Podman API socket, but it does not guess whether this
-node should initialize or join a cluster.
+`pacman`) and enables the rootful Podman API socket.
 
-Initialize the first node and start it:
+The system installation uses these paths:
+
+| Path | Purpose |
+| --- | --- |
+| `/usr/local/bin/swarmlite` | CLI and node process |
+| `/var/lib/swarmlite` | Node identity and durable SQLite state |
+| `/etc/swarmlite/runtime.env` | Installed data directory, runtime, and socket |
+| `/etc/systemd/system/swarmlite.service` | systemd unit |
+
+Explicit CLI options and process environment variables override the installed configuration.
+
+Common service commands are:
 
 ```bash
-. /etc/swarmlite/runtime.env
-sudo swarmlite --data-dir /var/lib/swarmlite init \
-  --runtime "$SWARMLITE_RUNTIME" --runtime-socket "$SWARMLITE_RUNTIME_SOCKET"
-sudo systemctl enable --now swarmlite
-```
-
-For another node, replace `init` with the generated `join` command and pass the same runtime flags,
-then enable the service. Logs and status are available through systemd:
-
-```bash
+sudo systemctl start swarmlite
+sudo systemctl restart swarmlite
 sudo systemctl status swarmlite
 sudo journalctl -u swarmlite -f
 ```
 
-The installed unit is maintained in
-[`packaging/systemd/swarmlite.service`](packaging/systemd/swarmlite.service). It runs the node from
-`/usr/local/bin/swarmlite`, stores durable local state in `/var/lib/swarmlite`, and reads the chosen
-runtime from `/etc/swarmlite/runtime.env`.
-
 ### macOS ARM64 CLI
 
-macOS does not install systemd or a container runtime. Any accessible Docker-compatible Unix socket
-is sufficient. If no socket exists, the installer exits and recommends installing OrbStack. Run
-the installer without `sudo` so it can access the current user's runtime socket:
+The macOS installer installs only the CLI. It requires Apple silicon and an accessible
+Docker-compatible Unix socket; OrbStack is the recommended local runtime.
+
+Run it without `sudo` so runtime detection uses the current user's environment:
 
 ```bash
 curl -fsSL https://github.com/gfreezy/swarmlite/releases/latest/download/install.sh | sh
 ```
 
-The installer supports Apple silicon, verifies the CLI archive, and asks for `sudo` only if writing
-to `/usr/local/bin` requires it. It probes `$HOME/.orbstack/run/docker.sock`,
-`/var/run/docker.sock`, and `$HOME/.docker/run/docker.sock`. Install OrbStack from
-[orbstack.dev/download](https://orbstack.dev/download) when no compatible runtime is available.
+The installer probes `$HOME/.orbstack/run/docker.sock`, `/var/run/docker.sock`, and
+`$HOME/.docker/run/docker.sock`. It asks for `sudo` only when `/usr/local/bin` is not writable.
 
-## Build
+### Uninstall
 
-Rust 1.97 or newer is required to build Swarmlite:
+On Linux, remove the service, CLI, and installed configuration while preserving node data:
 
 ```bash
-cargo build --release --locked
+curl -fsSL https://github.com/gfreezy/swarmlite/releases/latest/download/install.sh \
+  | sudo sh -s -- --uninstall
 ```
 
-GitHub Actions also builds downloadable archives for Linux AMD64, Linux ARM64, and macOS ARM64.
-Each workflow run stores one archive and SHA-256 checksum per platform as an Actions artifact;
-tag pushes additionally publish them in a GitHub Release.
+To also delete `/var/lib/swarmlite`, including the node database and recovery state, explicitly
+add `--purge`:
 
-The project [Dockerfile](Dockerfile) builds Swarmlite. Gateway nodes automatically pull the
-prebuilt `ghcr.io/gfreezy/swarmlite-caddy:latest` image, which contains Caddy plus the
-Swarmlite storage module. A Docker-compatible runtime is therefore required on deployed nodes;
-Go is needed only when developing or publishing the gateway image itself.
-
-## Commands
-
-```text
-init                 initialize a single-controller cluster
-join                 pull cluster settings and configure another node
-serve                run this node's fixed components
-config get|set       read or update cluster-wide settings
-gateway status|enable|disable
-                     read or update one node's gateway switch
-node label get|set|remove
-                     read or update one node's placement labels
-registry login       store cluster-wide private registry credentials
-deploy               deploy or update a Stack
-ls [STACK]           list cluster Services
-ps TARGET            list tasks for a Stack or Service
-inspect SERVICE      inspect a Service
-logs SERVICE|TASK    stream container logs
-scale SERVICE=N      scale replicated Services
-restart SERVICE      roll a Service
-rm STACK             remove Stacks
-status               inspect cluster state
+```bash
+curl -fsSL https://github.com/gfreezy/swarmlite/releases/latest/download/install.sh \
+  | sudo sh -s -- --uninstall --purge
 ```
 
-There are no separate public `controller`, `agent`, or `gateway` runtime commands.
+Neither form removes Docker, Podman, or managed containers. On macOS, remove only the CLI with:
 
-## Quick start
+```bash
+curl -fsSL https://github.com/gfreezy/swarmlite/releases/latest/download/install.sh \
+  | sh -s -- --uninstall
+```
 
-Initialize and serve the first node:
+## Cluster setup and node management
+
+Commands in this section assume the Linux system installation and therefore use `sudo`. Omit it
+when running Swarmlite in a user-owned data directory for local development.
+
+### Initialize a cluster
+
+Initialize the first node and start the installed service:
+
+```bash
+sudo swarmlite init
+sudo systemctl start swarmlite
+```
+
+The first node has its Gateway enabled by default. Initialize without one when another node will
+provide ingress:
+
+```bash
+sudo swarmlite init --no-gateway
+```
+
+When running directly rather than through systemd, use foreground mode:
 
 ```bash
 swarmlite init
 swarmlite serve
 ```
 
-Those commands show foreground operation. On a Linux server installed with `install.sh`, initialize
-or join the node under `/var/lib/swarmlite` as shown above, then use
-`sudo systemctl enable --now swarmlite` instead of starting `serve` manually.
-
-Every node runs an Agent. The initialized node is permanently the Controller and has its Gateway
-enabled by default. Joined nodes are never Controllers and have their Gateway disabled by default.
-Use `swarmlite init --no-gateway` when the initial node should not expose a Gateway.
-
-`serve` detects Docker or Podman and automatically selects the address used by the operating
-system's default route. Specify an address only when detection cannot choose a reachable one:
+Swarmlite detects Docker or Podman and selects the address used by the operating system's default
+route. When detection cannot choose a reachable address, set it during `init` or `join` so it is
+persisted before the service starts:
 
 ```bash
-swarmlite serve --advertise-address 10.0.0.21
+sudo swarmlite init --advertise-address 10.0.0.21
 ```
 
-The override is persisted. All durable Swarmlite state on a node is stored in one
-`swarmlite.sqlite` database; Swarmlite does not maintain separate local and control-plane database
-files or JSON state files. Agent nodes use only the local-state table, while the controller also
-uses the control-plane, KV object, and KV lock tables. The default data directory is
-`$XDG_STATE_HOME/swarmlite`, or `$HOME/.local/state/swarmlite`.
+### Join nodes
+
+Print a reusable join command on the Controller:
 
 ```bash
-swarmlite --data-dir /var/lib/swarmlite serve
+sudo swarmlite join-token
 ```
 
-Store private registry credentials once on the Controller. The password or access token is read
-only from standard input, persisted in the protected control-plane SQLite state, and synchronized
-to every joined Agent. Agents cache the latest credentials in their protected local SQLite state
-and use them whenever they pull an image.
+Run it on a machine where the installer has already completed:
 
 ```bash
-printf '%s' "$GHCR_TOKEN" | swarmlite registry login ghcr.io \
-  --username github-user --password-stdin
+sudo swarmlite join http://10.0.0.21:8080 --token '<generated-token>'
+sudo systemctl start swarmlite
 ```
 
-The command uses the saved Controller URL and cluster token. When running it away from a joined
-node, pass both connection options explicitly:
+Enable the Gateway while joining when this node should also accept ingress traffic:
 
 ```bash
-printf '%s' "$GHCR_TOKEN" | swarmlite registry login ghcr.io \
-  --username github-user --password-stdin \
-  --controller http://controller.example:8080 --token "$SWARMLITE_TOKEN"
-```
-
-Deploy and inspect a stack using the saved controller URL and token:
-
-```bash
-swarmlite deploy --compose-file examples/stack.yaml demo
-swarmlite ps demo
-swarmlite ls demo
-```
-
-`deploy` waits until every desired replica has been applied by its Agent and reports healthy, and
-obsolete tasks have been removed. An image-pull, container-create, start, remove, or
-runtime-inspection failure is returned with its service, node, task, and execution phase; the
-command exits non-zero. Use `--detach` to return as soon as the Controller has durably accepted the
-desired state.
-
-The CLI waits through the controller's long-poll deployment endpoint rather than polling rapidly.
-Deployments that do not become healthy within five minutes are marked `timed_out`. The controller
-accepts only one non-terminal deployment for a given Stack name. A concurrent deployment of the
-same Stack returns `409 Conflict`; deployments using different Stack names may be submitted
-independently.
-
-All workload commands are cluster-scoped, so the CLI uses flat action commands instead of separate
-Stack and Service namespaces. A Service deployed as `web` in Stack `demo` is addressed as
-`demo.web`:
-
-```bash
-swarmlite ls
-swarmlite ps demo
-swarmlite ps demo.web
-swarmlite inspect demo.web
-swarmlite logs --tail 200 demo.web
-swarmlite logs --follow demo.web
-swarmlite scale demo.web=3
-swarmlite restart demo.web
-swarmlite rm demo
-```
-
-`scale`, `restart`, and `rm` change desired state through the same deployment scheduler as
-`deploy`; they do not stop or remove an arbitrary container behind the scheduler. They wait for
-convergence by default and support `--detach`. `restart` increments the Service revision and
-performs the configured rolling replacement.
-
-Agents keep an independent authenticated long-poll open for data-session control commands. This
-outbound-only control channel lets `logs` reach the assigned node immediately without waiting for
-the next heartbeat or opening a listener on an Agent. Commands contain only small JSON metadata,
-have IDs and acknowledgements, and use a delivery lease so a lost HTTP response can be redelivered.
-
-Bulk data uses a separate WebSocket connection to the same Controller address. The Controller
-issues short-lived, session-scoped tokens to the CLI and each selected node, validates assigned
-stream IDs and frame sequence numbers, and relays bounded binary frames without converting their
-payloads to UTF-8. Closing the CLI connection cancels the Agent streams. Multiple Tasks are
-multiplexed by numeric stream ID; a single raw stream preserves arbitrary bytes. `logs` supports
-snapshots and `--follow`, with `--tail` limited to 10,000 lines and at most 64 selected Tasks.
-Log buffers are bounded throughout the Runtime, Agent, Controller, and CLI. When output is faster
-than the consumer, backpressure pauses upstream reads instead of silently dropping frames. The CLI
-batches writes and normally flushes every 100 ms. A data connection or local output that cannot
-accept data for 30 seconds terminates that log session so a slow consumer cannot retain resources
-indefinitely.
-
-## Join nodes and configure gateways
-
-Print a join command on an initialized node:
-
-```bash
-swarmlite join-token
-```
-
-Run it on another machine, then start the same runtime command:
-
-```bash
-swarmlite join http://10.0.0.21:8080 --token '<generated-token>'
-swarmlite serve
-```
-
-The initialized node is permanently the only Controller. Enable the Gateway while joining a node
-when needed:
-
-```bash
-swarmlite join http://10.0.0.21:8080 \
+sudo swarmlite join http://10.0.0.21:8080 \
   --token '<generated-token>' \
   --gateway
 ```
 
-Read or change the Gateway switch after startup:
+### Manage Gateways
+
+Read or change the Gateway switch after a node has joined:
 
 ```bash
-swarmlite gateway status node-a
-swarmlite gateway enable node-a
-swarmlite gateway disable node-a
+sudo swarmlite gateway status node-a
+sudo swarmlite gateway enable node-a
+sudo swarmlite gateway disable node-a
 ```
 
-The cluster may temporarily have no Gateway. Deploying a Stack with HTTP routes is rejected until
-one is enabled. Moving the Controller requires stopping the entire cluster and initializing a new
-cluster on the replacement node.
+The cluster may temporarily have no Gateway, but deploying a Stack with HTTP routes is rejected
+until at least one is enabled.
 
-## Node labels and placement
+> [!WARNING]
+> Disabling a Gateway deletes its Caddy container and persistent volumes, including its local
+> certificate data. Image, listener, and advertise-address replacements retain those volumes.
 
-Set initial labels while creating or joining a node:
+### Labels and placement
+
+Set initial labels while initializing or joining a node:
 
 ```bash
-swarmlite init --label region=cn-east --label disk=nvme
-swarmlite join http://10.0.0.21:8080 \
+sudo swarmlite init --label region=cn-east --label disk=nvme
+sudo swarmlite join http://10.0.0.21:8080 \
   --token '<generated-token>' \
   --label region=cn-east
 ```
 
-After a node has joined, its labels belong to cluster state. Read or change them through the
-controller:
+After the node has joined, its labels belong to cluster state and are changed through the
+Controller:
 
 ```bash
-swarmlite node label get node-a
-swarmlite node label set node-a region cn-north
-swarmlite node label remove node-a disk
+sudo swarmlite node label get node-a
+sudo swarmlite node label set node-a region cn-north
+sudo swarmlite node label remove node-a disk
 ```
 
-`serve` does not accept labels. A heartbeat cannot add or overwrite labels; it receives the
-authoritative label set from the controller and caches it in the node's local SQLite state.
-Label changes are committed to the controller's SQLite database.
-
-Use the labels with Swarm-style hard placement constraints:
+Use labels with Swarm-style hard placement constraints:
 
 ```yaml
 services:
@@ -300,44 +322,107 @@ services:
           - node.labels.disk == nvme
 ```
 
-When a label change makes a running task violate a hard constraint, Swarmlite stops that task
-through the normal drain/remove flow and schedules its replacement on an eligible live node. If
-no node matches, the service remains under-replicated until one does; constraints are never
-silently ignored.
+When a label change makes a running task violate a constraint, Swarmlite drains that task and
+schedules a replacement on an eligible live node. If no node matches, the service remains
+under-replicated; constraints are never silently ignored.
 
-## Controller lifecycle
+`serve` does not accept label arguments. Agent heartbeats receive the authoritative label set from
+the Controller and cache it in local SQLite state.
 
-The controller identity is immutable for the lifetime of a cluster. Swarmlite has no promotion,
-demotion, election, or automatic failover path. Back up the controller's `swarmlite.sqlite` file.
-To move the controller, stop every node, initialize a new cluster on the replacement controller,
-rejoin the agents with the new token, and redeploy the original Stack files. Existing matching
-workload containers can be adopted through the recovery workflow below.
+### Private registries
 
-## Gateway and HTTPS
-
-A node with its Gateway enabled makes `serve` create or start a separate `swarmlite-gateway`
-container. The
-container has `restart=unless-stopped`; stopping, crashing, or upgrading the Swarmlite process
-does not stop Caddy. The first node is always a gateway and additional gateways are opt-in. The
-controller discovers active gateways and publishes routing configuration automatically. Gateways
-listen on `:80` and `:443` by default, so normal public HTTPS needs no listener configuration.
-Advanced deployments can override the listeners with repeated `--gateway-listen` options at init.
-
-The default gateway image is `ghcr.io/gfreezy/swarmlite-caddy:latest`. Select another
-registry and tag during initialization, or roll the cluster to another image later:
+Store registry credentials once on the Controller. The password or token is read only from
+standard input, saved in the protected control-plane SQLite state, and synchronized to joined
+Agents:
 
 ```bash
-swarmlite init --gateway-image registry.example.com/swarmlite-caddy:1.0.0
-swarmlite config set gateway-image registry.example.com/swarmlite-caddy:1.1.0
+printf '%s' "$GHCR_TOKEN" | sudo swarmlite registry login ghcr.io \
+  --username github-user --password-stdin
 ```
 
-The image reference is replicated as cluster configuration and returned by
-`swarmlite config get`. Every gateway node pulls the new image and recreates its Caddy container
-after receiving the update. The pull completes before the existing container is removed, and
-the `/data` and `/config` volumes are retained.
+When running the command away from a configured node, pass the Controller and cluster token:
 
-Keep `services` compatible with Docker Compose/Swarm and put routing under `x-swarmlite`. Stack
-files do not need a top-level `version`:
+```bash
+printf '%s' "$GHCR_TOKEN" | swarmlite registry login ghcr.io \
+  --username github-user --password-stdin \
+  --controller http://controller.example:8080 --token "$SWARMLITE_TOKEN"
+```
+
+## Deploying and operating Stacks
+
+Deploy or update a Stack from a Compose-style file:
+
+```bash
+sudo swarmlite deploy --compose-file stack.yaml demo
+```
+
+The CLI stores the Controller URL and cluster token in node state, so normal workload commands do
+not need connection flags. All commands are cluster-scoped and use flat action names:
+
+```bash
+sudo swarmlite ls
+sudo swarmlite ls demo
+sudo swarmlite ps demo
+sudo swarmlite ps demo.web
+sudo swarmlite inspect demo.web
+sudo swarmlite logs --tail 200 demo.web
+sudo swarmlite logs --follow demo.web
+sudo swarmlite scale demo.web=3
+sudo swarmlite restart demo.web
+sudo swarmlite rm demo
+```
+
+`scale`, `restart`, and `rm` use the same deployment scheduler as `deploy`. They wait for
+convergence by default and support `--detach`. `restart` increments the Service revision and
+performs the configured rolling replacement.
+
+### Deployment behavior
+
+`deploy` waits until every desired replica has been applied by its Agent and is healthy, and until
+obsolete tasks have been removed. Runtime failures include their service, node, task, and execution
+phase, and make the command exit non-zero.
+
+Deployments that do not become healthy within five minutes are marked `timed_out`. The Controller
+accepts only one active deployment for a given Stack name; a concurrent update to the same Stack
+returns `409 Conflict`. Different Stacks may deploy independently.
+
+During rolling updates, old healthy tasks remain routable until replacements are healthy and all
+active Gateways acknowledge the new routing configuration.
+
+<details>
+<summary>How log streaming works</summary>
+
+Agents maintain an authenticated outbound long-poll for data-session control commands, so they do
+not need an inbound listener. Bulk data uses a separate WebSocket connection to the Controller.
+The Controller issues short-lived, session-scoped tokens and relays bounded binary frames without
+converting payloads to UTF-8.
+
+Multiple tasks are multiplexed by stream ID. `logs` supports snapshots and `--follow`, limits
+`--tail` to 10,000 lines, and selects at most 64 tasks. Buffers are bounded across the Runtime,
+Agent, Controller, and CLI. Backpressure pauses upstream reads instead of silently dropping data;
+a connection or local output blocked for 30 seconds terminates that log session.
+
+</details>
+
+## Stack files and HTTPS routing
+
+Stack files keep services compatible with Docker Compose/Swarm and place Swarmlite routing under
+`x-swarmlite`. A top-level `version` is not required.
+
+VS Code and YAML Language Server completion is available through
+[`stack.schema.json`](https://raw.githubusercontent.com/gfreezy/swarmlite/main/crates/swarmlite-stack/schema/stack.schema.json).
+Associate a file with the schema using:
+
+```yaml
+# yaml-language-server: $schema=https://raw.githubusercontent.com/gfreezy/swarmlite/main/crates/swarmlite-stack/schema/stack.schema.json
+```
+
+See [`examples/services-all.yaml`](examples/services-all.yaml) for accepted Service fields and
+[`examples/routing-all.yaml`](examples/routing-all.yaml) for complete routing examples.
+
+### Publish HTTP and HTTPS routes
+
+Gateway nodes listen on `:80` and `:443` by default. A basic internal route looks like this:
 
 ```yaml
 services:
@@ -357,176 +442,204 @@ x-swarmlite:
           backend:
             service: api
             port: 8080
-
-        - matches:
-            - path: /openai
-              type: prefix
-              ignore_case: true
-          rewrite:
-            replace_prefix: /
-          backend:
-            host: api.openai.com
-            port: 443
-            protocol: https
-            preserve_host: false
 ```
 
-`backend.service` references a service in the same Stack and is checked locally during deployment,
-without an external validation service or network request. Swarmlite allocates the required task
-port automatically. `backend.host` targets an external DNS name or IP. Both variants support
-`preserve_host`, and `protocol` is `http`, `https`, or `h2c`.
+`backend.service` references a Service in the same Stack, and Swarmlite allocates its task port.
+`backend.host` routes to an external DNS name or IP. Both support `preserve_host`; `protocol` may
+be `http`, `https`, or `h2c`.
 
-Path matches support `exact`, `prefix` (the default), and RE2-compatible `regex`; `ignore_case`
-defaults to `false`. Rewrites support exactly one of `strip_prefix`, `replace_prefix`, or
-`replace_path`. Multiple match entries in one rule are OR, while a rule without `matches` is the
-hostname fallback. Matching precedence is exact, longest prefix, regex, then fallback.
+Path matches support `exact`, `prefix` (the default), and RE2-compatible `regex`. Rewrites support
+exactly one of `strip_prefix`, `replace_prefix`, or `replace_path`. Multiple matches in one rule
+are OR conditions. A rule without matches is the hostname fallback. Precedence is exact, longest
+prefix, regex, then fallback.
 
-`tls` is `serve|disabled`; `http` is `redirect|serve|disabled`. Each route may override the
-top-level defaults. `http: redirect` requires `tls: serve`. See the complete example at
-[examples/routing-all.yaml](examples/routing-all.yaml).
+`tls` is `serve|disabled`, and `http` is `redirect|serve|disabled`. Each route may override the
+top-level defaults. `http: redirect` requires `tls: serve`.
 
-VS Code/YAML Language Server completion is available from
-[crates/swarmlite-stack/schema/stack.schema.json](crates/swarmlite-stack/schema/stack.schema.json).
-The Schema enumerates every supported `services` field and rejects unsupported keys; see
-[examples/services-all.yaml](examples/services-all.yaml) for all accepted service forms.
-Add this first line to a Stack file if it is not already associated in editor settings:
+### Gateway image and listeners
 
-```yaml
-# yaml-language-server: $schema=./crates/swarmlite-stack/schema/stack.schema.json
+The default image is `ghcr.io/gfreezy/swarmlite-caddy:latest`. Choose another image during
+initialization or roll all Gateways later:
+
+```bash
+sudo swarmlite init --gateway-image registry.example.com/swarmlite-caddy:1.0.0
+sudo swarmlite config set gateway-image registry.example.com/swarmlite-caddy:1.1.0
+sudo swarmlite config get
 ```
 
-The complete Stack parser, service model, routing validation, precedence, and Caddy JSON renderer
-live in the independent `swarmlite-stack` crate. The main orchestrator only persists normalized
-service specs and resolves internal service references to healthy task addresses.
+Every Gateway pulls the updated image before replacing its Caddy container. Its `/data` and
+`/config` volumes are retained. Advanced installations can override the default listeners with
+repeated `--gateway-listen` options during `init`. Custom images must contain
+`caddy.storage.swarmlite`; see [`caddy-storage/README.md`](caddy-storage/README.md).
 
-Caddy keeps certificates in a cluster-specific Docker volume mounted at `/data`, and the last
-accepted runtime configuration in another volume mounted at `/config`. It starts with `--resume`,
-so it can restore the last routes even when the controller is unavailable. Total loss of
-Swarmlite data does not remove either volume.
+<details>
+<summary>Gateway persistence and certificate coordination</summary>
 
-The gateway image includes and automatically enables `caddy.storage.swarmlite`. Local
-`FileStorage` remains authoritative, while certificate objects are copied to the generic KV API
-and certificate issuance uses its distributed locks. This normally lets additional gateway nodes
-reuse an existing certificate instead of applying for another one. The controller keeps its fixed
-URL current in the heartbeat-delivered Gateway configuration; the cluster token is supplied only
-through the container environment and only its SHA-256 fingerprint is stored in a recovery label.
+Caddy stores certificates in a cluster-specific volume mounted at `/data` and its last accepted
+configuration in a volume mounted at `/config`. It starts with `--resume`, so existing routes can
+survive temporary Controller unavailability.
 
-If Swarmlite or its KV state is unavailable, Caddy immediately falls back to its
-local certificate data and local lock. Existing HTTPS traffic continues; gateways may apply for
-duplicate certificates until coordination returns.
+The gateway image enables `caddy.storage.swarmlite`. Local Caddy storage remains authoritative,
+while certificate objects are copied to the Controller KV API and certificate issuance uses
+distributed locks. Additional Gateways can normally reuse an existing certificate. If the KV API
+is unavailable, Caddy falls back immediately to local certificate data and local locks; existing
+HTTPS traffic continues, though Gateways may request duplicate certificates until coordination
+returns.
 
-The gateway admin API listens inside the container on `0.0.0.0:2019`, but host port 2019 is
-published only on `127.0.0.1`. The local Swarmlite node atomically loads the complete Caddy
-configuration received in its heartbeat response and reports the applied generation to the
-controller. The generation changes only when the rendered Caddy configuration changes. Gateway
-traffic ports are published on all host interfaces.
+The Caddy admin API is reachable on host address `127.0.0.1:2019`; traffic ports are published on
+all host interfaces. Each node atomically loads the complete configuration and reports its applied
+generation to the Controller.
 
-Disabling the Gateway intentionally stops the container and deletes both its container and
-persistent volumes. Enabling it again therefore starts with empty Caddy data. Container
-replacement caused by an image, listener, or advertise-address change retains the volumes. Any
-configured image must contain `caddy.storage.swarmlite`. See
-[caddy-storage/README.md](caddy-storage/README.md).
+</details>
 
-During rolling updates, old healthy tasks remain routable until replacements are healthy and all
-active gateways acknowledge the new routing configuration.
+## Persistence, backup, and recovery
 
-## Generic KV service
+Each node stores durable state in one `swarmlite.sqlite` database. The Linux installer places it at
+`/var/lib/swarmlite/swarmlite.sqlite`; foreground user mode defaults to
+`$XDG_STATE_HOME/swarmlite` or `$HOME/.local/state/swarmlite`.
 
-The authenticated controller KV API has no Caddy, certificate, or TLS semantics. Integrations
-choose their own keys and values. Values are opaque base64 data and mutations use last-write-wins
-ordering from the single controller's SQLite transaction sequence.
+Agent nodes use local-state tables. The Controller database also stores cluster settings, member
+Gateway switches and labels, Stacks, deployment outcomes, normalized Service specifications,
+desired task assignments, allocated ports, drain deadlines, registry credentials, and KV data.
+Heartbeat liveness and observed runtime state are rebuilt from Agents.
+
+### Back up the Controller
+
+Back up the Controller's `swarmlite.sqlite` file and keep the original Stack files separately. The
+Controller is a single point of control-plane availability and cannot move in place.
+
+To intentionally replace it, stop every node, initialize a new cluster on the replacement machine,
+rejoin Agents with the new token, and redeploy the original Stack files.
+
+### Recover after control-plane loss
+
+Stop every old `swarmlite serve` process. On a machine that still has local cluster state or
+managed containers, run:
+
+```bash
+sudo systemctl stop swarmlite
+sudo swarmlite init --recover
+sudo systemctl start swarmlite
+```
+
+Recovery detects the previous cluster ID, archives stale state under `recovery-backup/`, rebuilds a
+single-controller control plane, and rotates the join token. It never deletes or changes a
+container. Legacy `local.redb`, Raft, and split SQLite state are archived as well. Print the new
+join command, rejoin the other nodes, and redeploy the same Stack names and files:
+
+```bash
+sudo swarmlite join-token
+sudo swarmlite deploy --compose-file stack.yaml demo
+```
+
+Matching containers are adopted using their cluster, Stack, Service, slot, normalized spec hash,
+ports, and Service revision. Matching stopped containers start in place; old or unmatched
+containers remain unclaimed. Inspect `recovery.awaiting_adoption` and
+`recovery.conflicting_slots` with:
+
+```bash
+sudo swarmlite status
+```
+
+<details>
+<summary>Container identity retained for extreme recovery</summary>
+
+Managed workload containers retain labels for cluster, task, Stack, Service, slot, revision,
+normalized spec hash, and published ports. They do not contain the full Stack definition.
+
+The independent Gateway container carries stable cluster and component identity, advertise
+address, image, listener, schema, and token-fingerprint labels. It never stores the token itself.
+These labels allow recovery to identify a cluster and restore Gateway settings even when Caddy is
+the only managed container left.
+
+Recovery first restores the highest valid Service revision, then adopts only containers at that
+revision. This allows an interrupted rolling update to complete without immediately replacing a
+newer replica with an older one.
+
+</details>
+
+## Runtime, networking, and security
+
+Detected sockets include Docker, OrbStack, rootful Podman, and rootless Podman. Override detection
+when necessary:
+
+```bash
+swarmlite serve --runtime podman --runtime-socket /run/podman/podman.sock
+```
+
+Every Agent requires access to its runtime socket. Treat that access as equivalent to root
+privileges. The Controller API uses HTTP, so deploy it on a trusted private network or terminate
+TLS in front of it.
+
+The advertised node address must be reachable by other nodes and Gateways. Swarmlite does not
+provide firewall rules, NAT traversal, an overlay network, or cross-node DNS.
+
+## Generic KV API
+
+The authenticated Controller KV API stores opaque base64 values with last-write-wins ordering from
+the single Controller's SQLite transaction sequence. It has no built-in Caddy, certificate, or TLS
+semantics.
+
+Available endpoints are:
 
 - `GET`, `PUT`, and `DELETE /v1/kv`
 - `GET /v1/kv/keys`
 - `GET /v1/kv/stat`
 - `POST /v1/kv/locks/{acquire,renew,release}`
 
-Consumers that treat it as an optional cache should continue locally when it is unavailable.
-Request and response bodies are documented in [docs/kv-api.md](docs/kv-api.md).
+Optional-cache consumers should continue locally when it is unavailable. Request and response
+formats are documented in [`docs/kv-api.md`](docs/kv-api.md).
 
-## Persistence and extreme recovery
+## Command reference
 
-On the controller, `swarmlite.sqlite` persists local node settings together with cluster settings,
-member Gateway switches and labels, stacks, deployment outcomes and errors, service
-specifications, desired task assignments, ports, drain deadlines, and dedicated KV object and lock
-tables. KV writes do not advance the orchestration generation. Heartbeat liveness, resources,
-per-task applied generations, and observed container state are rebuilt from agent heartbeats.
+Run `swarmlite COMMAND --help` for complete arguments.
 
-Every managed workload container carries the minimal labels needed to collect it after total
-control-plane loss: cluster, task, stack, service, slot, revision, normalized spec hash, and
-published ports. The labels do not contain the full stack. Keep the original stack file
-separately.
-
-The independent Caddy container is also recoverable, but is deliberately not labeled as a task.
-It carries these labels:
-
-- `io.swarmlite.managed=true`
-- the stable `io.swarmlite.cluster_id`
-- `io.swarmlite.system=true` and `io.swarmlite.component=gateway`
-- `io.swarmlite.advertise_address`
-- `io.swarmlite.gateway_image`, `io.swarmlite.gateway_listen`, and
-  `io.swarmlite.gateway_schema`
-- `io.swarmlite.gateway_token_sha256`, never the token itself
-
-They let recovery identify the cluster, restore the Gateway switch and listener settings, and keep
-using the existing Caddy image without mistaking the container for a stack service.
-
-Stop every old `swarmlite serve`, then rebuild the control plane on a machine that still has local
-cluster state or managed containers:
-
-```bash
-swarmlite init --recover
-swarmlite serve
+```text
+init                 initialize a single-controller cluster
+join                 configure another node from cluster settings
+join-token           print the generated join command
+serve                run this node's fixed components
+config get|set       read or update cluster-wide settings
+gateway status|enable|disable
+                     read or update one node's Gateway switch
+node label get|set|remove
+                     read or update one node's placement labels
+registry login       store private registry credentials
+deploy               deploy or update a Stack
+ls [STACK]           list Services
+ps TARGET            list tasks for a Stack or Service
+inspect SERVICE      inspect a Service
+logs SERVICE|TASK    stream container logs
+scale SERVICE=N      scale replicated Services
+restart SERVICE      roll a Service
+rm STACK             remove Stacks
+status               inspect cluster state
 ```
 
-Recovery detects the old cluster ID, including when Caddy is the only remaining managed
-container, archives stale SQLite state under `recovery-backup/`, creates a fresh single-controller
-control plane, and rotates the join token. Legacy `local.redb` and Raft data are archived too. It
-never deletes or changes a container.
-On another recovered node, join detects the labeled local Caddy container and restores its Gateway
-switch automatically. Rejoin and serve other nodes using the new
-token, then deploy the same stack name and file:
-
-```bash
-swarmlite deploy --compose-file stack.yaml demo
-```
-
-Matching containers are adopted by cluster ID, stack, service, slot, spec hash, ports, and Service
-revision. A newly recovered Service first restores the highest valid revision among its eligible
-containers, then adopts only containers at that revision. This completes an interrupted rolling
-update instead of adopting an older replica and replacing it immediately. Running containers stay
-running; matching stopped containers are started in place. Older revisions and other unmatched
-containers remain unclaimed. `swarmlite status` reports `recovery.awaiting_adoption` and
-`recovery.conflicting_slots`.
-
-## Runtime and networking
-
-Detected runtime sockets include Docker, OrbStack, Podman, and rootless Podman. Override
-detection when necessary:
-
-```bash
-swarmlite serve --runtime podman --runtime-socket /run/podman/podman.sock
-```
-
-Every served node runs the agent, so runtime socket access is required everywhere and is
-equivalent to root privileges. There is no cross-node container network. The controller allocates
-host ports and gateways connect to `node-advertise-address:allocated-host-port`.
+There are no separate public `controller`, `agent`, or `gateway` runtime commands.
 
 ## Current limitations
 
-- Linux Docker and Podman nodes are the intended targets.
-- No overlay networking, service VIP, routing mesh, or cross-node DNS.
-- Only replicated services are supported; `deploy.mode: global` is rejected.
-- No Compose `build`, `configs`, `secrets`, resource reservations, or autoscaling.
+- Linux Docker and Podman nodes are the intended production targets.
+- The Controller is a single point of control-plane availability and cannot change in place.
+- There is no overlay network, service VIP, routing mesh, or cross-node DNS.
+- Only replicated Services are supported; `deploy.mode: global` is rejected.
+- Compose `build`, `configs`, `secrets`, resource reservations, and autoscaling are not supported.
 - Named volumes and bind mounts remain node-local.
-- `stats` and interactive `exec` are not implemented yet; the binary data-session transport is
-  designed for them.
-- Gateway routing intentionally supports the documented host/path/rewrite/backend model, not
-  arbitrary Caddy handlers.
-- The controller API is HTTP; use a trusted private network or terminate TLS in front of it.
-- The controller is a single point of control-plane availability and cannot be changed in place.
+- `stats` and interactive `exec` are not implemented yet.
+- Gateway routing supports the documented host/path/rewrite/backend model, not arbitrary Caddy
+  handlers.
+- The Controller API is HTTP and should remain on a trusted network or behind TLS termination.
 
-## Test
+## Development
+
+Rust 1.97 or newer is required:
+
+```bash
+cargo build --release --locked
+```
+
+Run the project checks with:
 
 ```bash
 cargo fmt --all --check
@@ -534,3 +647,11 @@ cargo test --locked
 cargo clippy --all-targets --all-features -- -D warnings
 (cd caddy-storage && go test ./...)
 ```
+
+The project [`Dockerfile`](Dockerfile) builds Swarmlite. Gateway nodes pull the prebuilt
+`ghcr.io/gfreezy/swarmlite-caddy:latest` image, so Go is required only when developing or
+publishing the Gateway image.
+
+GitHub Actions builds release archives and SHA-256 checksums for Linux AMD64, Linux ARM64, and
+macOS ARM64. Tag pushes publish those artifacts together with the installer and systemd unit in a
+GitHub Release.

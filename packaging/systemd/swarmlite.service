@@ -3,12 +3,13 @@ Description=Swarmlite node service
 Documentation=https://github.com/gfreezy/swarmlite
 Wants=network-online.target
 After=network-online.target docker.service podman.socket
+ConditionPathExists=/var/lib/swarmlite/swarmlite.sqlite
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 EnvironmentFile=/etc/swarmlite/runtime.env
-ExecStart=/usr/local/bin/swarmlite --data-dir /var/lib/swarmlite serve --runtime ${SWARMLITE_RUNTIME} --runtime-socket ${SWARMLITE_RUNTIME_SOCKET}
+ExecStart=/usr/local/bin/swarmlite serve
 Restart=always
 RestartSec=5s
 KillSignal=SIGINT

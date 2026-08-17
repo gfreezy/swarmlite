@@ -7,8 +7,12 @@ requested_runtime="${SWARMLITE_RUNTIME:-auto}"
 requested_version="${SWARMLITE_VERSION:-latest}"
 install_dir="/usr/local/bin"
 data_dir="/var/lib/swarmlite"
+config_dir="/etc/swarmlite"
 runtime_config="/etc/swarmlite/runtime.env"
 service_path="/etc/systemd/system/swarmlite.service"
+action="install"
+purge_data="false"
+install_option_used="false"
 
 log() {
     printf '%s\n' "swarmlite installer: $*"
@@ -21,18 +25,24 @@ fail() {
 
 usage() {
     cat <<'EOF'
-Install Swarmlite and its platform integration.
+Install or uninstall Swarmlite and its platform integration.
 
 Usage:
   install.sh [--runtime auto|docker|podman] [--version VERSION]
+  install.sh --uninstall [--purge]
 
 Defaults:
   --runtime auto    Reuse the previous or installed runtime; install Docker if none exists.
   --version latest  Install assets from the latest GitHub Release.
 
+Uninstall:
+  --uninstall       Stop Swarmlite and remove its service, CLI, and installed configuration.
+  --purge           Also delete /var/lib/swarmlite (Linux only; requires --uninstall).
+
 Linux installs a container runtime when necessary and configures systemd. macOS requires an
 accessible Docker-compatible Unix socket, recommends OrbStack when none exists, and installs only
-the CLI.
+the CLI. Uninstalling never removes Docker, Podman, or managed containers. Node data is preserved
+unless --purge is explicitly supplied.
 EOF
 }
 
@@ -41,12 +51,22 @@ while [ "$#" -gt 0 ]; do
         --runtime)
             [ "$#" -ge 2 ] || fail "--runtime requires a value"
             requested_runtime="$2"
+            install_option_used="true"
             shift 2
             ;;
         --version)
             [ "$#" -ge 2 ] || fail "--version requires a value"
             requested_version="$2"
+            install_option_used="true"
             shift 2
+            ;;
+        --uninstall)
+            action="uninstall"
+            shift
+            ;;
+        --purge)
+            purge_data="true"
+            shift
             ;;
         -h|--help)
             usage
@@ -57,6 +77,61 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
+
+[ "$purge_data" = "false" ] || [ "$action" = "uninstall" ] || \
+    fail "--purge requires --uninstall"
+[ "$action" = "install" ] || [ "$install_option_used" = "false" ] || \
+    fail "--uninstall cannot be combined with --runtime or --version"
+
+if [ "$action" = "uninstall" ]; then
+    host_os="$(uname -s)"
+    case "$host_os" in
+        Linux)
+            [ "$(id -u)" -eq 0 ] || fail "run the Linux uninstaller as root, for example: curl ... | sudo sh -s -- --uninstall"
+            command -v systemctl >/dev/null 2>&1 || fail "systemctl is required on Linux"
+            [ -d /run/systemd/system ] || fail "systemd is not running"
+
+            if [ -e "$service_path" ] || systemctl cat swarmlite.service >/dev/null 2>&1; then
+                log "stopping and disabling the Swarmlite service"
+                systemctl disable --now swarmlite.service
+            fi
+            rm -f -- "$service_path" "$install_dir/swarmlite" "$runtime_config"
+            rmdir "$config_dir" 2>/dev/null || :
+            systemctl daemon-reload
+            systemctl reset-failed swarmlite.service >/dev/null 2>&1 || :
+
+            if [ "$purge_data" = "true" ]; then
+                case "$data_dir" in
+                    /var/lib/swarmlite)
+                        rm -rf -- "$data_dir"
+                        log "deleted node data at $data_dir"
+                        ;;
+                    *) fail "refusing to purge unexpected data directory: $data_dir" ;;
+                esac
+            elif [ -e "$data_dir" ]; then
+                log "preserved node data at $data_dir; use --uninstall --purge to delete it"
+            fi
+            log "uninstallation complete; Docker/Podman and managed containers were not removed"
+            ;;
+        Darwin)
+            [ "$purge_data" = "false" ] || fail "--purge is only supported by the Linux uninstaller"
+            if [ -e "$install_dir/swarmlite" ] || [ -L "$install_dir/swarmlite" ]; then
+                log "removing the Swarmlite CLI"
+                if [ -w "$install_dir" ]; then
+                    rm -f -- "$install_dir/swarmlite"
+                else
+                    command -v sudo >/dev/null 2>&1 || fail "sudo is required to remove $install_dir/swarmlite"
+                    sudo rm -f -- "$install_dir/swarmlite"
+                fi
+            fi
+            log "uninstallation complete; local node data and managed containers were not removed"
+            ;;
+        *)
+            fail "unsupported operating system: $host_os"
+            ;;
+    esac
+    exit 0
+fi
 
 case "$requested_runtime" in
     auto|docker|podman) ;;
@@ -319,28 +394,27 @@ log "installing the Swarmlite CLI"
 install -d -m 0755 "$install_dir"
 install -m 0755 "$install_tmp/swarmlite" "$install_dir/swarmlite"
 install -d -m 0700 "$data_dir"
-install -d -m 0755 /etc/swarmlite
+install -d -m 0755 "$config_dir"
 cat > "$runtime_config" <<EOF
 # Managed by the Swarmlite installer.
+SWARMLITE_DATA_DIR=$data_dir
 SWARMLITE_RUNTIME=$selected_runtime
 SWARMLITE_RUNTIME_SOCKET=$runtime_socket
 EOF
 chmod 0644 "$runtime_config"
 install -m 0644 "$install_tmp/swarmlite.service" "$service_path"
 systemctl daemon-reload
+systemctl enable swarmlite.service
 
 if [ -f "$data_dir/swarmlite.sqlite" ]; then
-    log "existing node state found; enabling and restarting Swarmlite"
-    systemctl enable swarmlite.service
+    log "existing node state found; restarting Swarmlite"
     systemctl restart swarmlite.service
 elif [ -f "$data_dir/local.sqlite" ] || [ -f "$data_dir/control-plane.sqlite" ] || [ -f "$data_dir/local.redb" ] || [ -d "$data_dir/raft" ]; then
     log "legacy SQLite/Raft/redb state found; stop the old cluster and run 'swarmlite init --recover'"
 else
     log "installation complete; runtime: $selected_runtime"
     printf '\n%s\n' "Initialize or join this node, then start the service:"
-    printf '  sudo swarmlite --data-dir %s init --runtime %s --runtime-socket %s\n' \
-        "$data_dir" "$selected_runtime" "$runtime_socket"
-    printf '  # or: sudo swarmlite --data-dir %s join <controller-url> --token <token> --runtime %s --runtime-socket %s\n' \
-        "$data_dir" "$selected_runtime" "$runtime_socket"
-    printf '  sudo systemctl enable --now swarmlite\n'
+    printf '  sudo swarmlite init\n'
+    printf '  # or: sudo swarmlite join <controller-url> --token <token>\n'
+    printf '  sudo systemctl start swarmlite\n'
 fi
