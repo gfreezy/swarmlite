@@ -311,8 +311,14 @@ fn explicit_ports_available(state: &ClusterState, node: &NodeRecord, spec: &Serv
     let used = used_ports(state, &node.id);
     spec.ports
         .iter()
-        .filter_map(|port| port.published)
-        .all(|port| !used.contains(&port))
+        .filter_map(|port| {
+            port.published
+                .map(|published| (published, port.protocol.as_str()))
+        })
+        .all(|(published, protocol)| {
+            used.get(protocol)
+                .is_none_or(|ports| !ports.contains(&published))
+        })
 }
 
 fn allocate_ports(
@@ -338,15 +344,22 @@ fn allocate_ports(
     let mut result = Vec::with_capacity(requested.len());
     for port in requested {
         let published = if let Some(published) = port.published {
-            if used.contains(&published) {
+            if used
+                .get(&port.protocol)
+                .is_some_and(|ports| ports.contains(&published))
+            {
                 return None;
             }
             published
         } else {
-            (node.port_range_start..=node.port_range_end)
-                .find(|candidate| !used.contains(candidate))?
+            (node.port_range_start..=node.port_range_end).find(|candidate| {
+                used.get(&port.protocol)
+                    .is_none_or(|ports| !ports.contains(candidate))
+            })?
         };
-        used.insert(published);
+        used.entry(port.protocol.clone())
+            .or_default()
+            .insert(published);
         result.push(PortBinding {
             target: port.target,
             published,
@@ -356,8 +369,12 @@ fn allocate_ports(
     Some(result)
 }
 
-fn used_ports(state: &ClusterState, node_id: &str) -> BTreeSet<u16> {
-    state
+fn used_ports(
+    state: &ClusterState,
+    node_id: &str,
+) -> std::collections::BTreeMap<String, BTreeSet<u16>> {
+    let mut used = std::collections::BTreeMap::<String, BTreeSet<u16>>::new();
+    for port in state
         .tasks
         .values()
         .filter(|task| {
@@ -367,8 +384,13 @@ fn used_ports(state: &ClusterState, node_id: &str) -> BTreeSet<u16> {
                     ObservedTaskState::Failed | ObservedTaskState::Lost
                 )
         })
-        .flat_map(|task| task.ports.iter().map(|port| port.published))
-        .collect()
+        .flat_map(|task| &task.ports)
+    {
+        used.entry(port.protocol.clone())
+            .or_default()
+            .insert(port.published);
+    }
+    used
 }
 
 #[cfg(test)]
@@ -652,6 +674,74 @@ mod tests {
         let binding = &state.tasks.values().next().unwrap().ports[0];
         assert_eq!(binding.target, 8080);
         assert!((20_000..=20_010).contains(&binding.published));
+    }
+
+    #[test]
+    fn allows_tcp_and_udp_to_share_a_published_port() {
+        let (mut state, mut live) = state_with_nodes();
+        state.nodes.remove("node-b");
+        live.remove("node-b");
+
+        let mut tcp = service(1, 1);
+        tcp.id = "demo.tcp".into();
+        tcp.name = "tcp".into();
+        tcp.spec.ports[0] = ServicePort {
+            target: 8080,
+            published: Some(20_000),
+            protocol: "tcp".into(),
+        };
+        let mut udp = service(1, 1);
+        udp.id = "demo.udp".into();
+        udp.name = "udp".into();
+        udp.spec.ports[0] = ServicePort {
+            target: 8080,
+            published: Some(20_000),
+            protocol: "udp".into(),
+        };
+        state.services.insert(tcp.id.clone(), tcp);
+        state.services.insert(udp.id.clone(), udp);
+
+        assert!(reconcile(&mut state, &live));
+        assert_eq!(state.tasks.len(), 2);
+        assert!(
+            state
+                .tasks
+                .values()
+                .all(|task| { task.ports.len() == 1 && task.ports[0].published == 20_000 })
+        );
+        assert_eq!(
+            state
+                .tasks
+                .values()
+                .map(|task| task.ports[0].protocol.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["tcp", "udp"])
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_published_port_for_the_same_protocol() {
+        let (mut state, mut live) = state_with_nodes();
+        state.nodes.remove("node-b");
+        live.remove("node-b");
+
+        let mut first = service(1, 1);
+        first.id = "demo.first".into();
+        first.name = "first".into();
+        first.spec.ports[0].published = Some(20_000);
+        let mut second = service(1, 1);
+        second.id = "demo.second".into();
+        second.name = "second".into();
+        second.spec.ports[0].published = Some(20_000);
+        state.services.insert(first.id.clone(), first);
+        state.services.insert(second.id.clone(), second);
+
+        assert!(reconcile(&mut state, &live));
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(
+            state.tasks.values().next().unwrap().ports[0].protocol,
+            "tcp"
+        );
     }
 
     fn route_service(state: &mut ClusterState, service: &str, port: u16) {
