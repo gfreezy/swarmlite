@@ -16,6 +16,7 @@ use swarmlite::{
 use tokio::io::AsyncReadExt;
 
 mod cluster_cli;
+mod upgrade;
 
 #[derive(Debug, Parser)]
 #[command(name = "swarmlite", version, about)]
@@ -64,6 +65,12 @@ enum Command {
     },
     /// Print a join command for this node's cluster.
     JoinToken,
+    /// Upgrade Swarmlite using an official GitHub Release.
+    Upgrade {
+        /// Release to install, such as v0.2.0.
+        #[arg(long, default_value = "latest", value_parser = upgrade::validate_version)]
+        version: String,
+    },
     /// Read or update cluster-wide configuration.
     Config {
         #[command(subcommand)]
@@ -282,6 +289,9 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if let Command::Upgrade { version } = &cli.command {
+        return upgrade::run(version).await;
+    }
     let installed = InstalledNodeConfig::load_if_exists(SYSTEM_CONFIG_PATH)?;
     let data_dir = node::resolve_data_dir(cli.data_dir.or_else(|| installed.data_dir.clone()))?;
     match cli.command {
@@ -359,6 +369,7 @@ async fn main() -> Result<()> {
             println!("{}", node::join_command(&data_dir).await?);
             Ok(())
         }
+        Command::Upgrade { .. } => unreachable!("upgrade returned before loading node state"),
         Command::Config { action } => {
             let (connection, update) = match action {
                 ConfigCommand::Get { connection } => (connection, None),
@@ -734,6 +745,7 @@ mod tests {
         assert!(names.contains(&"init"));
         assert!(names.contains(&"join"));
         assert!(names.contains(&"serve"));
+        assert!(names.contains(&"upgrade"));
         assert!(names.contains(&"config"));
         assert!(names.contains(&"gateway"));
         assert!(names.contains(&"node"));
@@ -748,6 +760,22 @@ mod tests {
         assert!(!names.contains(&"role"));
         assert!(!names.contains(&"controller"));
         assert!(!names.contains(&"agent"));
+    }
+
+    #[test]
+    fn upgrade_defaults_to_latest_and_accepts_a_pinned_version() {
+        let cli = Cli::try_parse_from(["swarmlite", "upgrade"]).unwrap();
+        let Command::Upgrade { version } = cli.command else {
+            panic!("expected upgrade command");
+        };
+        assert_eq!(version, "latest");
+
+        let cli = Cli::try_parse_from(["swarmlite", "upgrade", "--version", "v0.2.0"]).unwrap();
+        let Command::Upgrade { version } = cli.command else {
+            panic!("expected upgrade command");
+        };
+        assert_eq!(version, "v0.2.0");
+        assert!(Cli::try_parse_from(["swarmlite", "upgrade", "--version", "../latest"]).is_err());
     }
 
     #[test]

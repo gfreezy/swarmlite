@@ -174,6 +174,19 @@ sudo systemctl status swarmlite
 sudo journalctl -u swarmlite -f
 ```
 
+Upgrade to the latest release using the same installer and checksum verification flow. On Linux,
+run the command as root so it can update the systemd unit and restart an existing node:
+
+```bash
+sudo swarmlite upgrade
+```
+
+Install a specific release when needed:
+
+```bash
+sudo swarmlite upgrade --version v0.2.0
+```
+
 ### macOS ARM64 CLI
 
 The macOS installer installs only the CLI. It requires Apple silicon and an accessible
@@ -624,6 +637,7 @@ Run `swarmlite COMMAND --help` for complete arguments.
 init                 initialize a single-controller cluster
 join                 configure another node from cluster settings
 join-token           print the generated join command
+upgrade              install the latest or a selected GitHub Release
 serve                run this node's fixed components
 config get|set       read or update cluster-wide settings
 gateway status|enable|disable
