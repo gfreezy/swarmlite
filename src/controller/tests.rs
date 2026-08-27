@@ -4,7 +4,10 @@ use std::collections::BTreeMap;
 use swarmlite_stack::{ParsedStack, parse_stack};
 
 use crate::{
-    config::{DEFAULT_DEPLOYMENT_TIMEOUT_SECONDS, DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS},
+    config::{
+        DEFAULT_CONTROLLER_PORT, DEFAULT_DEPLOYMENT_TIMEOUT_SECONDS,
+        DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS,
+    },
     model::{
         CLUSTER_SCHEMA_VERSION, ClusterGatewayConfig, KvLockStatus, NodeRecord, PortBinding,
         ServicePort, ServiceSpec, StackGatewaySpec, TaskRecord, TaskReport,
@@ -18,7 +21,7 @@ fn test_cluster(id: &str) -> ClusterSettings {
         schema_version: CLUSTER_SCHEMA_VERSION,
         cluster_id: id.into(),
         controller_id: "controller-a".into(),
-        controller_port: 8080,
+        controller_port: DEFAULT_CONTROLLER_PORT,
         gateway: ClusterGatewayConfig::default(),
     }
 }
@@ -28,7 +31,7 @@ fn test_controller_config(cluster: &ClusterSettings) -> ControllerConfig {
         gateway_enabled: true,
         labels: BTreeMap::new(),
         listen: "127.0.0.1:0".parse().unwrap(),
-        advertise_url: "http://10.0.0.10:8080".into(),
+        advertise_url: "http://10.0.0.10:17080".into(),
         node_timeout_seconds: 20,
         reconcile_interval_seconds: 1,
         gateway_drain_timeout_seconds: DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS,
@@ -771,7 +774,7 @@ async fn caddy_acknowledgement_starts_drain_deadline() {
         .unwrap();
     assert_eq!(
         desired.config["storage"]["controller"],
-        "http://10.0.0.10:8080"
+        "http://10.0.0.10:17080"
     );
     assert!(desired.config["storage"].get("controllers").is_none());
     assert_eq!(

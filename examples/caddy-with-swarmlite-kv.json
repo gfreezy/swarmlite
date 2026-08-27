@@ -7,7 +7,7 @@
   },
   "storage": {
     "module": "swarmlite",
-    "controller": "http://10.0.0.21:8080",
+    "controller": "http://10.0.0.21:17080",
     "token_env": "SWARMLITE_TOKEN",
     "timeout": "500ms",
     "lock_lease": "30s"

@@ -828,7 +828,7 @@ mod tests {
             schema_version: crate::model::CLUSTER_SCHEMA_VERSION,
             cluster_id: "cluster-test".into(),
             controller_id: "controller-a".into(),
-            controller_port: 8080,
+            controller_port: crate::config::DEFAULT_CONTROLLER_PORT,
             gateway: ClusterGatewayConfig::default(),
         }
     }

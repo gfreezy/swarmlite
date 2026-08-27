@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use swarmlite::{
     client::ControllerClient,
-    config::{InstalledNodeConfig, RuntimeKind, SYSTEM_CONFIG_PATH},
+    config::{DEFAULT_CONTROLLER_PORT, InstalledNodeConfig, RuntimeKind, SYSTEM_CONFIG_PATH},
     model::{
         CLUSTER_SCHEMA_VERSION, ClusterConfigResponse, ClusterConfigUpdate, ClusterGatewayConfig,
         ClusterSettings, DEFAULT_GATEWAY_IMAGE, NodeGatewayResponse, NodeGatewayUpdate,
@@ -248,7 +248,7 @@ struct RegistryConnectionArgs {
 struct InitArgs {
     #[arg(long, env = "SWARMLITE_TOKEN")]
     token: Option<String>,
-    #[arg(long, default_value_t = 8080)]
+    #[arg(long, default_value_t = DEFAULT_CONTROLLER_PORT)]
     controller_port: u16,
     /// Rebuild the control plane and collect containers from the previous cluster.
     #[arg(long)]
@@ -675,6 +675,7 @@ async fn status(controller: String, token: String) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use clap::{CommandFactory, Parser};
+    use swarmlite::config::DEFAULT_CONTROLLER_PORT;
 
     use super::{Cli, Command};
 
@@ -695,6 +696,15 @@ mod tests {
             parse(&["--detach"]).command,
             Command::Deploy { .. }
         ));
+    }
+
+    #[test]
+    fn init_uses_the_swarmlite_controller_port_by_default() {
+        let cli = Cli::try_parse_from(["swarmlite", "init"]).unwrap();
+        let Command::Init { options } = cli.command else {
+            panic!("expected init command");
+        };
+        assert_eq!(options.controller_port, DEFAULT_CONTROLLER_PORT);
     }
 
     #[test]
@@ -846,7 +856,7 @@ mod tests {
             Cli::try_parse_from([
                 "swarmlite",
                 "join",
-                "http://127.0.0.1:8080",
+                "http://127.0.0.1:17080",
                 "--token",
                 "0123456789abcdef",
                 "--gateway",
@@ -857,7 +867,7 @@ mod tests {
             Cli::try_parse_from([
                 "swarmlite",
                 "join",
-                "http://127.0.0.1:8080",
+                "http://127.0.0.1:17080",
                 "--token",
                 "0123456789abcdef",
                 "--roles",
@@ -895,7 +905,7 @@ mod tests {
             Cli::try_parse_from([
                 "swarmlite",
                 "join",
-                "http://127.0.0.1:8080",
+                "http://127.0.0.1:17080",
                 "--token",
                 "0123456789abcdef",
                 "--label",

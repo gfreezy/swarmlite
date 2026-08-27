@@ -14,6 +14,7 @@ use crate::model::ClusterSettings;
 
 pub const DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS: u64 = 10;
 pub const DEFAULT_DEPLOYMENT_TIMEOUT_SECONDS: u64 = 300;
+pub const DEFAULT_CONTROLLER_PORT: u16 = 17_080;
 pub const SYSTEM_CONFIG_PATH: &str = "/etc/swarmlite/runtime.env";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

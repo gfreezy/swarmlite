@@ -85,7 +85,7 @@ sudo swarmlite join-token
 Run the printed command with `sudo` on the new machine, then start its service:
 
 ```bash
-sudo swarmlite join http://10.0.0.21:8080 --token '<generated-token>'
+sudo swarmlite join http://10.0.0.21:17080 --token '<generated-token>'
 sudo systemctl start swarmlite
 ```
 
@@ -226,6 +226,9 @@ sudo swarmlite init
 sudo systemctl start swarmlite
 ```
 
+The Controller API listens on TCP port `17080` by default. Select another port during
+initialization with `--controller-port` when necessary.
+
 The first node has its Gateway enabled by default. Initialize without one when another node will
 provide ingress:
 
@@ -259,14 +262,14 @@ sudo swarmlite join-token
 Run it on a machine where the installer has already completed:
 
 ```bash
-sudo swarmlite join http://10.0.0.21:8080 --token '<generated-token>'
+sudo swarmlite join http://10.0.0.21:17080 --token '<generated-token>'
 sudo systemctl start swarmlite
 ```
 
 Enable the Gateway while joining when this node should also accept ingress traffic:
 
 ```bash
-sudo swarmlite join http://10.0.0.21:8080 \
+sudo swarmlite join http://10.0.0.21:17080 \
   --token '<generated-token>' \
   --gateway
 ```
@@ -294,7 +297,7 @@ Set initial labels while initializing or joining a node:
 
 ```bash
 sudo swarmlite init --label region=cn-east --label disk=nvme
-sudo swarmlite join http://10.0.0.21:8080 \
+sudo swarmlite join http://10.0.0.21:17080 \
   --token '<generated-token>' \
   --label region=cn-east
 ```
@@ -345,7 +348,7 @@ When running the command away from a configured node, pass the Controller and cl
 ```bash
 printf '%s' "$GHCR_TOKEN" | swarmlite registry login ghcr.io \
   --username github-user --password-stdin \
-  --controller http://controller.example:8080 --token "$SWARMLITE_TOKEN"
+  --controller http://controller.example:17080 --token "$SWARMLITE_TOKEN"
 ```
 
 ## Deploying and operating Stacks

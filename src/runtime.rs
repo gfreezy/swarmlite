@@ -961,7 +961,7 @@ mod tests {
             cluster_id: "cluster-old".into(),
             advertise_address: "10.0.0.21".into(),
             listen: vec![":80".into()],
-            controller: "http://10.0.0.21:8080".into(),
+            controller: "http://10.0.0.21:17080".into(),
             token: "0123456789abcdef".into(),
             image: DEFAULT_GATEWAY_IMAGE.into(),
         };
@@ -998,7 +998,7 @@ mod tests {
             cluster_id: "cluster-old".into(),
             advertise_address: "10.0.0.21".into(),
             listen: vec![":80".into()],
-            controller: "http://10.0.0.21:8080".into(),
+            controller: "http://10.0.0.21:17080".into(),
             token: "0123456789abcdef".into(),
             image: DEFAULT_GATEWAY_IMAGE.into(),
         };
@@ -1034,7 +1034,7 @@ mod tests {
             cluster_id: "cluster-old".into(),
             advertise_address: "10.0.0.21".into(),
             listen: vec![":80".into()],
-            controller: "http://10.0.0.21:8080".into(),
+            controller: "http://10.0.0.21:17080".into(),
             token: "do-not-persist-this-token".into(),
             image: DEFAULT_GATEWAY_IMAGE.into(),
         };
@@ -1043,7 +1043,7 @@ mod tests {
         assert_eq!(value["admin"]["listen"], "0.0.0.0:2019");
         assert_eq!(value["admin"]["config"]["persist"], true);
         assert_eq!(value["storage"]["module"], "swarmlite");
-        assert_eq!(value["storage"]["controller"], "http://10.0.0.21:8080");
+        assert_eq!(value["storage"]["controller"], "http://10.0.0.21:17080");
         assert!(value["storage"].get("controllers").is_none());
         assert_eq!(value["storage"]["token_env"], "SWARMLITE_TOKEN");
         assert!(!encoded.contains("do-not-persist-this-token"));
