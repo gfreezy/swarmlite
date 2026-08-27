@@ -1,0 +1,23 @@
+version: 2
+
+multi-ecosystem-groups:
+  caddy:
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Shanghai
+
+updates:
+  - package-ecosystem: gomod
+    directory: /caddy-storage
+    patterns:
+      - github.com/caddyserver/caddy/v2
+      - github.com/caddyserver/certmagic
+    multi-ecosystem-group: caddy
+
+  - package-ecosystem: docker
+    directory: /caddy-storage
+    patterns:
+      - caddy
+    multi-ecosystem-group: caddy

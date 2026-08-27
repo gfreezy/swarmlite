@@ -23,6 +23,12 @@ docker build -t ghcr.io/gfreezy/swarmlite-caddy:latest ./caddy-storage
 docker push ghcr.io/gfreezy/swarmlite-caddy:latest
 ```
 
+Caddy stays pinned to a tested version in both `go.mod` and the runtime base image. Dependabot
+checks weekly for a newer stable Caddy release and groups the Go module, CertMagic, and Docker image
+updates into one pull request. The pull request must pass the Go tests and the multi-platform image
+build before it is merged and published; production builds never consume an untested floating
+upstream `latest` tag directly.
+
 Select another published image during cluster initialization or update it later:
 
 ```bash
