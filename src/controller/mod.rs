@@ -24,14 +24,17 @@ use crate::{
     model::{
         BootstrapResponse, ClusterConfigResponse, ClusterConfigUpdate, ClusterSettings,
         ClusterState, DataSessionCreateResponse, DataSessionOperation, DataSessionStream,
-        DesiredTaskState, GatewayAssignment, GatewayReport, GatewayStatus, HeartbeatResponse,
-        JoinRequest, JoinResponse, KvDeleteRequest, KvListResponse, KvLockAcquireRequest,
-        KvLockAcquireResponse, KvLockMutationRequest, KvObjectResponse, KvPutRequest,
-        KvStatResponse, NodeGatewayResponse, NodeGatewayUpdate, NodeHeartbeat,
-        NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, NodeMember,
-        ObservedTaskState, RegistryLoginRequest, RegistryLoginResponse, ServiceInspectResponse,
-        ServiceListResponse, ServiceRecord, ServiceSummary, StackDeploymentError,
-        StackDeploymentGatewayProgress, StackDeploymentRecord, StackDeploymentResponse,
+        DeploymentImageResolutionNodeRecord, DeploymentImageResolutionRecord, DesiredTaskState,
+        GatewayAssignment, GatewayReport, GatewayStatus, HeartbeatResponse,
+        ImageResolutionAssignment, ImageResolutionProgress, ImageResolutionReport,
+        ImageResolutionServiceAssignment, ImageResolutionStatus, JoinRequest, JoinResponse,
+        KvDeleteRequest, KvListResponse, KvLockAcquireRequest, KvLockAcquireResponse,
+        KvLockMutationRequest, KvObjectResponse, KvPutRequest, KvStatResponse, NodeGatewayResponse,
+        NodeGatewayUpdate, NodeHeartbeat, NodeLabelRemoveRequest, NodeLabelSetRequest,
+        NodeLabelsResponse, NodeMember, ObservedTaskState, RegistryLoginRequest,
+        RegistryLoginResponse, ServiceInspectResponse, ServiceListResponse, ServiceRecord,
+        ServiceSummary, StackDeploymentError, StackDeploymentGatewayProgress,
+        StackDeploymentImageProgress, StackDeploymentRecord, StackDeploymentResponse,
         StackDeploymentServiceProgress, StackDeploymentStatus, StackDeploymentTaskPhaseProgress,
         StackListResponse, StackRecord, StackSummary, StatusResponse, TaskAssignment,
         TaskListResponse, TaskReconcileError, TaskReconcileProgress, TaskReconcileReport,
@@ -59,7 +62,7 @@ mod resources;
 mod sessions;
 mod stacks;
 
-use deployment::apply_task_result;
+use deployment::{apply_image_progress, apply_image_resolution_report, apply_task_result};
 use membership::*;
 use recovery::*;
 use stacks::*;

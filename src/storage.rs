@@ -488,7 +488,9 @@ fn invalid(error: impl std::fmt::Display) -> StorageError {
 mod tests {
     use crate::local_state::{LocalState, NODE_KEY};
     use crate::model::{
-        ClusterGatewayConfig, KvLockStatus, NodeRecord, RegistryCredential, ServiceSpec,
+        ClusterGatewayConfig, DeploymentImageResolutionNodeRecord, DeploymentImageResolutionRecord,
+        ImageResolutionStatus, KvLockStatus, NodeRecord, RegistryCredential, ServiceSpec,
+        StackDeploymentRecord, StackDeploymentStatus,
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD};
 
@@ -524,6 +526,46 @@ mod tests {
                 port_range_start: 20_000,
                 port_range_end: 29_999,
                 gateway_enabled: false,
+            },
+        );
+        state.stacks.insert(
+            "demo".into(),
+            StackRecord {
+                name: "demo".into(),
+                applied_at_unix_ms: 1,
+                services: vec!["demo.web".into()],
+                gateway: Default::default(),
+                deployment: Some(StackDeploymentRecord {
+                    generation: 2,
+                    status: StackDeploymentStatus::Healthy,
+                    started_at_unix_ms: 1,
+                    wait_for_gateway: false,
+                    finished_at_unix_ms: Some(2),
+                    errors: Vec::new(),
+                    image_resolutions: BTreeMap::from([(
+                        "demo.web".into(),
+                        DeploymentImageResolutionRecord {
+                            service_id: "demo.web".into(),
+                            service: "web".into(),
+                            image: "nginx:latest".into(),
+                            baseline_revision: 1,
+                            status: ImageResolutionStatus::Unchanged,
+                            nodes: BTreeMap::from([(
+                                "soft-node".into(),
+                                DeploymentImageResolutionNodeRecord {
+                                    task_ids: vec!["task-1".into()],
+                                    status: ImageResolutionStatus::Unchanged,
+                                    old_image_ids: BTreeMap::from([(
+                                        "task-1".into(),
+                                        "sha256:current".into(),
+                                    )]),
+                                    resolved_image_id: Some("sha256:current".into()),
+                                    error: None,
+                                },
+                            )]),
+                        },
+                    )]),
+                }),
             },
         );
         state.services.insert(
@@ -590,6 +632,16 @@ mod tests {
         let loaded = repository.load().await.unwrap();
         assert!(loaded.state.nodes.is_empty());
         assert_eq!(loaded.state.services.len(), 1);
+        let image_resolution = &loaded.state.stacks["demo"]
+            .deployment
+            .as_ref()
+            .unwrap()
+            .image_resolutions["demo.web"]
+            .nodes["soft-node"];
+        assert_eq!(
+            image_resolution.resolved_image_id.as_deref(),
+            Some("sha256:current")
+        );
         assert_eq!(
             loaded.state.tasks["task-1"].observed,
             ObservedTaskState::Pending

@@ -455,17 +455,18 @@ sudo swarmlite connection-info --json
 convergence by default and support `--detach`. `restart` increments the Service revision and
 performs the configured rolling replacement.
 
-While waiting, `deploy`, `scale`, and `restart` report Agent milestones such as `pull`, `create`,
-`start`, and `verify`, together with per-Service applied and healthy replica progress. `rm` reports
-`stop` and `remove` milestones and the number of Tasks still pending removal. Routed deployments
-also report how many gateway nodes have applied the latest configuration and do not complete until
-all enabled gateways have converged. In an interactive terminal, progress is colored and refreshed
-in place on one line; set `NO_COLOR=1` to disable colors. When stderr is redirected or the terminal
-is non-interactive, progress remains plain text and a status line is printed every ten seconds when
-no state changes. Progress always goes to stderr. `deploy` and `rm` are quiet on stdout after
-completion; pass `--json` when the final machine-readable response is needed (`rm --json` returns
-an array because it accepts multiple Stacks). `--dry-run` continues to print its validation
-response as JSON.
+While waiting, `deploy`, `scale`, and `restart` report image checking, pulling and comparison as
+well as Agent milestones such as `create`, `start`, and `verify`, together with per-Service applied
+and healthy replica progress. Image checks finish as `unchanged`, `skipped`, or `changed/updating`.
+`rm` reports `stop` and `remove` milestones and the number of Tasks still pending removal. Routed
+deployments also report how many gateway nodes have applied the latest configuration and do not
+complete until all enabled gateways have converged. In an interactive terminal, progress is
+colored and refreshed in place on one line; set `NO_COLOR=1` to disable colors. When stderr is
+redirected or the terminal is non-interactive, progress remains plain text and a status line is
+printed every ten seconds when no state changes. Progress always goes to stderr. `deploy` and `rm`
+are quiet on stdout after completion; pass `--json` when the final machine-readable response is
+needed (`rm --json` returns an array because it accepts multiple Stacks). `--dry-run` continues to
+print its validation response as JSON.
 
 ### Deployment behavior
 
@@ -487,9 +488,13 @@ services:
 ```
 
 Supported values are `always`, `missing` (the default), `if_not_present` (an alias for `missing`),
-and `never`. `missing` uses a cached image when possible, except that an omitted tag or the
-`latest` tag is refreshed when a task is created. Deploying an unchanged Stack rolls Services
-whose policy requires a refresh (`always`, or `missing` with an effective `latest` tag).
+and `never`. On an unchanged Service, `never` and `missing` with a fixed tag or digest verify the
+existing Tasks without pulling. `always`, plus `missing` with an omitted or `latest` tag, pulls once
+per node and image for that deployment and compares the pulled image ID with the image ID of each
+running container on that node. Equal IDs do not increment the Service revision or restart its
+containers. A different ID increments the revision once and uses the normal safe rolling-update
+path. Pull failures fail the deployment while leaving existing running containers in place.
+`restart` remains an unconditional rolling replacement.
 
 During rolling updates, old healthy tasks remain routable until replacements are healthy and all
 active Gateways acknowledge the new routing configuration.

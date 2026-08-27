@@ -29,8 +29,8 @@ use crate::{
     data_plane::MAX_DATA_PAYLOAD_BYTES,
     gateway,
     model::{
-        ClusterState, GatewayAssignment, ObservedTaskState, PortBinding, PullPolicy,
-        TaskAssignment, TaskReconcilePhase,
+        ClusterState, GatewayAssignment, ImageResolutionStatus, ObservedTaskState, PortBinding,
+        PullPolicy, TaskAssignment, TaskReconcilePhase,
     },
     registry::RegistryCredentialStore,
 };
@@ -70,6 +70,7 @@ pub struct RuntimeSystemInfo {
 #[derive(Debug, Clone)]
 pub struct ManagedContainer {
     pub id: String,
+    pub image_id: Option<String>,
     pub task_id: String,
     pub revision: Option<u64>,
     pub running: bool,
@@ -151,6 +152,29 @@ impl Default for RuntimeTaskProgress {
     }
 }
 
+#[derive(Clone)]
+pub struct RuntimeImageProgress {
+    callback: Arc<dyn Fn(ImageResolutionStatus) + Send + Sync>,
+}
+
+impl RuntimeImageProgress {
+    pub fn new(callback: impl Fn(ImageResolutionStatus) + Send + Sync + 'static) -> Self {
+        Self {
+            callback: Arc::new(callback),
+        }
+    }
+
+    pub fn report(&self, status: ImageResolutionStatus) {
+        (self.callback)(status);
+    }
+}
+
+impl Default for RuntimeImageProgress {
+    fn default() -> Self {
+        Self::new(|_| {})
+    }
+}
+
 pub trait ContainerRuntime: Send + Sync + 'static {
     fn kind(&self) -> RuntimeKind;
 
@@ -164,6 +188,12 @@ pub trait ContainerRuntime: Send + Sync + 'static {
         &self,
         cluster_id: &str,
     ) -> impl Future<Output = Result<HashMap<String, ManagedContainer>>> + Send;
+
+    fn resolve_image(
+        &self,
+        image: &str,
+        progress: &RuntimeImageProgress,
+    ) -> impl Future<Output = Result<String>> + Send;
 
     fn create_task(
         &self,
@@ -586,6 +616,16 @@ impl DockerCompatibleRuntime {
         }
         Ok(())
     }
+
+    async fn inspect_image_id(&self, image: &str) -> Result<String> {
+        self.client
+            .inspect_image(image)
+            .await
+            .with_context(|| format!("failed to inspect image {image}"))?
+            .id
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("runtime did not report an image ID for {image}"))
+    }
 }
 
 fn gateway_labels(spec: &GatewayContainerSpec) -> HashMap<String, String> {
@@ -725,6 +765,7 @@ impl ContainerRuntime for DockerCompatibleRuntime {
                 task_id.clone(),
                 ManagedContainer {
                     id,
+                    image_id: inspect.image.clone(),
                     task_id,
                     revision,
                     running,
@@ -742,6 +783,14 @@ impl ContainerRuntime for DockerCompatibleRuntime {
         Ok(result)
     }
 
+    async fn resolve_image(&self, image: &str, progress: &RuntimeImageProgress) -> Result<String> {
+        progress.report(ImageResolutionStatus::Checking);
+        progress.report(ImageResolutionStatus::Pulling);
+        self.pull_image(image).await?;
+        progress.report(ImageResolutionStatus::Comparing);
+        self.inspect_image_id(image).await
+    }
+
     async fn create_task(
         &self,
         assignment: &TaskAssignment,
@@ -753,9 +802,14 @@ impl ContainerRuntime for DockerCompatibleRuntime {
             runtime = %self.kind,
             "creating task container"
         );
-        progress.report(TaskReconcilePhase::Pull);
-        self.ensure_image(&assignment.spec.image, assignment.spec.pull_policy)
-            .await?;
+        if assignment.image_resolved {
+            progress.report(TaskReconcilePhase::Inspect);
+            self.inspect_image_id(&assignment.spec.image).await?;
+        } else {
+            progress.report(TaskReconcilePhase::Pull);
+            self.ensure_image(&assignment.spec.image, assignment.spec.pull_policy)
+                .await?;
+        }
 
         let port_bindings = task_port_bindings(assignment);
         let exposed_ports = assignment
@@ -1273,6 +1327,7 @@ mod tests {
             generation: 4,
             deployment_generation: 4,
             spec_hash: "abc123".into(),
+            image_resolved: false,
         };
 
         let labels = task_labels(&assignment).unwrap();
@@ -1334,6 +1389,7 @@ mod tests {
             generation: 1,
             deployment_generation: 1,
             spec_hash: "hash".into(),
+            image_resolved: false,
         };
         let bindings = task_port_bindings(&assignment);
         assert_eq!(

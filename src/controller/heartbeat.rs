@@ -12,6 +12,8 @@ impl Controller {
             task_inventory_error,
             task_results,
             task_progress,
+            image_results,
+            image_progress,
             gateway: gateway_report,
         } = heartbeat;
         if node_id != node.id {
@@ -164,6 +166,12 @@ impl Controller {
             soft_changed |= task_changed;
             changed |= deployment_changed;
         }
+        for progress in &image_progress {
+            changed |= apply_image_progress(&mut inner.state, node_id, progress);
+        }
+        for report in &image_results {
+            changed |= apply_image_resolution_report(&mut inner.state, node_id, report);
+        }
         for progress in &task_progress {
             soft_changed |= apply_task_progress(&mut inner, node_id, progress);
         }
@@ -247,9 +255,11 @@ impl Controller {
                     generation,
                     deployment_generation,
                     spec_hash: service_spec_hash(&service.spec),
+                    image_resolved: image_was_resolved_on_node(&inner.state, service, task),
                 })
             })
             .collect();
+        let image_assignments = image_assignments_for_node(&inner.state, node_id);
         let remove_tasks = inner
             .state
             .tasks
@@ -276,6 +286,7 @@ impl Controller {
             generation,
             cluster: inner.cluster.clone(),
             assignments,
+            image_assignments,
             gateway_enabled,
             labels: desired_labels,
             remove_tasks,
@@ -328,6 +339,73 @@ impl Controller {
             state,
         }
     }
+}
+
+fn image_assignments_for_node(
+    state: &ClusterState,
+    node_id: &str,
+) -> Vec<ImageResolutionAssignment> {
+    let mut grouped = BTreeMap::<(u64, String), BTreeMap<String, Vec<String>>>::new();
+    for deployment in state
+        .stacks
+        .values()
+        .filter_map(|stack| stack.deployment.as_ref())
+        .filter(|deployment| deployment.status == StackDeploymentStatus::Deploying)
+    {
+        for resolution in deployment
+            .image_resolutions
+            .values()
+            .filter(|resolution| !resolution.status.is_complete())
+        {
+            let Some(node) = resolution
+                .nodes
+                .get(node_id)
+                .filter(|node| !node.status.is_complete())
+            else {
+                continue;
+            };
+            grouped
+                .entry((deployment.generation, resolution.image.clone()))
+                .or_default()
+                .insert(resolution.service_id.clone(), node.task_ids.clone());
+        }
+    }
+    grouped
+        .into_iter()
+        .map(
+            |((deployment_generation, image), services)| ImageResolutionAssignment {
+                deployment_generation,
+                image,
+                services: services
+                    .into_iter()
+                    .map(|(service_id, task_ids)| ImageResolutionServiceAssignment {
+                        service_id,
+                        task_ids,
+                    })
+                    .collect(),
+            },
+        )
+        .collect()
+}
+
+fn image_was_resolved_on_node(
+    state: &ClusterState,
+    service: &ServiceRecord,
+    task: &TaskRecord,
+) -> bool {
+    state
+        .stacks
+        .get(&service.stack)
+        .and_then(|stack| stack.deployment.as_ref())
+        .and_then(|deployment| deployment.image_resolutions.get(&service.id))
+        .is_some_and(|resolution| {
+            resolution.status == ImageResolutionStatus::Changed
+                && resolution.image == service.spec.image
+                && resolution.baseline_revision.checked_add(1) == Some(task.revision)
+                && resolution.nodes.get(&task.node_id).is_some_and(|node| {
+                    node.status.is_complete() && node.resolved_image_id.is_some()
+                })
+        })
 }
 
 fn apply_task_progress(inner: &mut Inner, node_id: &str, progress: &TaskReconcileProgress) -> bool {

@@ -9,8 +9,9 @@ use crate::{
         DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS,
     },
     model::{
-        CLUSTER_SCHEMA_VERSION, ClusterGatewayConfig, KvLockStatus, NodeRecord, PortBinding,
-        PullPolicy, ServicePort, ServiceSpec, StackGatewaySpec, TaskRecord, TaskReport,
+        CLUSTER_SCHEMA_VERSION, ClusterGatewayConfig, ImageResolutionServiceReport, KvLockStatus,
+        NodeRecord, PortBinding, PullPolicy, ServicePort, ServiceSpec, StackGatewaySpec,
+        TaskRecord, TaskReport,
     },
 };
 
@@ -93,6 +94,8 @@ async fn registry_login_is_persisted_and_synchronized_to_nodes() {
                 task_inventory_error: None,
                 task_results: Vec::new(),
                 task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
                 gateway: GatewayReport::default(),
             },
         )
@@ -437,6 +440,8 @@ async fn register_live_node(controller: &Controller) {
                 task_inventory_error: None,
                 task_results: Vec::new(),
                 task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
                 gateway: GatewayReport::default(),
             },
         )
@@ -451,15 +456,174 @@ fn parsed_test_stack() -> ParsedStack {
     }
 }
 
-#[tokio::test]
-async fn redeploy_rolls_a_service_whose_pull_policy_refreshes_cached_images() {
-    let (controller, _, _directory) = test_controller("pull-policy-redeploy-test").await;
-    register_live_node(&controller).await;
-    let mut parsed = parsed_test_stack();
-    parsed.services.get_mut("web").unwrap().pull_policy = PullPolicy::Always;
+fn image_test_heartbeat(
+    task: &TaskRecord,
+    desired_generation: Option<u64>,
+    image_result: Option<ImageResolutionReport>,
+) -> NodeHeartbeat {
+    image_test_heartbeat_on(
+        test_node(),
+        task,
+        "sha256:current",
+        desired_generation,
+        image_result,
+    )
+}
 
+fn image_test_heartbeat_on(
+    node: NodeRecord,
+    task: &TaskRecord,
+    image_id: &str,
+    desired_generation: Option<u64>,
+    image_result: Option<ImageResolutionReport>,
+) -> NodeHeartbeat {
+    NodeHeartbeat {
+        node,
+        tasks: vec![TaskReport {
+            id: task.id.clone(),
+            observed: ObservedTaskState::Healthy,
+            container_id: Some("container-web".into()),
+            image_id: Some(image_id.into()),
+            cluster_id: Some("image-resolution-test".into()),
+            stack: Some("demo".into()),
+            service: Some("web".into()),
+            slot: Some(task.slot),
+            revision: Some(task.revision),
+            spec_hash: Some("current-spec".into()),
+            ports: task.ports.clone(),
+        }],
+        task_inventory_error: None,
+        task_results: desired_generation
+            .map(|generation| {
+                vec![TaskReconcileReport {
+                    task_id: task.id.clone(),
+                    desired_generation: generation,
+                    applied_generation: Some(generation),
+                    phase: crate::model::TaskReconcilePhase::Verify,
+                    error: None,
+                }]
+            })
+            .unwrap_or_default(),
+        task_progress: Vec::new(),
+        image_results: image_result.into_iter().collect(),
+        image_progress: Vec::new(),
+        gateway: GatewayReport::default(),
+    }
+}
+
+async fn prepare_image_redeploy(
+    controller: &Controller,
+    pull_policy: PullPolicy,
+    image: &str,
+) -> (ParsedStack, TaskRecord, u64) {
+    let mut parsed = parsed_test_stack();
+    let service = parsed.services.get_mut("web").unwrap();
+    service.image = image.to_owned();
+    service.pull_policy = pull_policy;
     controller.apply("demo", parsed.clone()).await.unwrap();
-    let initial_revision = {
+    let mut inner = controller.inner.lock().await;
+    inner
+        .state
+        .stacks
+        .get_mut("demo")
+        .unwrap()
+        .deployment
+        .as_mut()
+        .unwrap()
+        .status = StackDeploymentStatus::Healthy;
+    let revision = inner.state.services["demo.web"].revision;
+    let task = inner
+        .state
+        .tasks
+        .values_mut()
+        .find(|task| task.service_id == "demo.web")
+        .unwrap();
+    task.observed = ObservedTaskState::Healthy;
+    task.container_id = Some("container-web".into());
+    (parsed, task.clone(), revision)
+}
+
+#[tokio::test]
+async fn latest_redeploy_keeps_revision_when_pulled_image_id_is_unchanged() {
+    let (controller, _, _directory) = test_controller("image-unchanged-test").await;
+    register_live_node(&controller).await;
+    let (parsed, task, initial_revision) =
+        prepare_image_redeploy(&controller, PullPolicy::Missing, "nginx:latest").await;
+
+    let accepted = controller.apply("demo", parsed).await.unwrap();
+    let assignment = controller
+        .heartbeat("node-a", image_test_heartbeat(&task, None, None))
+        .await
+        .unwrap();
+    assert_eq!(assignment.image_assignments.len(), 1);
+    let report = ImageResolutionReport {
+        deployment_generation: accepted.generation,
+        image: "nginx:latest".into(),
+        resolved_image_id: Some("sha256:current".into()),
+        services: vec![ImageResolutionServiceReport {
+            service_id: "demo.web".into(),
+            old_image_ids: BTreeMap::from([(task.id.clone(), "sha256:current".into())]),
+            changed: false,
+        }],
+        error: None,
+    };
+    let response = controller
+        .heartbeat(
+            "node-a",
+            image_test_heartbeat(&task, Some(accepted.generation), Some(report)),
+        )
+        .await
+        .unwrap();
+
+    let inner = controller.inner.lock().await;
+    assert_eq!(inner.state.services["demo.web"].revision, initial_revision);
+    assert_eq!(inner.state.tasks.len(), 1);
+    assert!(response.image_assignments.is_empty());
+    assert_eq!(
+        inner.state.stacks["demo"]
+            .deployment
+            .as_ref()
+            .unwrap()
+            .image_resolutions["demo.web"]
+            .status,
+        ImageResolutionStatus::Unchanged
+    );
+}
+
+#[tokio::test]
+async fn image_ids_are_compared_per_node_for_heterogeneous_runtimes() {
+    let (controller, _, _directory) = test_controller("heterogeneous-images-test").await;
+    register_live_node(&controller).await;
+    let mut node_b = test_node();
+    node_b.id = "node-b".into();
+    node_b.address = "127.0.0.2".into();
+    controller
+        .join_node("node-b", test_join_request("node-b", "127.0.0.2"))
+        .await
+        .unwrap();
+    controller
+        .heartbeat(
+            "node-b",
+            NodeHeartbeat {
+                node: node_b.clone(),
+                tasks: Vec::new(),
+                task_inventory_error: None,
+                task_results: Vec::new(),
+                task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
+                gateway: GatewayReport::default(),
+            },
+        )
+        .await
+        .unwrap();
+    let mut parsed = parsed_test_stack();
+    let service = parsed.services.get_mut("web").unwrap();
+    service.image = "nginx:latest".into();
+    service.pull_policy = PullPolicy::Missing;
+    service.replicas = 2;
+    controller.apply("demo", parsed.clone()).await.unwrap();
+    let (tasks, initial_revision) = {
         let mut inner = controller.inner.lock().await;
         inner
             .state
@@ -470,14 +634,313 @@ async fn redeploy_rolls_a_service_whose_pull_policy_refreshes_cached_images() {
             .as_mut()
             .unwrap()
             .status = StackDeploymentStatus::Healthy;
-        inner.state.services["demo.web"].revision
+        for task in inner.state.tasks.values_mut() {
+            task.observed = ObservedTaskState::Healthy;
+            task.container_id = Some(format!("container-{}", task.id));
+        }
+        (
+            inner
+                .state
+                .tasks
+                .values()
+                .map(|task| (task.node_id.clone(), task.clone()))
+                .collect::<BTreeMap<_, _>>(),
+            inner.state.services["demo.web"].revision,
+        )
     };
+    assert_eq!(tasks.len(), 2);
+    let accepted = controller.apply("demo", parsed).await.unwrap();
 
-    controller.apply("demo", parsed).await.unwrap();
+    for (node_id, old_image_id) in [
+        ("node-a", "sha256:amd64-image"),
+        ("node-b", "sha256:arm64-image"),
+    ] {
+        let task = &tasks[node_id];
+        let report = ImageResolutionReport {
+            deployment_generation: accepted.generation,
+            image: "nginx:latest".into(),
+            resolved_image_id: Some(old_image_id.into()),
+            services: vec![ImageResolutionServiceReport {
+                service_id: "demo.web".into(),
+                old_image_ids: BTreeMap::from([(task.id.clone(), old_image_id.into())]),
+                changed: false,
+            }],
+            error: None,
+        };
+        let node = if node_id == "node-a" {
+            test_node()
+        } else {
+            node_b.clone()
+        };
+        controller
+            .heartbeat(
+                node_id,
+                image_test_heartbeat_on(
+                    node,
+                    task,
+                    old_image_id,
+                    Some(accepted.generation),
+                    Some(report),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            controller.inner.lock().await.state.services["demo.web"].revision,
+            initial_revision
+        );
+    }
+
+    let inner = controller.inner.lock().await;
+    let resolution = &inner.state.stacks["demo"]
+        .deployment
+        .as_ref()
+        .unwrap()
+        .image_resolutions["demo.web"];
+    assert_eq!(resolution.status, ImageResolutionStatus::Unchanged);
     assert_eq!(
-        controller.inner.lock().await.state.services["demo.web"].revision,
+        resolution.nodes["node-a"].resolved_image_id.as_deref(),
+        Some("sha256:amd64-image")
+    );
+    assert_eq!(
+        resolution.nodes["node-b"].resolved_image_id.as_deref(),
+        Some("sha256:arm64-image")
+    );
+}
+
+#[test]
+fn one_service_image_result_does_not_wait_for_other_services() {
+    let mut state = ClusterState::default();
+    for name in ["api", "worker"] {
+        let mut service = test_service();
+        service.id = format!("demo.{name}");
+        service.name = name.into();
+        service.revision = 1;
+        service.spec.image = format!("example/{name}:latest");
+        state.services.insert(service.id.clone(), service);
+    }
+    let resolution = |name: &str, node_id: &str, task_id: &str| DeploymentImageResolutionRecord {
+        service_id: format!("demo.{name}"),
+        service: name.into(),
+        image: format!("example/{name}:latest"),
+        baseline_revision: 1,
+        status: ImageResolutionStatus::Checking,
+        nodes: BTreeMap::from([(
+            node_id.into(),
+            DeploymentImageResolutionNodeRecord {
+                task_ids: vec![task_id.into()],
+                status: ImageResolutionStatus::Checking,
+                old_image_ids: BTreeMap::new(),
+                resolved_image_id: None,
+                error: None,
+            },
+        )]),
+    };
+    state.stacks.insert(
+        "demo".into(),
+        StackRecord {
+            name: "demo".into(),
+            applied_at_unix_ms: 1,
+            services: vec!["demo.api".into(), "demo.worker".into()],
+            gateway: Default::default(),
+            deployment: Some(StackDeploymentRecord {
+                generation: 2,
+                status: StackDeploymentStatus::Deploying,
+                started_at_unix_ms: 1,
+                wait_for_gateway: false,
+                finished_at_unix_ms: None,
+                errors: Vec::new(),
+                image_resolutions: BTreeMap::from([
+                    ("demo.api".into(), resolution("api", "node-a", "task-api")),
+                    (
+                        "demo.worker".into(),
+                        resolution("worker", "node-b", "task-worker"),
+                    ),
+                ]),
+            }),
+        },
+    );
+
+    let changed = apply_image_resolution_report(
+        &mut state,
+        "node-a",
+        &ImageResolutionReport {
+            deployment_generation: 2,
+            image: "example/api:latest".into(),
+            resolved_image_id: Some("sha256:api-new".into()),
+            services: vec![ImageResolutionServiceReport {
+                service_id: "demo.api".into(),
+                old_image_ids: BTreeMap::from([("task-api".into(), "sha256:api-old".into())]),
+                changed: true,
+            }],
+            error: None,
+        },
+    );
+
+    assert!(changed);
+    assert_eq!(state.services["demo.api"].revision, 2);
+    assert_eq!(state.services["demo.worker"].revision, 1);
+    let deployment = state.stacks["demo"].deployment.as_ref().unwrap();
+    assert_eq!(
+        deployment.image_resolutions["demo.api"].status,
+        ImageResolutionStatus::Changed
+    );
+    assert_eq!(
+        deployment.image_resolutions["demo.worker"].status,
+        ImageResolutionStatus::Checking
+    );
+    assert_eq!(deployment.status, StackDeploymentStatus::Deploying);
+}
+
+#[tokio::test]
+async fn latest_redeploy_rolls_only_after_pulled_image_id_changes() {
+    let (controller, _, _directory) = test_controller("image-changed-test").await;
+    register_live_node(&controller).await;
+    let (parsed, task, initial_revision) =
+        prepare_image_redeploy(&controller, PullPolicy::Missing, "nginx:latest").await;
+
+    let accepted = controller.apply("demo", parsed).await.unwrap();
+    controller
+        .heartbeat("node-a", image_test_heartbeat(&task, None, None))
+        .await
+        .unwrap();
+    let report = ImageResolutionReport {
+        deployment_generation: accepted.generation,
+        image: "nginx:latest".into(),
+        resolved_image_id: Some("sha256:new".into()),
+        services: vec![ImageResolutionServiceReport {
+            service_id: "demo.web".into(),
+            old_image_ids: BTreeMap::from([(task.id.clone(), "sha256:current".into())]),
+            changed: true,
+        }],
+        error: None,
+    };
+    let response = controller
+        .heartbeat(
+            "node-a",
+            image_test_heartbeat(&task, Some(accepted.generation), Some(report)),
+        )
+        .await
+        .unwrap();
+
+    let inner = controller.inner.lock().await;
+    assert_eq!(
+        inner.state.services["demo.web"].revision,
         initial_revision + 1
     );
+    assert_eq!(
+        inner
+            .state
+            .tasks
+            .values()
+            .filter(|candidate| candidate.revision == initial_revision)
+            .count(),
+        1
+    );
+    assert!(inner.state.tasks.contains_key(&task.id));
+    assert!(
+        response
+            .assignments
+            .iter()
+            .filter(|assignment| assignment.revision == initial_revision + 1)
+            .all(|assignment| assignment.image_resolved)
+    );
+}
+
+#[tokio::test]
+async fn unchanged_never_and_fixed_missing_services_skip_image_pull() {
+    for (name, pull_policy, image) in [
+        ("never", PullPolicy::Never, "nginx:stable"),
+        ("fixed-missing", PullPolicy::Missing, "nginx:1.27"),
+    ] {
+        let (controller, _, _directory) = test_controller(name).await;
+        register_live_node(&controller).await;
+        let (parsed, task, initial_revision) =
+            prepare_image_redeploy(&controller, pull_policy, image).await;
+        let accepted = controller.apply("demo", parsed).await.unwrap();
+        let response = controller
+            .heartbeat(
+                "node-a",
+                image_test_heartbeat(&task, Some(accepted.generation), None),
+            )
+            .await
+            .unwrap();
+        let inner = controller.inner.lock().await;
+        assert!(response.image_assignments.is_empty(), "{name}");
+        assert_eq!(
+            inner.state.services["demo.web"].revision, initial_revision,
+            "{name}"
+        );
+        assert_eq!(
+            inner.state.stacks["demo"]
+                .deployment
+                .as_ref()
+                .unwrap()
+                .image_resolutions["demo.web"]
+                .status,
+            ImageResolutionStatus::Skipped,
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn image_pull_failure_fails_deployment_without_replacing_running_task() {
+    let (controller, _, _directory) = test_controller("image-pull-failure-test").await;
+    register_live_node(&controller).await;
+    let (parsed, task, initial_revision) =
+        prepare_image_redeploy(&controller, PullPolicy::Always, "nginx:latest").await;
+    let accepted = controller.apply("demo", parsed).await.unwrap();
+    controller
+        .heartbeat("node-a", image_test_heartbeat(&task, None, None))
+        .await
+        .unwrap();
+    let report = ImageResolutionReport {
+        deployment_generation: accepted.generation,
+        image: "nginx:latest".into(),
+        resolved_image_id: None,
+        services: Vec::new(),
+        error: Some("registry unavailable".into()),
+    };
+    let response = controller
+        .heartbeat(
+            "node-a",
+            image_test_heartbeat(&task, Some(accepted.generation), Some(report)),
+        )
+        .await
+        .unwrap();
+    let inner = controller.inner.lock().await;
+    assert_eq!(inner.state.services["demo.web"].revision, initial_revision);
+    assert_eq!(inner.state.tasks.len(), 1);
+    assert_eq!(
+        inner.state.tasks[&task.id].desired,
+        DesiredTaskState::Running
+    );
+    assert!(response.remove_tasks.is_empty());
+    assert_eq!(
+        inner.state.stacks["demo"]
+            .deployment
+            .as_ref()
+            .unwrap()
+            .status,
+        StackDeploymentStatus::Failed
+    );
+}
+
+#[tokio::test]
+async fn restart_forces_revision_without_image_resolution() {
+    let (controller, _, _directory) = test_controller("forced-restart-test").await;
+    register_live_node(&controller).await;
+    let (_parsed, _task, initial_revision) =
+        prepare_image_redeploy(&controller, PullPolicy::Always, "nginx:latest").await;
+
+    let response = controller.force_update_service("demo.web").await.unwrap();
+    let inner = controller.inner.lock().await;
+    assert_eq!(
+        inner.state.services["demo.web"].revision,
+        initial_revision + 1
+    );
+    assert!(response.image_resolutions.is_empty());
 }
 
 #[tokio::test]
@@ -505,6 +968,8 @@ async fn deployment_waits_for_agent_application_and_health() {
                     desired_generation: accepted.generation,
                     phase: crate::model::TaskReconcilePhase::Pull,
                 }],
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
                 gateway: GatewayReport::default(),
             },
         )
@@ -540,6 +1005,7 @@ async fn deployment_waits_for_agent_application_and_health() {
                     id: task.id.clone(),
                     observed: ObservedTaskState::Healthy,
                     container_id: Some("container-new".into()),
+                    image_id: None,
                     cluster_id: Some("deployment-success-test".into()),
                     stack: Some("demo".into()),
                     service: Some("web".into()),
@@ -557,6 +1023,8 @@ async fn deployment_waits_for_agent_application_and_health() {
                     error: None,
                 }],
                 task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
                 gateway: GatewayReport::default(),
             },
         )
@@ -608,6 +1076,8 @@ async fn routed_deployment_waits_for_gateway_application() {
                 task_inventory_error: None,
                 task_results: Vec::new(),
                 task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
                 gateway: GatewayReport::default(),
             },
         )
@@ -648,6 +1118,7 @@ x-swarmlite:
         id: task.id.clone(),
         observed: ObservedTaskState::Healthy,
         container_id: Some("container-routed".into()),
+        image_id: None,
         cluster_id: Some("deployment-gateway-wait-test".into()),
         stack: Some("demo".into()),
         service: Some("web".into()),
@@ -673,6 +1144,8 @@ x-swarmlite:
                 task_inventory_error: None,
                 task_results: vec![task_result.clone()],
                 task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
                 gateway: GatewayReport::default(),
             },
         )
@@ -697,6 +1170,8 @@ x-swarmlite:
                 task_inventory_error: None,
                 task_results: vec![task_result],
                 task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
                 gateway: GatewayReport {
                     applied_generation: Some(desired.generation),
                     error: None,
@@ -748,6 +1223,8 @@ async fn deployment_failure_is_persisted_and_releases_stack_name() {
                     error: Some("image pull denied".into()),
                 }],
                 task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
                 gateway: GatewayReport::default(),
             },
         )
@@ -807,6 +1284,7 @@ async fn failed_container_inventory_does_not_fail_stack_removal() {
                     id: task.id.clone(),
                     observed: ObservedTaskState::Failed,
                     container_id: Some("container-failed".into()),
+                    image_id: None,
                     cluster_id: Some("removal-inventory-race-test".into()),
                     stack: Some("demo".into()),
                     service: Some("web".into()),
@@ -818,6 +1296,8 @@ async fn failed_container_inventory_does_not_fail_stack_removal() {
                 task_inventory_error: None,
                 task_results: Vec::new(),
                 task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
                 gateway: GatewayReport::default(),
             },
         )
@@ -848,6 +1328,8 @@ async fn failed_container_inventory_does_not_fail_stack_removal() {
                     error: None,
                 }],
                 task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
                 gateway: GatewayReport::default(),
             },
         )
@@ -1048,6 +1530,8 @@ async fn node_labels_are_authoritative_and_persisted() {
                 task_inventory_error: None,
                 task_results: Vec::new(),
                 task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
                 gateway: GatewayReport::default(),
             },
         )
@@ -1101,6 +1585,7 @@ async fn caddy_acknowledgement_starts_drain_deadline() {
         id: "old-task".into(),
         observed: ObservedTaskState::Healthy,
         container_id: Some("container-old".into()),
+        image_id: None,
         cluster_id: Some("caddy-publisher-test".into()),
         stack: Some("demo".into()),
         service: Some("web".into()),
@@ -1122,6 +1607,8 @@ async fn caddy_acknowledgement_starts_drain_deadline() {
                 task_inventory_error: None,
                 task_results: Vec::new(),
                 task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
                 gateway: GatewayReport::default(),
             },
         )
@@ -1149,6 +1636,8 @@ async fn caddy_acknowledgement_starts_drain_deadline() {
                 task_inventory_error: None,
                 task_results: Vec::new(),
                 task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
                 gateway: GatewayReport {
                     applied_generation: Some(desired.generation),
                     error: None,
@@ -1182,6 +1671,8 @@ async fn gateway_failures_are_exposed_in_status() {
                 task_inventory_error: None,
                 task_results: Vec::new(),
                 task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
                 gateway: GatewayReport {
                     applied_generation: None,
                     error: Some("failed to bind gateway port 80".into()),
@@ -1275,6 +1766,7 @@ async fn heartbeat_then_deploy_adopts_the_existing_container() {
                     id: "existing-task".into(),
                     observed: ObservedTaskState::Healthy,
                     container_id: Some("container-existing".into()),
+                    image_id: None,
                     cluster_id: Some("recovery-test".into()),
                     stack: Some("demo".into()),
                     service: Some("web".into()),
@@ -1290,6 +1782,8 @@ async fn heartbeat_then_deploy_adopts_the_existing_container() {
                 task_inventory_error: None,
                 task_results: Vec::new(),
                 task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
                 gateway: GatewayReport::default(),
             },
         )
@@ -1330,6 +1824,7 @@ async fn recovery_restores_the_latest_service_revision_and_leaves_old_tasks_uncl
         id: id.into(),
         observed,
         container_id: Some(format!("container-{id}")),
+        image_id: None,
         cluster_id: Some("revision-recovery-test".into()),
         stack: Some("demo".into()),
         service: Some("web".into()),
@@ -1356,6 +1851,8 @@ async fn recovery_restores_the_latest_service_revision_and_leaves_old_tasks_uncl
                 task_inventory_error: None,
                 task_results: Vec::new(),
                 task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
                 gateway: GatewayReport::default(),
             },
         )
@@ -1420,6 +1917,7 @@ async fn recovery_ignores_invalid_service_revisions() {
                         id: id.into(),
                         observed: ObservedTaskState::Healthy,
                         container_id: Some(format!("container-{id}")),
+                        image_id: None,
                         cluster_id: Some("invalid-revision-recovery-test".into()),
                         stack: Some("demo".into()),
                         service: Some("web".into()),
@@ -1436,6 +1934,8 @@ async fn recovery_ignores_invalid_service_revisions() {
                 task_inventory_error: None,
                 task_results: Vec::new(),
                 task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
                 gateway: GatewayReport::default(),
             },
         )

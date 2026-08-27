@@ -603,9 +603,13 @@ impl DeploymentProgressRenderer {
     fn new() -> Self {
         let interactive = std::io::stderr().is_terminal()
             && std::env::var("TERM").ok().as_deref() != Some("dumb");
+        Self::for_output(interactive, std::env::var_os("NO_COLOR").is_some())
+    }
+
+    fn for_output(interactive: bool, no_color: bool) -> Self {
         Self {
             interactive,
-            color: interactive && std::env::var_os("NO_COLOR").is_none(),
+            color: interactive && !no_color,
             frame: 0,
             line_active: false,
         }
@@ -800,6 +804,10 @@ fn deployment_terminal_progress_summary(
         }
     }
 
+    if let Some((summary, color_code)) = image_resolution_summary(deployment) {
+        parts.push(ansi(color, color_code, summary));
+    }
+
     if let Some(gateway) = &deployment.gateway {
         let gateway_status = if gateway.applied_nodes >= gateway.total_nodes {
             "gateway ready".to_owned()
@@ -845,7 +853,7 @@ fn deployment_stage(
     operation: DeploymentOperation,
     deployment: &StackDeploymentResponse,
 ) -> &'static str {
-    use swarmlite::model::TaskReconcilePhase;
+    use swarmlite::model::{ImageResolutionStatus, TaskReconcilePhase};
 
     let reached = |phase| {
         deployment
@@ -890,6 +898,36 @@ fn deployment_stage(
         };
     }
 
+    if deployment
+        .image_resolutions
+        .iter()
+        .any(|image| image.status == ImageResolutionStatus::Pulling)
+    {
+        return "pulling images";
+    }
+    if deployment
+        .image_resolutions
+        .iter()
+        .any(|image| image.status == ImageResolutionStatus::Comparing)
+    {
+        return "comparing image IDs";
+    }
+    if deployment
+        .image_resolutions
+        .iter()
+        .any(|image| image.status == ImageResolutionStatus::Checking)
+    {
+        return "checking images";
+    }
+    if deployment
+        .image_resolutions
+        .iter()
+        .any(|image| image.status == ImageResolutionStatus::Changed)
+        && (applied < replicas || healthy < replicas || deployment.pending_removals > 0)
+    {
+        return "image changed; updating";
+    }
+
     if reached(TaskReconcilePhase::Remove) && deployment.pending_removals > 0 {
         return "removing old containers";
     }
@@ -930,6 +968,75 @@ fn deployment_stage(
         return "updating gateway";
     }
     "finishing"
+}
+
+fn image_resolution_summary(
+    deployment: &StackDeploymentResponse,
+) -> Option<(String, &'static str)> {
+    use swarmlite::model::ImageResolutionStatus;
+
+    if deployment.image_resolutions.is_empty()
+        || deployment.image_resolutions.iter().any(|image| {
+            matches!(
+                image.status,
+                ImageResolutionStatus::Checking
+                    | ImageResolutionStatus::Pulling
+                    | ImageResolutionStatus::Comparing
+            )
+        })
+    {
+        return None;
+    }
+    let changed = deployment
+        .image_resolutions
+        .iter()
+        .filter(|image| image.status == ImageResolutionStatus::Changed)
+        .count();
+    let unchanged = deployment
+        .image_resolutions
+        .iter()
+        .filter(|image| image.status == ImageResolutionStatus::Unchanged)
+        .count();
+    let skipped = deployment
+        .image_resolutions
+        .iter()
+        .filter(|image| image.status == ImageResolutionStatus::Skipped)
+        .count();
+    let failed = deployment
+        .image_resolutions
+        .iter()
+        .filter(|image| image.status == ImageResolutionStatus::Failed)
+        .count();
+    if failed > 0 {
+        return Some((format!("{failed} image check(s) failed"), "31"));
+    }
+    if deployment.image_resolutions.len() == 1 {
+        let image = &deployment.image_resolutions[0];
+        let outcome = match image.status {
+            ImageResolutionStatus::Changed => "image changed",
+            ImageResolutionStatus::Unchanged => "image unchanged",
+            ImageResolutionStatus::Skipped => "image check skipped",
+            _ => return None,
+        };
+        return Some((
+            format!("{} {outcome}", image.service),
+            if changed > 0 { "33" } else { "32" },
+        ));
+    }
+    let mut outcomes = Vec::new();
+    if changed > 0 {
+        outcomes.push(format!("{changed} changed"));
+    }
+    if unchanged > 0 {
+        outcomes.push(format!("{unchanged} unchanged"));
+    }
+    if skipped > 0 {
+        outcomes.push(format!("{skipped} skipped"));
+    }
+    Some((
+        format!("images {}", outcomes.join(", ")),
+        if changed > 0 { "33" } else { "32" },
+    ))
 }
 
 fn plural<'a>(count: u32, singular: &'a str, plural: &'a str) -> &'a str {
@@ -973,6 +1080,21 @@ fn deployment_progress_summary(
         .collect::<Vec<_>>()
         .join(",");
     let phases = (!phases.is_empty()).then(|| format!("; phases {phases}"));
+    let images = (!deployment.image_resolutions.is_empty()).then(|| {
+        let statuses = deployment
+            .image_resolutions
+            .iter()
+            .map(|image| {
+                format!(
+                    "{}={}",
+                    image.service,
+                    image_resolution_status_label(image.status)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("; images {statuses}")
+    });
     let gateway = deployment.gateway.as_ref().map(|gateway| {
         let errors = gateway
             .errors
@@ -998,12 +1120,13 @@ fn deployment_progress_summary(
             StackDeploymentStatus::TimedOut => "timed out",
         };
         return format!(
-            "{}: remove generation {} {}: {} task(s) remaining{}{} ({elapsed})",
+            "{}: remove generation {} {}: {} task(s) remaining{}{}{} ({elapsed})",
             deployment.stack,
             deployment.generation,
             status,
             deployment.pending_removals,
             phases.as_deref().unwrap_or_default(),
+            images.as_deref().unwrap_or_default(),
             gateway.as_deref().unwrap_or_default()
         );
     }
@@ -1041,15 +1164,29 @@ fn deployment_progress_summary(
     let removals = (deployment.pending_removals > 0)
         .then(|| format!("; {} task(s) pending removal", deployment.pending_removals));
     format!(
-        "{}: {} generation {} {status}: {applied}/{replicas} applied, {healthy}/{replicas} healthy [{}]{}{}{} ({elapsed})",
+        "{}: {} generation {} {status}: {applied}/{replicas} applied, {healthy}/{replicas} healthy [{}]{}{}{}{} ({elapsed})",
         deployment.stack,
         operation.label(),
         deployment.generation,
         services,
         removals.as_deref().unwrap_or_default(),
         phases.as_deref().unwrap_or_default(),
+        images.as_deref().unwrap_or_default(),
         gateway.as_deref().unwrap_or_default()
     )
+}
+
+fn image_resolution_status_label(status: swarmlite::model::ImageResolutionStatus) -> &'static str {
+    use swarmlite::model::ImageResolutionStatus;
+    match status {
+        ImageResolutionStatus::Checking => "checking",
+        ImageResolutionStatus::Pulling => "pulling",
+        ImageResolutionStatus::Comparing => "comparing",
+        ImageResolutionStatus::Unchanged => "unchanged",
+        ImageResolutionStatus::Changed => "changed/updating",
+        ImageResolutionStatus::Skipped => "skipped",
+        ImageResolutionStatus::Failed => "failed",
+    }
 }
 
 fn task_phase_label(phase: swarmlite::model::TaskReconcilePhase) -> &'static str {
@@ -1253,6 +1390,7 @@ async fn wait_for_deployment(
                     || deployment.services != next.services
                     || deployment.pending_removals != next.pending_removals
                     || deployment.task_phases != next.task_phases
+                    || deployment.image_resolutions != next.image_resolutions
                     || deployment.gateway != next.gateway
                     || deployment.errors != next.errors;
                 deployment = next;
@@ -1294,14 +1432,14 @@ mod tests {
     use swarmlite::{
         config::DEFAULT_CONTROLLER_PORT,
         model::{
-            StackDeploymentGatewayProgress, StackDeploymentResponse,
-            StackDeploymentServiceProgress, StackDeploymentStatus,
+            ImageResolutionStatus, StackDeploymentGatewayProgress, StackDeploymentImageProgress,
+            StackDeploymentResponse, StackDeploymentServiceProgress, StackDeploymentStatus,
             StackDeploymentTaskPhaseProgress, TaskReconcilePhase,
         },
     };
 
     use super::{
-        Cli, Command, DeploymentOperation, deployment_progress_summary,
+        Cli, Command, DeploymentOperation, DeploymentProgressRenderer, deployment_progress_summary,
         deployment_terminal_progress_summary, resolve_stack_name, write_terminal_progress,
     };
 
@@ -1364,6 +1502,7 @@ mod tests {
                 phase: TaskReconcilePhase::Pull,
                 tasks: 1,
             }],
+            image_resolutions: Vec::new(),
             gateway: Some(StackDeploymentGatewayProgress {
                 generation: 8,
                 applied_nodes: 0,
@@ -1452,6 +1591,70 @@ mod tests {
         write_terminal_progress(&mut output, "first", false).unwrap();
         write_terminal_progress(&mut output, "done", true).unwrap();
         assert_eq!(output, b"\r\x1b[2Kfirst\r\x1b[2Kdone\n");
+    }
+
+    #[test]
+    fn image_progress_is_readable_in_tty_and_plain_output() {
+        let mut deployment = StackDeploymentResponse {
+            stack: "demo".into(),
+            generation: 2,
+            revision: 1,
+            status: StackDeploymentStatus::Deploying,
+            started_at_unix_ms: 0,
+            finished_at_unix_ms: None,
+            services: vec![StackDeploymentServiceProgress {
+                service: "web".into(),
+                replicas: 1,
+                applied: 1,
+                healthy: 1,
+            }],
+            pending_removals: 0,
+            task_phases: Vec::new(),
+            image_resolutions: vec![StackDeploymentImageProgress {
+                service: "web".into(),
+                image: "nginx:latest".into(),
+                status: ImageResolutionStatus::Pulling,
+                completed_nodes: 0,
+                total_nodes: 1,
+            }],
+            gateway: None,
+            errors: Vec::new(),
+        };
+        let plain = deployment_progress_summary(
+            DeploymentOperation::Deploy,
+            &deployment,
+            std::time::Duration::from_secs(1),
+        );
+        assert!(plain.contains("images web=pulling"));
+        assert!(!plain.contains("\x1b["));
+        assert!(
+            deployment_terminal_progress_summary(
+                DeploymentOperation::Deploy,
+                &deployment,
+                std::time::Duration::from_secs(1),
+                0,
+                false,
+            )
+            .contains("pulling images")
+        );
+
+        deployment.image_resolutions[0].status = ImageResolutionStatus::Unchanged;
+        let colored = deployment_terminal_progress_summary(
+            DeploymentOperation::Deploy,
+            &deployment,
+            std::time::Duration::from_secs(2),
+            0,
+            true,
+        );
+        assert!(colored.contains("web image unchanged"));
+        assert!(colored.contains("\x1b[32m"));
+
+        let no_color = DeploymentProgressRenderer::for_output(true, true);
+        let redirected = DeploymentProgressRenderer::for_output(false, false);
+        assert!(no_color.interactive);
+        assert!(!no_color.color);
+        assert!(!redirected.interactive);
+        assert!(!redirected.color);
     }
 
     #[test]

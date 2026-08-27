@@ -18,18 +18,28 @@ use crate::{
     model::{
         AgentCommand, AgentCommandAck, AgentCommandOperation, AgentCommandPollResponse,
         AgentCommandResult, AgentDataStream, AgentDataStreamOperation, GatewayReport,
-        HeartbeatResponse, NodeControl, NodeHeartbeat, NodeRecord, ObservedTaskState,
+        HeartbeatResponse, ImageResolutionProgress, ImageResolutionReport,
+        ImageResolutionServiceReport, NodeControl, NodeHeartbeat, NodeRecord, ObservedTaskState,
         TaskReconcilePhase, TaskReconcileProgress, TaskReconcileReport, TaskReport,
     },
     registry::RegistryCredentialStore,
     runtime::{
-        ContainerRuntime, DockerCompatibleRuntime, ManagedContainer, RuntimeLogChannel,
-        RuntimeLogChunk, RuntimeTaskProgress,
+        ContainerRuntime, DockerCompatibleRuntime, ManagedContainer, RuntimeImageProgress,
+        RuntimeLogChannel, RuntimeLogChunk, RuntimeTaskProgress,
     },
 };
 
 const AGENT_DATA_QUEUE_FRAMES: usize = 64;
 const RUNTIME_LOG_QUEUE_FRAMES: usize = 16;
+
+#[derive(Clone)]
+struct ReconciliationState {
+    task_results: Arc<Mutex<BTreeMap<String, TaskReconcileReport>>>,
+    task_progress: Arc<Mutex<BTreeMap<(String, TaskReconcilePhase), TaskReconcileProgress>>>,
+    image_results: Arc<Mutex<BTreeMap<(u64, String), ImageResolutionReport>>>,
+    image_progress: Arc<Mutex<BTreeMap<(u64, String), ImageResolutionProgress>>>,
+    events: tokio::sync::mpsc::UnboundedSender<()>,
+}
 
 pub(crate) async fn run_with_token_and_updates(
     config: AgentConfig,
@@ -73,20 +83,29 @@ async fn run_with_runtime<R: ContainerRuntime>(
         (String, TaskReconcilePhase),
         TaskReconcileProgress,
     >::new()));
+    let image_results = Arc::new(Mutex::new(
+        BTreeMap::<(u64, String), ImageResolutionReport>::new(),
+    ));
+    let image_progress = Arc::new(Mutex::new(
+        BTreeMap::<(u64, String), ImageResolutionProgress>::new(),
+    ));
     let (reconcile_events_tx, mut reconcile_events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let reconciliation_state = ReconciliationState {
+        task_results: Arc::clone(&reconcile_results),
+        task_progress: Arc::clone(&reconcile_progress),
+        image_results: Arc::clone(&image_results),
+        image_progress: Arc::clone(&image_progress),
+        events: reconcile_events_tx,
+    };
     let runtime = Arc::new(runtime);
     let reconcile_runtime = Arc::clone(&runtime);
     let reconcile_cluster_id = config.cluster_id.clone();
-    let loop_results = Arc::clone(&reconcile_results);
-    let loop_progress = Arc::clone(&reconcile_progress);
     tokio::spawn(async move {
         reconciliation_loop(
             reconcile_runtime,
             assignments_rx,
             reconcile_cluster_id,
-            loop_results,
-            loop_progress,
-            reconcile_events_tx,
+            reconciliation_state,
         )
         .await;
     });
@@ -137,6 +156,7 @@ async fn run_with_runtime<R: ContainerRuntime>(
                     id: container.task_id.clone(),
                     observed: container.observed.clone(),
                     container_id: Some(container.id.clone()),
+                    image_id: container.image_id.clone(),
                     cluster_id: container.cluster_id.clone(),
                     stack: container.stack.clone(),
                     service: container.service.clone(),
@@ -154,6 +174,18 @@ async fn run_with_runtime<R: ContainerRuntime>(
                 .cloned()
                 .collect(),
             task_progress: reconcile_progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .values()
+                .cloned()
+                .collect(),
+            image_results: image_results
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .values()
+                .cloned()
+                .collect(),
+            image_progress: image_progress
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .values()
@@ -471,45 +503,80 @@ async fn reconciliation_loop<R: ContainerRuntime>(
     runtime: Arc<R>,
     mut assignments: tokio::sync::watch::Receiver<Option<HeartbeatResponse>>,
     cluster_id: String,
-    results: Arc<Mutex<BTreeMap<String, TaskReconcileReport>>>,
-    progress: Arc<Mutex<BTreeMap<(String, TaskReconcilePhase), TaskReconcileProgress>>>,
-    events: tokio::sync::mpsc::UnboundedSender<()>,
+    state: ReconciliationState,
 ) {
     let progress = ReconcileProgressPublisher {
-        progress,
-        events: events.clone(),
+        progress: Arc::clone(&state.task_progress),
+        events: state.events.clone(),
+    };
+    let image_progress = ImageProgressPublisher {
+        progress: Arc::clone(&state.image_progress),
+        events: state.events.clone(),
     };
     while assignments.changed().await.is_ok() {
         let Some(response) = assignments.borrow_and_update().clone() else {
             continue;
         };
-        let existing =
-            match runtime.list_managed(&cluster_id).await {
-                Ok(containers) => containers,
-                Err(error) => {
-                    error!(%error, "failed to inspect containers in reconciliation loop");
-                    let message = format!("{error:#}");
-                    let reports =
+        let existing = match runtime.list_managed(&cluster_id).await {
+            Ok(containers) => containers,
+            Err(error) => {
+                error!(%error, "failed to inspect containers in reconciliation loop");
+                let message = format!("{error:#}");
+                let reports = response
+                    .assignments
+                    .iter()
+                    .map(|assignment| (&assignment.id, assignment.deployment_generation))
+                    .chain(
                         response
-                            .assignments
+                            .remove_tasks
                             .iter()
-                            .map(|assignment| (&assignment.id, assignment.deployment_generation))
-                            .chain(response.remove_tasks.iter().map(|assignment| {
-                                (&assignment.id, assignment.deployment_generation)
-                            }))
-                            .map(|(task_id, desired_generation)| TaskReconcileReport {
-                                task_id: task_id.clone(),
-                                desired_generation,
-                                applied_generation: None,
-                                phase: TaskReconcilePhase::Inspect,
-                                error: Some(message.clone()),
-                            })
-                            .collect();
-                    publish_reconcile_results(&response, reports, &results, &events);
-                    continue;
-                }
-            };
+                            .map(|assignment| (&assignment.id, assignment.deployment_generation)),
+                    )
+                    .map(|(task_id, desired_generation)| TaskReconcileReport {
+                        task_id: task_id.clone(),
+                        desired_generation,
+                        applied_generation: None,
+                        phase: TaskReconcilePhase::Inspect,
+                        error: Some(message.clone()),
+                    })
+                    .collect();
+                publish_reconcile_results(&response, reports, &state.task_results, &state.events);
+                let image_reports = response
+                    .image_assignments
+                    .iter()
+                    .map(|assignment| ImageResolutionReport {
+                        deployment_generation: assignment.deployment_generation,
+                        image: assignment.image.clone(),
+                        resolved_image_id: None,
+                        services: Vec::new(),
+                        error: Some(message.clone()),
+                    })
+                    .collect();
+                publish_image_results(
+                    &response,
+                    image_reports,
+                    &state.image_results,
+                    &state.events,
+                );
+                continue;
+            }
+        };
         progress.retain_for_response(&response);
+        image_progress.retain_for_response(&response);
+        let image_reports = reconcile_images(
+            runtime.as_ref(),
+            &existing,
+            &response,
+            &state.image_results,
+            &image_progress,
+        )
+        .await;
+        publish_image_results(
+            &response,
+            image_reports,
+            &state.image_results,
+            &state.events,
+        );
         let reports = reconcile_containers_with_progress(
             runtime.as_ref(),
             &existing,
@@ -517,7 +584,140 @@ async fn reconciliation_loop<R: ContainerRuntime>(
             Some(&progress),
         )
         .await;
-        publish_reconcile_results(&response, reports, &results, &events);
+        publish_reconcile_results(&response, reports, &state.task_results, &state.events);
+    }
+}
+
+#[derive(Clone)]
+struct ImageProgressPublisher {
+    progress: Arc<Mutex<BTreeMap<(u64, String), ImageResolutionProgress>>>,
+    events: tokio::sync::mpsc::UnboundedSender<()>,
+}
+
+impl ImageProgressPublisher {
+    fn reporter(&self, deployment_generation: u64, image: &str) -> RuntimeImageProgress {
+        let image = image.to_owned();
+        let progress = Arc::clone(&self.progress);
+        let events = self.events.clone();
+        RuntimeImageProgress::new(move |status| {
+            let next = ImageResolutionProgress {
+                deployment_generation,
+                image: image.clone(),
+                status,
+            };
+            let key = (deployment_generation, image.clone());
+            let mut current = progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if current.get(&key) != Some(&next) {
+                current.insert(key, next);
+                let _ = events.send(());
+            }
+        })
+    }
+
+    fn retain_for_response(&self, response: &HeartbeatResponse) {
+        let expected = response
+            .image_assignments
+            .iter()
+            .map(|assignment| (assignment.deployment_generation, assignment.image.as_str()))
+            .collect::<std::collections::HashSet<_>>();
+        self.progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(generation, image), _| expected.contains(&(*generation, image.as_str())));
+    }
+}
+
+async fn reconcile_images<R: ContainerRuntime>(
+    runtime: &R,
+    existing: &HashMap<String, ManagedContainer>,
+    response: &HeartbeatResponse,
+    current_results: &Mutex<BTreeMap<(u64, String), ImageResolutionReport>>,
+    progress: &ImageProgressPublisher,
+) -> Vec<ImageResolutionReport> {
+    let completed = current_results
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .keys()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let mut reports = Vec::new();
+    for assignment in &response.image_assignments {
+        let key = (assignment.deployment_generation, assignment.image.clone());
+        if completed.contains(&key) {
+            continue;
+        }
+        let reporter = progress.reporter(assignment.deployment_generation, &assignment.image);
+        let result = async {
+            let resolved_image_id = runtime.resolve_image(&assignment.image, &reporter).await?;
+            let mut services = Vec::new();
+            for service in &assignment.services {
+                let mut old_image_ids = BTreeMap::new();
+                for task_id in &service.task_ids {
+                    let container = existing.get(task_id).ok_or_else(|| {
+                        anyhow::anyhow!("running task {task_id} disappeared during image check")
+                    })?;
+                    let image_id = container.image_id.clone().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "runtime did not report the image ID for running task {task_id}"
+                        )
+                    })?;
+                    old_image_ids.insert(task_id.clone(), image_id);
+                }
+                let changed = old_image_ids
+                    .values()
+                    .any(|image_id| image_id != &resolved_image_id);
+                services.push(ImageResolutionServiceReport {
+                    service_id: service.service_id.clone(),
+                    old_image_ids,
+                    changed,
+                });
+            }
+            anyhow::Ok((resolved_image_id, services))
+        }
+        .await;
+        reports.push(match result {
+            Ok((resolved_image_id, services)) => ImageResolutionReport {
+                deployment_generation: assignment.deployment_generation,
+                image: assignment.image.clone(),
+                resolved_image_id: Some(resolved_image_id),
+                services,
+                error: None,
+            },
+            Err(error) => ImageResolutionReport {
+                deployment_generation: assignment.deployment_generation,
+                image: assignment.image.clone(),
+                resolved_image_id: None,
+                services: Vec::new(),
+                error: Some(format!("{error:#}")),
+            },
+        });
+    }
+    reports
+}
+
+fn publish_image_results(
+    response: &HeartbeatResponse,
+    reports: Vec<ImageResolutionReport>,
+    results: &Mutex<BTreeMap<(u64, String), ImageResolutionReport>>,
+    events: &tokio::sync::mpsc::UnboundedSender<()>,
+) {
+    let expected = response
+        .image_assignments
+        .iter()
+        .map(|assignment| (assignment.deployment_generation, assignment.image.as_str()))
+        .collect::<std::collections::HashSet<_>>();
+    let mut current = results
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous = current.clone();
+    current.retain(|(generation, image), _| expected.contains(&(*generation, image.as_str())));
+    for report in reports {
+        current.insert((report.deployment_generation, report.image.clone()), report);
+    }
+    if *current != previous {
+        let _ = events.send(());
     }
 }
 
@@ -787,6 +987,9 @@ mod tests {
         log_output: Arc<Mutex<Vec<u8>>>,
         fail_create: bool,
         start_port_conflicts: Arc<AtomicUsize>,
+        resolve_count: Arc<AtomicUsize>,
+        resolved_image_id: Option<String>,
+        fail_resolve: bool,
     }
 
     impl ContainerRuntime for FakeRuntime {
@@ -814,6 +1017,24 @@ mod tests {
             _cluster_id: &str,
         ) -> Result<HashMap<String, ManagedContainer>> {
             Ok(HashMap::new())
+        }
+
+        async fn resolve_image(
+            &self,
+            _image: &str,
+            progress: &RuntimeImageProgress,
+        ) -> Result<String> {
+            progress.report(crate::model::ImageResolutionStatus::Checking);
+            progress.report(crate::model::ImageResolutionStatus::Pulling);
+            self.resolve_count.fetch_add(1, Ordering::Relaxed);
+            if self.fail_resolve {
+                bail!("image pull denied");
+            }
+            progress.report(crate::model::ImageResolutionStatus::Comparing);
+            Ok(self
+                .resolved_image_id
+                .clone()
+                .unwrap_or_else(|| "sha256:resolved".into()))
         }
 
         async fn create_task(
@@ -891,6 +1112,7 @@ mod tests {
     fn managed(task_id: &str) -> ManagedContainer {
         ManagedContainer {
             id: format!("container-{task_id}"),
+            image_id: Some("sha256:current".into()),
             task_id: task_id.to_owned(),
             revision: Some(1),
             running: true,
@@ -903,6 +1125,86 @@ mod tests {
             spec_hash: Some("hash".into()),
             ports: Vec::new(),
         }
+    }
+
+    fn image_test_response(task_ids: &[&str]) -> HeartbeatResponse {
+        HeartbeatResponse {
+            generation: 2,
+            cluster: test_cluster(),
+            assignments: Vec::new(),
+            image_assignments: vec![crate::model::ImageResolutionAssignment {
+                deployment_generation: 2,
+                image: "nginx:latest".into(),
+                services: task_ids
+                    .iter()
+                    .enumerate()
+                    .map(
+                        |(index, task_id)| crate::model::ImageResolutionServiceAssignment {
+                            service_id: format!("demo.service-{index}"),
+                            task_ids: vec![(*task_id).to_owned()],
+                        },
+                    )
+                    .collect(),
+            }],
+            gateway_enabled: false,
+            labels: Default::default(),
+            remove_tasks: Vec::new(),
+            gateway_config: None,
+            registry_credentials: Default::default(),
+            registry_credentials_hash: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolves_each_deployment_image_once_and_never_removes_containers() {
+        let runtime = FakeRuntime {
+            resolved_image_id: Some("sha256:current".into()),
+            ..Default::default()
+        };
+        let existing = HashMap::from([
+            ("task-a".into(), managed("task-a")),
+            ("task-b".into(), managed("task-b")),
+        ]);
+        let response = image_test_response(&["task-a", "task-b"]);
+        let current = Mutex::new(BTreeMap::new());
+        let (events, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let progress = ImageProgressPublisher {
+            progress: Arc::new(Mutex::new(BTreeMap::new())),
+            events: events.clone(),
+        };
+
+        let reports = reconcile_images(&runtime, &existing, &response, &current, &progress).await;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].services.len(), 2);
+        assert!(reports[0].services.iter().all(|service| !service.changed));
+        publish_image_results(&response, reports, &current, &events);
+        let repeated = reconcile_images(&runtime, &existing, &response, &current, &progress).await;
+
+        assert!(repeated.is_empty());
+        assert_eq!(runtime.resolve_count.load(Ordering::Relaxed), 1);
+        assert!(runtime.removed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn image_pull_failure_reports_error_without_removing_the_old_container() {
+        let runtime = FakeRuntime {
+            fail_resolve: true,
+            ..Default::default()
+        };
+        let existing = HashMap::from([("task-a".into(), managed("task-a"))]);
+        let response = image_test_response(&["task-a"]);
+        let current = Mutex::new(BTreeMap::new());
+        let (events, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let progress = ImageProgressPublisher {
+            progress: Arc::new(Mutex::new(BTreeMap::new())),
+            events,
+        };
+
+        let reports = reconcile_images(&runtime, &existing, &response, &current, &progress).await;
+
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].error.as_deref().unwrap().contains("pull denied"));
+        assert!(runtime.removed.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -999,6 +1301,7 @@ mod tests {
             generation: 1,
             cluster: test_cluster(),
             assignments: Vec::new(),
+            image_assignments: Vec::new(),
             gateway_enabled: false,
             labels: Default::default(),
             remove_tasks: Vec::new(),
@@ -1076,7 +1379,9 @@ mod tests {
                 generation: 1,
                 deployment_generation: 1,
                 spec_hash: "hash".into(),
+                image_resolved: false,
             }],
+            image_assignments: Vec::new(),
             gateway_enabled: false,
             labels: Default::default(),
             remove_tasks: Vec::new(),
@@ -1138,7 +1443,9 @@ mod tests {
                 generation: 2,
                 deployment_generation: 2,
                 spec_hash: "new-scale-hash".into(),
+                image_resolved: false,
             }],
+            image_assignments: Vec::new(),
             gateway_enabled: false,
             labels: Default::default(),
             remove_tasks: Vec::new(),
@@ -1192,7 +1499,9 @@ mod tests {
                 generation: 7,
                 deployment_generation: 5,
                 spec_hash: "hash".into(),
+                image_resolved: false,
             }],
+            image_assignments: Vec::new(),
             gateway_enabled: false,
             labels: Default::default(),
             remove_tasks: Vec::new(),

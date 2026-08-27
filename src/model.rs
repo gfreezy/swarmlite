@@ -164,6 +164,49 @@ pub struct StackDeploymentRecord {
     pub finished_at_unix_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<StackDeploymentError>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub image_resolutions: BTreeMap<String, DeploymentImageResolutionRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeploymentImageResolutionRecord {
+    pub service_id: String,
+    pub service: String,
+    pub image: String,
+    pub baseline_revision: u64,
+    pub status: ImageResolutionStatus,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub nodes: BTreeMap<String, DeploymentImageResolutionNodeRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeploymentImageResolutionNodeRecord {
+    pub task_ids: Vec<String>,
+    pub status: ImageResolutionStatus,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub old_image_ids: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_image_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageResolutionStatus {
+    Checking,
+    Pulling,
+    Comparing,
+    Unchanged,
+    Changed,
+    Skipped,
+    Failed,
+}
+
+impl ImageResolutionStatus {
+    pub fn is_complete(self) -> bool {
+        matches!(self, Self::Unchanged | Self::Changed | Self::Skipped)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -326,6 +369,10 @@ pub struct NodeHeartbeat {
     #[serde(default)]
     pub task_progress: Vec<TaskReconcileProgress>,
     #[serde(default)]
+    pub image_results: Vec<ImageResolutionReport>,
+    #[serde(default)]
+    pub image_progress: Vec<ImageResolutionProgress>,
+    #[serde(default)]
     pub gateway: GatewayReport,
 }
 
@@ -371,6 +418,8 @@ pub struct TaskReport {
     pub id: String,
     pub observed: ObservedTaskState,
     pub container_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_id: Option<String>,
     pub cluster_id: Option<String>,
     pub stack: Option<String>,
     pub service: Option<String>,
@@ -385,6 +434,8 @@ pub struct HeartbeatResponse {
     pub generation: u64,
     pub cluster: ClusterSettings,
     pub assignments: Vec<TaskAssignment>,
+    #[serde(default)]
+    pub image_assignments: Vec<ImageResolutionAssignment>,
     pub gateway_enabled: bool,
     pub labels: BTreeMap<String, String>,
     pub remove_tasks: Vec<TaskRemovalAssignment>,
@@ -492,6 +543,47 @@ pub struct TaskAssignment {
     pub generation: u64,
     pub deployment_generation: u64,
     pub spec_hash: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub image_resolved: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageResolutionAssignment {
+    pub deployment_generation: u64,
+    pub image: String,
+    pub services: Vec<ImageResolutionServiceAssignment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageResolutionServiceAssignment {
+    pub service_id: String,
+    pub task_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageResolutionProgress {
+    pub deployment_generation: u64,
+    pub image: String,
+    pub status: ImageResolutionStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageResolutionReport {
+    pub deployment_generation: u64,
+    pub image: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_image_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<ImageResolutionServiceReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageResolutionServiceReport {
+    pub service_id: String,
+    pub old_image_ids: BTreeMap<String, String>,
+    pub changed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -508,6 +600,8 @@ pub struct StackDeploymentResponse {
     pub pending_removals: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub task_phases: Vec<StackDeploymentTaskPhaseProgress>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_resolutions: Vec<StackDeploymentImageProgress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway: Option<StackDeploymentGatewayProgress>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -536,6 +630,15 @@ pub struct StackDeploymentServiceProgress {
 pub struct StackDeploymentTaskPhaseProgress {
     pub phase: TaskReconcilePhase,
     pub tasks: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StackDeploymentImageProgress {
+    pub service: String,
+    pub image: String,
+    pub status: ImageResolutionStatus,
+    pub completed_nodes: u32,
+    pub total_nodes: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

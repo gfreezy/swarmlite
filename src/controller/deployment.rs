@@ -21,6 +21,37 @@ impl RevisionPolicy<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceUpdatePlan {
+    VerifyOnly,
+    ResolveImage,
+    Reconcile { bump_revision: bool },
+}
+
+fn service_update_plan(
+    previous: &ServiceRecord,
+    next: &swarmlite_stack::ServiceSpec,
+    routing_ports_changed: bool,
+    revision_policy: RevisionPolicy<'_>,
+) -> ServiceUpdatePlan {
+    let service_changed = previous.deleted || previous.spec != *next || routing_ports_changed;
+    if revision_policy.forces(&previous.name) {
+        return ServiceUpdatePlan::Reconcile {
+            bump_revision: true,
+        };
+    }
+    if service_changed {
+        return ServiceUpdatePlan::Reconcile {
+            bump_revision: !revision_policy.preserves(&previous.name),
+        };
+    }
+    if revision_policy.refreshes_images() && next.pull_policy.refreshes_cached_image(&next.image) {
+        ServiceUpdatePlan::ResolveImage
+    } else {
+        ServiceUpdatePlan::VerifyOnly
+    }
+}
+
 pub(super) struct StackDeployment<'a> {
     active: &'a std::sync::Mutex<BTreeSet<String>>,
     stack_name: String,
@@ -145,6 +176,7 @@ impl Controller {
             .get(stack_name)
             .map(|stack| stack.gateway.clone())
             .unwrap_or_default();
+        let live = current_live_nodes(&inner, self.config.node_timeout_seconds);
         let wait_for_gateway =
             !previous_gateway.http_routes.is_empty() || !stack_gateway.http_routes.is_empty();
         let desired_ids: BTreeSet<String> = services
@@ -152,6 +184,7 @@ impl Controller {
             .map(|name| service_id(stack_name, name))
             .collect();
         let mut new_service_ids = BTreeSet::new();
+        let mut image_resolutions = BTreeMap::new();
         for service in inner
             .state
             .services
@@ -164,27 +197,94 @@ impl Controller {
             let id = service_id(stack_name, &name);
             let routing_ports_changed = gateway::routed_service_ports(&previous_gateway, &name)
                 != gateway::routed_service_ports(&stack_gateway, &name);
+            let update_plan = previous.services.get(&id).map(|existing| {
+                service_update_plan(existing, &spec, routing_ports_changed, revision_policy)
+            });
             match inner.state.services.get_mut(&id) {
-                Some(existing)
-                    if existing.spec == spec
-                        && !existing.deleted
-                        && !routing_ports_changed
-                        && !(revision_policy.refreshes_images()
-                            && spec.pull_policy.refreshes_cached_image(&spec.image))
-                        && !revision_policy.forces(&name) => {}
                 Some(existing) => {
-                    if !revision_policy.preserves(&name) {
-                        let Some(revision) = existing.revision.checked_add(1) else {
-                            let service_id = existing.id.clone();
-                            inner.state = previous;
-                            return Err(ControllerError::Invalid(format!(
-                                "service {service_id:?} revision overflow"
-                            )));
-                        };
-                        existing.revision = revision;
+                    match update_plan.expect("existing service has a previous record") {
+                        ServiceUpdatePlan::VerifyOnly => {
+                            if revision_policy.refreshes_images() {
+                                image_resolutions.insert(
+                                    id.clone(),
+                                    DeploymentImageResolutionRecord {
+                                        service_id: id,
+                                        service: name,
+                                        image: spec.image.clone(),
+                                        baseline_revision: existing.revision,
+                                        status: ImageResolutionStatus::Skipped,
+                                        nodes: BTreeMap::new(),
+                                    },
+                                );
+                            }
+                        }
+                        ServiceUpdatePlan::ResolveImage => {
+                            if existing.revision == u64::MAX {
+                                let service_id = existing.id.clone();
+                                inner.state = previous;
+                                return Err(ControllerError::Invalid(format!(
+                                    "service {service_id:?} revision overflow"
+                                )));
+                            }
+                            let mut targets =
+                                BTreeMap::<String, DeploymentImageResolutionNodeRecord>::new();
+                            for task in previous.tasks.values().filter(|task| {
+                                task.service_id == existing.id
+                                    && task.revision == existing.revision
+                                    && task.desired == DesiredTaskState::Running
+                                    && live.contains(&task.node_id)
+                                    && task.container_id.is_some()
+                                    && matches!(
+                                        task.observed,
+                                        ObservedTaskState::Starting
+                                            | ObservedTaskState::Running
+                                            | ObservedTaskState::Healthy
+                                    )
+                            }) {
+                                targets
+                                    .entry(task.node_id.clone())
+                                    .or_insert_with(|| DeploymentImageResolutionNodeRecord {
+                                        task_ids: Vec::new(),
+                                        status: ImageResolutionStatus::Checking,
+                                        old_image_ids: BTreeMap::new(),
+                                        resolved_image_id: None,
+                                        error: None,
+                                    })
+                                    .task_ids
+                                    .push(task.id.clone());
+                            }
+                            let status = if targets.is_empty() {
+                                ImageResolutionStatus::Unchanged
+                            } else {
+                                ImageResolutionStatus::Checking
+                            };
+                            image_resolutions.insert(
+                                id.clone(),
+                                DeploymentImageResolutionRecord {
+                                    service_id: id,
+                                    service: name,
+                                    image: spec.image.clone(),
+                                    baseline_revision: existing.revision,
+                                    status,
+                                    nodes: targets,
+                                },
+                            );
+                        }
+                        ServiceUpdatePlan::Reconcile { bump_revision } => {
+                            if bump_revision {
+                                let Some(revision) = existing.revision.checked_add(1) else {
+                                    let service_id = existing.id.clone();
+                                    inner.state = previous;
+                                    return Err(ControllerError::Invalid(format!(
+                                        "service {service_id:?} revision overflow"
+                                    )));
+                                };
+                                existing.revision = revision;
+                            }
+                            existing.spec = spec;
+                            existing.deleted = false;
+                        }
                     }
-                    existing.spec = spec;
-                    existing.deleted = false;
                 }
                 None => {
                     new_service_ids.insert(id.clone());
@@ -216,12 +316,12 @@ impl Controller {
                     wait_for_gateway,
                     finished_at_unix_ms: None,
                     errors: Vec::new(),
+                    image_resolutions,
                 }),
             },
         );
         restore_unclaimed_service_revisions(&mut inner.state, &new_service_ids);
         adopt_unclaimed_tasks(&mut inner.state, stack_name);
-        let live = current_live_nodes(&inner, self.config.node_timeout_seconds);
         scheduler::reconcile(&mut inner.state, &live);
         self.refresh_stack_deployments_locked(&mut inner, unix_ms())?;
         if let Err(error) = self.commit_locked(&mut inner).await {
@@ -465,6 +565,246 @@ pub(super) fn apply_task_result(
     (true, deployment_changed)
 }
 
+pub(super) fn apply_image_progress(
+    state: &mut ClusterState,
+    node_id: &str,
+    progress: &ImageResolutionProgress,
+) -> bool {
+    if !matches!(
+        progress.status,
+        ImageResolutionStatus::Checking
+            | ImageResolutionStatus::Pulling
+            | ImageResolutionStatus::Comparing
+    ) {
+        return false;
+    }
+    let Some(deployment) = state
+        .stacks
+        .values_mut()
+        .filter_map(|stack| stack.deployment.as_mut())
+        .find(|deployment| {
+            deployment.generation == progress.deployment_generation
+                && deployment.status == StackDeploymentStatus::Deploying
+        })
+    else {
+        return false;
+    };
+    let mut changed = false;
+    for resolution in deployment
+        .image_resolutions
+        .values_mut()
+        .filter(|resolution| resolution.image == progress.image && !resolution.status.is_complete())
+    {
+        let Some(node) = resolution.nodes.get_mut(node_id) else {
+            continue;
+        };
+        if !node.status.is_complete() && node.status != progress.status {
+            node.status = progress.status;
+            changed = true;
+        }
+        let aggregate = resolution
+            .nodes
+            .values()
+            .filter(|node| !node.status.is_complete())
+            .map(|node| node.status)
+            .max()
+            .unwrap_or(resolution.status);
+        if !resolution.status.is_complete() && resolution.status != aggregate {
+            resolution.status = aggregate;
+            changed = true;
+        }
+    }
+    changed
+}
+
+pub(super) fn apply_image_resolution_report(
+    state: &mut ClusterState,
+    node_id: &str,
+    report: &ImageResolutionReport,
+) -> bool {
+    let Some(stack_name) = state.stacks.iter().find_map(|(stack_name, stack)| {
+        stack
+            .deployment
+            .as_ref()
+            .filter(|deployment| {
+                deployment.generation == report.deployment_generation
+                    && deployment.status == StackDeploymentStatus::Deploying
+            })
+            .map(|_| stack_name.clone())
+    }) else {
+        return false;
+    };
+
+    let expected = state
+        .stacks
+        .get(&stack_name)
+        .and_then(|stack| stack.deployment.as_ref())
+        .into_iter()
+        .flat_map(|deployment| deployment.image_resolutions.values())
+        .filter(|resolution| {
+            resolution.image == report.image
+                && !resolution.status.is_complete()
+                && resolution
+                    .nodes
+                    .get(node_id)
+                    .is_some_and(|node| !node.status.is_complete())
+        })
+        .map(|resolution| (resolution.service_id.clone(), resolution.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if expected.is_empty() {
+        return false;
+    }
+
+    let validation_error = report.error.clone().or_else(|| {
+        let Some(resolved_image_id) = report.resolved_image_id.as_deref() else {
+            return Some("runtime did not report the resolved image ID".to_owned());
+        };
+        if resolved_image_id.is_empty() {
+            return Some("runtime reported an empty image ID".to_owned());
+        }
+        let reported = report
+            .services
+            .iter()
+            .map(|service| service.service_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let expected_ids = expected.keys().map(String::as_str).collect::<BTreeSet<_>>();
+        if reported != expected_ids {
+            return Some("image resolution report did not cover the assigned services".to_owned());
+        }
+        for service in &report.services {
+            let expected_tasks = expected[&service.service_id]
+                .nodes
+                .get(node_id)
+                .expect("target node was filtered above")
+                .task_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            let reported_tasks = service
+                .old_image_ids
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            if expected_tasks != reported_tasks {
+                return Some(format!(
+                    "image resolution report for service {:?} did not cover its running tasks",
+                    service.service_id
+                ));
+            }
+            let changed = service
+                .old_image_ids
+                .values()
+                .any(|image_id| image_id != resolved_image_id);
+            if service.changed != changed {
+                return Some(format!(
+                    "image resolution report for service {:?} contained an inconsistent comparison",
+                    service.service_id
+                ));
+            }
+        }
+        None
+    });
+    if let Some(message) = validation_error {
+        let deployment = state
+            .stacks
+            .get_mut(&stack_name)
+            .and_then(|stack| stack.deployment.as_mut())
+            .expect("deployment was found above");
+        for resolution in deployment
+            .image_resolutions
+            .values_mut()
+            .filter(|resolution| expected.contains_key(&resolution.service_id))
+        {
+            resolution.status = ImageResolutionStatus::Failed;
+            if let Some(node) = resolution.nodes.get_mut(node_id) {
+                node.status = ImageResolutionStatus::Failed;
+                node.error = Some(message.clone());
+            }
+            let error = StackDeploymentError {
+                task_id: format!("image:{}", report.image),
+                service: resolution.service.clone(),
+                node_id: node_id.to_owned(),
+                phase: crate::model::TaskReconcilePhase::Pull,
+                message: message.clone(),
+            };
+            if !deployment.errors.contains(&error) {
+                deployment.errors.push(error);
+            }
+        }
+        deployment.status = StackDeploymentStatus::Failed;
+        deployment.finished_at_unix_ms = Some(unix_ms());
+        return true;
+    }
+
+    let resolved_image_id = report
+        .resolved_image_id
+        .as_ref()
+        .expect("validated successful report has an image ID")
+        .clone();
+    let reports = report
+        .services
+        .iter()
+        .map(|service| (service.service_id.as_str(), service))
+        .collect::<BTreeMap<_, _>>();
+    let mut changed_services = Vec::new();
+    {
+        let deployment = state
+            .stacks
+            .get_mut(&stack_name)
+            .and_then(|stack| stack.deployment.as_mut())
+            .expect("deployment was found above");
+        for resolution in deployment
+            .image_resolutions
+            .values_mut()
+            .filter(|resolution| expected.contains_key(&resolution.service_id))
+        {
+            let service_report = reports[resolution.service_id.as_str()];
+            let node = resolution
+                .nodes
+                .get_mut(node_id)
+                .expect("target node was validated above");
+            node.old_image_ids.clone_from(&service_report.old_image_ids);
+            node.resolved_image_id = Some(resolved_image_id.clone());
+            node.error = None;
+            node.status = if service_report.changed {
+                ImageResolutionStatus::Changed
+            } else {
+                ImageResolutionStatus::Unchanged
+            };
+            if resolution
+                .nodes
+                .values()
+                .all(|node| node.status.is_complete())
+            {
+                resolution.status = if resolution
+                    .nodes
+                    .values()
+                    .any(|node| node.status == ImageResolutionStatus::Changed)
+                {
+                    changed_services
+                        .push((resolution.service_id.clone(), resolution.baseline_revision));
+                    ImageResolutionStatus::Changed
+                } else {
+                    ImageResolutionStatus::Unchanged
+                };
+            }
+        }
+    }
+    for (service_id, baseline_revision) in changed_services {
+        let service = state
+            .services
+            .get_mut(&service_id)
+            .expect("image resolution references an existing service");
+        if service.revision == baseline_revision {
+            service.revision = service
+                .revision
+                .checked_add(1)
+                .expect("image resolution revision overflow was validated at apply time");
+        }
+    }
+    true
+}
+
 fn deployment_is_healthy(
     state: &ClusterState,
     stack_name: &str,
@@ -481,6 +821,13 @@ fn deployment_is_healthy(
     else {
         return false;
     };
+    if !deployment
+        .image_resolutions
+        .values()
+        .all(|resolution| resolution.status.is_complete())
+    {
+        return false;
+    }
     let replicas_healthy = stack.services.iter().all(|service_id| {
         let Some(service) = state
             .services
@@ -587,6 +934,24 @@ fn deployment_response(
         .into_iter()
         .map(|(phase, tasks)| StackDeploymentTaskPhaseProgress { phase, tasks })
         .collect();
+    let image_resolutions = deployment
+        .image_resolutions
+        .values()
+        .map(|resolution| StackDeploymentImageProgress {
+            service: resolution.service.clone(),
+            image: resolution.image.clone(),
+            status: resolution.status,
+            completed_nodes: u32::try_from(
+                resolution
+                    .nodes
+                    .values()
+                    .filter(|node| node.status.is_complete())
+                    .count(),
+            )
+            .unwrap_or(u32::MAX),
+            total_nodes: u32::try_from(resolution.nodes.len()).unwrap_or(u32::MAX),
+        })
+        .collect();
     let pending_removals = u32::try_from(
         inner
             .state
@@ -651,6 +1016,7 @@ fn deployment_response(
         services,
         pending_removals,
         task_phases,
+        image_resolutions,
         gateway,
         errors: deployment.errors.clone(),
     })
