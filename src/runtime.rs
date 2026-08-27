@@ -27,7 +27,9 @@ use crate::{
     config::{ResolvedRuntimeConfig, RuntimeKind},
     data_plane::MAX_DATA_PAYLOAD_BYTES,
     gateway,
-    model::{ClusterState, GatewayAssignment, ObservedTaskState, PortBinding, TaskAssignment},
+    model::{
+        ClusterState, GatewayAssignment, ObservedTaskState, PortBinding, PullPolicy, TaskAssignment,
+    },
     registry::RegistryCredentialStore,
 };
 
@@ -302,7 +304,7 @@ impl DockerCompatibleRuntime {
                 }
                 return Ok(());
             }
-            self.ensure_image(&spec.image).await?;
+            self.ensure_image_if_missing(&spec.image).await?;
             info!(
                 previous_address = ?existing.advertise_address,
                 address = %spec.advertise_address,
@@ -373,7 +375,7 @@ impl DockerCompatibleRuntime {
     }
 
     async fn create_gateway(&self, spec: &GatewayContainerSpec) -> Result<()> {
-        self.ensure_image(&spec.image).await?;
+        self.ensure_image_if_missing(&spec.image).await?;
         let bootstrap = gateway_bootstrap(spec)?;
         let ports = gateway_ports(&spec.listen)?;
         let mut port_bindings = HashMap::new();
@@ -502,10 +504,36 @@ impl DockerCompatibleRuntime {
         Ok(())
     }
 
-    async fn ensure_image(&self, image: &str) -> Result<()> {
+    async fn ensure_image(&self, image: &str, pull_policy: PullPolicy) -> Result<()> {
+        match pull_policy {
+            PullPolicy::Never => {
+                return self
+                    .client
+                    .inspect_image(image)
+                    .await
+                    .map(|_| ())
+                    .with_context(|| {
+                        format!("pull_policy=never requires image {image} in the local cache")
+                    });
+            }
+            PullPolicy::Missing if !pull_policy.refreshes_cached_image(image) => {
+                if self.client.inspect_image(image).await.is_ok() {
+                    return Ok(());
+                }
+            }
+            PullPolicy::Always | PullPolicy::Missing => {}
+        }
+        self.pull_image(image).await
+    }
+
+    async fn ensure_image_if_missing(&self, image: &str) -> Result<()> {
         if self.client.inspect_image(image).await.is_ok() {
             return Ok(());
         }
+        self.pull_image(image).await
+    }
+
+    async fn pull_image(&self, image: &str) -> Result<()> {
         let credentials = self
             .registry_credentials
             .as_ref()
@@ -682,13 +710,23 @@ impl ContainerRuntime for DockerCompatibleRuntime {
             runtime = %self.kind,
             "creating task container"
         );
-        self.ensure_image(&assignment.spec.image).await?;
+        self.ensure_image(&assignment.spec.image, assignment.spec.pull_policy)
+            .await?;
 
         let mut port_bindings = HashMap::new();
         let exposed_ports = assignment
-            .ports
+            .spec
+            .expose
             .iter()
             .map(|port| format!("{}/{}", port.target, port.protocol))
+            .chain(
+                assignment
+                    .ports
+                    .iter()
+                    .map(|port| format!("{}/{}", port.target, port.protocol)),
+            )
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect::<Vec<_>>();
         for port in &assignment.ports {
             port_bindings.insert(
@@ -1066,9 +1104,11 @@ mod tests {
             desired: crate::model::DesiredTaskState::Running,
             spec: ServiceSpec {
                 image: "nginx:alpine".into(),
+                pull_policy: Default::default(),
                 command: Vec::new(),
                 entrypoint: Vec::new(),
                 environment: Vec::new(),
+                expose: Vec::new(),
                 ports: Vec::new(),
                 volumes: Vec::new(),
                 container_labels: BTreeMap::from([(CLUSTER_LABEL.to_owned(), "user-value".into())]),

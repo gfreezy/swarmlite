@@ -23,6 +23,12 @@
           "minLength": 1,
           "description": "Container image reference. Image builds are not supported."
         },
+        "pull_policy": {
+          "type": "string",
+          "enum": ["always", "missing", "if_not_present", "never"],
+          "default": "missing",
+          "description": "Controls registry pulls. missing refreshes an omitted or latest tag; if_not_present is an alias for missing."
+        },
         "command": {
           "$ref": "#/$defs/stringOrList",
           "description": "Container command. String form is parsed with shell-style word splitting; list form is passed verbatim."
@@ -39,11 +45,17 @@
           "$ref": "#/$defs/stringMapOrList",
           "description": "Labels attached to each task container. deploy.labels are service metadata instead."
         },
+        "expose": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/exposedPort" },
+          "default": [],
+          "description": "Container target ports available to internal consumers such as x-swarmlite routes. These ports are not published directly on the host."
+        },
         "ports": {
           "type": "array",
           "items": { "$ref": "#/$defs/servicePort" },
           "default": [],
-          "description": "Host-published ports. Omit published to let Swarmlite allocate a node port. Port ranges, host-IP prefixes, and mode are not supported."
+          "description": "Node-local host-published ports. Omit published to let Swarmlite allocate a node port. A fixed published port permits only one task per protocol on each node. Port ranges, host-IP prefixes, and mode are not supported."
         },
         "volumes": {
           "type": "array",
@@ -107,6 +119,20 @@
           "$ref": "#/$defs/servicePortLong"
         }
       ]
+    },
+    "exposedPort": {
+      "oneOf": [
+        {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        {
+          "type": "string",
+          "pattern": "^(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])(?:/(?:tcp|udp))?$"
+        }
+      ],
+      "description": "An internal container target port with an optional protocol. Port ranges are not supported."
     },
     "servicePortLong": {
       "type": "object",
@@ -385,7 +411,6 @@
     },
     "backend": {
       "type": "object",
-      "required": ["port"],
       "properties": {
         "service": {
           "type": "string",
@@ -398,7 +423,8 @@
         "port": {
           "type": "integer",
           "minimum": 1,
-          "maximum": 65535
+          "maximum": 65535,
+          "description": "Required for host backends. For service backends, may be omitted when the Service declares exactly one TCP target across expose and ports."
         },
         "protocol": {
           "type": "string",
@@ -417,7 +443,10 @@
         },
         {
           "required": ["host"],
-          "not": { "required": ["service"] }
+          "allOf": [
+            { "required": ["port"] },
+            { "not": { "required": ["service"] } }
+          ]
         }
       ],
       "additionalProperties": false

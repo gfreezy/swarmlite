@@ -93,6 +93,7 @@ mod tests {
 services:
   web:
     image: nginx
+    expose: [80]
 x-swarmlite:
   http_routes:
     - hostnames: [example.com]
@@ -162,9 +163,11 @@ x-swarmlite:
             revision: 1,
             spec: ServiceSpec {
                 image: "nginx".into(),
+                pull_policy: Default::default(),
                 command: Vec::new(),
                 entrypoint: Vec::new(),
                 environment: Vec::new(),
+                expose: Vec::new(),
                 ports: vec![ServicePort {
                     target: 80,
                     published: None,

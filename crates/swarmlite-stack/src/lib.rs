@@ -16,9 +16,13 @@ pub use compose::{ParsedStack, parse_stack};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServiceSpec {
     pub image: String,
+    #[serde(default, skip_serializing_if = "PullPolicy::is_missing")]
+    pub pull_policy: PullPolicy,
     pub command: Vec<String>,
     pub entrypoint: Vec<String>,
     pub environment: Vec<String>,
+    #[serde(default)]
+    pub expose: Vec<ServicePort>,
     pub ports: Vec<ServicePort>,
     pub volumes: Vec<String>,
     pub container_labels: BTreeMap<String, String>,
@@ -30,10 +34,72 @@ pub struct ServiceSpec {
     pub stop_grace_period_seconds: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PullPolicy {
+    Always,
+    #[default]
+    #[serde(alias = "if_not_present")]
+    Missing,
+    Never,
+}
+
+impl PullPolicy {
+    pub const fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+
+    pub fn refreshes_cached_image(self, image: &str) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Missing => image_uses_latest_tag(image),
+            Self::Never => false,
+        }
+    }
+}
+
+fn image_uses_latest_tag(image: &str) -> bool {
+    if image.contains('@') {
+        return false;
+    }
+    let name = image.rsplit('/').next().unwrap_or(image);
+    match name.rsplit_once(':') {
+        Some((_, tag)) => tag == "latest",
+        None => true,
+    }
+}
+
 pub fn service_spec_hash(spec: &ServiceSpec) -> String {
     let encoded = serde_json::to_vec(spec).expect("ServiceSpec serialization cannot fail");
     let digest = Sha256::digest(encoded);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod pull_policy_tests {
+    use super::*;
+
+    #[test]
+    fn missing_policy_refreshes_only_effective_latest_tags() {
+        for image in [
+            "nginx",
+            "nginx:latest",
+            "docker.io/library/nginx",
+            "localhost:5000/nginx:latest",
+        ] {
+            assert!(PullPolicy::Missing.refreshes_cached_image(image), "{image}");
+        }
+        for image in [
+            "nginx:1.29",
+            "localhost:5000/nginx:1.29",
+            "nginx@sha256:0123456789abcdef",
+        ] {
+            assert!(
+                !PullPolicy::Missing.refreshes_cached_image(image),
+                "{image}"
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -149,6 +215,7 @@ pub struct HttpBackend {
     pub service: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_backend_port")]
     pub port: u16,
     #[serde(default)]
     pub protocol: HttpBackendProtocol,
@@ -167,6 +234,17 @@ pub enum HttpBackendProtocol {
 
 const fn default_true() -> bool {
     true
+}
+
+fn deserialize_backend_port<'de, D>(deserializer: D) -> std::result::Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let port = u16::deserialize(deserializer)?;
+    if port == 0 {
+        return Err(serde::de::Error::custom("port must be between 1 and 65535"));
+    }
+    Ok(port)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -217,7 +295,7 @@ pub struct PathRegexpMatcher {
 
 pub fn validate_and_normalize(
     gateway: &mut StackGatewaySpec,
-    services: &BTreeSet<String>,
+    services: &BTreeMap<String, ServiceSpec>,
 ) -> Result<()> {
     let mut seen_hostnames = BTreeSet::new();
     for (route_index, route) in gateway.http_routes.iter_mut().enumerate() {
@@ -448,22 +526,61 @@ fn validate_rewrite_path(path: &str) -> Result<()> {
     Ok(())
 }
 
-fn normalize_backend(backend: &mut HttpBackend, services: &BTreeSet<String>) -> Result<()> {
-    if backend.port == 0 {
-        bail!("port must be between 1 and 65535");
-    }
+fn normalize_backend(
+    backend: &mut HttpBackend,
+    services: &BTreeMap<String, ServiceSpec>,
+) -> Result<()> {
     match (&mut backend.service, &mut backend.host) {
         (Some(service), None) => {
             *service = service.trim().to_owned();
-            if !services.contains(service) {
+            let Some(spec) = services.get(service) else {
                 bail!("service {service:?} does not exist in this stack");
+            };
+            let targets = declared_tcp_targets(spec);
+            if backend.port == 0 {
+                match targets.as_slice() {
+                    [target] => backend.port = *target,
+                    [] => bail!(
+                        "service {service:?} declares no TCP target ports; backend.port is required"
+                    ),
+                    _ => bail!(
+                        "service {service:?} declares multiple TCP target ports: {}; backend.port is required",
+                        targets
+                            .iter()
+                            .map(u16::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                }
+            } else if !targets.contains(&backend.port) {
+                bail!(
+                    "service {service:?} does not declare TCP target port {} in expose or ports",
+                    backend.port
+                );
             }
         }
-        (None, Some(host)) => *host = normalize_hostname(host, false)?,
+        (None, Some(host)) => {
+            if backend.port == 0 {
+                bail!("port is required for a host backend");
+            }
+            *host = normalize_hostname(host, false)?;
+        }
         (Some(_), Some(_)) => bail!("service and host are mutually exclusive"),
         (None, None) => bail!("one of service or host is required"),
     }
     Ok(())
+}
+
+fn declared_tcp_targets(service: &ServiceSpec) -> Vec<u16> {
+    service
+        .expose
+        .iter()
+        .chain(&service.ports)
+        .filter(|port| port.protocol == "tcp")
+        .map(|port| port.target)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn build_proxy_routes(
@@ -693,9 +810,34 @@ fn sanitize_id(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use super::*;
+
+    fn service_with_tcp_ports(targets: &[u16]) -> ServiceSpec {
+        ServiceSpec {
+            image: "example/service:latest".into(),
+            pull_policy: PullPolicy::Missing,
+            command: Vec::new(),
+            entrypoint: Vec::new(),
+            environment: Vec::new(),
+            expose: targets
+                .iter()
+                .map(|target| ServicePort {
+                    target: *target,
+                    published: None,
+                    protocol: "tcp".into(),
+                })
+                .collect(),
+            ports: Vec::new(),
+            volumes: Vec::new(),
+            container_labels: BTreeMap::new(),
+            service_labels: BTreeMap::new(),
+            healthcheck: None,
+            replicas: 1,
+            constraints: Vec::new(),
+            max_surge: 1,
+            stop_grace_period_seconds: 10,
+        }
+    }
 
     #[test]
     fn validates_normalizes_and_collects_service_ports() {
@@ -725,7 +867,11 @@ mod tests {
             }],
             ..Default::default()
         };
-        validate_and_normalize(&mut spec, &BTreeSet::from(["api".into()])).unwrap();
+        validate_and_normalize(
+            &mut spec,
+            &BTreeMap::from([("api".into(), service_with_tcp_ports(&[8080]))]),
+        )
+        .unwrap();
         assert_eq!(spec.http_routes[0].hostnames, ["example.com"]);
         assert_eq!(spec.http_routes[0].rules[0].matches[0].path, "/api");
         assert_eq!(routed_service_ports(&spec, "api"), BTreeSet::from([8080]));
@@ -759,7 +905,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let error = validate_and_normalize(&mut spec, &BTreeSet::new()).unwrap_err();
+        let error = validate_and_normalize(&mut spec, &BTreeMap::new()).unwrap_err();
         assert!(error.to_string().contains("rewrite"));
     }
 
@@ -850,7 +996,7 @@ mod tests {
             }]
         }))
         .unwrap();
-        validate_and_normalize(&mut gateway, &BTreeSet::new()).unwrap();
+        validate_and_normalize(&mut gateway, &BTreeMap::new()).unwrap();
 
         let value = serde_json::to_value(generate(
             [("demo", &gateway)],
@@ -918,7 +1064,11 @@ mod tests {
             }]
         }))
         .unwrap();
-        validate_and_normalize(&mut gateway, &BTreeSet::from(["secure_api".into()])).unwrap();
+        validate_and_normalize(
+            &mut gateway,
+            &BTreeMap::from([("secure_api".into(), service_with_tcp_ports(&[8443]))]),
+        )
+        .unwrap();
         let value = serde_json::to_value(generate(
             [("demo", &gateway)],
             &[":80".into()],

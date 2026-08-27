@@ -2,6 +2,8 @@
 services:
   web:
     image: nginx:1.29-alpine
+    expose:
+      - "80"
     stop_grace_period: 20s
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ >/dev/null"]
@@ -27,6 +29,5 @@ x-swarmlite:
       rules:
         - backend:
             service: web
-            port: 80
             protocol: http
             preserve_host: true

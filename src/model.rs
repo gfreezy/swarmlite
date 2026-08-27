@@ -3,8 +3,8 @@ use std::{collections::BTreeMap, fmt};
 use serde::{Deserialize, Serialize};
 pub use swarmlite_stack::{
     GatewayHttpMode, GatewayTlsMode, HealthcheckSpec, HttpBackend, HttpBackendProtocol,
-    HttpPathMatch, HttpPathMatchType, HttpPathRewrite, HttpRouteRule, HttpRouteSpec, ServicePort,
-    ServiceSpec, StackGatewaySpec, service_spec_hash,
+    HttpPathMatch, HttpPathMatchType, HttpPathRewrite, HttpRouteRule, HttpRouteSpec, PullPolicy,
+    ServicePort, ServiceSpec, StackGatewaySpec, service_spec_hash,
 };
 
 pub const CLUSTER_SCHEMA_VERSION: u32 = 7;

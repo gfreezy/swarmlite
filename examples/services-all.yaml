@@ -2,6 +2,7 @@
 services:
   api:
     image: example/api:1.0
+    pull_policy: always
     entrypoint: ["/usr/bin/env"]
     command: ["/app/api", "--listen=:8080"]
     environment:
@@ -12,6 +13,9 @@ services:
     labels:
       com.example.component: api
       com.example.public: true
+    expose:
+      - "8082"
+      - "5354/udp"
     ports:
       - 8080
       - "18081:8081/tcp"

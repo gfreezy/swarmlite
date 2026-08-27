@@ -389,6 +389,20 @@ Deployments that do not become healthy within five minutes are marked `timed_out
 accepts only one active deployment for a given Stack name; a concurrent update to the same Stack
 returns `409 Conflict`. Different Stacks may deploy independently.
 
+Control image pulls per Service with the Compose-style `pull_policy` field:
+
+```yaml
+services:
+  api:
+    image: example/api:latest
+    pull_policy: always
+```
+
+Supported values are `always`, `missing` (the default), `if_not_present` (an alias for `missing`),
+and `never`. `missing` uses a cached image when possible, except that an omitted tag or the
+`latest` tag is refreshed when a task is created. Deploying an unchanged Stack rolls Services
+whose policy requires a refresh (`always`, or `missing` with an effective `latest` tag).
+
 During rolling updates, old healthy tasks remain routable until replacements are healthy and all
 active Gateways acknowledge the new routing configuration.
 
@@ -431,6 +445,8 @@ Gateway nodes listen on `:80` and `:443` by default. A basic internal route look
 services:
   api:
     image: example/api:latest
+    expose:
+      - "8080"
 
 x-swarmlite:
   tls: serve
@@ -444,12 +460,19 @@ x-swarmlite:
             strip_prefix: true
           backend:
             service: api
-            port: 8080
 ```
 
-`backend.service` references a Service in the same Stack, and Swarmlite allocates its task port.
-`backend.host` routes to an external DNS name or IP. Both support `preserve_host`; `protocol` may
-be `http`, `https`, or `h2c`.
+`backend.service` references a Service in the same Stack. When that Service declares exactly one
+TCP target across `expose` and `ports`, `backend.port` is inferred. Multiple targets require an
+explicit `backend.port`, and an explicit value must name a declared target. Swarmlite allocates a
+host port for each routed task. `backend.host` routes to an external DNS name or IP and always
+requires `port`. Both backend forms support `preserve_host`; `protocol` may be `http`, `https`, or
+`h2c`.
+
+For replicated routed Services, prefer `expose` and let Swarmlite allocate task ports. An explicit
+`ports.published` value is node-local: only one task per protocol can use it on a node, replicas
+need enough distinct nodes, and a `start-first` update may need a spare node. Use `stop-first` when
+the fixed host port must be released before its replacement starts.
 
 Path matches support `exact`, `prefix` (the default), and RE2-compatible `regex`. Rewrites support
 exactly one of `strip_prefix`, `replace_prefix`, or `replace_path`. Multiple matches in one rule

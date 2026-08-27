@@ -413,9 +413,11 @@ mod tests {
             deleted: false,
             spec: ServiceSpec {
                 image: format!("example/web:v{revision}"),
+                pull_policy: Default::default(),
                 command: vec![],
                 entrypoint: vec![],
                 environment: vec![],
+                expose: vec![],
                 ports: vec![ServicePort {
                     target: 80,
                     published: None,

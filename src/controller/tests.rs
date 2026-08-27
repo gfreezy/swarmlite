@@ -10,7 +10,7 @@ use crate::{
     },
     model::{
         CLUSTER_SCHEMA_VERSION, ClusterGatewayConfig, KvLockStatus, NodeRecord, PortBinding,
-        ServicePort, ServiceSpec, StackGatewaySpec, TaskRecord, TaskReport,
+        PullPolicy, ServicePort, ServiceSpec, StackGatewaySpec, TaskRecord, TaskReport,
     },
 };
 
@@ -395,6 +395,35 @@ fn parsed_test_stack() -> ParsedStack {
 }
 
 #[tokio::test]
+async fn redeploy_rolls_a_service_whose_pull_policy_refreshes_cached_images() {
+    let (controller, _, _directory) = test_controller("pull-policy-redeploy-test").await;
+    register_live_node(&controller).await;
+    let mut parsed = parsed_test_stack();
+    parsed.services.get_mut("web").unwrap().pull_policy = PullPolicy::Always;
+
+    controller.apply("demo", parsed.clone()).await.unwrap();
+    let initial_revision = {
+        let mut inner = controller.inner.lock().await;
+        inner
+            .state
+            .stacks
+            .get_mut("demo")
+            .unwrap()
+            .deployment
+            .as_mut()
+            .unwrap()
+            .status = StackDeploymentStatus::Healthy;
+        inner.state.services["demo.web"].revision
+    };
+
+    controller.apply("demo", parsed).await.unwrap();
+    assert_eq!(
+        controller.inner.lock().await.state.services["demo.web"].revision,
+        initial_revision + 1
+    );
+}
+
+#[tokio::test]
 async fn deployment_waits_for_agent_application_and_health() {
     let (controller, _, _directory) = test_controller("deployment-success-test").await;
     register_live_node(&controller).await;
@@ -539,6 +568,7 @@ fn rejects_a_gateway_hostname_owned_by_another_stack() {
 services:
   web:
     image: nginx
+    expose: [80]
 x-swarmlite:
   http_routes:
     - hostnames: [EXAMPLE.com]
@@ -838,9 +868,11 @@ fn test_service() -> ServiceRecord {
         revision: 2,
         spec: ServiceSpec {
             image: "nginx:1.29-alpine".into(),
+            pull_policy: Default::default(),
             command: Vec::new(),
             entrypoint: Vec::new(),
             environment: Vec::new(),
+            expose: Vec::new(),
             ports: vec![ServicePort {
                 target: 80,
                 published: None,

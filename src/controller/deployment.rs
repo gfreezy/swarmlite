@@ -15,6 +15,10 @@ impl RevisionPolicy<'_> {
     fn preserves(self, service: &str) -> bool {
         matches!(self, Self::Preserve(target) if target == service)
     }
+
+    fn refreshes_images(self) -> bool {
+        matches!(self, Self::DetectChanges)
+    }
 }
 
 pub(super) struct StackDeployment<'a> {
@@ -175,6 +179,8 @@ impl Controller {
                     if existing.spec == spec
                         && !existing.deleted
                         && !routing_ports_changed
+                        && !(revision_policy.refreshes_images()
+                            && spec.pull_policy.refreshes_cached_image(&spec.image))
                         && !revision_policy.forces(&name) => {}
                 Some(existing) => {
                     if !revision_policy.preserves(&name) {

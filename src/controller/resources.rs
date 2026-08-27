@@ -427,9 +427,11 @@ mod tests {
                 revision: 1,
                 spec: crate::model::ServiceSpec {
                     image: "nginx".into(),
+                    pull_policy: Default::default(),
                     command: Vec::new(),
                     entrypoint: Vec::new(),
                     environment: Vec::new(),
+                    expose: Vec::new(),
                     ports: Vec::new(),
                     volumes: Vec::new(),
                     container_labels: Default::default(),

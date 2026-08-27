@@ -2,22 +2,27 @@
 services:
   web:
     image: example/web:latest
+    expose: [3000]
     deploy:
       replicas: 3
 
   api:
     image: example/api:latest
+    expose: [8080]
     deploy:
       replicas: 3
 
   legacy_api:
     image: example/legacy-api:latest
+    expose: [8080]
 
   health:
     image: example/health:latest
+    expose: [8080]
 
   h2c_api:
     image: example/h2c-api:latest
+    expose: [8080]
     deploy:
       replicas: 2
 
@@ -38,7 +43,6 @@ x-swarmlite:
               type: exact
           backend:
             service: health
-            port: 8080
             protocol: http
             preserve_host: true
 
@@ -51,7 +55,6 @@ x-swarmlite:
             replace_path: /internal/ready
           backend:
             service: health
-            port: 8080
 
         # prefix is the default type
         - matches:
@@ -60,7 +63,6 @@ x-swarmlite:
             strip_prefix: true
           backend:
             service: api
-            port: 8080
 
         # prefix + ignore_case + replace_prefix
         - matches:
@@ -71,7 +73,6 @@ x-swarmlite:
             replace_prefix: /v1
           backend:
             service: legacy_api
-            port: 8080
             preserve_host: false
 
         # regex
@@ -81,7 +82,6 @@ x-swarmlite:
               ignore_case: true
           backend:
             service: api
-            port: 8080
 
         # Multiple matches in one rule are OR.
         - matches:
@@ -91,12 +91,10 @@ x-swarmlite:
               type: exact
           backend:
             service: web
-            port: 3000
 
         # No matches is the fallback rule.
         - backend:
             service: web
-            port: 3000
 
     # External HTTPS proxy; Host is changed to api.revenuecat.com.
     - hostnames:
@@ -153,7 +151,6 @@ x-swarmlite:
             strip_prefix: true
           backend:
             service: h2c_api
-            port: 8080
             protocol: h2c
 
     # HTTP only.
@@ -164,7 +161,6 @@ x-swarmlite:
       rules:
         - backend:
             service: web
-            port: 3000
 
     # HTTP and HTTPS without a redirect.
     - hostnames:
@@ -174,7 +170,6 @@ x-swarmlite:
       rules:
         - backend:
             service: web
-            port: 3000
 
     # HTTPS only.
     - hostnames:
@@ -184,4 +179,3 @@ x-swarmlite:
       rules:
         - backend:
             service: web
-            port: 3000

@@ -1,13 +1,10 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    time::Duration,
-};
+use std::{collections::BTreeMap, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_yaml::Value;
 
-use crate::{HealthcheckSpec, ServicePort, ServiceSpec, StackGatewaySpec};
+use crate::{HealthcheckSpec, PullPolicy, ServicePort, ServiceSpec, StackGatewaySpec};
 
 #[derive(Debug, Clone)]
 pub struct ParsedStack {
@@ -26,12 +23,16 @@ struct RawStack {
 #[serde(deny_unknown_fields)]
 struct RawService {
     image: Option<String>,
+    #[serde(default)]
+    pull_policy: PullPolicy,
     command: Option<StringOrList>,
     entrypoint: Option<StringOrList>,
     #[serde(default)]
     environment: StringMapOrList,
     #[serde(default)]
     labels: StringMapOrList,
+    #[serde(default)]
+    expose: Vec<ExposeValue>,
     #[serde(default)]
     ports: Vec<PortValue>,
     #[serde(default)]
@@ -150,6 +151,13 @@ enum PortValue {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ExposeValue {
+    Number(u16),
+    String(String),
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LongPort {
     target: u16,
@@ -184,11 +192,8 @@ pub fn parse_stack(yaml: &str) -> Result<ParsedStack> {
         .into_iter()
         .map(|(name, service)| normalize_service(&name, service).map(|spec| (name, spec)))
         .collect::<Result<_>>()?;
-    crate::validate_and_normalize(
-        &mut raw.gateway,
-        &services.keys().cloned().collect::<BTreeSet<_>>(),
-    )
-    .context("invalid x-swarmlite configuration")?;
+    crate::validate_and_normalize(&mut raw.gateway, &services)
+        .context("invalid x-swarmlite configuration")?;
     Ok(ParsedStack {
         services,
         gateway: raw.gateway,
@@ -227,6 +232,11 @@ fn normalize_service(name: &str, raw: RawService) -> Result<ServiceSpec> {
         0
     };
 
+    let expose = raw
+        .expose
+        .into_iter()
+        .map(normalize_expose)
+        .collect::<Result<Vec<_>>>()?;
     let ports = raw
         .ports
         .into_iter()
@@ -248,6 +258,7 @@ fn normalize_service(name: &str, raw: RawService) -> Result<ServiceSpec> {
 
     let spec = ServiceSpec {
         image,
+        pull_policy: raw.pull_policy,
         command: raw
             .command
             .map(|value| value.into_vec("command"))
@@ -259,6 +270,7 @@ fn normalize_service(name: &str, raw: RawService) -> Result<ServiceSpec> {
             .transpose()?
             .unwrap_or_default(),
         environment: raw.environment.into_environment()?,
+        expose,
         ports,
         volumes,
         container_labels: raw.labels.into_map()?,
@@ -273,6 +285,29 @@ fn normalize_service(name: &str, raw: RawService) -> Result<ServiceSpec> {
         stop_grace_period_seconds,
     };
     Ok(spec)
+}
+
+fn normalize_expose(value: ExposeValue) -> Result<ServicePort> {
+    let value = match value {
+        ExposeValue::Number(port) => port.to_string(),
+        ExposeValue::String(value) => value,
+    };
+    let (target, protocol) = value
+        .rsplit_once('/')
+        .map_or((value.as_str(), "tcp"), |(target, protocol)| {
+            (target, protocol)
+        });
+    if protocol != "tcp" && protocol != "udp" {
+        bail!("unsupported expose protocol in {value}");
+    }
+    if target.contains(':') {
+        bail!("expose accepts only container target ports: {value}");
+    }
+    Ok(ServicePort {
+        target: parse_port_number(target, &value)?,
+        published: None,
+        protocol: protocol.to_owned(),
+    })
 }
 
 fn normalize_healthcheck(name: &str, raw: RawHealthcheck) -> Result<HealthcheckSpec> {
@@ -448,6 +483,7 @@ mod tests {
 services:
   web:
     image: nginx:1.29-alpine
+    pull_policy: always
     command: ["--name", "demo"]
     environment:
       MODE: production
@@ -481,12 +517,12 @@ x-swarmlite:
             strip_prefix: true
           backend:
             service: web
-            port: 80
 "#,
         )
         .unwrap();
 
         let web = &stack.services["web"];
+        assert_eq!(web.pull_policy, PullPolicy::Always);
         assert_eq!(web.replicas, 3);
         assert_eq!(web.max_surge, 2);
         assert_eq!(web.stop_grace_period_seconds, 20);
@@ -498,7 +534,163 @@ x-swarmlite:
         assert_eq!(web.environment, ["DEBUG=false", "MODE=production"]);
         let rule = &stack.gateway.http_routes[0].rules[0];
         assert_eq!(rule.backend.service.as_deref(), Some("web"));
+        assert_eq!(rule.backend.port, 80);
         assert_eq!(rule.matches[0].path, "/api");
+    }
+
+    #[test]
+    fn parses_expose_and_infers_the_only_tcp_backend_port() {
+        let stack = parse_stack(
+            r#"
+services:
+  api:
+    image: example/api
+    expose:
+      - 8080
+      - "5353/udp"
+x-swarmlite:
+  http_routes:
+    - hostnames: [api.example.com]
+      rules:
+        - backend:
+            service: api
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(stack.services["api"].expose.len(), 2);
+        assert_eq!(stack.services["api"].expose[0].target, 8080);
+        assert_eq!(stack.services["api"].expose[1].protocol, "udp");
+        assert_eq!(stack.gateway.http_routes[0].rules[0].backend.port, 8080);
+    }
+
+    #[test]
+    fn requires_a_backend_port_when_the_service_has_zero_or_multiple_tcp_targets() {
+        for (expose, expected) in [
+            ("", "declares no TCP target ports"),
+            (
+                "    expose: [8080, 9090]\n",
+                "multiple TCP target ports: 8080, 9090",
+            ),
+        ] {
+            let yaml = format!(
+                r#"
+services:
+  api:
+    image: example/api
+{expose}x-swarmlite:
+  http_routes:
+    - hostnames: [api.example.com]
+      rules:
+        - backend:
+            service: api
+"#
+            );
+            let error = parse_stack(&yaml).unwrap_err();
+            assert!(format!("{error:#}").contains(expected));
+        }
+    }
+
+    #[test]
+    fn requires_an_explicit_service_backend_port_to_be_declared() {
+        let error = parse_stack(
+            r#"
+services:
+  api:
+    image: example/api
+    expose: [8080]
+x-swarmlite:
+  http_routes:
+    - hostnames: [api.example.com]
+      rules:
+        - backend:
+            service: api
+            port: 9090
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains("does not declare TCP target port 9090 in expose or ports")
+        );
+    }
+
+    #[test]
+    fn requires_external_host_backends_to_keep_an_explicit_port() {
+        let error = parse_stack(
+            r#"
+services:
+  api:
+    image: example/api
+x-swarmlite:
+  http_routes:
+    - hostnames: [api.example.com]
+      rules:
+        - backend:
+            host: upstream.example.com
+"#,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("port is required for a host backend"));
+    }
+
+    #[test]
+    fn rejects_an_explicit_zero_backend_port_instead_of_treating_it_as_omitted() {
+        let error = parse_stack(
+            r#"
+services:
+  api:
+    image: example/api
+    expose: [8080]
+x-swarmlite:
+  http_routes:
+    - hostnames: [api.example.com]
+      rules:
+        - backend:
+            service: api
+            port: 0
+"#,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("port must be between 1 and 65535"));
+    }
+
+    #[test]
+    fn defaults_pull_policy_to_missing_and_accepts_compatibility_alias() {
+        let default = parse_stack(
+            r#"
+services:
+  web:
+    image: nginx
+"#,
+        )
+        .unwrap();
+        assert_eq!(default.services["web"].pull_policy, PullPolicy::Missing);
+
+        let alias = parse_stack(
+            r#"
+services:
+  web:
+    image: nginx
+    pull_policy: if_not_present
+"#,
+        )
+        .unwrap();
+        assert_eq!(alias.services["web"].pull_policy, PullPolicy::Missing);
+    }
+
+    #[test]
+    fn rejects_unsupported_pull_policy() {
+        let error = parse_stack(
+            r#"
+services:
+  web:
+    image: nginx
+    pull_policy: daily
+"#,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("pull_policy"));
     }
 
     #[test]
