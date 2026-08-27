@@ -757,5 +757,6 @@ The project [`Dockerfile`](Dockerfile) builds Swarmlite. Gateway nodes pull the 
 publishing the Gateway image.
 
 GitHub Actions builds release archives and SHA-256 checksums for Linux AMD64, Linux ARM64, and
-macOS ARM64. Tag pushes publish those artifacts together with the installer and systemd unit in a
-GitHub Release.
+macOS ARM64. The Linux archives use musl and are verified to be fully static ELF binaries with no
+dynamic interpreter or shared-library dependencies. Tag pushes publish those artifacts together
+with the installer and systemd unit in a GitHub Release.

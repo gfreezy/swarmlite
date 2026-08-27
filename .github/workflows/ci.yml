@@ -45,10 +45,10 @@ jobs:
       matrix:
         include:
           - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             artifact: swarmlite-linux-amd64
           - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
             artifact: swarmlite-linux-arm64
           - runner: macos-14
             target: aarch64-apple-darwin
@@ -60,6 +60,15 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
 
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install musl build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -67,6 +76,21 @@ jobs:
 
       - name: Build release CLI
         run: cargo build --release --locked --bin swarmlite --target ${{ matrix.target }}
+
+      - name: Verify fully static Linux CLI
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/release/swarmlite"
+          file "$binary"
+          if readelf --program-headers --wide "$binary" | grep -q 'INTERP'; then
+            echo 'Linux release binary contains a dynamic ELF interpreter' >&2
+            exit 1
+          fi
+          if readelf --dynamic --wide "$binary" 2>&1 | grep -q '(NEEDED)'; then
+            echo 'Linux release binary depends on a shared library' >&2
+            exit 1
+          fi
 
       - name: Package CLI
         shell: bash
