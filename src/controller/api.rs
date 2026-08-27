@@ -20,7 +20,8 @@ use crate::model::{
     KvPutRequest, KvStatResponse, NodeGatewayResponse, NodeGatewayUpdate, NodeHeartbeat,
     NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, RegistryLoginRequest,
     RegistryLoginResponse, ServiceInspectResponse, ServiceListResponse, ServiceScaleRequest,
-    StackDeploymentResponse, StackListResponse, StatusResponse, TaskListResponse,
+    StackDeploymentResponse, StackListResponse, StackValidationResponse, StatusResponse,
+    TaskListResponse,
 };
 use swarmlite_stack::parse_stack;
 
@@ -38,6 +39,7 @@ pub(super) fn router(controller: Arc<Controller>) -> Router {
         .route("/v1/registry-credentials", put(set_registry_credential))
         .route("/v1/stacks", get(list_stacks))
         .route("/v1/stacks/{name}", put(apply_stack).delete(remove_stack))
+        .route("/v1/stacks/{name}/validate", put(validate_stack))
         .route("/v1/stacks/{name}/tasks", get(stack_tasks))
         .route("/v1/stacks/{name}/deployment", get(stack_deployment))
         .route("/v1/services", get(list_services))
@@ -207,6 +209,23 @@ async fn apply_stack(
         std::str::from_utf8(&body).map_err(|error| ControllerError::Invalid(error.to_string()))?;
     let parsed = parse_stack(yaml).map_err(|error| ControllerError::Invalid(error.to_string()))?;
     controller.apply(&name, parsed).await.map(Json)
+}
+
+async fn validate_stack(
+    State(controller): State<Arc<Controller>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<StackValidationResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    let yaml =
+        std::str::from_utf8(&body).map_err(|error| ControllerError::Invalid(error.to_string()))?;
+    let parsed = parse_stack(yaml).map_err(|error| ControllerError::Invalid(error.to_string()))?;
+    controller.validate_apply(&name, &parsed).await?;
+    Ok(Json(StackValidationResponse {
+        stack: name,
+        valid: true,
+    }))
 }
 
 async fn list_stacks(

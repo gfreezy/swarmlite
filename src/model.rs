@@ -495,6 +495,12 @@ pub struct StackDeploymentResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StackValidationResponse {
+    pub stack: String,
+    pub valid: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StackDeploymentServiceProgress {
     pub service: String,
     pub replicas: u32,

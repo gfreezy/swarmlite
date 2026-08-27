@@ -36,6 +36,17 @@ impl Drop for StackDeployment<'_> {
 }
 
 impl Controller {
+    pub(super) async fn validate_apply(
+        &self,
+        stack_name: &str,
+        parsed: &ParsedStack,
+    ) -> Result<(), ControllerError> {
+        validate_stack_name(stack_name)?;
+        let _deployment = self.begin_stack_deployment(stack_name)?;
+        let inner = self.inner.lock().await;
+        validate_apply_locked(&inner, stack_name, &parsed.gateway)
+    }
+
     pub(super) async fn apply(
         &self,
         stack_name: &str,
@@ -124,32 +135,9 @@ impl Controller {
             gateway: stack_gateway,
         } = parsed;
         let mut inner = self.inner.lock().await;
-        if inner
-            .state
-            .stacks
-            .get(stack_name)
-            .and_then(|stack| stack.deployment.as_ref())
-            .is_some_and(|deployment| deployment.status == StackDeploymentStatus::Deploying)
-        {
-            return Err(ControllerError::Conflict(format!(
-                "stack {stack_name:?} already has a deployment in progress"
-            )));
-        }
-        let has_gateway = inner
-            .state
-            .members
-            .values()
-            .any(|member| member.gateway_enabled);
-        if !has_gateway && !stack_gateway.http_routes.is_empty() {
-            return Err(ControllerError::Invalid(
-                "gateway routing is enabled but no node has its gateway enabled".to_owned(),
-            ));
-        }
-        validate_gateway_hostname_ownership(&inner.state, stack_name, &stack_gateway)?;
+        validate_apply_locked(&inner, stack_name, &stack_gateway)?;
         let previous = inner.state.clone();
-        let deployment_generation = inner.generation.checked_add(1).ok_or_else(|| {
-            ControllerError::Invalid("control-plane generation overflow".to_owned())
-        })?;
+        let deployment_generation = inner.generation + 1;
         let started_at_unix_ms = unix_ms();
         let previous_gateway = inner
             .state
@@ -282,6 +270,40 @@ impl Controller {
         let inner = self.inner.lock().await;
         deployment_response(&inner, stack_name, generation)
     }
+}
+
+fn validate_apply_locked(
+    inner: &Inner,
+    stack_name: &str,
+    stack_gateway: &StackGatewaySpec,
+) -> Result<(), ControllerError> {
+    if inner
+        .state
+        .stacks
+        .get(stack_name)
+        .and_then(|stack| stack.deployment.as_ref())
+        .is_some_and(|deployment| deployment.status == StackDeploymentStatus::Deploying)
+    {
+        return Err(ControllerError::Conflict(format!(
+            "stack {stack_name:?} already has a deployment in progress"
+        )));
+    }
+    let has_gateway = inner
+        .state
+        .members
+        .values()
+        .any(|member| member.gateway_enabled);
+    if !has_gateway && !stack_gateway.http_routes.is_empty() {
+        return Err(ControllerError::Invalid(
+            "gateway routing is enabled but no node has its gateway enabled".to_owned(),
+        ));
+    }
+    validate_gateway_hostname_ownership(&inner.state, stack_name, stack_gateway)?;
+    inner
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| ControllerError::Invalid("control-plane generation overflow".to_owned()))?;
+    Ok(())
 }
 
 pub(super) fn refresh_stack_deployments(

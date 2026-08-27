@@ -10,6 +10,7 @@ use swarmlite::{
         ClusterSettings, DEFAULT_GATEWAY_IMAGE, NodeGatewayResponse, NodeGatewayUpdate,
         NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, RegistryLoginRequest,
         RegistryLoginResponse, StackDeploymentResponse, StackDeploymentStatus,
+        StackValidationResponse,
     },
     node, registry,
 };
@@ -624,12 +625,26 @@ async fn deploy(
     name: Option<String>,
     file: PathBuf,
     detach: bool,
+    dry_run: bool,
 ) -> Result<()> {
     let stack = tokio::fs::read_to_string(&file)
         .await
         .with_context(|| format!("failed to read Stack file {}", file.display()))?;
     let document = swarmlite_stack::parse_stack_document(&stack)?;
     let name = resolve_stack_name(name, document.name)?;
+    if dry_run {
+        let body = client
+            .send_text(
+                reqwest::Method::PUT,
+                &format!("/v1/stacks/{name}/validate"),
+                Some("application/x-yaml"),
+                Some(stack),
+            )
+            .await?;
+        let validation: StackValidationResponse = serde_json::from_str(&body)?;
+        println!("{}", serde_json::to_string_pretty(&validation)?);
+        return Ok(());
+    }
     let body = client
         .send_text(
             reqwest::Method::PUT,
@@ -724,10 +739,16 @@ mod tests {
         };
         assert_eq!(options.file, PathBuf::from("swarmlite.yaml"));
         assert_eq!(options.stack, None);
+        assert!(!options.dry_run);
         assert!(matches!(
             parse(&["--detach"]).command,
             Command::Deploy { .. }
         ));
+        let Command::Deploy { options } = parse(&["--dry-run"]).command else {
+            panic!("expected deploy command");
+        };
+        assert!(options.dry_run);
+        assert!(Cli::try_parse_from(["swarmlite", "deploy", "--dry-run", "--detach"]).is_err());
         let Command::Deploy { options } = parse(&["demo", "-c", "production.yaml"]).command else {
             panic!("expected deploy command");
         };

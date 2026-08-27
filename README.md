@@ -390,6 +390,15 @@ swarmlite deploy                    # deploy as demo
 swarmlite deploy temporary-preview  # deploy the same file under an explicit name
 ```
 
+Validate the file and its cluster-dependent settings without changing cluster state:
+
+```bash
+swarmlite deploy --dry-run
+```
+
+This runs the same parser and Controller preflight checks as a real deployment, including gateway
+availability and hostname ownership checks.
+
 The CLI stores the Controller URL and cluster token in node state, so normal workload commands do
 not need connection flags. All commands are cluster-scoped and use flat action names:
 

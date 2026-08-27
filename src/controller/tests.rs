@@ -121,6 +121,61 @@ async fn allows_only_one_inflight_deployment_per_stack() {
 }
 
 #[tokio::test]
+async fn deployment_validation_does_not_change_cluster_state() {
+    let (controller, repository, _directory) = test_controller("deployment-validation-test").await;
+    register_live_node(&controller).await;
+    let before = repository.load().await.unwrap();
+
+    controller
+        .validate_apply("demo", &parsed_test_stack())
+        .await
+        .unwrap();
+
+    let after = repository.load().await.unwrap();
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(
+        serde_json::to_value(after.state).unwrap(),
+        serde_json::to_value(before.state).unwrap()
+    );
+    assert!(controller.begin_stack_deployment("demo").is_ok());
+}
+
+#[tokio::test]
+async fn deployment_validation_runs_cluster_dependent_checks() {
+    let (controller, repository, _directory) = test_controller("deployment-preflight-test").await;
+    controller
+        .update_node_gateway("controller-a", NodeGatewayUpdate { enabled: false })
+        .await
+        .unwrap();
+    let parsed = parse_stack(
+        r#"
+services:
+  web:
+    image: nginx
+    expose: [80]
+x-swarmlite:
+  http_routes:
+    - hostnames: [example.com]
+      rules:
+        - backend: { service: web, port: 80 }
+"#,
+    )
+    .unwrap();
+    let before = repository.load().await.unwrap();
+
+    assert!(matches!(
+        controller.validate_apply("demo", &parsed).await,
+        Err(ControllerError::Invalid(message))
+            if message.contains("no node has its gateway enabled")
+    ));
+
+    let after = repository.load().await.unwrap();
+    assert_eq!(after.generation, before.generation);
+    assert!(after.state.stacks.is_empty());
+    assert!(after.state.services.is_empty());
+}
+
+#[tokio::test]
 async fn swarm_style_mutations_reuse_the_stack_deployment_state_machine() {
     let (controller, _, _directory) = test_controller("service-mutation-test").await;
     register_live_node(&controller).await;

@@ -39,7 +39,7 @@ use crate::{
     scheduler,
     storage::{StateRepository, StorageError},
 };
-use swarmlite_stack::ParsedStack;
+use swarmlite_stack::{ParsedStack, StackGatewaySpec};
 
 mod api;
 mod cluster;
