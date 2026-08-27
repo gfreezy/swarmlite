@@ -96,7 +96,7 @@ impl Controller {
     ) -> Result<StackDeploymentResponse, ControllerError> {
         let service = {
             let inner = self.inner.lock().await;
-            resolve_service(&inner.state, target)?
+            resolve_service(&inner.state, target, "scale")?
         };
         let stack_name = service.stack.clone();
         let _deployment = self.begin_stack_deployment(&stack_name)?;
@@ -119,7 +119,7 @@ impl Controller {
     ) -> Result<StackDeploymentResponse, ControllerError> {
         let service = {
             let inner = self.inner.lock().await;
-            resolve_service(&inner.state, target)?
+            resolve_service(&inner.state, target, "restart")?
         };
         let _deployment = self.begin_stack_deployment(&service.stack)?;
         let parsed = {
@@ -137,11 +137,7 @@ impl Controller {
         validate_stack_name(stack_name)?;
         {
             let inner = self.inner.lock().await;
-            if !stack_is_active(&inner.state, stack_name) {
-                return Err(ControllerError::NotFound(format!(
-                    "stack {stack_name:?} not found"
-                )));
-            }
+            require_stack(&inner.state, stack_name, "rm")?;
         }
         let _deployment = self.begin_stack_deployment(stack_name)?;
         self.apply_guarded(

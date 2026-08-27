@@ -57,12 +57,8 @@ impl Controller {
         stack: Option<&str>,
     ) -> Result<ServiceListResponse, ControllerError> {
         let inner = self.inner.lock().await;
-        if let Some(stack) = stack
-            && !stack_is_active(&inner.state, stack)
-        {
-            return Err(ControllerError::NotFound(format!(
-                "Stack {stack:?} not found"
-            )));
+        if let Some(stack) = stack {
+            require_stack(&inner.state, stack, "ls")?;
         }
         let services = inner
             .state
@@ -103,7 +99,7 @@ impl Controller {
         target: &str,
     ) -> Result<ServiceInspectResponse, ControllerError> {
         let inner = self.inner.lock().await;
-        let service = resolve_service(&inner.state, target)?;
+        let service = resolve_service(&inner.state, target, "inspect")?;
         let stack = inner
             .state
             .stacks
@@ -131,11 +127,7 @@ impl Controller {
         stack_name: &str,
     ) -> Result<TaskListResponse, ControllerError> {
         let inner = self.inner.lock().await;
-        if !stack_is_active(&inner.state, stack_name) {
-            return Err(ControllerError::NotFound(format!(
-                "stack {stack_name:?} not found"
-            )));
-        }
+        require_stack(&inner.state, stack_name, "Stack task listing")?;
         Ok(TaskListResponse {
             tasks: summarize_tasks(&inner.state, |service| service.stack == stack_name),
         })
@@ -146,7 +138,7 @@ impl Controller {
         target: &str,
     ) -> Result<TaskListResponse, ControllerError> {
         let inner = self.inner.lock().await;
-        let service = resolve_service(&inner.state, target)?;
+        let service = resolve_service(&inner.state, target, "Service task listing")?;
         Ok(TaskListResponse {
             tasks: summarize_tasks(&inner.state, |candidate| candidate.id == service.id),
         })
@@ -173,8 +165,13 @@ impl Controller {
             (false, Some(service)) => Ok(TaskListResponse {
                 tasks: summarize_tasks(&inner.state, |candidate| candidate.id == service.id),
             }),
+            (false, None) if target_matches_task(&inner.state, target) => {
+                Err(ControllerError::Invalid(format!(
+                    "ps expects a Stack or Service, but {target:?} identifies a Task; use the Task's parent Service, or use `swarmlite logs {target}` to read this Task"
+                )))
+            }
             (false, None) => Err(ControllerError::NotFound(format!(
-                "Stack or Service {target:?} not found"
+                "Stack or Service {target:?} not found; ps expects STACK or STACK.SERVICE. Run `swarmlite ls` to list available targets"
             ))),
         }
     }
@@ -420,7 +417,19 @@ fn resolve_log_tasks(
         )));
     }
 
-    let service = resolve_service(state, target)?;
+    if stack_is_active(state, target)
+        && !state
+            .services
+            .get(target)
+            .is_some_and(|service| !service.deleted)
+    {
+        return Err(ControllerError::Invalid(format!(
+            "logs expects a Service or Task, but {target:?} is a Stack. Run `swarmlite ps {target}` to list its Tasks.{}",
+            stack_service_hint(state, target)
+        )));
+    }
+
+    let service = resolve_service(state, target, "logs")?;
     let tasks = state
         .tasks
         .values()

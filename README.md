@@ -420,6 +420,12 @@ sudo swarmlite restart demo.web
 sudo swarmlite rm demo
 ```
 
+Target arguments are resource-specific. `deploy`, `ls`, and `rm` take a Stack; `inspect`, `scale`,
+and `restart` take a Service in `STACK.SERVICE` form; `ps` takes either a Stack or Service; and
+`logs` takes a Service, Task name, or Task ID. When an existing resource of the wrong type is
+provided, the CLI identifies its actual type and suggests the expected target, including available
+Services when a Stack was supplied where a Service is required.
+
 ### Operate a cluster over SSH
 
 Management commands accept an SSH Controller URL. The CLI reads the protected connection settings

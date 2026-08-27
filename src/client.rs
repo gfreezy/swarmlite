@@ -19,11 +19,12 @@ pub enum ControllerClientError {
         #[source]
         source: reqwest::Error,
     },
-    #[error("controller {endpoint} returned {status}: {body}")]
+    #[error("controller request failed ({status}): {message}")]
     Http {
         endpoint: String,
         status: reqwest::StatusCode,
         body: String,
+        message: String,
     },
     #[error("controller {endpoint} returned an invalid response: {source}")]
     InvalidResponse {
@@ -167,14 +168,49 @@ impl ControllerClient {
             return Ok(response);
         }
         let body = response.text().await.unwrap_or_default();
+        let message = controller_error_message(&body);
         Err(ControllerClientError::Http {
             endpoint,
             status,
             body,
+            message,
         })
     }
 
     fn endpoint(&self, path: &str) -> String {
         format!("{}{}", self.controller, path)
+    }
+}
+
+fn controller_error_message(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("error")?.as_str().map(str::to_owned))
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| {
+            let body = body.trim();
+            if body.is_empty() {
+                "Controller returned an empty error response".into()
+            } else {
+                body.into()
+            }
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::controller_error_message;
+
+    #[test]
+    fn extracts_human_readable_controller_error() {
+        assert_eq!(
+            controller_error_message(r#"{"error":"restart expects STACK.SERVICE"}"#),
+            "restart expects STACK.SERVICE"
+        );
+        assert_eq!(controller_error_message("plain failure"), "plain failure");
+        assert_eq!(
+            controller_error_message(""),
+            "Controller returned an empty error response"
+        );
     }
 }

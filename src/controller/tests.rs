@@ -272,6 +272,77 @@ async fn swarm_style_mutations_reuse_the_stack_deployment_state_machine() {
 }
 
 #[tokio::test]
+async fn resource_type_mismatches_explain_expected_targets() {
+    let (controller, _, _directory) = test_controller("typed-target-errors-test").await;
+    register_live_node(&controller).await;
+    controller.apply("demo", parsed_test_stack()).await.unwrap();
+    let task_id = controller
+        .inner
+        .lock()
+        .await
+        .state
+        .tasks
+        .values()
+        .next()
+        .unwrap()
+        .id
+        .clone();
+
+    for error in [
+        controller.inspect_service("demo").await.unwrap_err(),
+        controller.scale_service("demo", 2).await.unwrap_err(),
+        controller.force_update_service("demo").await.unwrap_err(),
+    ] {
+        assert!(matches!(
+            error,
+            ControllerError::Invalid(message)
+                if message.contains("expects a Service (STACK.SERVICE)")
+                    && message.contains("\"demo\" is a Stack")
+                    && message.contains("demo.web")
+        ));
+    }
+
+    assert!(matches!(
+        controller.list_services(Some("demo.web")).await,
+        Err(ControllerError::Invalid(message))
+            if message.contains("ls expects a Stack name")
+                && message.contains("\"demo.web\" is a Service")
+                && message.contains("use \"demo\" instead")
+    ));
+    assert!(matches!(
+        controller.remove_stack("demo.web").await,
+        Err(ControllerError::Invalid(message))
+            if message.contains("rm expects a Stack name")
+                && message.contains("use \"demo\" instead")
+    ));
+    assert!(matches!(
+        controller.target_tasks(&task_id).await,
+        Err(ControllerError::Invalid(message))
+            if message.contains("ps expects a Stack or Service")
+                && message.contains("identifies a Task")
+    ));
+    assert!(matches!(
+        controller
+            .create_data_session(crate::model::DataSessionOperation::Logs {
+                target: "demo".into(),
+                tail: 10,
+                follow: false,
+            })
+            .await,
+        Err(ControllerError::Invalid(message))
+            if message.contains("logs expects a Service or Task")
+                && message.contains("\"demo\" is a Stack")
+                && message.contains("swarmlite ps demo")
+    ));
+    assert!(matches!(
+        controller.inspect_service(&task_id).await,
+        Err(ControllerError::Invalid(message))
+            if message.contains("inspect expects a Service")
+                && message.contains("identifies a Task")
+    ));
+}
+
+#[tokio::test]
 async fn task_target_rejects_a_stack_and_service_name_collision() {
     let (controller, _, _directory) = test_controller("task-target-conflict-test").await;
     register_live_node(&controller).await;

@@ -12,13 +12,61 @@ pub(super) fn service_id(stack: &str, service: &str) -> String {
 pub(super) fn resolve_service(
     state: &ClusterState,
     target: &str,
+    operation: &str,
 ) -> Result<ServiceRecord, ControllerError> {
-    state
+    if let Some(service) = state
         .services
         .get(target)
         .filter(|service| !service.deleted)
         .cloned()
-        .ok_or_else(|| ControllerError::NotFound(format!("service {target:?} not found")))
+    {
+        return Ok(service);
+    }
+
+    if stack_is_active(state, target) {
+        return Err(ControllerError::Invalid(format!(
+            "{operation} expects a Service (STACK.SERVICE), but {target:?} is a Stack.{}",
+            stack_service_hint(state, target)
+        )));
+    }
+    if target_matches_task(state, target) {
+        return Err(ControllerError::Invalid(format!(
+            "{operation} expects a Service (STACK.SERVICE), but {target:?} identifies a Task; use the Task's parent Service instead"
+        )));
+    }
+
+    Err(ControllerError::NotFound(format!(
+        "Service {target:?} not found; {operation} expects STACK.SERVICE. Run `swarmlite ls` to list available Services"
+    )))
+}
+
+pub(super) fn require_stack(
+    state: &ClusterState,
+    target: &str,
+    operation: &str,
+) -> Result<(), ControllerError> {
+    if stack_is_active(state, target) {
+        return Ok(());
+    }
+    if let Some(service) = state
+        .services
+        .get(target)
+        .filter(|service| !service.deleted)
+    {
+        return Err(ControllerError::Invalid(format!(
+            "{operation} expects a Stack name, but {target:?} is a Service in Stack {:?}; use {:?} instead",
+            service.stack, service.stack
+        )));
+    }
+    if target_matches_task(state, target) {
+        return Err(ControllerError::Invalid(format!(
+            "{operation} expects a Stack name, but {target:?} identifies a Task; use the Task's Stack instead"
+        )));
+    }
+
+    Err(ControllerError::NotFound(format!(
+        "Stack {target:?} not found; {operation} expects a Stack name. Run `swarmlite ls` to list available Stacks"
+    )))
 }
 
 pub(super) fn current_stack(
@@ -50,6 +98,38 @@ pub(super) fn stack_is_active(state: &ClusterState, stack_name: &str) -> bool {
             .stacks
             .get(stack_name)
             .is_some_and(|stack| !stack.gateway.http_routes.is_empty())
+}
+
+pub(super) fn target_matches_task(state: &ClusterState, target: &str) -> bool {
+    state.tasks.contains_key(target)
+        || (!target.is_empty() && state.tasks.keys().any(|id| id.starts_with(target)))
+        || state
+            .tasks
+            .values()
+            .any(|task| format!("{}.{}", task.service_id, task.slot.saturating_add(1)) == target)
+}
+
+pub(super) fn stack_service_hint(state: &ClusterState, stack: &str) -> String {
+    const DISPLAY_LIMIT: usize = 8;
+
+    let mut services = state
+        .services
+        .values()
+        .filter(|service| service.stack == stack && !service.deleted)
+        .map(|service| service.id.as_str())
+        .collect::<Vec<_>>();
+    services.sort_unstable();
+    if services.is_empty() {
+        return " This Stack has no active Services".into();
+    }
+
+    let hidden = services.len().saturating_sub(DISPLAY_LIMIT);
+    services.truncate(DISPLAY_LIMIT);
+    let mut hint = format!(" Available Services: {}", services.join(", "));
+    if hidden > 0 {
+        hint.push_str(&format!(" (and {hidden} more)"));
+    }
+    hint
 }
 
 pub(super) fn validate_gateway_hostname_ownership(

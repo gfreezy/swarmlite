@@ -286,7 +286,9 @@ fn parse_scale(value: &str) -> Result<(&str, u32)> {
         anyhow::anyhow!("scale target {value:?} must use STACK.SERVICE=REPLICAS syntax")
     })?;
     if service.is_empty() || !service.contains('.') {
-        anyhow::bail!("scale service must use STACK.SERVICE syntax");
+        anyhow::bail!(
+            "scale expects STACK.SERVICE=REPLICAS, but {service:?} is not a qualified Service name; for example: demo.web=3. Run `swarmlite ls` to list available Services"
+        );
     }
     let replicas = replicas.parse::<u32>().map_err(|_| {
         anyhow::anyhow!("replica count {replicas:?} must be a non-negative integer")
@@ -630,7 +632,9 @@ mod tests {
     #[test]
     fn scale_requires_a_qualified_service_name() {
         assert_eq!(parse_scale("demo.web=3").unwrap(), ("demo.web", 3));
-        assert!(parse_scale("web=3").is_err());
+        let error = parse_scale("web=3").unwrap_err().to_string();
+        assert!(error.contains("scale expects STACK.SERVICE=REPLICAS"));
+        assert!(error.contains("demo.web=3"));
         assert!(parse_scale("demo.web=-1").is_err());
     }
 
