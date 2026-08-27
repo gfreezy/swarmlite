@@ -894,6 +894,42 @@ async fn caddy_acknowledgement_starts_drain_deadline() {
 }
 
 #[tokio::test]
+async fn gateway_failures_are_exposed_in_status() {
+    let (controller, _, _directory) = test_controller("gateway-error-status-test").await;
+    let mut request = test_join_request("node-a", "127.0.0.1");
+    request.gateway_enabled = true;
+    controller.join_node("node-a", request).await.unwrap();
+
+    controller
+        .heartbeat(
+            "node-a",
+            NodeHeartbeat {
+                node: test_node(),
+                tasks: Vec::new(),
+                task_inventory_error: None,
+                task_results: Vec::new(),
+                gateway: GatewayReport {
+                    applied_generation: None,
+                    error: Some("failed to bind gateway port 80".into()),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    let status = controller.status().await;
+    assert_eq!(status.gateway.applied_generation, None);
+    assert_eq!(
+        status
+            .gateway
+            .endpoint_errors
+            .get("node-a")
+            .map(String::as_str),
+        Some("failed to bind gateway port 80")
+    );
+}
+
+#[tokio::test]
 async fn gateway_generation_tracks_rendered_config_only() {
     let (controller, _, _directory) = test_controller("gateway-generation-test").await;
     let mut inner = controller.inner.lock().await;

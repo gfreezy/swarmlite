@@ -227,12 +227,19 @@ pub async fn run(options: ServeOptions) -> Result<()> {
         &runtime_config.resolve()?,
         registry_credentials.clone(),
     )?;
-    runtime
-        .reconcile_gateway(
-            &gateway_container_spec(&settings, &advertise_address, &public_controller)?,
-            settings.gateway_enabled,
-        )
-        .await?;
+    let initial_gateway_report = gateway_operation_report(
+        "failed to reconcile gateway during node startup",
+        None,
+        runtime
+            .reconcile_gateway(
+                &gateway_container_spec(&settings, &advertise_address, &public_controller),
+                settings.gateway_enabled,
+            )
+            .await,
+    );
+    if settings.gateway_enabled && initial_gateway_report.error.is_none() {
+        info!("gateway enabled; independent Caddy container is running");
+    }
     let agent_controller = if is_controller(&settings) {
         local_controller
     } else {
@@ -260,7 +267,7 @@ pub async fn run(options: ServeOptions) -> Result<()> {
         registry_credentials_hash: credentials_hash(&registry_credentials.snapshot()?),
     };
     let (control_tx, control_rx) = watch::channel(initial_control);
-    let (gateway_report_tx, gateway_report_rx) = watch::channel(GatewayReport::default());
+    let (gateway_report_tx, gateway_report_rx) = watch::channel(initial_gateway_report);
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let token = settings.token.clone();
     let agent_events = events_tx.clone();
@@ -326,10 +333,6 @@ impl NodeSupervisor {
                     .await?,
             );
         }
-        if settings.gateway_enabled {
-            info!("gateway enabled; independent Caddy container is running");
-        }
-
         loop {
             tokio::select! {
                 signal = tokio::signal::ctrl_c() => {
@@ -357,49 +360,49 @@ impl NodeSupervisor {
                     local_state.put(NODE_KEY, &settings)?;
                     let has_gateway = settings.gateway_enabled;
                     if has_gateway {
-                        runtime
-                            .reconcile_gateway(
+                        let mut report = gateway_operation_report(
+                            "failed to reconcile enabled gateway",
+                            None,
+                            runtime.reconcile_gateway(
                                 &gateway_container_spec(
                                     &settings,
                                     &advertise_address,
                                     &public_controller,
-                                )?,
+                                ),
                                 true,
                             )
-                            .await?;
-                        if let Some(assignment) = &control.gateway_config {
-                            let report = match runtime.apply_gateway_config(assignment).await {
-                                Ok(()) => GatewayReport {
-                                    applied_generation: Some(assignment.generation),
-                                    error: None,
-                                },
-                                Err(error) => {
-                                    let error = format!("{error:#}");
-                                    warn!(%error, "failed to apply local gateway configuration");
-                                    GatewayReport {
-                                        applied_generation: None,
-                                        error: Some(error),
-                                    }
-                                }
-                            };
-                            gateway_report_tx.send_replace(report);
+                            .await,
+                        );
+                        let reconciled = report.error.is_none();
+                        if reconciled && let Some(assignment) = &control.gateway_config {
+                            report = gateway_operation_report(
+                                "failed to apply gateway configuration",
+                                Some(assignment.generation),
+                                runtime.apply_gateway_config(assignment).await,
+                            );
                         }
-                        if !had_gateway {
+                        gateway_report_tx.send_replace(report);
+                        if !had_gateway && reconciled {
                             info!("gateway enabled; started independent Caddy container");
                         }
                     } else if had_gateway && !has_gateway {
-                        runtime
-                            .reconcile_gateway(
+                        let report = gateway_operation_report(
+                            "failed to remove disabled gateway",
+                            None,
+                            runtime.reconcile_gateway(
                                 &gateway_container_spec(
                                     &settings,
                                     &advertise_address,
                                     &public_controller,
-                                )?,
+                                ),
                                 false,
                             )
-                            .await?;
-                        info!("gateway disabled; removed independent Caddy container");
-                        gateway_report_tx.send_replace(GatewayReport::default());
+                            .await,
+                        );
+                        if report.error.is_none() {
+                            info!("gateway disabled; removed independent Caddy container");
+                        }
+                        gateway_report_tx.send_replace(report);
                     }
                 }
                 event = events_rx.recv() => {
@@ -427,20 +430,41 @@ fn gateway_container_spec(
     settings: &NodeSettings,
     advertise_address: &str,
     public_controller: &str,
-) -> Result<GatewayContainerSpec> {
+) -> GatewayContainerSpec {
     let controller = if is_controller(settings) {
         public_controller.to_owned()
     } else {
         settings.controller_url.clone()
     };
-    Ok(GatewayContainerSpec {
+    GatewayContainerSpec {
         cluster_id: settings.cluster.cluster_id.clone(),
         advertise_address: advertise_address.to_owned(),
         listen: settings.cluster.gateway.listen.clone(),
         controller,
         token: settings.token.clone(),
         image: settings.cluster.gateway.image.clone(),
-    })
+    }
+}
+
+fn gateway_operation_report(
+    operation: &'static str,
+    applied_generation: Option<u64>,
+    result: Result<()>,
+) -> GatewayReport {
+    match result {
+        Ok(()) => GatewayReport {
+            applied_generation,
+            error: None,
+        },
+        Err(error) => {
+            let error = format!("{operation}: {error:#}");
+            warn!(%error, "gateway operation failed; continuing node service");
+            GatewayReport {
+                applied_generation: None,
+                error: Some(error),
+            }
+        }
+    }
 }
 
 async fn start_controller(
@@ -1295,6 +1319,25 @@ mod tests {
             gateway: Default::default(),
         };
         assert!(validate_cluster(&cluster).is_ok());
+    }
+
+    #[test]
+    fn gateway_operations_become_heartbeat_reports() {
+        let success =
+            gateway_operation_report("failed to apply gateway configuration", Some(7), Ok(()));
+        assert_eq!(success.applied_generation, Some(7));
+        assert_eq!(success.error, None);
+
+        let failure = gateway_operation_report(
+            "failed to reconcile gateway during node startup",
+            Some(7),
+            Err(anyhow::anyhow!("port 80 is already allocated")),
+        );
+        assert_eq!(failure.applied_generation, None);
+        assert_eq!(
+            failure.error.as_deref(),
+            Some("failed to reconcile gateway during node startup: port 80 is already allocated")
+        );
     }
 
     #[test]

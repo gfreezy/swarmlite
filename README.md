@@ -308,6 +308,11 @@ until at least one is enabled.
 > Disabling a Gateway deletes its Caddy container and persistent volumes, including its local
 > certificate data. Image, listener, and advertise-address replacements retain those volumes.
 
+Gateway lifecycle and configuration operations are best-effort. A Gateway image, port binding,
+container startup, or Caddy configuration error does not stop the node Agent or Controller. The
+Agent reports the error through `swarmlite status` under `gateway.endpoint_errors` and retries the
+enabled Gateway on subsequent heartbeats.
+
 ### Labels and placement
 
 Set initial labels while initializing or joining a node:
