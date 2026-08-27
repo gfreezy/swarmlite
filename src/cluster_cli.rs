@@ -39,6 +39,9 @@ pub(super) struct DeployArgs {
     /// Validate the Stack without changing cluster state.
     #[arg(long, conflicts_with = "detach")]
     pub(super) dry_run: bool,
+    /// Print the final deployment response as JSON.
+    #[arg(long)]
+    pub(super) json: bool,
     #[command(flatten)]
     connection: ConnectionArgs,
 }
@@ -119,6 +122,9 @@ pub(super) struct RemoveArgs {
     /// Return after the Controller accepts the desired state.
     #[arg(short = 'd', long)]
     detach: bool,
+    /// Print final removal response(s) as a JSON array.
+    #[arg(long)]
+    json: bool,
     #[command(flatten)]
     connection: ConnectionArgs,
 }
@@ -126,7 +132,15 @@ pub(super) struct RemoveArgs {
 pub(super) async fn run_deploy(data_dir: &Path, args: DeployArgs) -> Result<()> {
     let client =
         connection::resolve(data_dir, args.connection.controller, args.connection.token).await?;
-    deploy(&client, args.stack, args.file, args.detach, args.dry_run).await
+    deploy(
+        &client,
+        args.stack,
+        args.file,
+        args.detach,
+        args.dry_run,
+        args.json,
+    )
+    .await
 }
 
 pub(super) async fn run_list(data_dir: &Path, args: ListArgs) -> Result<()> {
@@ -232,6 +246,7 @@ pub(super) async fn run_restart(data_dir: &Path, args: RestartArgs) -> Result<()
 
 pub(super) async fn run_remove(data_dir: &Path, args: RemoveArgs) -> Result<()> {
     let client = resolve_client(data_dir, args.connection).await?;
+    let mut deployments = Vec::with_capacity(args.stacks.len());
     for stack in args.stacks {
         let deployment: StackDeploymentResponse = client
             .send_json::<_, ()>(
@@ -240,14 +255,17 @@ pub(super) async fn run_remove(data_dir: &Path, args: RemoveArgs) -> Result<()> 
                 None,
             )
             .await?;
-        finish_deployment(
+        let deployment = finish_deployment(
             &client,
             deployment,
             args.detach,
             DeploymentOperation::Remove,
         )
         .await?;
-        println!("{stack}");
+        deployments.push(deployment);
+    }
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&deployments)?);
     }
     Ok(())
 }

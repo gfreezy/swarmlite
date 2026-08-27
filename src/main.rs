@@ -1,4 +1,8 @@
-use std::{path::PathBuf, process::ExitCode};
+use std::{
+    io::{IsTerminal, Write},
+    path::PathBuf,
+    process::ExitCode,
+};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -546,23 +550,23 @@ async fn finish_deployment(
     detach: bool,
     operation: DeploymentOperation,
 ) -> Result<StackDeploymentResponse> {
-    eprintln!(
-        "{}: {} generation {} accepted{}",
-        deployment.stack,
-        operation.label(),
-        deployment.generation,
-        if detach { " (detached)" } else { "" }
-    );
+    let mut progress = DeploymentProgressRenderer::new();
+    progress.accepted(operation, &deployment, detach);
     if detach {
         return Ok(deployment);
     }
     let started = tokio::time::Instant::now();
-    eprintln!(
-        "{}",
-        deployment_progress_summary(operation, &deployment, started.elapsed())
-    );
+    progress.render(operation, &deployment, started.elapsed());
     let stack = deployment.stack.clone();
-    deployment = wait_for_deployment(client, &stack, deployment, operation, started).await?;
+    deployment = wait_for_deployment(
+        client,
+        &stack,
+        deployment,
+        operation,
+        started,
+        &mut progress,
+    )
+    .await?;
     ensure_deployment_succeeded(&deployment)?;
     Ok(deployment)
 }
@@ -583,6 +587,370 @@ impl DeploymentOperation {
             Self::Restart => "restart",
             Self::Remove => "remove",
         }
+    }
+}
+
+const PROGRESS_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+struct DeploymentProgressRenderer {
+    interactive: bool,
+    color: bool,
+    frame: usize,
+    line_active: bool,
+}
+
+impl DeploymentProgressRenderer {
+    fn new() -> Self {
+        let interactive = std::io::stderr().is_terminal()
+            && std::env::var("TERM").ok().as_deref() != Some("dumb");
+        Self {
+            interactive,
+            color: interactive && std::env::var_os("NO_COLOR").is_none(),
+            frame: 0,
+            line_active: false,
+        }
+    }
+
+    fn refresh_interval(&self) -> std::time::Duration {
+        if self.interactive {
+            std::time::Duration::from_millis(120)
+        } else {
+            std::time::Duration::from_secs(10)
+        }
+    }
+
+    fn accepted(
+        &mut self,
+        operation: DeploymentOperation,
+        deployment: &StackDeploymentResponse,
+        detach: bool,
+    ) {
+        if !self.interactive {
+            eprintln!(
+                "{}: {} generation {} accepted{}",
+                deployment.stack,
+                operation.label(),
+                deployment.generation,
+                if detach { " (detached)" } else { "" }
+            );
+            return;
+        }
+
+        let accepted = if detach {
+            "accepted (detached)"
+        } else {
+            "accepted"
+        };
+        let line = format!(
+            "{} {} · {} {}",
+            ansi(self.color, "32", "✓"),
+            ansi(self.color, "1", compact_name(&deployment.stack)),
+            ansi(self.color, "36", operation.label()),
+            ansi(self.color, "32", accepted)
+        );
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(stderr, "{line}");
+        let _ = stderr.flush();
+    }
+
+    fn render(
+        &mut self,
+        operation: DeploymentOperation,
+        deployment: &StackDeploymentResponse,
+        elapsed: std::time::Duration,
+    ) {
+        if !self.interactive {
+            eprintln!(
+                "{}",
+                deployment_progress_summary(operation, deployment, elapsed)
+            );
+            return;
+        }
+
+        let complete = deployment.status != StackDeploymentStatus::Deploying;
+        let line = deployment_terminal_progress_summary(
+            operation, deployment, elapsed, self.frame, self.color,
+        );
+        self.frame = self.frame.wrapping_add(1);
+        let mut stderr = std::io::stderr().lock();
+        let _ = write_terminal_progress(&mut stderr, &line, complete);
+        self.line_active = !complete;
+    }
+
+    fn warning(&mut self, message: &str) {
+        if !self.interactive {
+            eprintln!("{message}");
+            return;
+        }
+
+        let mut stderr = std::io::stderr().lock();
+        if self.line_active {
+            let _ = write!(stderr, "\r\x1b[2K");
+            self.line_active = false;
+        }
+        let _ = writeln!(stderr, "{} {message}", ansi(self.color, "33", "!"));
+        let _ = stderr.flush();
+    }
+}
+
+impl Drop for DeploymentProgressRenderer {
+    fn drop(&mut self) {
+        if self.line_active {
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(stderr);
+            let _ = stderr.flush();
+            self.line_active = false;
+        }
+    }
+}
+
+fn write_terminal_progress(
+    writer: &mut impl Write,
+    line: &str,
+    complete: bool,
+) -> std::io::Result<()> {
+    write!(writer, "\r\x1b[2K{line}")?;
+    if complete {
+        writeln!(writer)?;
+    }
+    writer.flush()
+}
+
+fn deployment_terminal_progress_summary(
+    operation: DeploymentOperation,
+    deployment: &StackDeploymentResponse,
+    elapsed: std::time::Duration,
+    frame: usize,
+    color: bool,
+) -> String {
+    let (symbol, symbol_color) = match deployment.status {
+        StackDeploymentStatus::Deploying => {
+            (PROGRESS_SPINNER[frame % PROGRESS_SPINNER.len()], "36")
+        }
+        StackDeploymentStatus::Healthy => ("✓", "32"),
+        StackDeploymentStatus::Failed | StackDeploymentStatus::TimedOut => ("✗", "31"),
+    };
+    let action = match deployment.status {
+        StackDeploymentStatus::Deploying => match operation {
+            DeploymentOperation::Deploy => "deploying",
+            DeploymentOperation::Scale => "scaling",
+            DeploymentOperation::Restart => "restarting",
+            DeploymentOperation::Remove => "removing",
+        },
+        StackDeploymentStatus::Healthy => match operation {
+            DeploymentOperation::Deploy => "deploy complete",
+            DeploymentOperation::Scale => "scale complete",
+            DeploymentOperation::Restart => "restart complete",
+            DeploymentOperation::Remove => "remove complete",
+        },
+        StackDeploymentStatus::Failed => "failed",
+        StackDeploymentStatus::TimedOut => "timed out",
+    };
+    let mut parts = vec![format!(
+        "{} {}",
+        ansi(color, symbol_color, symbol),
+        ansi(color, "1", compact_name(&deployment.stack))
+    )];
+    if deployment.status == StackDeploymentStatus::Deploying {
+        parts.push(ansi(color, "36", deployment_stage(operation, deployment)));
+    } else {
+        parts.push(ansi(color, symbol_color, action));
+    }
+
+    if operation == DeploymentOperation::Remove {
+        parts.push(ansi(
+            color,
+            if deployment.pending_removals == 0 {
+                "32"
+            } else {
+                "33"
+            },
+            format!(
+                "{} {} remaining",
+                deployment.pending_removals,
+                plural(deployment.pending_removals, "container", "containers")
+            ),
+        ));
+    } else {
+        let replicas = deployment
+            .services
+            .iter()
+            .map(|service| service.replicas)
+            .sum::<u32>();
+        let healthy = deployment
+            .services
+            .iter()
+            .map(|service| service.healthy)
+            .sum::<u32>();
+        parts.push(ansi(
+            color,
+            if healthy >= replicas { "32" } else { "33" },
+            format!("{healthy}/{replicas} containers ready"),
+        ));
+        if deployment.pending_removals > 0 {
+            parts.push(ansi(
+                color,
+                "33",
+                format!(
+                    "{} old {}",
+                    deployment.pending_removals,
+                    plural(deployment.pending_removals, "container", "containers")
+                ),
+            ));
+        }
+    }
+
+    if let Some(gateway) = &deployment.gateway {
+        let gateway_status = if gateway.applied_nodes >= gateway.total_nodes {
+            "gateway ready".to_owned()
+        } else if gateway.applied_nodes == 0 {
+            format!(
+                "waiting for {} gateway {}",
+                gateway.total_nodes,
+                plural(gateway.total_nodes, "node", "nodes")
+            )
+        } else {
+            format!(
+                "{} of {} gateway nodes ready",
+                gateway.applied_nodes, gateway.total_nodes
+            )
+        };
+        if gateway.applied_nodes < gateway.total_nodes
+            || deployment.status != StackDeploymentStatus::Deploying
+        {
+            parts.push(ansi(
+                color,
+                if gateway.applied_nodes >= gateway.total_nodes {
+                    "32"
+                } else {
+                    "35"
+                },
+                gateway_status,
+            ));
+        }
+        if !gateway.errors.is_empty() {
+            parts.push(ansi(
+                color,
+                "31",
+                format!("{} gateway error(s)", gateway.errors.len()),
+            ));
+        }
+    }
+
+    parts.push(ansi(color, "2", format!("{:.1}s", elapsed.as_secs_f64())));
+    parts.join(" · ")
+}
+
+fn deployment_stage(
+    operation: DeploymentOperation,
+    deployment: &StackDeploymentResponse,
+) -> &'static str {
+    use swarmlite::model::TaskReconcilePhase;
+
+    let reached = |phase| {
+        deployment
+            .task_phases
+            .iter()
+            .any(|progress| progress.phase == phase)
+    };
+    let replicas = deployment
+        .services
+        .iter()
+        .map(|service| service.replicas)
+        .sum::<u32>();
+    let applied = deployment
+        .services
+        .iter()
+        .map(|service| service.applied)
+        .sum::<u32>();
+    let healthy = deployment
+        .services
+        .iter()
+        .map(|service| service.healthy)
+        .sum::<u32>();
+    let gateway_waiting = deployment
+        .gateway
+        .as_ref()
+        .is_some_and(|gateway| gateway.applied_nodes < gateway.total_nodes);
+
+    if operation == DeploymentOperation::Remove {
+        if deployment.pending_removals > 0 {
+            if reached(TaskReconcilePhase::Remove) {
+                return "removing containers";
+            }
+            if reached(TaskReconcilePhase::Stop) {
+                return "stopping containers";
+            }
+            return "waiting for agents";
+        }
+        return if gateway_waiting {
+            "updating gateway"
+        } else {
+            "finishing"
+        };
+    }
+
+    if reached(TaskReconcilePhase::Remove) && deployment.pending_removals > 0 {
+        return "removing old containers";
+    }
+    if reached(TaskReconcilePhase::Stop) && deployment.pending_removals > 0 {
+        return "stopping old containers";
+    }
+    if healthy >= replicas && deployment.pending_removals > 0 {
+        return "draining old containers";
+    }
+    if healthy >= replicas && gateway_waiting {
+        return "updating gateway";
+    }
+    if reached(TaskReconcilePhase::Verify) && healthy < replicas {
+        return "checking container health";
+    }
+    if reached(TaskReconcilePhase::Start) && applied < replicas {
+        return "starting containers";
+    }
+    if reached(TaskReconcilePhase::Replace) {
+        return "replacing containers";
+    }
+    if reached(TaskReconcilePhase::Create) {
+        return "creating containers";
+    }
+    if reached(TaskReconcilePhase::Pull) {
+        return "pulling images";
+    }
+    if reached(TaskReconcilePhase::Inspect) {
+        return "inspecting runtime";
+    }
+    if applied < replicas {
+        return "scheduling containers";
+    }
+    if healthy < replicas {
+        return "checking container health";
+    }
+    if gateway_waiting {
+        return "updating gateway";
+    }
+    "finishing"
+}
+
+fn plural<'a>(count: u32, singular: &'a str, plural: &'a str) -> &'a str {
+    if count == 1 { singular } else { plural }
+}
+
+fn compact_name(value: &str) -> String {
+    const MAX_CHARS: usize = 24;
+    if value.chars().count() <= MAX_CHARS {
+        return value.to_owned();
+    }
+    let mut compact = value.chars().take(MAX_CHARS - 1).collect::<String>();
+    compact.push('…');
+    compact
+}
+
+fn ansi(color: bool, code: &str, value: impl std::fmt::Display) -> String {
+    if color {
+        format!("\x1b[{code}m{value}\x1b[0m")
+    } else {
+        value.to_string()
     }
 }
 
@@ -798,6 +1166,7 @@ async fn deploy(
     file: PathBuf,
     detach: bool,
     dry_run: bool,
+    json: bool,
 ) -> Result<()> {
     let stack = tokio::fs::read_to_string(&file)
         .await
@@ -828,7 +1197,9 @@ async fn deploy(
     let deployment: StackDeploymentResponse = serde_json::from_str(&body)?;
     let deployment =
         finish_deployment(client, deployment, detach, DeploymentOperation::Deploy).await?;
-    println!("{}", serde_json::to_string_pretty(&deployment)?);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&deployment)?);
+    }
     Ok(())
 }
 
@@ -844,12 +1215,13 @@ async fn wait_for_deployment(
     mut deployment: StackDeploymentResponse,
     operation: DeploymentOperation,
     started: tokio::time::Instant,
+    progress: &mut DeploymentProgressRenderer,
 ) -> Result<StackDeploymentResponse> {
     const CLIENT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(330);
     const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
     let deadline = tokio::time::Instant::now() + CLIENT_WAIT_TIMEOUT;
     let mut last_error: Option<anyhow::Error> = None;
-    let mut progress_tick = tokio::time::interval(std::time::Duration::from_secs(10));
+    let mut progress_tick = tokio::time::interval(progress.refresh_interval());
     progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     progress_tick.tick().await;
     while deployment.status == StackDeploymentStatus::Deploying {
@@ -871,10 +1243,7 @@ async fn wait_for_deployment(
             tokio::select! {
                 response = &mut request => break response,
                 _ = progress_tick.tick() => {
-                    eprintln!(
-                        "{}",
-                        deployment_progress_summary(operation, &deployment, started.elapsed())
-                    );
+                    progress.render(operation, &deployment, started.elapsed());
                 }
             }
         };
@@ -889,22 +1258,21 @@ async fn wait_for_deployment(
                 deployment = next;
                 last_error = None;
                 if progress_changed {
-                    eprintln!(
-                        "{}",
-                        deployment_progress_summary(operation, &deployment, started.elapsed())
-                    );
+                    progress.render(operation, &deployment, started.elapsed());
                 }
             }
             Ok(Err(error)) if error.is_retryable() => {
                 let error: anyhow::Error = error.into();
-                eprintln!("{stack_name}: controller unavailable; retrying: {error}");
+                progress.warning(&format!(
+                    "{stack_name}: controller unavailable; retrying: {error}"
+                ));
                 last_error = Some(error);
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             Ok(Err(error)) => return Err(error.into()),
             Err(_) => {
                 let error = anyhow::anyhow!("controller deployment watch timed out");
-                eprintln!("{stack_name}: {error}; retrying");
+                progress.warning(&format!("{stack_name}: {error}; retrying"));
                 last_error = Some(error);
             }
         }
@@ -933,7 +1301,8 @@ mod tests {
     };
 
     use super::{
-        Cli, Command, DeploymentOperation, deployment_progress_summary, resolve_stack_name,
+        Cli, Command, DeploymentOperation, deployment_progress_summary,
+        deployment_terminal_progress_summary, resolve_stack_name, write_terminal_progress,
     };
 
     #[test]
@@ -954,6 +1323,7 @@ mod tests {
         assert_eq!(options.file, PathBuf::from("swarmlite.yaml"));
         assert_eq!(options.stack, None);
         assert!(!options.dry_run);
+        assert!(!options.json);
         assert!(matches!(
             parse(&["--detach"]).command,
             Command::Deploy { .. }
@@ -963,6 +1333,10 @@ mod tests {
         };
         assert!(options.dry_run);
         assert!(Cli::try_parse_from(["swarmlite", "deploy", "--dry-run", "--detach"]).is_err());
+        let Command::Deploy { options } = parse(&["--json"]).command else {
+            panic!("expected deploy command");
+        };
+        assert!(options.json);
         let Command::Deploy { options } = parse(&["demo", "-c", "production.yaml"]).command else {
             panic!("expected deploy command");
         };
@@ -1006,6 +1380,28 @@ mod tests {
             ),
             "demo: deploy generation 7 deploying: 2/3 applied, 1/3 healthy [web=2/3 applied,1/3 healthy]; 1 task(s) pending removal; phases pull=1; gateway 0/1 applied (1.2s)"
         );
+        assert_eq!(
+            deployment_terminal_progress_summary(
+                DeploymentOperation::Deploy,
+                &deployment,
+                std::time::Duration::from_millis(1_200),
+                0,
+                false,
+            ),
+            "⠋ demo · pulling images · 1/3 containers ready · 1 old container · waiting for 1 gateway node · 1.2s"
+        );
+        let colored = deployment_terminal_progress_summary(
+            DeploymentOperation::Deploy,
+            &deployment,
+            std::time::Duration::from_millis(1_200),
+            1,
+            true,
+        );
+        assert!(colored.contains("\x1b[36m⠙\x1b[0m"));
+        assert!(colored.contains("\x1b[33m1/3 containers ready\x1b[0m"));
+        assert!(colored.contains("\x1b[35mwaiting for 1 gateway node\x1b[0m"));
+        assert!(!colored.contains("#7"));
+        assert!(!colored.contains("pull 1/3"));
 
         deployment.services.clear();
         deployment.task_phases.clear();
@@ -1018,6 +1414,16 @@ mod tests {
             ),
             "demo: remove generation 7 removing: 1 task(s) remaining (2.0s)"
         );
+        assert_eq!(
+            deployment_terminal_progress_summary(
+                DeploymentOperation::Remove,
+                &deployment,
+                std::time::Duration::from_secs(2),
+                0,
+                false,
+            ),
+            "⠋ demo · waiting for agents · 1 container remaining · 2.0s"
+        );
         deployment.status = StackDeploymentStatus::Healthy;
         deployment.pending_removals = 0;
         assert_eq!(
@@ -1028,6 +1434,24 @@ mod tests {
             ),
             "demo: remove generation 7 complete: 0 task(s) remaining (2.5s)"
         );
+        assert_eq!(
+            deployment_terminal_progress_summary(
+                DeploymentOperation::Remove,
+                &deployment,
+                std::time::Duration::from_millis(2_500),
+                0,
+                false,
+            ),
+            "✓ demo · remove complete · 0 containers remaining · 2.5s"
+        );
+    }
+
+    #[test]
+    fn terminal_progress_rewrites_one_line_and_finishes_with_a_newline() {
+        let mut output = Vec::new();
+        write_terminal_progress(&mut output, "first", false).unwrap();
+        write_terminal_progress(&mut output, "done", true).unwrap();
+        assert_eq!(output, b"\r\x1b[2Kfirst\r\x1b[2Kdone\n");
     }
 
     #[test]
@@ -1065,6 +1489,7 @@ mod tests {
         assert!(Cli::try_parse_from(["swarmlite", "scale", "--detach", "demo.web=3",]).is_ok());
         assert!(Cli::try_parse_from(["swarmlite", "restart", "demo.web",]).is_ok());
         assert!(Cli::try_parse_from(["swarmlite", "rm", "demo", "other",]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "rm", "--json", "demo",]).is_ok());
         assert!(Cli::try_parse_from(["swarmlite", "stack", "ls"]).is_err());
         assert!(Cli::try_parse_from(["swarmlite", "service", "ls"]).is_err());
     }
