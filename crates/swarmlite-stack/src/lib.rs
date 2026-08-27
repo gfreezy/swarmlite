@@ -11,7 +11,18 @@ use sha2::{Digest, Sha256};
 
 mod compose;
 
-pub use compose::{ParsedStack, parse_stack};
+pub use compose::{ParsedStack, ParsedStackDocument, parse_stack, parse_stack_document};
+
+pub fn validate_stack_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.'))
+    {
+        bail!("stack name may contain only letters, numbers, '.', '-' and '_'");
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServiceSpec {

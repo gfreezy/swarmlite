@@ -38,7 +38,7 @@ Gateway enabled by default.
 
 ### 3. Deploy an application
 
-Create `stack.yaml`:
+Create `swarmlite.yaml`:
 
 ```yaml
 services:
@@ -48,12 +48,15 @@ services:
       - "8088:80"
     deploy:
       replicas: 1
+
+x-swarmlite:
+  name: demo
 ```
 
 Deploy it and verify the result:
 
 ```bash
-sudo swarmlite deploy --compose-file stack.yaml demo
+sudo swarmlite deploy
 sudo swarmlite ps demo
 curl http://127.0.0.1:8088
 ```
@@ -69,6 +72,7 @@ Services use the qualified name `STACK.SERVICE`, such as `demo.web`:
 sudo swarmlite ls
 sudo swarmlite inspect demo.web
 sudo swarmlite logs --tail 200 demo.web
+sudo swarmlite logs --tail 200 demo.web.1
 sudo swarmlite scale demo.web=3
 sudo swarmlite restart demo.web
 sudo swarmlite rm demo
@@ -369,7 +373,21 @@ printf '%s' "$GHCR_TOKEN" | swarmlite registry login ghcr.io \
 Deploy or update a Stack from a Compose-style file:
 
 ```bash
-sudo swarmlite deploy --compose-file stack.yaml demo
+sudo swarmlite deploy
+```
+
+`deploy` reads `swarmlite.yaml` from the current directory by default. Use `--compose-file` (or
+`-c`) to select another file. Set the default Stack name in that file; a command-line name remains
+available as an override:
+
+```yaml
+x-swarmlite:
+  name: demo
+```
+
+```bash
+swarmlite deploy                    # deploy as demo
+swarmlite deploy temporary-preview  # deploy the same file under an explicit name
 ```
 
 The CLI stores the Controller URL and cluster token in node state, so normal workload commands do
@@ -386,6 +404,37 @@ sudo swarmlite logs --follow demo.web
 sudo swarmlite scale demo.web=3
 sudo swarmlite restart demo.web
 sudo swarmlite rm demo
+```
+
+### Operate a cluster over SSH
+
+Management commands accept an SSH Controller URL. The CLI reads the protected connection settings
+on the remote node, starts a temporary OpenSSH tunnel, and closes it when the command exits. The
+Stack file remains local:
+
+```bash
+swarmlite deploy --controller ssh://deploy@server
+swarmlite ps --controller ssh://deploy@server demo
+swarmlite logs --controller ssh://deploy@server --follow demo.web
+```
+
+The SSH URL supports `ssh://[user@]host[:port]`; its port is the SSH port. Host aliases and options
+from `~/.ssh/config`, including `ProxyJump`, are handled by the system `ssh` executable. SSH mode is
+for management commands only; nodes still use a persistent HTTP Controller URL when joining.
+
+The remote CLI must be the same version and must be able to read `/var/lib/swarmlite`. Root SSH
+works directly. For another SSH user, allow only the machine-readable connection command without a
+password prompt:
+
+```sudoers
+deploy ALL=(root) NOPASSWD: /usr/local/bin/swarmlite connection-info --json
+```
+
+The CLI invokes `sudo -n`, transfers the cluster token only through the encrypted SSH stdout, and
+keeps it out of process arguments and logs. Inspect the same information locally when needed:
+
+```bash
+sudo swarmlite connection-info --json
 ```
 
 `scale`, `restart`, and `rm` use the same deployment scheduler as `deploy`. They wait for
@@ -431,6 +480,10 @@ Multiple tasks are multiplexed by stream ID. `logs` supports snapshots and `--fo
 `--tail` to 10,000 lines, and selects at most 64 tasks. Buffers are bounded across the Runtime,
 Agent, Controller, and CLI. Backpressure pauses upstream reads instead of silently dropping data;
 a connection or local output blocked for 30 seconds terminates that log session.
+
+Pass a Service name to stream all of its tasks, or copy the `STACK.SERVICE.SLOT` name or Task ID
+shown by `swarmlite ps` to select one task. During a rolling update, the old and new task can
+temporarily share a slot name; use the Task ID in that case.
 
 </details>
 
@@ -637,6 +690,7 @@ Run `swarmlite COMMAND --help` for complete arguments.
 init                 initialize a single-controller cluster
 join                 configure another node from cluster settings
 join-token           print the generated join command
+connection-info      print the stored Controller address and cluster token
 upgrade              install the latest or a selected GitHub Release
 serve                run this node's fixed components
 config get|set       read or update cluster-wide settings
@@ -649,7 +703,8 @@ deploy               deploy or update a Stack
 ls [STACK]           list Services
 ps TARGET            list tasks for a Stack or Service
 inspect SERVICE      inspect a Service
-logs SERVICE|TASK    stream container logs
+logs SERVICE|TASK_NAME|TASK_ID
+                     stream container logs
 scale SERVICE=N      scale replicated Services
 restart SERVICE      roll a Service
 rm STACK             remove Stacks

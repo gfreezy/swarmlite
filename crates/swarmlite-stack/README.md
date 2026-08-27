@@ -5,6 +5,7 @@
 - Docker Compose/Swarm-compatible `services` parsing and normalization;
 - the internal `ServiceSpec`, port, and healthcheck models;
 - the `x-swarmlite` routing data model;
+- the optional `x-swarmlite.name` default used by the deploy CLI;
 - normalization and validation;
 - internal service port discovery from route references;
 - deterministic rule ordering;
@@ -21,6 +22,9 @@ main process passes the normalized services from the same Stack file to `validat
 no external validation service or network request is involved. This in-process check is
 authoritative because the standard JSON Schema implementation used by VS Code cannot compare a
 route backend with arbitrary keys and ports in the sibling `services` map.
+
+Set `x-swarmlite.name` to let `swarmlite deploy` use a Stack name from the document. An explicit
+command-line Stack name takes precedence.
 
 ## Supported service fields
 

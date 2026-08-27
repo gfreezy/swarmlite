@@ -84,15 +84,6 @@ pub(super) fn validate_gateway_hostname_ownership(
 }
 
 pub(super) fn validate_stack_name(name: &str) -> Result<(), ControllerError> {
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.'))
-    {
-        Err(ControllerError::Invalid(
-            "stack name may contain only letters, numbers, '.', '-' and '_'".to_owned(),
-        ))
-    } else {
-        Ok(())
-    }
+    swarmlite_stack::validate_stack_name(name)
+        .map_err(|error| ControllerError::Invalid(error.to_string()))
 }

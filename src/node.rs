@@ -71,6 +71,12 @@ pub struct JoinOptions {
     pub gateway_enabled: bool,
 }
 
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectionInfo {
+    pub controller: String,
+    pub token: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct NodeSettings {
     schema_version: u32,
@@ -625,6 +631,11 @@ pub async fn join_command(data_dir: &Path) -> Result<String> {
         "swarmlite join {} --token {}",
         controller, settings.token
     ))
+}
+
+pub async fn connection_info(data_dir: &Path) -> Result<ConnectionInfo> {
+    let (controller, token) = resolve_connection(data_dir, None, None).await?;
+    Ok(ConnectionInfo { controller, token })
 }
 
 pub async fn resolve_connection(
@@ -1427,6 +1438,9 @@ mod tests {
             .unwrap();
         assert_eq!(connection.0, "http://127.0.0.1:18080");
         assert_eq!(connection.1, "0123456789abcdef");
+        let info = connection_info(directory.path()).await.unwrap();
+        assert_eq!(info.controller, "http://127.0.0.1:18080");
+        assert_eq!(info.token, "0123456789abcdef");
 
         let duplicate = init(InitOptions {
             data_dir: directory.path().to_owned(),
@@ -1449,6 +1463,13 @@ mod tests {
         .await
         .unwrap_err();
         assert!(duplicate.to_string().contains("serve"));
+    }
+
+    #[test]
+    fn persistent_node_connections_reject_ssh_urls() {
+        assert!(normalize_controller_url("http://controller.example:17080").is_ok());
+        assert!(normalize_controller_url("https://controller.example:17080").is_ok());
+        assert!(normalize_controller_url("ssh://controller.example").is_err());
     }
 
     #[tokio::test]

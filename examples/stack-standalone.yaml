@@ -11,3 +11,6 @@ services:
       retries: 3
     deploy:
       replicas: 1
+
+x-swarmlite:
+  name: demo

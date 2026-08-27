@@ -16,6 +16,7 @@ use swarmlite::{
 use tokio::io::AsyncReadExt;
 
 mod cluster_cli;
+mod connection;
 mod upgrade;
 
 #[derive(Debug, Parser)]
@@ -65,6 +66,12 @@ enum Command {
     },
     /// Print a join command for this node's cluster.
     JoinToken,
+    /// Print the Controller address and cluster token stored on this node.
+    ConnectionInfo {
+        /// Emit one machine-readable JSON object.
+        #[arg(long)]
+        json: bool,
+    },
     /// Upgrade Swarmlite using an official GitHub Release.
     Upgrade {
         /// Release to install, such as v0.2.0.
@@ -111,7 +118,7 @@ enum Command {
         #[command(flatten)]
         options: cluster_cli::InspectArgs,
     },
-    /// Fetch logs from a Service or Task.
+    /// Fetch logs from a Service, Task name, or Task ID.
     Logs {
         #[command(flatten)]
         options: cluster_cli::LogsArgs,
@@ -133,6 +140,7 @@ enum Command {
     },
     /// Display the current cluster state.
     Status {
+        /// HTTP(S) Controller URL or ssh://[user@]host[:port].
         #[arg(short = 'u', long)]
         controller: Option<String>,
         #[arg(long, env = "SWARMLITE_TOKEN")]
@@ -237,6 +245,7 @@ enum ConfigKey {
 
 #[derive(Debug, Args)]
 struct ConnectionArgs {
+    /// HTTP(S) Controller URL or ssh://[user@]host[:port].
     #[arg(short = 'u', long)]
     controller: Option<String>,
     #[arg(long, env = "SWARMLITE_TOKEN")]
@@ -245,6 +254,7 @@ struct ConnectionArgs {
 
 #[derive(Debug, Args)]
 struct RegistryConnectionArgs {
+    /// HTTP(S) Controller URL or ssh://[user@]host[:port].
     #[arg(long)]
     controller: Option<String>,
     #[arg(long, env = "SWARMLITE_TOKEN")]
@@ -369,6 +379,16 @@ async fn main() -> Result<()> {
             println!("{}", node::join_command(&data_dir).await?);
             Ok(())
         }
+        Command::ConnectionInfo { json } => {
+            let info = node::connection_info(&data_dir).await?;
+            if json {
+                println!("{}", serde_json::to_string(&info)?);
+            } else {
+                println!("controller: {}", info.controller);
+                println!("token: {}", info.token);
+            }
+            Ok(())
+        }
         Command::Upgrade { .. } => unreachable!("upgrade returned before loading node state"),
         Command::Config { action } => {
             let (connection, update) = match action {
@@ -386,10 +406,9 @@ async fn main() -> Result<()> {
                     (connection, Some(update))
                 }
             };
-            let (controller, token) =
-                node::resolve_connection(&data_dir, connection.controller, connection.token)
-                    .await?;
-            let response = cluster_config(controller, token, update.as_ref()).await?;
+            let client =
+                connection::resolve(&data_dir, connection.controller, connection.token).await?;
+            let response = cluster_config(&client, update.as_ref()).await?;
             println!("{}", serde_json::to_string_pretty(&response)?);
             Ok(())
         }
@@ -408,10 +427,9 @@ async fn main() -> Result<()> {
                     connection,
                 } => (node_id, Some(false), connection),
             };
-            let (controller, token) =
-                node::resolve_connection(&data_dir, connection.controller, connection.token)
-                    .await?;
-            let response = node_gateway(controller, token, &node_id, enabled).await?;
+            let client =
+                connection::resolve(&data_dir, connection.controller, connection.token).await?;
+            let response = node_gateway(&client, &node_id, enabled).await?;
             println!("{}", serde_json::to_string_pretty(&response)?);
             Ok(())
         }
@@ -444,11 +462,9 @@ async fn main() -> Result<()> {
                         connection,
                     ),
                 };
-                let (controller, token) =
-                    node::resolve_connection(&data_dir, connection.controller, connection.token)
-                        .await?;
-                let response =
-                    node_labels(controller, token, &node_id, method, body.as_ref()).await?;
+                let client =
+                    connection::resolve(&data_dir, connection.controller, connection.token).await?;
+                let response = node_labels(&client, &node_id, method, body.as_ref()).await?;
                 println!("{}", serde_json::to_string_pretty(&response)?);
                 Ok(())
             }
@@ -461,10 +477,9 @@ async fn main() -> Result<()> {
                 connection,
             } => {
                 let password = read_registry_password().await?;
-                let (controller, token) =
-                    node::resolve_connection(&data_dir, connection.controller, connection.token)
-                        .await?;
-                let response: RegistryLoginResponse = ControllerClient::new(controller, token)
+                let client =
+                    connection::resolve(&data_dir, connection.controller, connection.token).await?;
+                let response: RegistryLoginResponse = client
                     .send_json(
                         reqwest::Method::PUT,
                         "/v1/registry-credentials",
@@ -491,9 +506,8 @@ async fn main() -> Result<()> {
         Command::Restart { options } => cluster_cli::run_restart(&data_dir, options).await,
         Command::Rm { options } => cluster_cli::run_remove(&data_dir, options).await,
         Command::Status { controller, token } => {
-            let (controller, token) =
-                node::resolve_connection(&data_dir, controller, token).await?;
-            status(controller, token).await
+            let client = connection::resolve(&data_dir, controller, token).await?;
+            status(&client).await
         }
     }
 }
@@ -563,20 +577,18 @@ fn ensure_deployment_succeeded(deployment: &StackDeploymentResponse) -> Result<(
 }
 
 async fn node_labels(
-    controller: String,
-    token: String,
+    client: &ControllerClient,
     node_id: &str,
     method: reqwest::Method,
     body: Option<&serde_json::Value>,
 ) -> Result<NodeLabelsResponse> {
-    Ok(ControllerClient::new(controller, token)
+    Ok(client
         .send_json(method, &format!("/v1/nodes/{node_id}/labels"), body)
         .await?)
 }
 
 async fn node_gateway(
-    controller: String,
-    token: String,
+    client: &ControllerClient,
     node_id: &str,
     enabled: Option<bool>,
 ) -> Result<NodeGatewayResponse> {
@@ -586,7 +598,7 @@ async fn node_gateway(
     } else {
         reqwest::Method::GET
     };
-    Ok(ControllerClient::new(controller, token)
+    Ok(client
         .send_json(
             method,
             &format!("/v1/nodes/{node_id}/gateway"),
@@ -596,8 +608,7 @@ async fn node_gateway(
 }
 
 async fn cluster_config(
-    controller: String,
-    token: String,
+    client: &ControllerClient,
     update: Option<&ClusterConfigUpdate>,
 ) -> Result<ClusterConfigResponse> {
     let method = if update.is_some() {
@@ -605,20 +616,20 @@ async fn cluster_config(
     } else {
         reqwest::Method::GET
     };
-    Ok(ControllerClient::new(controller, token)
-        .send_json(method, "/v1/config", update)
-        .await?)
+    Ok(client.send_json(method, "/v1/config", update).await?)
 }
 
 async fn deploy(
-    controller: String,
-    name: String,
+    client: &ControllerClient,
+    name: Option<String>,
     file: PathBuf,
-    token: String,
     detach: bool,
 ) -> Result<()> {
-    let stack = tokio::fs::read_to_string(file).await?;
-    let client = ControllerClient::new(controller, token);
+    let stack = tokio::fs::read_to_string(&file)
+        .await
+        .with_context(|| format!("failed to read Stack file {}", file.display()))?;
+    let document = swarmlite_stack::parse_stack_document(&stack)?;
+    let name = resolve_stack_name(name, document.name)?;
     let body = client
         .send_text(
             reqwest::Method::PUT,
@@ -628,9 +639,15 @@ async fn deploy(
         )
         .await?;
     let deployment: StackDeploymentResponse = serde_json::from_str(&body)?;
-    let deployment = finish_deployment(&client, deployment, detach).await?;
+    let deployment = finish_deployment(client, deployment, detach).await?;
     println!("{}", serde_json::to_string_pretty(&deployment)?);
     Ok(())
+}
+
+fn resolve_stack_name(command_line: Option<String>, document: Option<String>) -> Result<String> {
+    command_line
+        .or(document)
+        .context("stack name is required; pass STACK to `swarmlite deploy` or set x-swarmlite.name")
 }
 
 async fn wait_for_deployment(
@@ -675,20 +692,20 @@ async fn wait_for_deployment(
     Ok(deployment)
 }
 
-async fn status(controller: String, token: String) -> Result<()> {
-    let value: serde_json::Value = ControllerClient::new(controller, token)
-        .get_json("/v1/status")
-        .await?;
+async fn status(client: &ControllerClient) -> Result<()> {
+    let value: serde_json::Value = client.get_json("/v1/status").await?;
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use clap::{CommandFactory, Parser};
     use swarmlite::config::DEFAULT_CONTROLLER_PORT;
 
-    use super::{Cli, Command};
+    use super::{Cli, Command, resolve_stack_name};
 
     #[test]
     fn cli_definition_is_valid() {
@@ -698,15 +715,37 @@ mod tests {
     #[test]
     fn deploy_waits_by_default_and_supports_detach() {
         let parse = |extra: &[&str]| {
-            let mut arguments = vec!["swarmlite", "deploy", "-c", "stack.yaml", "demo"];
+            let mut arguments = vec!["swarmlite", "deploy"];
             arguments.extend_from_slice(extra);
             Cli::try_parse_from(arguments).unwrap()
         };
-        assert!(matches!(parse(&[]).command, Command::Deploy { .. }));
+        let Command::Deploy { options } = parse(&[]).command else {
+            panic!("expected deploy command");
+        };
+        assert_eq!(options.file, PathBuf::from("swarmlite.yaml"));
+        assert_eq!(options.stack, None);
         assert!(matches!(
             parse(&["--detach"]).command,
             Command::Deploy { .. }
         ));
+        let Command::Deploy { options } = parse(&["demo", "-c", "production.yaml"]).command else {
+            panic!("expected deploy command");
+        };
+        assert_eq!(options.file, PathBuf::from("production.yaml"));
+        assert_eq!(options.stack.as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn command_line_stack_name_overrides_document_name() {
+        assert_eq!(
+            resolve_stack_name(Some("override".into()), Some("embedded".into())).unwrap(),
+            "override"
+        );
+        assert_eq!(
+            resolve_stack_name(None, Some("embedded".into())).unwrap(),
+            "embedded"
+        );
+        assert!(resolve_stack_name(None, None).is_err());
     }
 
     #[test]
@@ -745,6 +784,7 @@ mod tests {
         assert!(names.contains(&"init"));
         assert!(names.contains(&"join"));
         assert!(names.contains(&"serve"));
+        assert!(names.contains(&"connection-info"));
         assert!(names.contains(&"upgrade"));
         assert!(names.contains(&"config"));
         assert!(names.contains(&"gateway"));
@@ -760,6 +800,12 @@ mod tests {
         assert!(!names.contains(&"role"));
         assert!(!names.contains(&"controller"));
         assert!(!names.contains(&"agent"));
+    }
+
+    #[test]
+    fn connection_info_supports_machine_readable_output() {
+        assert!(Cli::try_parse_from(["swarmlite", "connection-info"]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "connection-info", "--json"]).is_ok());
     }
 
     #[test]

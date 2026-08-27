@@ -7,27 +7,32 @@ use anyhow::Result;
 use clap::Args;
 use futures_util::{SinkExt, StreamExt};
 use swarmlite::{
-    client::ControllerClient,
     data_plane::{DATA_STREAM_WRITE_TIMEOUT, DataChannel, DataFrame, DataFrameKind},
     model::{
         DataSessionCreateResponse, DataSessionOperation, DataSessionStream, ServiceInspectResponse,
         ServiceListResponse, ServiceScaleRequest, StackDeploymentResponse, TaskListResponse,
     },
-    node,
 };
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio_tungstenite::tungstenite::Message;
 
-use super::{ConnectionArgs, deploy, finish_deployment};
+use super::{ConnectionArgs, connection, deploy, finish_deployment};
 
 const LOG_OUTPUT_BUFFER_BYTES: usize = 256 * 1024;
 const LOG_OUTPUT_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[derive(Debug, Args)]
 pub(super) struct DeployArgs {
-    #[arg(short = 'c', long = "compose-file", visible_alias = "file")]
-    file: PathBuf,
-    stack: String,
+    #[arg(
+        short = 'c',
+        long = "compose-file",
+        visible_alias = "file",
+        default_value = "swarmlite.yaml"
+    )]
+    pub(super) file: PathBuf,
+    /// Override x-swarmlite.name from the Stack file.
+    #[arg(value_name = "STACK")]
+    pub(super) stack: Option<String>,
     /// Return after the Controller accepts the desired state.
     #[arg(short = 'd', long)]
     detach: bool,
@@ -67,7 +72,8 @@ pub(super) struct InspectArgs {
 
 #[derive(Debug, Args)]
 pub(super) struct LogsArgs {
-    #[arg(value_name = "STACK.SERVICE|TASK")]
+    /// Service, Task name from `ps`, or Task ID/prefix.
+    #[arg(value_name = "STACK.SERVICE|STACK.SERVICE.SLOT|TASK_ID")]
     target: String,
     #[arg(short = 'n', long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(0..=10_000))]
     tail: u32,
@@ -115,10 +121,9 @@ pub(super) struct RemoveArgs {
 }
 
 pub(super) async fn run_deploy(data_dir: &Path, args: DeployArgs) -> Result<()> {
-    let (controller, token) =
-        node::resolve_connection(data_dir, args.connection.controller, args.connection.token)
-            .await?;
-    deploy(controller, args.stack, args.file, token, args.detach).await
+    let client =
+        connection::resolve(data_dir, args.connection.controller, args.connection.token).await?;
+    deploy(&client, args.stack, args.file, args.detach).await
 }
 
 pub(super) async fn run_list(data_dir: &Path, args: ListArgs) -> Result<()> {
@@ -226,10 +231,11 @@ pub(super) async fn run_remove(data_dir: &Path, args: RemoveArgs) -> Result<()> 
     Ok(())
 }
 
-async fn resolve_client(data_dir: &Path, connection: ConnectionArgs) -> Result<ControllerClient> {
-    let (controller, token) =
-        node::resolve_connection(data_dir, connection.controller, connection.token).await?;
-    Ok(ControllerClient::new(controller, token))
+async fn resolve_client(
+    data_dir: &Path,
+    connection: ConnectionArgs,
+) -> Result<connection::ControllerConnection> {
+    connection::resolve(data_dir, connection.controller, connection.token).await
 }
 
 fn encode(value: &str) -> String {

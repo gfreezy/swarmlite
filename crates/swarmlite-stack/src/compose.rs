@@ -4,7 +4,10 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_yaml::Value;
 
-use crate::{HealthcheckSpec, PullPolicy, ServicePort, ServiceSpec, StackGatewaySpec};
+use crate::{
+    GatewayHttpMode, GatewayTlsMode, HealthcheckSpec, HttpRouteSpec, PullPolicy, ServicePort,
+    ServiceSpec, StackGatewaySpec,
+};
 
 #[derive(Debug, Clone)]
 pub struct ParsedStack {
@@ -12,11 +15,39 @@ pub struct ParsedStack {
     pub gateway: StackGatewaySpec,
 }
 
+#[derive(Debug, Clone)]
+pub struct ParsedStackDocument {
+    pub name: Option<String>,
+    pub stack: ParsedStack,
+}
+
 #[derive(Debug, Deserialize)]
 struct RawStack {
     services: BTreeMap<String, RawService>,
     #[serde(rename = "x-swarmlite", default)]
-    gateway: StackGatewaySpec,
+    swarmlite: RawSwarmlite,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSwarmlite {
+    name: Option<String>,
+    #[serde(default)]
+    tls: GatewayTlsMode,
+    #[serde(default)]
+    http: GatewayHttpMode,
+    #[serde(default)]
+    http_routes: Vec<HttpRouteSpec>,
+}
+
+impl RawSwarmlite {
+    fn gateway(self) -> StackGatewaySpec {
+        StackGatewaySpec {
+            tls: self.tls,
+            http: self.http,
+            http_routes: self.http_routes,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,9 +213,17 @@ struct LongVolume {
 }
 
 pub fn parse_stack(yaml: &str) -> Result<ParsedStack> {
+    Ok(parse_stack_document(yaml)?.stack)
+}
+
+pub fn parse_stack_document(yaml: &str) -> Result<ParsedStackDocument> {
     let mut raw: RawStack = serde_yaml::from_str(yaml).context("invalid stack YAML")?;
     if raw.services.is_empty() {
         bail!("stack must contain at least one service");
+    }
+
+    if let Some(name) = raw.swarmlite.name.as_deref() {
+        crate::validate_stack_name(name).context("invalid x-swarmlite.name")?;
     }
 
     let services: BTreeMap<String, ServiceSpec> = raw
@@ -192,11 +231,13 @@ pub fn parse_stack(yaml: &str) -> Result<ParsedStack> {
         .into_iter()
         .map(|(name, service)| normalize_service(&name, service).map(|spec| (name, spec)))
         .collect::<Result<_>>()?;
-    crate::validate_and_normalize(&mut raw.gateway, &services)
+    let name = raw.swarmlite.name.take();
+    let mut gateway = raw.swarmlite.gateway();
+    crate::validate_and_normalize(&mut gateway, &services)
         .context("invalid x-swarmlite configuration")?;
-    Ok(ParsedStack {
-        services,
-        gateway: raw.gateway,
+    Ok(ParsedStackDocument {
+        name,
+        stack: ParsedStack { services, gateway },
     })
 }
 
@@ -474,6 +515,34 @@ mod tests {
             assert!(!yaml.lines().any(|line| line.starts_with("version:")));
             parse_stack(yaml).unwrap();
         }
+    }
+
+    #[test]
+    fn parses_and_validates_the_optional_stack_name() {
+        let document = parse_stack_document(
+            r#"
+services:
+  web:
+    image: nginx
+x-swarmlite:
+  name: demo.production
+"#,
+        )
+        .unwrap();
+        assert_eq!(document.name.as_deref(), Some("demo.production"));
+        assert!(document.stack.services.contains_key("web"));
+
+        let error = parse_stack_document(
+            r#"
+services:
+  web:
+    image: nginx
+x-swarmlite:
+  name: "invalid name"
+"#,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("invalid x-swarmlite.name"));
     }
 
     #[test]

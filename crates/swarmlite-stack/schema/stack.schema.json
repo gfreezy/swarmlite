@@ -286,6 +286,12 @@
     "swarmlite": {
       "type": "object",
       "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "description": "Default Stack name used when the deploy command omits its STACK argument."
+        },
         "tls": {
           "$ref": "#/$defs/tlsMode",
           "default": "serve"

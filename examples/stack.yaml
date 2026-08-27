@@ -21,6 +21,7 @@ services:
         order: start-first
 
 x-swarmlite:
+  name: demo
   tls: serve
   http: redirect
   http_routes:

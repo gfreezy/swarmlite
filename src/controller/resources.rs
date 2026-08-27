@@ -395,6 +395,31 @@ fn resolve_log_tasks(
         )));
     }
 
+    let named_matches = state
+        .tasks
+        .values()
+        .filter(|task| format!("{}.{}", task.service_id, task.slot.saturating_add(1)) == target)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !named_matches.is_empty()
+        && state
+            .services
+            .get(target)
+            .is_some_and(|service| !service.deleted)
+    {
+        return Err(ControllerError::Conflict(format!(
+            "log target {target:?} matches both a Task name and a Service; use a Task ID"
+        )));
+    }
+    if named_matches.len() == 1 {
+        return Ok(named_matches);
+    }
+    if named_matches.len() > 1 {
+        return Err(ControllerError::Conflict(format!(
+            "task name {target:?} is ambiguous during an update; use a Task ID"
+        )));
+    }
+
     let service = resolve_service(state, target)?;
     let tasks = state
         .tasks
@@ -466,6 +491,70 @@ mod tests {
             resolve_log_tasks(&state, "task-1").unwrap()[0].id,
             "task-123"
         );
+        assert_eq!(
+            resolve_log_tasks(&state, "demo.web.1").unwrap()[0].id,
+            "task-123"
+        );
         assert_eq!(resolve_log_tasks(&state, "demo.web").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rejects_an_ambiguous_task_name_during_an_update() {
+        let mut state = ClusterState::default();
+        state.services.insert(
+            "demo.web".into(),
+            ServiceRecord {
+                id: "demo.web".into(),
+                stack: "demo".into(),
+                name: "web".into(),
+                revision: 2,
+                spec: crate::model::ServiceSpec {
+                    image: "nginx".into(),
+                    pull_policy: Default::default(),
+                    command: Vec::new(),
+                    entrypoint: Vec::new(),
+                    environment: Vec::new(),
+                    expose: Vec::new(),
+                    ports: Vec::new(),
+                    volumes: Vec::new(),
+                    container_labels: Default::default(),
+                    service_labels: Default::default(),
+                    healthcheck: None,
+                    replicas: 1,
+                    constraints: Vec::new(),
+                    max_surge: 1,
+                    stop_grace_period_seconds: 10,
+                },
+                deleted: false,
+            },
+        );
+        for (id, revision, desired) in [
+            ("old-task", 1, DesiredTaskState::Draining),
+            ("new-task", 2, DesiredTaskState::Running),
+        ] {
+            state.tasks.insert(
+                id.into(),
+                TaskRecord {
+                    id: id.into(),
+                    service_id: "demo.web".into(),
+                    revision,
+                    slot: 0,
+                    node_id: "node-a".into(),
+                    desired,
+                    observed: ObservedTaskState::Healthy,
+                    ports: Vec::new(),
+                    container_id: Some(format!("container-{id}")),
+                    drain_until_unix_ms: None,
+                    applied_generation: Some(1),
+                    reconcile_error: None,
+                },
+            );
+        }
+
+        assert!(matches!(
+            resolve_log_tasks(&state, "demo.web.1"),
+            Err(ControllerError::Conflict(message))
+                if message == "task name \"demo.web.1\" is ambiguous during an update; use a Task ID"
+        ));
     }
 }
