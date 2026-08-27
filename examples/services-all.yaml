@@ -18,9 +18,8 @@ services:
       - "5354/udp"
     ports:
       - 8080
-      - "18081:8081/tcp"
+      - "8081/tcp"
       - target: 5353
-        published: 15353
         protocol: udp
     volumes:
       - api-data:/var/lib/api

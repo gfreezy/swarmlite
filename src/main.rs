@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, process::ExitCode};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -291,7 +291,17 @@ struct InitArgs {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -534,13 +544,158 @@ async fn finish_deployment(
     client: &ControllerClient,
     mut deployment: StackDeploymentResponse,
     detach: bool,
+    operation: DeploymentOperation,
 ) -> Result<StackDeploymentResponse> {
-    if !detach {
-        let stack = deployment.stack.clone();
-        deployment = wait_for_deployment(client, &stack, deployment).await?;
-        ensure_deployment_succeeded(&deployment)?;
+    eprintln!(
+        "{}: {} generation {} accepted{}",
+        deployment.stack,
+        operation.label(),
+        deployment.generation,
+        if detach { " (detached)" } else { "" }
+    );
+    if detach {
+        return Ok(deployment);
     }
+    let started = tokio::time::Instant::now();
+    eprintln!(
+        "{}",
+        deployment_progress_summary(operation, &deployment, started.elapsed())
+    );
+    let stack = deployment.stack.clone();
+    deployment = wait_for_deployment(client, &stack, deployment, operation, started).await?;
+    ensure_deployment_succeeded(&deployment)?;
     Ok(deployment)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeploymentOperation {
+    Deploy,
+    Scale,
+    Restart,
+    Remove,
+}
+
+impl DeploymentOperation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Deploy => "deploy",
+            Self::Scale => "scale",
+            Self::Restart => "restart",
+            Self::Remove => "remove",
+        }
+    }
+}
+
+fn deployment_progress_summary(
+    operation: DeploymentOperation,
+    deployment: &StackDeploymentResponse,
+    elapsed: std::time::Duration,
+) -> String {
+    let elapsed = format!("{:.1}s", elapsed.as_secs_f64());
+    let status = match deployment.status {
+        StackDeploymentStatus::Deploying => "deploying",
+        StackDeploymentStatus::Healthy => "healthy",
+        StackDeploymentStatus::Failed => "failed",
+        StackDeploymentStatus::TimedOut => "timed out",
+    };
+    let phases = deployment
+        .task_phases
+        .iter()
+        .map(|progress| format!("{}={}", task_phase_label(progress.phase), progress.tasks))
+        .collect::<Vec<_>>()
+        .join(",");
+    let phases = (!phases.is_empty()).then(|| format!("; phases {phases}"));
+    let gateway = deployment.gateway.as_ref().map(|gateway| {
+        let errors = gateway
+            .errors
+            .iter()
+            .map(|(node, error)| format!("{node}={error}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!(
+            "; gateway {}/{} applied{}",
+            gateway.applied_nodes,
+            gateway.total_nodes,
+            (!errors.is_empty())
+                .then(|| format!("; errors [{errors}]"))
+                .as_deref()
+                .unwrap_or_default()
+        )
+    });
+    if operation == DeploymentOperation::Remove {
+        let status = match deployment.status {
+            StackDeploymentStatus::Deploying => "removing",
+            StackDeploymentStatus::Healthy => "complete",
+            StackDeploymentStatus::Failed => "failed",
+            StackDeploymentStatus::TimedOut => "timed out",
+        };
+        return format!(
+            "{}: remove generation {} {}: {} task(s) remaining{}{} ({elapsed})",
+            deployment.stack,
+            deployment.generation,
+            status,
+            deployment.pending_removals,
+            phases.as_deref().unwrap_or_default(),
+            gateway.as_deref().unwrap_or_default()
+        );
+    }
+
+    let replicas = deployment
+        .services
+        .iter()
+        .map(|service| service.replicas)
+        .sum::<u32>();
+    let applied = deployment
+        .services
+        .iter()
+        .map(|service| service.applied)
+        .sum::<u32>();
+    let healthy = deployment
+        .services
+        .iter()
+        .map(|service| service.healthy)
+        .sum::<u32>();
+    let services = deployment
+        .services
+        .iter()
+        .map(|service| {
+            format!(
+                "{}={}/{} applied,{}/{} healthy",
+                service.service,
+                service.applied,
+                service.replicas,
+                service.healthy,
+                service.replicas
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let removals = (deployment.pending_removals > 0)
+        .then(|| format!("; {} task(s) pending removal", deployment.pending_removals));
+    format!(
+        "{}: {} generation {} {status}: {applied}/{replicas} applied, {healthy}/{replicas} healthy [{}]{}{}{} ({elapsed})",
+        deployment.stack,
+        operation.label(),
+        deployment.generation,
+        services,
+        removals.as_deref().unwrap_or_default(),
+        phases.as_deref().unwrap_or_default(),
+        gateway.as_deref().unwrap_or_default()
+    )
+}
+
+fn task_phase_label(phase: swarmlite::model::TaskReconcilePhase) -> &'static str {
+    use swarmlite::model::TaskReconcilePhase;
+    match phase {
+        TaskReconcilePhase::Inspect => "inspect",
+        TaskReconcilePhase::Pull => "pull",
+        TaskReconcilePhase::Create => "create",
+        TaskReconcilePhase::Replace => "replace",
+        TaskReconcilePhase::Start => "start",
+        TaskReconcilePhase::Stop => "stop",
+        TaskReconcilePhase::Remove => "remove",
+        TaskReconcilePhase::Verify => "verify",
+    }
 }
 
 fn ensure_deployment_succeeded(deployment: &StackDeploymentResponse) -> Result<()> {
@@ -550,7 +705,7 @@ fn ensure_deployment_succeeded(deployment: &StackDeploymentResponse) -> Result<(
     ) {
         return Ok(());
     }
-    let details = deployment
+    let mut details = deployment
         .errors
         .iter()
         .map(|error| {
@@ -559,8 +714,25 @@ fn ensure_deployment_succeeded(deployment: &StackDeploymentResponse) -> Result<(
                 error.service, error.node_id, error.phase, error.message
             )
         })
-        .collect::<Vec<_>>()
-        .join("; ");
+        .collect::<Vec<_>>();
+    if let Some(gateway) = &deployment.gateway
+        && gateway.applied_nodes < gateway.total_nodes
+    {
+        if gateway.errors.is_empty() {
+            details.push(format!(
+                "gateway configuration reached {}/{} nodes",
+                gateway.applied_nodes, gateway.total_nodes
+            ));
+        } else {
+            details.extend(
+                gateway
+                    .errors
+                    .iter()
+                    .map(|(node, error)| format!("gateway on {node}: {error}")),
+            );
+        }
+    }
+    let details = details.join("; ");
     anyhow::bail!(
         "stack {:?} deployment {}: {}",
         deployment.stack,
@@ -654,7 +826,8 @@ async fn deploy(
         )
         .await?;
     let deployment: StackDeploymentResponse = serde_json::from_str(&body)?;
-    let deployment = finish_deployment(client, deployment, detach).await?;
+    let deployment =
+        finish_deployment(client, deployment, detach, DeploymentOperation::Deploy).await?;
     println!("{}", serde_json::to_string_pretty(&deployment)?);
     Ok(())
 }
@@ -669,11 +842,16 @@ async fn wait_for_deployment(
     client: &ControllerClient,
     stack_name: &str,
     mut deployment: StackDeploymentResponse,
+    operation: DeploymentOperation,
+    started: tokio::time::Instant,
 ) -> Result<StackDeploymentResponse> {
     const CLIENT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(330);
     const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
     let deadline = tokio::time::Instant::now() + CLIENT_WAIT_TIMEOUT;
     let mut last_error: Option<anyhow::Error> = None;
+    let mut progress_tick = tokio::time::interval(std::time::Duration::from_secs(10));
+    progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    progress_tick.tick().await;
     while deployment.status == StackDeploymentStatus::Deploying {
         if tokio::time::Instant::now() >= deadline {
             return Err(last_error.unwrap_or_else(|| {
@@ -684,23 +862,50 @@ async fn wait_for_deployment(
             "/v1/stacks/{stack_name}/deployment?generation={}&after_revision={}&wait_seconds=25",
             deployment.generation, deployment.revision
         );
-        match tokio::time::timeout(
+        let request = tokio::time::timeout(
             REQUEST_TIMEOUT,
             client.get_json::<StackDeploymentResponse>(&path),
-        )
-        .await
-        {
+        );
+        tokio::pin!(request);
+        let response = loop {
+            tokio::select! {
+                response = &mut request => break response,
+                _ = progress_tick.tick() => {
+                    eprintln!(
+                        "{}",
+                        deployment_progress_summary(operation, &deployment, started.elapsed())
+                    );
+                }
+            }
+        };
+        match response {
             Ok(Ok(next)) => {
+                let progress_changed = deployment.status != next.status
+                    || deployment.services != next.services
+                    || deployment.pending_removals != next.pending_removals
+                    || deployment.task_phases != next.task_phases
+                    || deployment.gateway != next.gateway
+                    || deployment.errors != next.errors;
                 deployment = next;
                 last_error = None;
+                if progress_changed {
+                    eprintln!(
+                        "{}",
+                        deployment_progress_summary(operation, &deployment, started.elapsed())
+                    );
+                }
             }
             Ok(Err(error)) if error.is_retryable() => {
-                last_error = Some(error.into());
+                let error: anyhow::Error = error.into();
+                eprintln!("{stack_name}: controller unavailable; retrying: {error}");
+                last_error = Some(error);
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             Ok(Err(error)) => return Err(error.into()),
             Err(_) => {
-                last_error = Some(anyhow::anyhow!("controller deployment watch timed out"));
+                let error = anyhow::anyhow!("controller deployment watch timed out");
+                eprintln!("{stack_name}: {error}; retrying");
+                last_error = Some(error);
             }
         }
     }
@@ -718,9 +923,18 @@ mod tests {
     use std::path::PathBuf;
 
     use clap::{CommandFactory, Parser};
-    use swarmlite::config::DEFAULT_CONTROLLER_PORT;
+    use swarmlite::{
+        config::DEFAULT_CONTROLLER_PORT,
+        model::{
+            StackDeploymentGatewayProgress, StackDeploymentResponse,
+            StackDeploymentServiceProgress, StackDeploymentStatus,
+            StackDeploymentTaskPhaseProgress, TaskReconcilePhase,
+        },
+    };
 
-    use super::{Cli, Command, resolve_stack_name};
+    use super::{
+        Cli, Command, DeploymentOperation, deployment_progress_summary, resolve_stack_name,
+    };
 
     #[test]
     fn cli_definition_is_valid() {
@@ -754,6 +968,66 @@ mod tests {
         };
         assert_eq!(options.file, PathBuf::from("production.yaml"));
         assert_eq!(options.stack.as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn deployment_progress_summarizes_service_and_removal_state() {
+        let mut deployment = StackDeploymentResponse {
+            stack: "demo".into(),
+            generation: 7,
+            revision: 1,
+            status: StackDeploymentStatus::Deploying,
+            started_at_unix_ms: 0,
+            finished_at_unix_ms: None,
+            services: vec![StackDeploymentServiceProgress {
+                service: "web".into(),
+                replicas: 3,
+                applied: 2,
+                healthy: 1,
+            }],
+            pending_removals: 1,
+            task_phases: vec![StackDeploymentTaskPhaseProgress {
+                phase: TaskReconcilePhase::Pull,
+                tasks: 1,
+            }],
+            gateway: Some(StackDeploymentGatewayProgress {
+                generation: 8,
+                applied_nodes: 0,
+                total_nodes: 1,
+                errors: Default::default(),
+            }),
+            errors: Vec::new(),
+        };
+        assert_eq!(
+            deployment_progress_summary(
+                DeploymentOperation::Deploy,
+                &deployment,
+                std::time::Duration::from_millis(1_200),
+            ),
+            "demo: deploy generation 7 deploying: 2/3 applied, 1/3 healthy [web=2/3 applied,1/3 healthy]; 1 task(s) pending removal; phases pull=1; gateway 0/1 applied (1.2s)"
+        );
+
+        deployment.services.clear();
+        deployment.task_phases.clear();
+        deployment.gateway = None;
+        assert_eq!(
+            deployment_progress_summary(
+                DeploymentOperation::Remove,
+                &deployment,
+                std::time::Duration::from_secs(2),
+            ),
+            "demo: remove generation 7 removing: 1 task(s) remaining (2.0s)"
+        );
+        deployment.status = StackDeploymentStatus::Healthy;
+        deployment.pending_removals = 0;
+        assert_eq!(
+            deployment_progress_summary(
+                DeploymentOperation::Remove,
+                &deployment,
+                std::time::Duration::from_millis(2_500),
+            ),
+            "demo: remove generation 7 complete: 0 task(s) remaining (2.5s)"
+        );
     }
 
     #[test]

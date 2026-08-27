@@ -45,7 +45,7 @@ services:
   web:
     image: nginx:1.29-alpine
     ports:
-      - "8088:80"
+      - "80"
     deploy:
       replicas: 1
 
@@ -455,6 +455,13 @@ sudo swarmlite connection-info --json
 convergence by default and support `--detach`. `restart` increments the Service revision and
 performs the configured rolling replacement.
 
+While waiting, `deploy`, `scale`, and `restart` report Agent milestones such as `pull`, `create`,
+`start`, and `verify`, together with per-Service applied and healthy replica progress. `rm` reports
+`stop` and `remove` milestones and the number of Tasks still pending removal. Routed deployments
+also report how many gateway nodes have applied the latest configuration and do not complete until
+all enabled gateways have converged. Progress goes to stderr, a status line is printed every ten
+seconds when no state changes, and final command output remains on stdout.
+
 ### Deployment behavior
 
 `deploy` waits until every desired replica has been applied by its Agent and is healthy, and until
@@ -544,15 +551,14 @@ x-swarmlite:
 
 `backend.service` references a Service in the same Stack. When that Service declares exactly one
 TCP target across `expose` and `ports`, `backend.port` is inferred. Multiple targets require an
-explicit `backend.port`, and an explicit value must name a declared target. Swarmlite allocates a
-host port for each routed task. `backend.host` routes to an external DNS name or IP and always
+explicit `backend.port`, and an explicit value must name a declared target. Docker allocates an
+ephemeral host port for each routed task. `backend.host` routes to an external DNS name or IP and always
 requires `port`. Both backend forms support `preserve_host`; `protocol` may be `http`, `https`, or
 `h2c`.
 
-For replicated routed Services, prefer `expose` and let Swarmlite allocate task ports. An explicit
-`ports.published` value is node-local: only one task per protocol can use it on a node, replicas
-need enough distinct nodes, and a `start-first` update may need a spare node. Use `stop-first` when
-the fixed host port must be released before its replacement starts.
+For replicated routed Services, prefer `expose`. Fixed `ports.published` values are rejected so a
+`start-first` replacement can run beside the old task on the same node without a host-port
+collision.
 
 Path matches support `exact`, `prefix` (the default), and RE2-compatible `regex`. Rewrites support
 exactly one of `strip_prefix`, `replace_prefix`, or `replace_path`. Multiple matches in one rule
@@ -561,6 +567,21 @@ prefix, regex, then fallback.
 
 `tls` is `serve|disabled`, and `http` is `redirect|serve|disabled`. Each route may override the
 top-level defaults. `http: redirect` requires `tls: serve`.
+
+Set `canonical_hostname` to one of the route's `hostnames` to permanently redirect every other
+hostname to it while preserving the request path and query. With `http: redirect`, HTTP aliases
+redirect directly to the canonical HTTPS URL without an intermediate redirect:
+
+```yaml
+x-swarmlite:
+  http_routes:
+    - hostnames: [ieltsbao.com, www.ieltsbao.com]
+      canonical_hostname: ieltsbao.com
+      rules:
+        - backend: { service: web }
+```
+
+Hostnames are literal DNS names, so dots are not regex-escaped.
 
 ### Gateway image and listeners
 

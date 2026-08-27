@@ -19,12 +19,12 @@ use crate::{
         AgentCommand, AgentCommandAck, AgentCommandOperation, AgentCommandPollResponse,
         AgentCommandResult, AgentDataStream, AgentDataStreamOperation, GatewayReport,
         HeartbeatResponse, NodeControl, NodeHeartbeat, NodeRecord, ObservedTaskState,
-        TaskReconcilePhase, TaskReconcileReport, TaskReport,
+        TaskReconcilePhase, TaskReconcileProgress, TaskReconcileReport, TaskReport,
     },
     registry::RegistryCredentialStore,
     runtime::{
         ContainerRuntime, DockerCompatibleRuntime, ManagedContainer, RuntimeLogChannel,
-        RuntimeLogChunk,
+        RuntimeLogChunk, RuntimeTaskProgress,
     },
 };
 
@@ -69,17 +69,23 @@ async fn run_with_runtime<R: ContainerRuntime>(
     let client = ControllerClient::new(&config.controller, token);
     let (assignments_tx, assignments_rx) = tokio::sync::watch::channel(None);
     let reconcile_results = Arc::new(Mutex::new(BTreeMap::<String, TaskReconcileReport>::new()));
+    let reconcile_progress = Arc::new(Mutex::new(BTreeMap::<
+        (String, TaskReconcilePhase),
+        TaskReconcileProgress,
+    >::new()));
     let (reconcile_events_tx, mut reconcile_events_rx) = tokio::sync::mpsc::unbounded_channel();
     let runtime = Arc::new(runtime);
     let reconcile_runtime = Arc::clone(&runtime);
     let reconcile_cluster_id = config.cluster_id.clone();
     let loop_results = Arc::clone(&reconcile_results);
+    let loop_progress = Arc::clone(&reconcile_progress);
     tokio::spawn(async move {
         reconciliation_loop(
             reconcile_runtime,
             assignments_rx,
             reconcile_cluster_id,
             loop_results,
+            loop_progress,
             reconcile_events_tx,
         )
         .await;
@@ -142,6 +148,12 @@ async fn run_with_runtime<R: ContainerRuntime>(
                 .collect(),
             task_inventory_error,
             task_results: reconcile_results
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .values()
+                .cloned()
+                .collect(),
+            task_progress: reconcile_progress
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .values()
@@ -460,8 +472,13 @@ async fn reconciliation_loop<R: ContainerRuntime>(
     mut assignments: tokio::sync::watch::Receiver<Option<HeartbeatResponse>>,
     cluster_id: String,
     results: Arc<Mutex<BTreeMap<String, TaskReconcileReport>>>,
+    progress: Arc<Mutex<BTreeMap<(String, TaskReconcilePhase), TaskReconcileProgress>>>,
     events: tokio::sync::mpsc::UnboundedSender<()>,
 ) {
+    let progress = ReconcileProgressPublisher {
+        progress,
+        events: events.clone(),
+    };
     while assignments.changed().await.is_ok() {
         let Some(response) = assignments.borrow_and_update().clone() else {
             continue;
@@ -492,8 +509,62 @@ async fn reconciliation_loop<R: ContainerRuntime>(
                     continue;
                 }
             };
-        let reports = reconcile_containers(runtime.as_ref(), &existing, &response).await;
+        progress.retain_for_response(&response);
+        let reports = reconcile_containers_with_progress(
+            runtime.as_ref(),
+            &existing,
+            &response,
+            Some(&progress),
+        )
+        .await;
         publish_reconcile_results(&response, reports, &results, &events);
+    }
+}
+
+#[derive(Clone)]
+struct ReconcileProgressPublisher {
+    progress: Arc<Mutex<BTreeMap<(String, TaskReconcilePhase), TaskReconcileProgress>>>,
+    events: tokio::sync::mpsc::UnboundedSender<()>,
+}
+
+impl ReconcileProgressPublisher {
+    fn reporter(&self, task_id: &str, desired_generation: u64) -> RuntimeTaskProgress {
+        let task_id = task_id.to_owned();
+        let progress = Arc::clone(&self.progress);
+        let events = self.events.clone();
+        RuntimeTaskProgress::new(move |phase| {
+            let next = TaskReconcileProgress {
+                task_id: task_id.clone(),
+                desired_generation,
+                phase,
+            };
+            let mut current = progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let key = (task_id.clone(), phase);
+            if current.get(&key) != Some(&next) {
+                current.insert(key, next);
+                let _ = events.send(());
+            }
+        })
+    }
+
+    fn retain_for_response(&self, response: &HeartbeatResponse) {
+        let expected = response
+            .assignments
+            .iter()
+            .map(|assignment| assignment.id.as_str())
+            .chain(
+                response
+                    .remove_tasks
+                    .iter()
+                    .map(|assignment| assignment.id.as_str()),
+            )
+            .collect::<std::collections::HashSet<_>>();
+        self.progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(task_id, _), _| expected.contains(task_id.as_str()));
     }
 }
 
@@ -541,16 +612,32 @@ async fn send_heartbeat(
         .await?)
 }
 
+#[cfg(test)]
 async fn reconcile_containers<R: ContainerRuntime>(
     runtime: &R,
     existing: &HashMap<String, ManagedContainer>,
     response: &HeartbeatResponse,
 ) -> Vec<TaskReconcileReport> {
+    reconcile_containers_with_progress(runtime, existing, response, None).await
+}
+
+async fn reconcile_containers_with_progress<R: ContainerRuntime>(
+    runtime: &R,
+    existing: &HashMap<String, ManagedContainer>,
+    response: &HeartbeatResponse,
+    progress: Option<&ReconcileProgressPublisher>,
+) -> Vec<TaskReconcileReport> {
     let mut reports = Vec::new();
     for removal in &response.remove_tasks {
+        let reporter = progress.map_or_else(RuntimeTaskProgress::default, |progress| {
+            progress.reporter(&removal.id, removal.deployment_generation)
+        });
         let result = match existing.get(&removal.id) {
-            Some(container) => runtime.remove_task(container).await,
-            None => Ok(()),
+            Some(container) => runtime.remove_task(container, &reporter).await,
+            None => {
+                reporter.report(TaskReconcilePhase::Remove);
+                Ok(())
+            }
         };
         reports.push(reconcile_report(
             &removal.id,
@@ -561,7 +648,11 @@ async fn reconcile_containers<R: ContainerRuntime>(
     }
 
     for assignment in &response.assignments {
+        let reporter = progress.map_or_else(RuntimeTaskProgress::default, |progress| {
+            progress.reporter(&assignment.id, assignment.deployment_generation)
+        });
         if assignment.desired == crate::model::DesiredTaskState::Draining {
+            reporter.report(TaskReconcilePhase::Verify);
             reports.push(reconcile_report(
                 &assignment.id,
                 assignment.deployment_generation,
@@ -578,30 +669,48 @@ async fn reconcile_containers<R: ContainerRuntime>(
                 ) =>
             {
                 let result = async {
-                    runtime.remove_task(container).await?;
-                    runtime.create_task(assignment).await
+                    runtime.remove_task(container, &reporter).await?;
+                    runtime.create_task(assignment, &reporter).await
                 }
                 .await;
                 (TaskReconcilePhase::Replace, result)
             }
-            Some(container) if !container.running => (
-                TaskReconcilePhase::Start,
-                runtime.start_task(container).await,
-            ),
+            Some(container) if !container.running => {
+                let result = match runtime.start_task(container, &reporter).await {
+                    Err(error)
+                        if crate::runtime::is_host_port_conflict(&error)
+                            && assignment_uses_only_dynamic_ports(assignment) =>
+                    {
+                        async {
+                            runtime.remove_task(container, &reporter).await?;
+                            runtime.create_task(assignment, &reporter).await
+                        }
+                        .await
+                    }
+                    result => result,
+                };
+                (TaskReconcilePhase::Start, result)
+            }
             Some(container) if container.observed == ObservedTaskState::Failed => {
                 let result = async {
-                    runtime.remove_task(container).await?;
-                    runtime.create_task(assignment).await
+                    runtime.remove_task(container, &reporter).await?;
+                    runtime.create_task(assignment, &reporter).await
                 }
                 .await;
                 (TaskReconcilePhase::Replace, result)
             }
-            Some(_) => (TaskReconcilePhase::Verify, Ok(())),
+            Some(_) => {
+                reporter.report(TaskReconcilePhase::Verify);
+                (TaskReconcilePhase::Verify, Ok(()))
+            }
             None => (
                 TaskReconcilePhase::Create,
-                runtime.create_task(assignment).await,
+                runtime.create_task(assignment, &reporter).await,
             ),
         };
+        if result.is_ok() {
+            reporter.report(TaskReconcilePhase::Verify);
+        }
         if let Err(error) = &result {
             error!(
                 task_id = %assignment.id,
@@ -643,9 +752,24 @@ fn reconcile_report(
     }
 }
 
+fn assignment_uses_only_dynamic_ports(assignment: &crate::model::TaskAssignment) -> bool {
+    !assignment.ports.is_empty()
+        && assignment.ports.iter().all(|binding| {
+            assignment
+                .spec
+                .ports
+                .iter()
+                .filter(|port| port.target == binding.target && port.protocol == binding.protocol)
+                .all(|port| port.published.is_none())
+        })
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use crate::{
         config::RuntimeKind,
@@ -657,10 +781,12 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct FakeRuntime {
+        created: Arc<Mutex<Vec<String>>>,
         removed: Arc<Mutex<Vec<String>>>,
         started: Arc<Mutex<Vec<String>>>,
         log_output: Arc<Mutex<Vec<u8>>>,
         fail_create: bool,
+        start_port_conflicts: Arc<AtomicUsize>,
     }
 
     impl ContainerRuntime for FakeRuntime {
@@ -690,20 +816,52 @@ mod tests {
             Ok(HashMap::new())
         }
 
-        async fn create_task(&self, _assignment: &crate::model::TaskAssignment) -> Result<()> {
+        async fn create_task(
+            &self,
+            assignment: &crate::model::TaskAssignment,
+            progress: &RuntimeTaskProgress,
+        ) -> Result<()> {
+            progress.report(TaskReconcilePhase::Pull);
             if self.fail_create {
                 bail!("image pull denied");
             }
+            progress.report(TaskReconcilePhase::Create);
+            progress.report(TaskReconcilePhase::Start);
+            self.created.lock().unwrap().push(assignment.id.clone());
             Ok(())
         }
 
-        async fn start_task(&self, container: &ManagedContainer) -> Result<()> {
+        async fn start_task(
+            &self,
+            container: &ManagedContainer,
+            progress: &RuntimeTaskProgress,
+        ) -> Result<()> {
+            progress.report(TaskReconcilePhase::Start);
+            if self
+                .start_port_conflicts
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 500,
+                    message: "port is already allocated".into(),
+                }
+                .into());
+            }
             self.started.lock().unwrap().push(container.task_id.clone());
             Ok(())
         }
 
-        async fn remove_task(&self, container: &ManagedContainer) -> Result<()> {
+        async fn remove_task(
+            &self,
+            container: &ManagedContainer,
+            progress: &RuntimeTaskProgress,
+        ) -> Result<()> {
+            progress.report(TaskReconcilePhase::Stop);
             self.removed.lock().unwrap().push(container.task_id.clone());
+            progress.report(TaskReconcilePhase::Remove);
             Ok(())
         }
 
@@ -871,6 +1029,11 @@ mod tests {
         let mut container = managed("task-1");
         container.running = false;
         container.observed = ObservedTaskState::Failed;
+        container.ports = vec![crate::model::PortBinding {
+            target: 80,
+            published: Some(40_000),
+            protocol: "tcp".into(),
+        }];
         let existing = HashMap::from([("task-1".into(), container)]);
         let response = HeartbeatResponse {
             generation: 1,
@@ -891,7 +1054,11 @@ mod tests {
                     entrypoint: Vec::new(),
                     environment: Vec::new(),
                     expose: Vec::new(),
-                    ports: Vec::new(),
+                    ports: vec![crate::model::ServicePort {
+                        target: 80,
+                        published: None,
+                        protocol: "tcp".into(),
+                    }],
                     volumes: Vec::new(),
                     container_labels: Default::default(),
                     service_labels: Default::default(),
@@ -901,7 +1068,11 @@ mod tests {
                     max_surge: 1,
                     stop_grace_period_seconds: 10,
                 },
-                ports: Vec::new(),
+                ports: vec![crate::model::PortBinding {
+                    target: 80,
+                    published: Some(40_000),
+                    protocol: "tcp".into(),
+                }],
                 generation: 1,
                 deployment_generation: 1,
                 spec_hash: "hash".into(),
@@ -919,6 +1090,15 @@ mod tests {
         assert!(runtime.removed.lock().unwrap().is_empty());
         assert_eq!(reports[0].phase, TaskReconcilePhase::Start);
         assert_eq!(reports[0].applied_generation, Some(1));
+
+        let retry_runtime = FakeRuntime {
+            start_port_conflicts: Arc::new(AtomicUsize::new(1)),
+            ..FakeRuntime::default()
+        };
+        let reports = reconcile_containers(&retry_runtime, &existing, &response).await;
+        assert_eq!(&*retry_runtime.removed.lock().unwrap(), &["task-1"]);
+        assert_eq!(&*retry_runtime.created.lock().unwrap(), &["task-1"]);
+        assert_eq!(reports[0].error, None);
     }
 
     #[tokio::test]

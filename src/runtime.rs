@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
@@ -28,7 +29,8 @@ use crate::{
     data_plane::MAX_DATA_PAYLOAD_BYTES,
     gateway,
     model::{
-        ClusterState, GatewayAssignment, ObservedTaskState, PortBinding, PullPolicy, TaskAssignment,
+        ClusterState, GatewayAssignment, ObservedTaskState, PortBinding, PullPolicy,
+        TaskAssignment, TaskReconcilePhase,
     },
     registry::RegistryCredentialStore,
 };
@@ -126,6 +128,29 @@ struct ExistingGatewayContainer {
     running: bool,
 }
 
+#[derive(Clone)]
+pub struct RuntimeTaskProgress {
+    callback: Arc<dyn Fn(TaskReconcilePhase) + Send + Sync>,
+}
+
+impl RuntimeTaskProgress {
+    pub fn new(callback: impl Fn(TaskReconcilePhase) + Send + Sync + 'static) -> Self {
+        Self {
+            callback: Arc::new(callback),
+        }
+    }
+
+    pub fn report(&self, phase: TaskReconcilePhase) {
+        (self.callback)(phase);
+    }
+}
+
+impl Default for RuntimeTaskProgress {
+    fn default() -> Self {
+        Self::new(|_| {})
+    }
+}
+
 pub trait ContainerRuntime: Send + Sync + 'static {
     fn kind(&self) -> RuntimeKind;
 
@@ -140,11 +165,23 @@ pub trait ContainerRuntime: Send + Sync + 'static {
         cluster_id: &str,
     ) -> impl Future<Output = Result<HashMap<String, ManagedContainer>>> + Send;
 
-    fn create_task(&self, assignment: &TaskAssignment) -> impl Future<Output = Result<()>> + Send;
+    fn create_task(
+        &self,
+        assignment: &TaskAssignment,
+        progress: &RuntimeTaskProgress,
+    ) -> impl Future<Output = Result<()>> + Send;
 
-    fn start_task(&self, container: &ManagedContainer) -> impl Future<Output = Result<()>> + Send;
+    fn start_task(
+        &self,
+        container: &ManagedContainer,
+        progress: &RuntimeTaskProgress,
+    ) -> impl Future<Output = Result<()>> + Send;
 
-    fn remove_task(&self, container: &ManagedContainer) -> impl Future<Output = Result<()>> + Send;
+    fn remove_task(
+        &self,
+        container: &ManagedContainer,
+        progress: &RuntimeTaskProgress,
+    ) -> impl Future<Output = Result<()>> + Send;
 
     fn stream_task_logs(
         &self,
@@ -669,6 +706,7 @@ impl ContainerRuntime for DockerCompatibleRuntime {
                 .is_some_and(|state| state.running == Some(true));
             let observed = inspect
                 .state
+                .clone()
                 .map(observed_state)
                 .unwrap_or(ObservedTaskState::Failed);
             let revision = labels
@@ -681,6 +719,7 @@ impl ContainerRuntime for DockerCompatibleRuntime {
             let ports = labels
                 .get(PORTS_LABEL)
                 .and_then(|value| serde_json::from_str(value).ok())
+                .map(|ports| resolved_container_ports(&inspect, ports))
                 .unwrap_or_default();
             result.insert(
                 task_id.clone(),
@@ -703,17 +742,22 @@ impl ContainerRuntime for DockerCompatibleRuntime {
         Ok(result)
     }
 
-    async fn create_task(&self, assignment: &TaskAssignment) -> Result<()> {
+    async fn create_task(
+        &self,
+        assignment: &TaskAssignment,
+        progress: &RuntimeTaskProgress,
+    ) -> Result<()> {
         info!(
             task_id = %assignment.id,
             image = %assignment.spec.image,
             runtime = %self.kind,
             "creating task container"
         );
+        progress.report(TaskReconcilePhase::Pull);
         self.ensure_image(&assignment.spec.image, assignment.spec.pull_policy)
             .await?;
 
-        let mut port_bindings = HashMap::new();
+        let port_bindings = task_port_bindings(assignment);
         let exposed_ports = assignment
             .spec
             .expose
@@ -728,15 +772,6 @@ impl ContainerRuntime for DockerCompatibleRuntime {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        for port in &assignment.ports {
-            port_bindings.insert(
-                format!("{}/{}", port.target, port.protocol),
-                Some(vec![DockerPortBinding {
-                    host_ip: Some("0.0.0.0".to_owned()),
-                    host_port: Some(port.published.to_string()),
-                }]),
-            );
-        }
         let labels = task_labels(assignment)?;
         let host_config = HostConfig {
             binds: (!assignment.spec.volumes.is_empty()).then_some(assignment.spec.volumes.clone()),
@@ -779,19 +814,53 @@ impl ContainerRuntime for DockerCompatibleRuntime {
             assignment.slot
         );
         let create_options = CreateContainerOptionsBuilder::default().name(&name).build();
-        let created = self
-            .client
-            .create_container(Some(create_options), body)
-            .await
-            .with_context(|| format!("failed to create task {}", assignment.id))?;
-        self.client
-            .start_container(&created.id, None)
-            .await
-            .with_context(|| format!("failed to start task {}", assignment.id))?;
-        Ok(())
+        for attempt in 0..3 {
+            progress.report(TaskReconcilePhase::Create);
+            let created = match self
+                .client
+                .create_container(Some(create_options.clone()), body.clone())
+                .await
+            {
+                Ok(created) => created,
+                Err(error) if attempt < 2 && docker_port_conflict(&error) => {
+                    warn!(task_id = %assignment.id, %error, "Docker port allocation raced; retrying task creation");
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to create task {}", assignment.id));
+                }
+            };
+            progress.report(TaskReconcilePhase::Start);
+            match self.client.start_container(&created.id, None).await {
+                Ok(()) => return Ok(()),
+                Err(error) if attempt < 2 && docker_port_conflict(&error) => {
+                    warn!(task_id = %assignment.id, %error, "Docker port allocation raced; recreating task container");
+                    let remove = RemoveContainerOptionsBuilder::default().force(true).build();
+                    self.client
+                        .remove_container(&created.id, Some(remove))
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to remove task {} after a port allocation conflict",
+                                assignment.id
+                            )
+                        })?;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to start task {}", assignment.id));
+                }
+            }
+        }
+        unreachable!("task creation retry loop always returns")
     }
 
-    async fn remove_task(&self, container: &ManagedContainer) -> Result<()> {
+    async fn remove_task(
+        &self,
+        container: &ManagedContainer,
+        progress: &RuntimeTaskProgress,
+    ) -> Result<()> {
         info!(
             task_id = %container.task_id,
             runtime = %self.kind,
@@ -800,9 +869,11 @@ impl ContainerRuntime for DockerCompatibleRuntime {
         let stop = StopContainerOptionsBuilder::default()
             .t(container.stop_grace_seconds)
             .build();
+        progress.report(TaskReconcilePhase::Stop);
         if let Err(error) = self.client.stop_container(&container.id, Some(stop)).await {
             warn!(task_id = %container.task_id, %error, "graceful stop failed; forcing removal");
         }
+        progress.report(TaskReconcilePhase::Remove);
         let remove = RemoveContainerOptionsBuilder::default().force(true).build();
         self.client
             .remove_container(&container.id, Some(remove))
@@ -811,12 +882,17 @@ impl ContainerRuntime for DockerCompatibleRuntime {
         Ok(())
     }
 
-    async fn start_task(&self, container: &ManagedContainer) -> Result<()> {
+    async fn start_task(
+        &self,
+        container: &ManagedContainer,
+        progress: &RuntimeTaskProgress,
+    ) -> Result<()> {
         info!(
             task_id = %container.task_id,
             runtime = %self.kind,
             "starting recovered task container"
         );
+        progress.report(TaskReconcilePhase::Start);
         self.client
             .start_container(&container.id, None)
             .await
@@ -852,6 +928,80 @@ impl ContainerRuntime for DockerCompatibleRuntime {
         }
         Ok(())
     }
+}
+
+fn resolved_container_ports(
+    inspect: &bollard::models::ContainerInspectResponse,
+    expected: Vec<PortBinding>,
+) -> Vec<PortBinding> {
+    let actual = inspect
+        .network_settings
+        .as_ref()
+        .and_then(|settings| settings.ports.as_ref());
+    expected
+        .into_iter()
+        .map(|mut port| {
+            let key = format!("{}/{}", port.target, port.protocol);
+            if let Some(published) = actual
+                .and_then(|ports| ports.get(&key))
+                .and_then(Option::as_ref)
+                .and_then(|bindings| {
+                    bindings
+                        .iter()
+                        .find_map(|binding| binding.host_port.as_ref())
+                })
+                .and_then(|port| port.parse().ok())
+            {
+                port.published = Some(published);
+            }
+            port
+        })
+        .collect()
+}
+
+fn task_port_bindings(
+    assignment: &TaskAssignment,
+) -> HashMap<String, Option<Vec<DockerPortBinding>>> {
+    assignment
+        .ports
+        .iter()
+        .map(|port| {
+            let published = assignment
+                .spec
+                .ports
+                .iter()
+                .find(|requested| {
+                    requested.target == port.target && requested.protocol == port.protocol
+                })
+                .and_then(|requested| requested.published);
+            (
+                format!("{}/{}", port.target, port.protocol),
+                Some(vec![DockerPortBinding {
+                    host_ip: Some("0.0.0.0".to_owned()),
+                    host_port: Some(published.map_or_else(String::new, |port| port.to_string())),
+                }]),
+            )
+        })
+        .collect()
+}
+
+fn docker_port_conflict(error: &bollard::errors::Error) -> bool {
+    matches!(
+        error,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message,
+        } if message.contains("port is already allocated")
+            || message.contains("address already in use")
+    )
+}
+
+pub(crate) fn is_host_port_conflict(error: &anyhow::Error) -> bool {
+    error.chain().any(|source| {
+        source
+            .downcast_ref::<bollard::errors::Error>()
+            .is_some_and(docker_port_conflict)
+    })
 }
 
 async fn send_runtime_log_chunks(
@@ -936,7 +1086,7 @@ fn sanitize_name(value: &str) -> String {
 mod tests {
     use std::collections::BTreeMap;
 
-    use crate::model::ServiceSpec;
+    use crate::model::{ServicePort, ServiceSpec};
 
     use super::*;
 
@@ -1142,5 +1292,69 @@ mod tests {
         assert!(!labels.contains_key("io.swarmlite.claim_signature"));
         assert!(!labels.contains_key("io.swarmlite.term"));
         assert!(!labels.contains_key("io.swarmlite.generation"));
+    }
+
+    #[test]
+    fn lets_docker_allocate_and_then_reads_the_published_port() {
+        let assignment = TaskAssignment {
+            id: "task-1".into(),
+            cluster_id: "cluster-old".into(),
+            stack: "demo".into(),
+            service: "web".into(),
+            service_id: "demo.web".into(),
+            revision: 1,
+            slot: 0,
+            desired: crate::model::DesiredTaskState::Running,
+            spec: ServiceSpec {
+                image: "nginx:alpine".into(),
+                pull_policy: Default::default(),
+                command: Vec::new(),
+                entrypoint: Vec::new(),
+                environment: Vec::new(),
+                expose: Vec::new(),
+                ports: vec![ServicePort {
+                    target: 80,
+                    published: None,
+                    protocol: "tcp".into(),
+                }],
+                volumes: Vec::new(),
+                container_labels: BTreeMap::new(),
+                service_labels: BTreeMap::new(),
+                healthcheck: None,
+                replicas: 1,
+                constraints: Vec::new(),
+                max_surge: 1,
+                stop_grace_period_seconds: 10,
+            },
+            ports: vec![PortBinding {
+                target: 80,
+                published: None,
+                protocol: "tcp".into(),
+            }],
+            generation: 1,
+            deployment_generation: 1,
+            spec_hash: "hash".into(),
+        };
+        let bindings = task_port_bindings(&assignment);
+        assert_eq!(
+            bindings["80/tcp"].as_ref().unwrap()[0].host_port.as_deref(),
+            Some("")
+        );
+
+        let inspect = bollard::models::ContainerInspectResponse {
+            network_settings: Some(bollard::models::NetworkSettings {
+                ports: Some(HashMap::from([(
+                    "80/tcp".into(),
+                    Some(vec![DockerPortBinding {
+                        host_ip: Some("0.0.0.0".into()),
+                        host_port: Some("49152".into()),
+                    }]),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolved_container_ports(&inspect, assignment.ports);
+        assert_eq!(resolved[0].published, Some(49_152));
     }
 }

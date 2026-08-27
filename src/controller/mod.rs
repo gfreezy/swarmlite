@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -31,10 +31,12 @@ use crate::{
         NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, NodeMember,
         ObservedTaskState, RegistryLoginRequest, RegistryLoginResponse, ServiceInspectResponse,
         ServiceListResponse, ServiceRecord, ServiceSummary, StackDeploymentError,
-        StackDeploymentRecord, StackDeploymentResponse, StackDeploymentServiceProgress,
-        StackDeploymentStatus, StackListResponse, StackRecord, StackSummary, StatusResponse,
-        TaskAssignment, TaskListResponse, TaskReconcileError, TaskReconcileReport, TaskRecord,
-        TaskRemovalAssignment, TaskSummary, UnclaimedTask, service_spec_hash, valid_gateway_image,
+        StackDeploymentGatewayProgress, StackDeploymentRecord, StackDeploymentResponse,
+        StackDeploymentServiceProgress, StackDeploymentStatus, StackDeploymentTaskPhaseProgress,
+        StackListResponse, StackRecord, StackSummary, StatusResponse, TaskAssignment,
+        TaskListResponse, TaskReconcileError, TaskReconcileProgress, TaskReconcileReport,
+        TaskRecord, TaskRemovalAssignment, TaskSummary, UnclaimedTask, service_spec_hash,
+        valid_gateway_image,
     },
     scheduler,
     storage::{StateRepository, StorageError},
@@ -57,7 +59,7 @@ mod resources;
 mod sessions;
 mod stacks;
 
-use deployment::{apply_task_result, refresh_stack_deployments};
+use deployment::apply_task_result;
 use membership::*;
 use recovery::*;
 use stacks::*;
@@ -102,6 +104,7 @@ struct Inner {
     gateway_generation: u64,
     gateway_config: serde_json::Value,
     gateway_reports: HashMap<String, GatewayReport>,
+    task_progress: HashMap<(String, crate::model::TaskReconcilePhase), TaskReconcileProgress>,
 }
 
 pub struct Controller {

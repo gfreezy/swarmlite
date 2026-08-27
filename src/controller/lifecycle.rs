@@ -92,6 +92,7 @@ impl Controller {
                 gateway_generation: versioned.generation,
                 gateway_config,
                 gateway_reports: HashMap::new(),
+                task_progress: HashMap::new(),
             }),
         })
     }
@@ -114,11 +115,7 @@ impl Controller {
         let previous = inner.state.clone();
         let mut changed = scheduler::finish_drains(&mut inner.state, unix_ms());
         changed |= scheduler::reconcile(&mut inner.state, &live);
-        changed |= refresh_stack_deployments(
-            &mut inner.state,
-            unix_ms(),
-            self.config.deployment_timeout_seconds,
-        );
+        changed |= self.refresh_stack_deployments_locked(&mut inner, unix_ms())?;
         if changed && let Err(error) = self.commit_locked(&mut inner).await {
             inner.state = previous;
             return Err(error);

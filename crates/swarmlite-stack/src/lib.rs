@@ -173,6 +173,8 @@ pub enum GatewayHttpMode {
 pub struct HttpRouteSpec {
     pub hostnames: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<GatewayTlsMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http: Option<GatewayHttpMode>,
@@ -324,6 +326,18 @@ pub fn validate_and_normalize(
         route.hostnames.sort();
         route.hostnames.dedup();
 
+        if let Some(canonical_hostname) = &mut route.canonical_hostname {
+            *canonical_hostname =
+                normalize_hostname(canonical_hostname, false).with_context(|| {
+                    format!(
+                        "http_routes[{route_index}].canonical_hostname contains an invalid host"
+                    )
+                })?;
+            if !route.hostnames.contains(canonical_hostname) {
+                bail!("http_routes[{route_index}].canonical_hostname must appear in hostnames");
+            }
+        }
+
         let tls = route.tls.unwrap_or(gateway.tls);
         let http = route.http.unwrap_or(gateway.http);
         if tls == GatewayTlsMode::Disabled && http == GatewayHttpMode::Disabled {
@@ -372,17 +386,59 @@ pub fn generate<'a>(
         for (route_index, route) in gateway.http_routes.iter().enumerate() {
             let tls = route.tls.unwrap_or(gateway.tls);
             let http = route.http.unwrap_or(gateway.http);
+            let proxy_hostnames = route.canonical_hostname.as_ref().map_or_else(
+                || route.hostnames.clone(),
+                |hostname| vec![hostname.clone()],
+            );
+            let alias_hostnames = route
+                .canonical_hostname
+                .as_ref()
+                .map(|canonical_hostname| {
+                    route
+                        .hostnames
+                        .iter()
+                        .filter(|hostname| *hostname != canonical_hostname)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             if tls == GatewayTlsMode::Disabled {
                 skip_certificates.extend(route.hostnames.iter().cloned());
             }
             if http == GatewayHttpMode::Redirect {
-                routes.push(redirect_route(stack_name, route_index, &route.hostnames));
+                let target_host = route
+                    .canonical_hostname
+                    .as_deref()
+                    .map(format_host)
+                    .unwrap_or_else(|| "{http.request.host}".to_owned());
+                routes.push(redirect_route(
+                    stack_name,
+                    route_index,
+                    "redirect",
+                    &route.hostnames,
+                    "http",
+                    "https",
+                    &target_host,
+                ));
             }
             if tls == GatewayTlsMode::Serve {
+                if let Some(canonical_hostname) = route.canonical_hostname.as_deref()
+                    && !alias_hostnames.is_empty()
+                {
+                    routes.push(redirect_route(
+                        stack_name,
+                        route_index,
+                        "canonical-https",
+                        &alias_hostnames,
+                        "https",
+                        "https",
+                        &format_host(canonical_hostname),
+                    ));
+                }
                 build_proxy_routes(
                     stack_name,
                     route_index,
-                    &route.hostnames,
+                    &proxy_hostnames,
                     &route.rules,
                     "https",
                     &mut resolve_service,
@@ -390,10 +446,23 @@ pub fn generate<'a>(
                 );
             }
             if http == GatewayHttpMode::Serve {
+                if let Some(canonical_hostname) = route.canonical_hostname.as_deref()
+                    && !alias_hostnames.is_empty()
+                {
+                    routes.push(redirect_route(
+                        stack_name,
+                        route_index,
+                        "canonical-http",
+                        &alias_hostnames,
+                        "http",
+                        "http",
+                        &format_host(canonical_hostname),
+                    ));
+                }
                 build_proxy_routes(
                     stack_name,
                     route_index,
-                    &route.hostnames,
+                    &proxy_hostnames,
                     &route.rules,
                     "http",
                     &mut resolve_service,
@@ -659,23 +728,34 @@ fn build_proxy_routes(
     }
 }
 
-fn redirect_route(stack_name: &str, route_index: usize, hostnames: &[String]) -> Route {
+fn redirect_route(
+    stack_name: &str,
+    route_index: usize,
+    id_suffix: &str,
+    hostnames: &[String],
+    request_protocol: &'static str,
+    target_protocol: &str,
+    target_host: &str,
+) -> Route {
     Route {
         id: format!(
-            "swarmlite-{}-route-{}-redirect",
+            "swarmlite-{}-route-{}-{}",
             sanitize_id(stack_name),
-            route_index + 1
+            route_index + 1,
+            id_suffix
         ),
         matchers: vec![RequestMatcher {
             host: hostnames.to_vec(),
-            protocol: "http",
+            protocol: request_protocol,
             path_regexp: None,
         }],
         handle: vec![json!({
             "handler": "static_response",
             "status_code": 308,
             "headers": {
-                "Location": ["https://{http.request.host}{http.request.uri}"]
+                "Location": [format!(
+                    "{target_protocol}://{target_host}{{http.request.uri}}"
+                )]
             }
         })],
         terminal: true,
@@ -855,6 +935,7 @@ mod tests {
         let mut spec = StackGatewaySpec {
             http_routes: vec![HttpRouteSpec {
                 hostnames: vec!["EXAMPLE.COM".into()],
+                canonical_hostname: None,
                 tls: None,
                 http: None,
                 rules: vec![HttpRouteRule {
@@ -893,6 +974,7 @@ mod tests {
         let mut spec = StackGatewaySpec {
             http_routes: vec![HttpRouteSpec {
                 hostnames: vec!["example.com".into()],
+                canonical_hostname: None,
                 tls: None,
                 http: None,
                 rules: vec![HttpRouteRule {
@@ -970,6 +1052,74 @@ mod tests {
         assert_eq!(
             handler["headers"]["request"]["set"]["Host"][0],
             "api.openai.com"
+        );
+    }
+
+    #[test]
+    fn redirects_aliases_to_the_canonical_hostname_in_one_hop() {
+        let mut gateway: StackGatewaySpec = serde_json::from_value(json!({
+            "tls": "serve",
+            "http": "redirect",
+            "http_routes": [{
+                "hostnames": ["www.ieltsbao.com", "IELTSBAO.COM"],
+                "canonical_hostname": "IELTSBAO.COM",
+                "rules": [{
+                    "backend": {"host": "upstream.example.com", "port": 80}
+                }]
+            }]
+        }))
+        .unwrap();
+        validate_and_normalize(&mut gateway, &BTreeMap::new()).unwrap();
+
+        assert_eq!(
+            gateway.http_routes[0].canonical_hostname.as_deref(),
+            Some("ieltsbao.com")
+        );
+        let value = serde_json::to_value(generate(
+            [("demo", &gateway)],
+            &[":80".into(), ":443".into()],
+            |_, _, _| Vec::new(),
+        ))
+        .unwrap();
+        let routes = value["routes"].as_array().unwrap();
+
+        assert_eq!(
+            routes[0]["match"][0]["host"],
+            json!(["ieltsbao.com", "www.ieltsbao.com"])
+        );
+        assert_eq!(routes[0]["match"][0]["protocol"], "http");
+        assert_eq!(
+            routes[0]["handle"][0]["headers"]["Location"][0],
+            "https://ieltsbao.com{http.request.uri}"
+        );
+        assert_eq!(routes[1]["match"][0]["host"], json!(["www.ieltsbao.com"]));
+        assert_eq!(routes[1]["match"][0]["protocol"], "https");
+        assert_eq!(
+            routes[1]["handle"][0]["headers"]["Location"][0],
+            "https://ieltsbao.com{http.request.uri}"
+        );
+        assert_eq!(routes[2]["match"][0]["host"], json!(["ieltsbao.com"]));
+        assert_eq!(routes[2]["handle"][0]["handler"], "reverse_proxy");
+    }
+
+    #[test]
+    fn requires_the_canonical_hostname_to_belong_to_the_route() {
+        let mut gateway: StackGatewaySpec = serde_json::from_value(json!({
+            "http_routes": [{
+                "hostnames": ["www.ieltsbao.com"],
+                "canonical_hostname": "ieltsbao.com",
+                "rules": [{
+                    "backend": {"host": "upstream.example.com", "port": 80}
+                }]
+            }]
+        }))
+        .unwrap();
+
+        let error = validate_and_normalize(&mut gateway, &BTreeMap::new()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("canonical_hostname must appear in hostnames")
         );
     }
 

@@ -158,6 +158,8 @@ pub struct StackDeploymentRecord {
     pub generation: u64,
     pub status: StackDeploymentStatus,
     pub started_at_unix_ms: i64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wait_for_gateway: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at_unix_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -222,7 +224,8 @@ pub enum ObservedTaskState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PortBinding {
     pub target: u16,
-    pub published: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published: Option<u16>,
     pub protocol: String,
 }
 
@@ -321,7 +324,16 @@ pub struct NodeHeartbeat {
     #[serde(default)]
     pub task_results: Vec<TaskReconcileReport>,
     #[serde(default)]
+    pub task_progress: Vec<TaskReconcileProgress>,
+    #[serde(default)]
     pub gateway: GatewayReport,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskReconcileProgress {
+    pub task_id: String,
+    pub desired_generation: u64,
+    pub phase: TaskReconcilePhase,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -335,13 +347,15 @@ pub struct TaskReconcileReport {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskReconcilePhase {
     Inspect,
+    Pull,
     Create,
     Replace,
     Start,
+    Stop,
     Remove,
     Verify,
 }
@@ -490,8 +504,18 @@ pub struct StackDeploymentResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_at_unix_ms: Option<i64>,
     pub services: Vec<StackDeploymentServiceProgress>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pending_removals: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_phases: Vec<StackDeploymentTaskPhaseProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<StackDeploymentGatewayProgress>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<StackDeploymentError>,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -506,6 +530,21 @@ pub struct StackDeploymentServiceProgress {
     pub replicas: u32,
     pub applied: u32,
     pub healthy: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StackDeploymentTaskPhaseProgress {
+    pub phase: TaskReconcilePhase,
+    pub tasks: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StackDeploymentGatewayProgress {
+    pub generation: u64,
+    pub applied_nodes: u32,
+    pub total_nodes: u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub errors: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -39,7 +39,7 @@ rejected instead of being silently ignored. The complete supported surface is:
 | `environment` | Scalar map or string array |
 | `labels` | Scalar map or string array; attached to task containers |
 | `expose` | Internal target number or `target[/tcp|udp]`; port ranges are not supported |
-| `ports` | Target number, `target[/tcp|udp]`, `published:target[/tcp|udp]`, or long syntax with `target`, optional `published` and `protocol` |
+| `ports` | Target number, `target[/tcp|udp]`, or long syntax with `target` and optional `protocol`; Docker assigns the host port |
 | `volumes` | Docker short bind syntax, or long syntax with `target`, optional `source` and `read_only` |
 | `healthcheck` | `test`, `disable`, `interval`, `timeout`, `retries`, `start_period`, and `start_interval` |
 | `stop_grace_period` | Human-readable duration; defaults to `10s` |
@@ -53,10 +53,8 @@ An internal route may omit `backend.port` when its Service declares exactly one 
 target across `expose` and `ports`. A Service with zero or multiple TCP targets requires an
 explicit declared target. External `backend.host` routes always require `port`.
 
-Published ports are node-local. A fixed `published` value allows only one task per protocol on a
-node, so replicated routed Services should normally use `expose` and dynamically allocated task
-ports. Fixed published ports may also require `deploy.update_config.order: stop-first` when no
-spare node is available for a replacement.
+Fixed `published` values are rejected. Docker assigns an ephemeral host port so replicated and
+`start-first` Services can run old and replacement tasks on the same node without a port collision.
 
 See [../../examples/services-all.yaml](../../examples/services-all.yaml) for every accepted shape in
 one Stack file. Fields such as `build`, `depends_on`, `networks`, `restart`, `resources`, `configs`,

@@ -55,7 +55,7 @@
           "type": "array",
           "items": { "$ref": "#/$defs/servicePort" },
           "default": [],
-          "description": "Node-local host-published ports. Omit published to let Swarmlite allocate a node port. A fixed published port permits only one task per protocol on each node. Port ranges, host-IP prefixes, and mode are not supported."
+          "description": "Container target ports published through a Docker-assigned ephemeral host port. Fixed published ports, ranges, host-IP prefixes, and mode are not supported."
         },
         "volumes": {
           "type": "array",
@@ -112,8 +112,8 @@
         },
         {
           "type": "string",
-          "pattern": "^(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?(?:/(?:tcp|udp))?$",
-          "description": "Short syntax: target[/protocol] or published:target[/protocol]. Each port must be 1-65535."
+          "pattern": "^(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])(?:/(?:tcp|udp))?$",
+          "description": "Short syntax: target[/protocol]. Docker allocates the host port."
         },
         {
           "$ref": "#/$defs/servicePortLong"
@@ -142,12 +142,6 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 65535
-        },
-        "published": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 65535,
-          "description": "Omit to allocate a free node port automatically."
         },
         "protocol": {
           "type": "string",
@@ -325,6 +319,11 @@
           "minItems": 1,
           "uniqueItems": true,
           "items": { "type": "string", "minLength": 1 }
+        },
+        "canonical_hostname": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A hostname from hostnames which is served by this route. Requests for every other hostname are permanently redirected to it while preserving the path and query."
         },
         "tls": { "$ref": "#/$defs/tlsMode" },
         "http": { "$ref": "#/$defs/httpMode" },

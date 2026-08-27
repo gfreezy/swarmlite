@@ -36,6 +36,8 @@ x-swarmlite:
     - hostnames:
         - example.com
         - www.example.com
+      # Redirect www.example.com to example.com while preserving path and query.
+      canonical_hostname: example.com
       rules:
         # exact
         - matches:

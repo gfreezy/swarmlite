@@ -115,7 +115,11 @@ fn reconcile_service(
 
     let healthy_current = current_running
         .iter()
-        .filter(|id| state.tasks[*id].observed == ObservedTaskState::Healthy)
+        .filter(|id| {
+            let task = &state.tasks[*id];
+            task.observed == ObservedTaskState::Healthy
+                && task.ports.iter().all(|port| port.published.is_some())
+        })
         .count();
     let old_to_keep = (service.spec.replicas as usize).saturating_sub(healthy_current);
     while old_running.len() > old_to_keep {
@@ -323,7 +327,7 @@ fn explicit_ports_available(state: &ClusterState, node: &NodeRecord, spec: &Serv
 
 fn allocate_ports(
     state: &ClusterState,
-    node: &NodeRecord,
+    _node: &NodeRecord,
     service: &ServiceRecord,
 ) -> Option<Vec<PortBinding>> {
     let mut requested = service.spec.ports.clone();
@@ -340,29 +344,11 @@ fn allocate_ports(
         }
     }
 
-    let mut used = used_ports(state, &node.id);
     let mut result = Vec::with_capacity(requested.len());
     for port in requested {
-        let published = if let Some(published) = port.published {
-            if used
-                .get(&port.protocol)
-                .is_some_and(|ports| ports.contains(&published))
-            {
-                return None;
-            }
-            published
-        } else {
-            (node.port_range_start..=node.port_range_end).find(|candidate| {
-                used.get(&port.protocol)
-                    .is_none_or(|ports| !ports.contains(candidate))
-            })?
-        };
-        used.entry(port.protocol.clone())
-            .or_default()
-            .insert(published);
         result.push(PortBinding {
             target: port.target,
-            published,
+            published: port.published,
             protocol: port.protocol,
         });
     }
@@ -374,7 +360,7 @@ fn used_ports(
     node_id: &str,
 ) -> std::collections::BTreeMap<String, BTreeSet<u16>> {
     let mut used = std::collections::BTreeMap::<String, BTreeSet<u16>>::new();
-    for port in state
+    let assigned_ports = state
         .tasks
         .values()
         .filter(|task| {
@@ -384,11 +370,21 @@ fn used_ports(
                     ObservedTaskState::Failed | ObservedTaskState::Lost
                 )
         })
-        .flat_map(|task| &task.ports)
-    {
-        used.entry(port.protocol.clone())
-            .or_default()
-            .insert(port.published);
+        .flat_map(|task| &task.ports);
+    // Recovery deliberately leaves unmatched containers running and unclaimed.
+    // Their bindings still belong to Docker even though they have no TaskRecord,
+    // so keep those ports reserved until the containers disappear or are adopted.
+    let unclaimed_ports = state
+        .unclaimed_tasks
+        .values()
+        .filter(|task| task.node_id == node_id)
+        .flat_map(|task| &task.ports);
+    for port in assigned_ports.chain(unclaimed_ports) {
+        if let Some(published) = port.published {
+            used.entry(port.protocol.clone())
+                .or_default()
+                .insert(published);
+        }
     }
     used
 }
@@ -651,7 +647,21 @@ mod tests {
             .unwrap()
             .id
             .clone();
-        state.tasks.get_mut(&new_id).unwrap().observed = ObservedTaskState::Healthy;
+        let new_task = state.tasks.get_mut(&new_id).unwrap();
+        new_task.observed = ObservedTaskState::Healthy;
+        reconcile(&mut state, &live);
+        assert_eq!(
+            state
+                .tasks
+                .values()
+                .find(|task| task.revision == 1)
+                .unwrap()
+                .desired,
+            DesiredTaskState::Running,
+            "keep the old task until Docker reports the replacement port"
+        );
+        let new_task = state.tasks.get_mut(&new_id).unwrap();
+        new_task.ports[0].published = Some(20_005);
         reconcile(&mut state, &live);
 
         let old = state
@@ -664,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn gateway_backend_allocates_a_host_port_without_compose_ports() {
+    fn gateway_backend_leaves_host_port_allocation_to_docker() {
         let (mut state, live) = state_with_nodes();
         let mut service = service(1, 1);
         service.spec.ports.clear();
@@ -675,7 +685,42 @@ mod tests {
 
         let binding = &state.tasks.values().next().unwrap().ports[0];
         assert_eq!(binding.target, 8080);
-        assert!((20_000..=20_010).contains(&binding.published));
+        assert_eq!(binding.published, None);
+    }
+
+    #[test]
+    fn gateway_backend_uses_docker_allocation_with_unclaimed_ports() {
+        let (mut state, mut live) = state_with_nodes();
+        state.nodes.remove("node-b");
+        live.remove("node-b");
+        state.unclaimed_tasks.insert(
+            "old-task".into(),
+            crate::model::UnclaimedTask {
+                id: "old-task".into(),
+                stack: "demo".into(),
+                service: "old-web".into(),
+                slot: 0,
+                revision: 1,
+                spec_hash: "old-hash".into(),
+                node_id: "node-a".into(),
+                observed: ObservedTaskState::Failed,
+                ports: vec![PortBinding {
+                    target: 3000,
+                    published: Some(20_000),
+                    protocol: "tcp".into(),
+                }],
+                container_id: Some("old-container".into()),
+            },
+        );
+        let mut service = service(1, 1);
+        service.spec.ports.clear();
+        route_service(&mut state, "web", 8080);
+        state.services.insert(service.id.clone(), service);
+
+        reconcile(&mut state, &live);
+
+        let binding = &state.tasks.values().next().unwrap().ports[0];
+        assert_eq!(binding.published, None);
     }
 
     #[test]
@@ -709,7 +754,7 @@ mod tests {
             state
                 .tasks
                 .values()
-                .all(|task| { task.ports.len() == 1 && task.ports[0].published == 20_000 })
+                .all(|task| { task.ports.len() == 1 && task.ports[0].published == Some(20_000) })
         );
         assert_eq!(
             state
@@ -756,6 +801,7 @@ mod tests {
                 gateway: StackGatewaySpec {
                     http_routes: vec![HttpRouteSpec {
                         hostnames: vec!["example.com".into()],
+                        canonical_hostname: None,
                         tls: None,
                         http: None,
                         rules: vec![HttpRouteRule {

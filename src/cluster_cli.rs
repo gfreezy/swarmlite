@@ -16,7 +16,7 @@ use swarmlite::{
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio_tungstenite::tungstenite::Message;
 
-use super::{ConnectionArgs, connection, deploy, finish_deployment};
+use super::{ConnectionArgs, DeploymentOperation, connection, deploy, finish_deployment};
 
 const LOG_OUTPUT_BUFFER_BYTES: usize = 256 * 1024;
 const LOG_OUTPUT_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -198,7 +198,13 @@ pub(super) async fn run_scale(data_dir: &Path, args: ScaleArgs) -> Result<()> {
             )
             .await?;
         // Serialize intermediate updates so targets in the same Stack cannot conflict.
-        finish_deployment(&client, deployment, args.detach && index == last).await?;
+        finish_deployment(
+            &client,
+            deployment,
+            args.detach && index == last,
+            DeploymentOperation::Scale,
+        )
+        .await?;
         println!("{service} scaled to {replicas}");
     }
     Ok(())
@@ -213,7 +219,13 @@ pub(super) async fn run_restart(data_dir: &Path, args: RestartArgs) -> Result<()
             None,
         )
         .await?;
-    finish_deployment(&client, deployment, args.detach).await?;
+    finish_deployment(
+        &client,
+        deployment,
+        args.detach,
+        DeploymentOperation::Restart,
+    )
+    .await?;
     println!("{}", args.service);
     Ok(())
 }
@@ -228,7 +240,13 @@ pub(super) async fn run_remove(data_dir: &Path, args: RemoveArgs) -> Result<()> 
                 None,
             )
             .await?;
-        finish_deployment(&client, deployment, args.detach).await?;
+        finish_deployment(
+            &client,
+            deployment,
+            args.detach,
+            DeploymentOperation::Remove,
+        )
+        .await?;
         println!("{stack}");
     }
     Ok(())
@@ -289,7 +307,12 @@ fn print_task_table(response: &TaskListResponse, quiet: bool, no_trunc: bool) {
             let ports = task
                 .ports
                 .iter()
-                .map(|port| format!("{}->{}/{}", port.published, port.target, port.protocol))
+                .map(|port| {
+                    port.published.map_or_else(
+                        || format!("pending->{}/{}", port.target, port.protocol),
+                        |published| format!("{published}->{}/{}", port.target, port.protocol),
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(",");
             vec![

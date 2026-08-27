@@ -29,7 +29,11 @@ pub fn generate(state: &ClusterState, listen: &[String]) -> HttpServer {
                         .ports
                         .iter()
                         .find(|port| port.target == target_port && port.protocol == "tcp")?;
-                    Some(format!("{}:{}", format_host(&node.address), port.published))
+                    Some(format!(
+                        "{}:{}",
+                        format_host(&node.address),
+                        port.published?
+                    ))
                 })
                 .collect()
         },
@@ -140,6 +144,15 @@ x-swarmlite:
                 20_002,
             ),
         );
+        let mut unresolved = task(
+            "unresolved",
+            "node-b",
+            DesiredTaskState::Running,
+            ObservedTaskState::Healthy,
+            20_003,
+        );
+        unresolved.ports[0].published = None;
+        state.tasks.insert("unresolved".into(), unresolved);
 
         let value = serde_json::to_value(generate(&state, &[":80".into(), ":443".into()])).unwrap();
         let proxy = value["routes"]
@@ -216,7 +229,7 @@ x-swarmlite:
             observed,
             ports: vec![PortBinding {
                 target: 80,
-                published,
+                published: Some(published),
                 protocol: "tcp".into(),
             }],
             container_id: None,

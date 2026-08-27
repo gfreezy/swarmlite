@@ -145,6 +145,8 @@ impl Controller {
             .get(stack_name)
             .map(|stack| stack.gateway.clone())
             .unwrap_or_default();
+        let wait_for_gateway =
+            !previous_gateway.http_routes.is_empty() || !stack_gateway.http_routes.is_empty();
         let desired_ids: BTreeSet<String> = services
             .keys()
             .map(|name| service_id(stack_name, name))
@@ -211,6 +213,7 @@ impl Controller {
                     generation: deployment_generation,
                     status: StackDeploymentStatus::Deploying,
                     started_at_unix_ms,
+                    wait_for_gateway,
                     finished_at_unix_ms: None,
                     errors: Vec::new(),
                 }),
@@ -220,11 +223,7 @@ impl Controller {
         adopt_unclaimed_tasks(&mut inner.state, stack_name);
         let live = current_live_nodes(&inner, self.config.node_timeout_seconds);
         scheduler::reconcile(&mut inner.state, &live);
-        refresh_stack_deployments(
-            &mut inner.state,
-            unix_ms(),
-            self.config.deployment_timeout_seconds,
-        );
+        self.refresh_stack_deployments_locked(&mut inner, unix_ms())?;
         if let Err(error) = self.commit_locked(&mut inner).await {
             inner.state = previous;
             return Err(error.into());
@@ -270,6 +269,33 @@ impl Controller {
         let inner = self.inner.lock().await;
         deployment_response(&inner, stack_name, generation)
     }
+
+    pub(super) fn refresh_stack_deployments_locked(
+        &self,
+        inner: &mut Inner,
+        now_unix_ms: i64,
+    ) -> Result<bool, StorageError> {
+        let (gateway_generation, _) = self.next_gateway_snapshot(inner)?;
+        let enabled = inner
+            .state
+            .members
+            .values()
+            .filter(|member| member.gateway_enabled)
+            .map(|member| member.id.as_str())
+            .collect::<Vec<_>>();
+        let gateway_ready = !enabled.is_empty()
+            && enabled.iter().all(|node_id| {
+                inner.gateway_reports.get(*node_id).is_some_and(|report| {
+                    report.error.is_none() && report.applied_generation == Some(gateway_generation)
+                })
+            });
+        Ok(refresh_stack_deployments(
+            &mut inner.state,
+            now_unix_ms,
+            self.config.deployment_timeout_seconds,
+            gateway_ready,
+        ))
+    }
 }
 
 fn validate_apply_locked(
@@ -310,6 +336,7 @@ pub(super) fn refresh_stack_deployments(
     state: &mut ClusterState,
     now_unix_ms: i64,
     timeout_seconds: u64,
+    gateway_ready: bool,
 ) -> bool {
     let stack_names = state.stacks.keys().cloned().collect::<Vec<_>>();
     let mut changed = false;
@@ -324,14 +351,15 @@ pub(super) fn refresh_stack_deployments(
         if deployment.status != StackDeploymentStatus::Deploying {
             continue;
         }
-        let next_status = if deployment_is_healthy(state, &stack_name, deployment.generation) {
-            Some(StackDeploymentStatus::Healthy)
-        } else {
-            let timeout_ms =
-                i64::try_from(timeout_seconds.saturating_mul(1_000)).unwrap_or(i64::MAX);
-            (now_unix_ms.saturating_sub(deployment.started_at_unix_ms) >= timeout_ms)
-                .then_some(StackDeploymentStatus::TimedOut)
-        };
+        let next_status =
+            if deployment_is_healthy(state, &stack_name, deployment.generation, gateway_ready) {
+                Some(StackDeploymentStatus::Healthy)
+            } else {
+                let timeout_ms =
+                    i64::try_from(timeout_seconds.saturating_mul(1_000)).unwrap_or(i64::MAX);
+                (now_unix_ms.saturating_sub(deployment.started_at_unix_ms) >= timeout_ms)
+                    .then_some(StackDeploymentStatus::TimedOut)
+            };
         if let Some(status) = next_status {
             let deployment = state
                 .stacks
@@ -437,8 +465,20 @@ pub(super) fn apply_task_result(
     (true, deployment_changed)
 }
 
-fn deployment_is_healthy(state: &ClusterState, stack_name: &str, generation: u64) -> bool {
+fn deployment_is_healthy(
+    state: &ClusterState,
+    stack_name: &str,
+    generation: u64,
+    gateway_ready: bool,
+) -> bool {
     let Some(stack) = state.stacks.get(stack_name) else {
+        return false;
+    };
+    let Some(deployment) = stack
+        .deployment
+        .as_ref()
+        .filter(|deployment| deployment.generation == generation)
+    else {
         return false;
     };
     let replicas_healthy = stack.services.iter().all(|service_id| {
@@ -458,11 +498,13 @@ fn deployment_is_healthy(state: &ClusterState, stack_name: &str, generation: u64
                     && task.desired == DesiredTaskState::Running
                     && task.observed == ObservedTaskState::Healthy
                     && task.applied_generation == Some(generation)
+                    && task.ports.iter().all(|port| port.published.is_some())
             })
             .count()
             >= service.spec.replicas as usize
     });
-    replicas_healthy
+    (!deployment.wait_for_gateway || gateway_ready)
+        && replicas_healthy
         && state.tasks.values().all(|task| {
             let Some(service) = state.services.get(&task.service_id) else {
                 return true;
@@ -525,6 +567,80 @@ fn deployment_response(
             }
         })
         .collect();
+    let mut task_phase_counts = BTreeMap::new();
+    for progress in inner
+        .task_progress
+        .values()
+        .filter(|progress| progress.desired_generation == generation)
+    {
+        let Some(task) = inner.state.tasks.get(&progress.task_id) else {
+            continue;
+        };
+        let Some(service) = inner.state.services.get(&task.service_id) else {
+            continue;
+        };
+        if service.stack == stack_name {
+            *task_phase_counts.entry(progress.phase).or_insert(0_u32) += 1;
+        }
+    }
+    let task_phases = task_phase_counts
+        .into_iter()
+        .map(|(phase, tasks)| StackDeploymentTaskPhaseProgress { phase, tasks })
+        .collect();
+    let pending_removals = u32::try_from(
+        inner
+            .state
+            .tasks
+            .values()
+            .filter(|task| {
+                let Some(service) = inner.state.services.get(&task.service_id) else {
+                    return false;
+                };
+                if service.stack != stack_name {
+                    return false;
+                }
+                let is_current = !service.deleted
+                    && task.revision == service.revision
+                    && task.desired == DesiredTaskState::Running;
+                !is_current && task.observed != ObservedTaskState::Lost
+            })
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    let gateway = deployment.wait_for_gateway.then(|| {
+        let enabled = inner
+            .state
+            .members
+            .values()
+            .filter(|member| member.gateway_enabled)
+            .map(|member| member.id.as_str())
+            .collect::<Vec<_>>();
+        let applied_nodes = enabled
+            .iter()
+            .filter(|node_id| {
+                inner.gateway_reports.get(**node_id).is_some_and(|report| {
+                    report.error.is_none()
+                        && report.applied_generation == Some(inner.gateway_generation)
+                })
+            })
+            .count();
+        let errors = enabled
+            .iter()
+            .filter_map(|node_id| {
+                inner
+                    .gateway_reports
+                    .get(*node_id)
+                    .and_then(|report| report.error.clone())
+                    .map(|error| ((*node_id).to_owned(), error))
+            })
+            .collect();
+        StackDeploymentGatewayProgress {
+            generation: inner.gateway_generation,
+            applied_nodes: u32::try_from(applied_nodes).unwrap_or(u32::MAX),
+            total_nodes: u32::try_from(enabled.len()).unwrap_or(u32::MAX),
+            errors,
+        }
+    });
     Ok(StackDeploymentResponse {
         stack: stack_name.to_owned(),
         generation,
@@ -533,6 +649,9 @@ fn deployment_response(
         started_at_unix_ms: deployment.started_at_unix_ms,
         finished_at_unix_ms: deployment.finished_at_unix_ms,
         services,
+        pending_removals,
+        task_phases,
+        gateway,
         errors: deployment.errors.clone(),
     })
 }

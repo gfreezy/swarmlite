@@ -11,6 +11,7 @@ impl Controller {
             tasks,
             task_inventory_error,
             task_results,
+            task_progress,
             gateway: gateway_report,
         } = heartbeat;
         if node_id != node.id {
@@ -107,7 +108,21 @@ impl Controller {
                         task.container_id = report.container_id.clone();
                         soft_changed = true;
                     }
-                    if report.observed == ObservedTaskState::Failed {
+                    let ports_resolved = task.ports.len() == report.ports.len()
+                        && task.ports.iter().all(|expected| {
+                            report.ports.iter().any(|actual| {
+                                actual.target == expected.target
+                                    && actual.protocol == expected.protocol
+                                    && actual.published.is_some()
+                            })
+                        });
+                    if ports_resolved && task.ports != report.ports {
+                        task.ports.clone_from(&report.ports);
+                        changed = true;
+                    }
+                    if task.desired == DesiredTaskState::Running
+                        && report.observed == ObservedTaskState::Failed
+                    {
                         observed_failures.push((id.clone(), "container reported failed"));
                     }
                 }
@@ -130,10 +145,27 @@ impl Controller {
             }
         }
         for report in &task_results {
+            let phase = if report.error.is_none() {
+                crate::model::TaskReconcilePhase::Verify
+            } else {
+                report.phase
+            };
+            soft_changed |= apply_task_progress(
+                &mut inner,
+                node_id,
+                &TaskReconcileProgress {
+                    task_id: report.task_id.clone(),
+                    desired_generation: report.desired_generation,
+                    phase,
+                },
+            );
             let (task_changed, deployment_changed) =
                 apply_task_result(&mut inner.state, node_id, report);
             soft_changed |= task_changed;
             changed |= deployment_changed;
+        }
+        for progress in &task_progress {
+            soft_changed |= apply_task_progress(&mut inner, node_id, progress);
         }
         let reported_failures = task_results
             .iter()
@@ -162,16 +194,13 @@ impl Controller {
         }
         for id in remove {
             inner.state.tasks.remove(&id);
+            inner.task_progress.retain(|(task_id, _), _| task_id != &id);
             changed = true;
         }
 
         let live = current_live_nodes(&inner, self.config.node_timeout_seconds);
         changed |= scheduler::reconcile(&mut inner.state, &live);
-        changed |= refresh_stack_deployments(
-            &mut inner.state,
-            unix_ms(),
-            self.config.deployment_timeout_seconds,
-        );
+        changed |= self.refresh_stack_deployments_locked(&mut inner, unix_ms())?;
         if changed && let Err(error) = self.commit_locked(&mut inner).await {
             inner.state = previous;
             return Err(error.into());
@@ -299,6 +328,30 @@ impl Controller {
             state,
         }
     }
+}
+
+fn apply_task_progress(inner: &mut Inner, node_id: &str, progress: &TaskReconcileProgress) -> bool {
+    let Some(task) = inner
+        .state
+        .tasks
+        .get(&progress.task_id)
+        .filter(|task| task.node_id == node_id)
+    else {
+        return false;
+    };
+    let task_id = task.id.clone();
+    let Some(deployment_generation) = task_deployment_generation(&inner.state, &task_id) else {
+        return false;
+    };
+    if progress.desired_generation != deployment_generation {
+        return false;
+    }
+    let key = (task_id, progress.phase);
+    if inner.task_progress.get(&key) == Some(progress) {
+        return false;
+    }
+    inner.task_progress.insert(key, progress.clone());
+    true
 }
 
 fn task_deployment_generation(state: &ClusterState, task_id: &str) -> Option<u64> {

@@ -405,8 +405,10 @@ fn normalize_port(value: PortValue) -> Result<ServicePort> {
         }
         PortValue::Long(port) => {
             ensure_nonzero_port(port.target, "long port target")?;
-            if let Some(published) = port.published {
-                ensure_nonzero_port(published, "long port published")?;
+            if port.published.is_some() {
+                bail!(
+                    "ports.published is not supported; omit it to let Docker allocate the host port"
+                );
             }
             let protocol = port.protocol.unwrap_or_else(|| "tcp".to_owned());
             if protocol != "tcp" && protocol != "udp" {
@@ -414,7 +416,7 @@ fn normalize_port(value: PortValue) -> Result<ServicePort> {
             }
             Ok(ServicePort {
                 target: port.target,
-                published: port.published,
+                published: None,
                 protocol,
             })
         }
@@ -430,17 +432,16 @@ fn parse_short_port(value: &str) -> Result<ServicePort> {
         bail!("unsupported port protocol in {value}");
     }
     let parts: Vec<&str> = address.rsplit(':').collect();
-    let (target, published) = match parts.as_slice() {
-        [target] => (parse_port_number(target, value)?, None),
-        [target, published] => (
-            parse_port_number(target, value)?,
-            Some(parse_port_number(published, value)?),
+    let target = match parts.as_slice() {
+        [target] => parse_port_number(target, value)?,
+        [_, _] => bail!(
+            "published ports are not supported in {value}; use target[/protocol] and let Docker allocate the host port"
         ),
         _ => bail!("invalid port mapping {value}"),
     };
     Ok(ServicePort {
         target,
-        published,
+        published: None,
         protocol: protocol.to_owned(),
     })
 }
@@ -558,7 +559,7 @@ services:
       MODE: production
       DEBUG: false
     ports:
-      - "8080:80"
+      - "80"
     volumes:
       - data:/data
     stop_grace_period: 20s
@@ -599,7 +600,7 @@ x-swarmlite:
             web.healthcheck.as_ref().unwrap().interval_nanos,
             Some(5_000_000_000)
         );
-        assert_eq!(web.ports[0].published, Some(8080));
+        assert_eq!(web.ports[0].published, None);
         assert_eq!(web.environment, ["DEBUG=false", "MODE=production"]);
         let rule = &stack.gateway.http_routes[0].rules[0];
         assert_eq!(rule.backend.service.as_deref(), Some("web"));
@@ -805,6 +806,18 @@ services:
 "#,
         ] {
             assert!(parse_stack(yaml).is_err(), "expected rejection for {yaml}");
+        }
+    }
+
+    #[test]
+    fn rejects_fixed_published_ports() {
+        for port in ["\"8080:80\"", "{ target: 80, published: 8080 }"] {
+            let yaml = format!("services:\n  web:\n    image: nginx\n    ports:\n      - {port}\n");
+            let error = parse_stack(&yaml).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("not supported"),
+                "unexpected error: {error:#}"
+            );
         }
     }
 
