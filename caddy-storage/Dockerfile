@@ -6,7 +6,7 @@ COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/caddy ./cmd/caddy
 RUN /out/caddy list-modules | grep -qx 'caddy.storage.swarmlite'
 
-FROM caddy:2.11.2-alpine
+FROM caddy:2.11.4-alpine
 COPY --from=build /out/caddy /usr/bin/caddy
 COPY bootstrap.json /etc/caddy/bootstrap.json
 LABEL io.swarmlite.system="true" \
