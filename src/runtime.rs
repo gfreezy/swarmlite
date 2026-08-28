@@ -534,15 +534,45 @@ impl DockerCompatibleRuntime {
                     "failed to create gateway container {GATEWAY_CONTAINER_NAME}; remove any unrelated container using that name"
                 )
             })?;
-        self.client
-            .start_container(&created.id, None)
-            .await
-            .context("failed to start the gateway container")?;
+        if let Err(error) = self.client.start_container(&created.id, None).await {
+            let start_error =
+                anyhow::Error::new(error).context("failed to start the gateway container");
+            if let Err(cleanup_error) = self
+                .remove_new_container_after_failed_start(&created.id, "gateway")
+                .await
+            {
+                return Err(start_error.context(format!(
+                    "also failed to remove the newly created gateway container: {cleanup_error:#}"
+                )));
+            }
+            return Err(start_error);
+        }
         info!(
             image = %spec.image,
             address = %spec.advertise_address,
             runtime = %self.kind,
             "started independent gateway container"
+        );
+        Ok(())
+    }
+
+    async fn remove_new_container_after_failed_start(
+        &self,
+        container_id: &str,
+        kind: &str,
+    ) -> Result<()> {
+        let remove = RemoveContainerOptionsBuilder::default().force(true).build();
+        self.client
+            .remove_container(container_id, Some(remove))
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to remove newly created {kind} container {container_id} after it failed to start"
+                )
+            })?;
+        info!(
+            container_id,
+            kind, "removed newly created container after start failure"
         );
         Ok(())
     }
@@ -937,22 +967,23 @@ impl ContainerRuntime for DockerCompatibleRuntime {
             progress.report(TaskReconcilePhase::Start);
             match self.client.start_container(&created.id, None).await {
                 Ok(()) => return Ok(()),
-                Err(error) if attempt < 2 && docker_port_conflict(&error) => {
-                    warn!(task_id = %assignment.id, %error, "Docker port allocation raced; recreating task container");
-                    let remove = RemoveContainerOptionsBuilder::default().force(true).build();
-                    self.client
-                        .remove_container(&created.id, Some(remove))
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "failed to remove task {} after a port allocation conflict",
-                                assignment.id
-                            )
-                        })?;
-                }
                 Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("failed to start task {}", assignment.id));
+                    let port_conflict = docker_port_conflict(&error);
+                    let start_error = anyhow::Error::new(error)
+                        .context(format!("failed to start task {}", assignment.id));
+                    if let Err(cleanup_error) = self
+                        .remove_new_container_after_failed_start(&created.id, "task")
+                        .await
+                    {
+                        return Err(start_error.context(format!(
+                            "also failed to remove the newly created task container: {cleanup_error:#}"
+                        )));
+                    }
+                    if attempt < 2 && port_conflict {
+                        warn!(task_id = %assignment.id, %start_error, "Docker port allocation raced; recreating task container");
+                        continue;
+                    }
+                    return Err(start_error);
                 }
             }
         }
@@ -1216,15 +1247,179 @@ fn sanitize_name(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+    };
+
+    use axum::{
+        Router,
+        body::Body,
+        extract::State,
+        http::{Method, StatusCode, Uri},
+        routing::any,
+    };
 
     use crate::model::{ServiceConfigMount, ServicePort, ServiceSpec};
 
     use super::*;
 
+    async fn start_failure_docker_api(
+        State(calls): State<Arc<Mutex<Vec<String>>>>,
+        method: Method,
+        uri: Uri,
+    ) -> axum::response::Response {
+        calls
+            .lock()
+            .unwrap()
+            .push(format!("{method} {}", uri.path()));
+        let path = uri.path();
+        let (status, body) = if method == Method::GET && path.contains("/images/") {
+            (StatusCode::OK, r#"{"Id":"sha256:test-image"}"#)
+        } else if method == Method::POST && path.ends_with("/containers/create") {
+            (
+                StatusCode::CREATED,
+                r#"{"Id":"created-container","Warnings":[]}"#,
+            )
+        } else if method == Method::POST && path.ends_with("/containers/created-container/start") {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"message":"port is already allocated"}"#,
+            )
+        } else if method == Method::DELETE && path.ends_with("/containers/created-container") {
+            (StatusCode::NO_CONTENT, "")
+        } else {
+            (StatusCode::NOT_FOUND, r#"{"message":"unexpected request"}"#)
+        };
+        axum::response::Response::builder()
+            .status(status)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn runtime_with_start_failure_api() -> (
+        DockerCompatibleRuntime,
+        Arc<Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .fallback(any(start_failure_docker_api))
+            .with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let endpoint = format!("http://{address}");
+        let client = Docker::connect_with_http(&endpoint, 5, API_DEFAULT_VERSION).unwrap();
+        (
+            DockerCompatibleRuntime {
+                client,
+                kind: RuntimeKind::Docker,
+                socket: endpoint,
+                registry_credentials: None,
+                config_root: None,
+            },
+            calls,
+            server,
+        )
+    }
+
+    fn start_failure_assignment() -> TaskAssignment {
+        TaskAssignment {
+            id: "task-start-failure".into(),
+            cluster_id: "cluster-old".into(),
+            stack: "demo".into(),
+            service: "web".into(),
+            service_id: "demo.web".into(),
+            revision: 1,
+            slot: 0,
+            desired: crate::model::DesiredTaskState::Running,
+            spec: ServiceSpec {
+                image: "nginx:alpine".into(),
+                pull_policy: Default::default(),
+                command: Vec::new(),
+                entrypoint: Vec::new(),
+                environment: Vec::new(),
+                expose: Vec::new(),
+                ports: Vec::new(),
+                volumes: Vec::new(),
+                configs: Vec::new(),
+                container_labels: BTreeMap::new(),
+                service_labels: BTreeMap::new(),
+                healthcheck: None,
+                replicas: 1,
+                constraints: Vec::new(),
+                max_surge: 1,
+                stop_grace_period_seconds: 10,
+            },
+            ports: Vec::new(),
+            generation: 1,
+            deployment_generation: 1,
+            spec_hash: "hash".into(),
+            image_resolved: true,
+        }
+    }
+
     #[test]
     fn sanitizes_runtime_container_names() {
         assert_eq!(sanitize_name("demo/web:v1"), "demo-web-v1");
+    }
+
+    #[tokio::test]
+    async fn removes_every_new_task_container_when_start_fails() {
+        let (runtime, calls, server) = runtime_with_start_failure_api().await;
+        let error = runtime
+            .create_task(&start_failure_assignment(), &RuntimeTaskProgress::default())
+            .await
+            .unwrap_err();
+        server.abort();
+
+        assert!(format!("{error:#}").contains("failed to start task task-start-failure"));
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("POST ") && call.ends_with("/containers/create"))
+                .count(),
+            3
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("DELETE "))
+                .count(),
+            3,
+            "the final failed attempt must be cleaned up too: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn removes_a_new_gateway_container_when_start_fails() {
+        let (runtime, calls, server) = runtime_with_start_failure_api().await;
+        let error = runtime
+            .create_gateway(&GatewayContainerSpec {
+                cluster_id: "cluster-old".into(),
+                advertise_address: "10.0.0.21".into(),
+                listen: vec![":80".into()],
+                controller: "http://10.0.0.21:17080".into(),
+                token: "0123456789abcdef".into(),
+                image: DEFAULT_GATEWAY_IMAGE.into(),
+            })
+            .await
+            .unwrap_err();
+        server.abort();
+
+        assert!(format!("{error:#}").contains("failed to start the gateway container"));
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("DELETE "))
+                .count(),
+            1,
+            "the failed gateway container must be cleaned up: {calls:?}"
+        );
     }
 
     #[tokio::test]
