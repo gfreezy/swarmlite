@@ -161,6 +161,8 @@ pub struct StackGatewaySpec {
     pub tls: GatewayTlsMode,
     #[serde(default)]
     pub http: GatewayHttpMode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_proxies: Vec<String>,
     #[serde(default)]
     pub http_routes: Vec<HttpRouteSpec>,
 }
@@ -170,6 +172,7 @@ impl Default for StackGatewaySpec {
         Self {
             tls: GatewayTlsMode::Serve,
             http: GatewayHttpMode::Redirect,
+            trusted_proxies: Vec::new(),
             http_routes: Vec::new(),
         }
     }
@@ -202,6 +205,8 @@ pub struct HttpRouteSpec {
     pub tls: Option<GatewayTlsMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http: Option<GatewayHttpMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_proxies: Option<Vec<String>>,
     pub rules: Vec<HttpRouteRule>,
 }
 
@@ -336,6 +341,7 @@ pub fn validate_and_normalize(
     gateway: &mut StackGatewaySpec,
     services: &BTreeMap<String, ServiceSpec>,
 ) -> Result<()> {
+    normalize_trusted_proxies(&mut gateway.trusted_proxies).context("invalid trusted_proxies")?;
     let mut seen_hostnames = BTreeSet::new();
     for (route_index, route) in gateway.http_routes.iter_mut().enumerate() {
         if route.hostnames.is_empty() {
@@ -371,6 +377,10 @@ pub fn validate_and_normalize(
         }
         if http == GatewayHttpMode::Redirect && tls != GatewayTlsMode::Serve {
             bail!("http_routes[{route_index}].http=redirect requires tls=serve");
+        }
+        if let Some(trusted_proxies) = &mut route.trusted_proxies {
+            normalize_trusted_proxies(trusted_proxies)
+                .with_context(|| format!("invalid http_routes[{route_index}].trusted_proxies"))?;
         }
         if route.rules.is_empty() {
             bail!("http_routes[{route_index}].rules must not be empty");
@@ -415,6 +425,10 @@ pub fn generate<'a>(
         for (route_index, route) in gateway.http_routes.iter().enumerate() {
             let tls = route.tls.unwrap_or(gateway.tls);
             let http = route.http.unwrap_or(gateway.http);
+            let trusted_proxies = route
+                .trusted_proxies
+                .as_deref()
+                .unwrap_or(&gateway.trusted_proxies);
             let proxy_hostnames = route.canonical_hostname.as_ref().map_or_else(
                 || route.hostnames.clone(),
                 |hostname| vec![hostname.clone()],
@@ -465,11 +479,14 @@ pub fn generate<'a>(
                     ));
                 }
                 build_proxy_routes(
-                    stack_name,
-                    route_index,
-                    &proxy_hostnames,
-                    &route.rules,
-                    "https",
+                    ProxyRouteConfig {
+                        stack_name,
+                        route_index,
+                        hostnames: &proxy_hostnames,
+                        rules: &route.rules,
+                        trusted_proxies,
+                        request_protocol: "https",
+                    },
                     &mut resolve_service,
                     &mut routes,
                 );
@@ -489,11 +506,14 @@ pub fn generate<'a>(
                     ));
                 }
                 build_proxy_routes(
-                    stack_name,
-                    route_index,
-                    &proxy_hostnames,
-                    &route.rules,
-                    "http",
+                    ProxyRouteConfig {
+                        stack_name,
+                        route_index,
+                        hostnames: &proxy_hostnames,
+                        rules: &route.rules,
+                        trusted_proxies,
+                        request_protocol: "http",
+                    },
                     &mut resolve_service,
                     &mut routes,
                 );
@@ -536,6 +556,47 @@ pub fn routed_service_ports(gateway: &StackGatewaySpec, service_name: &str) -> B
             (rule.backend.service.as_deref() == Some(service_name)).then_some(rule.backend.port)
         })
         .collect()
+}
+
+const PRIVATE_PROXY_RANGES: [&str; 6] = [
+    "192.168.0.0/16",
+    "172.16.0.0/12",
+    "10.0.0.0/8",
+    "127.0.0.1/8",
+    "fd00::/8",
+    "::1",
+];
+
+fn normalize_trusted_proxies(proxies: &mut Vec<String>) -> Result<()> {
+    let mut normalized = BTreeSet::new();
+    for proxy in std::mem::take(proxies) {
+        let proxy = proxy.trim();
+        if proxy == "private_ranges" {
+            normalized.extend(PRIVATE_PROXY_RANGES.into_iter().map(ToOwned::to_owned));
+            continue;
+        }
+        let (address, prefix) = match proxy.split_once('/') {
+            Some((address, prefix)) => (address, Some(prefix)),
+            None => (proxy, None),
+        };
+        let address = address
+            .parse::<IpAddr>()
+            .with_context(|| format!("{proxy:?} is not an IP address or CIDR range"))?;
+        let Some(prefix) = prefix else {
+            normalized.insert(address.to_string());
+            continue;
+        };
+        let prefix = prefix
+            .parse::<u8>()
+            .with_context(|| format!("{proxy:?} has an invalid CIDR prefix"))?;
+        let maximum = if address.is_ipv4() { 32 } else { 128 };
+        if prefix > maximum {
+            bail!("{proxy:?} has a CIDR prefix greater than {maximum}");
+        }
+        normalized.insert(format!("{address}/{prefix}"));
+    }
+    *proxies = normalized.into_iter().collect();
+    Ok(())
 }
 
 fn normalize_hostname(value: &str, allow_wildcard: bool) -> Result<String> {
@@ -706,16 +767,22 @@ fn declared_tcp_targets(service: &ServiceSpec) -> Vec<u16> {
         .collect()
 }
 
-fn build_proxy_routes(
-    stack_name: &str,
+struct ProxyRouteConfig<'a> {
+    stack_name: &'a str,
     route_index: usize,
-    hostnames: &[String],
-    rules: &[HttpRouteRule],
+    hostnames: &'a [String],
+    rules: &'a [HttpRouteRule],
+    trusted_proxies: &'a [String],
     request_protocol: &'static str,
+}
+
+fn build_proxy_routes(
+    config: ProxyRouteConfig<'_>,
     resolve_service: &mut impl FnMut(&str, &str, u16) -> Vec<String>,
     routes: &mut Vec<Route>,
 ) {
-    let mut expanded = rules
+    let mut expanded = config
+        .rules
         .iter()
         .enumerate()
         .flat_map(|(rule_index, rule)| {
@@ -754,19 +821,24 @@ fn build_proxy_routes(
             .into_iter()
             .collect::<Vec<_>>();
         handle.extend(rewrite_handlers(rule.rewrite.as_ref(), path_match));
-        handle.extend(backend_handlers(stack_name, &rule.backend, resolve_service));
+        handle.extend(backend_handlers(
+            config.stack_name,
+            &rule.backend,
+            config.trusted_proxies,
+            resolve_service,
+        ));
         routes.push(Route {
             id: format!(
                 "swarmlite-{}-route-{}-rule-{}-match-{}-{}",
-                sanitize_id(stack_name),
-                route_index + 1,
+                sanitize_id(config.stack_name),
+                config.route_index + 1,
                 rule_index + 1,
                 match_index + 1,
-                request_protocol
+                config.request_protocol
             ),
             matchers: vec![RequestMatcher {
-                host: hostnames.to_vec(),
-                protocol: request_protocol,
+                host: config.hostnames.to_vec(),
+                protocol: config.request_protocol,
                 path_regexp: path_match.map(|path_match| PathRegexpMatcher {
                     pattern: path_pattern(path_match),
                 }),
@@ -874,6 +946,7 @@ fn rewrite_handlers(
 fn backend_handlers(
     stack_name: &str,
     backend: &HttpBackend,
+    trusted_proxies: &[String],
     resolve_service: &mut impl FnMut(&str, &str, u16) -> Vec<String>,
 ) -> Vec<Value> {
     let (upstreams, upstream_name) = match (&backend.service, &backend.host) {
@@ -917,6 +990,9 @@ fn backend_handlers(
         ("handler".to_owned(), json!("reverse_proxy")),
         ("upstreams".to_owned(), json!(upstreams)),
     ]);
+    if !trusted_proxies.is_empty() {
+        handler.insert("trusted_proxies".to_owned(), json!(trusted_proxies));
+    }
     if let Some(transport) = transport {
         handler.insert("transport".to_owned(), transport);
     }
@@ -1011,6 +1087,7 @@ mod tests {
                 canonical_hostname: None,
                 tls: None,
                 http: None,
+                trusted_proxies: None,
                 rules: vec![HttpRouteRule {
                     matches: vec![HttpPathMatch {
                         path: "/api/".into(),
@@ -1051,6 +1128,7 @@ mod tests {
                 canonical_hostname: None,
                 tls: None,
                 http: None,
+                trusted_proxies: None,
                 rules: vec![HttpRouteRule {
                     matches: vec![HttpPathMatch {
                         path: "/health".into(),
@@ -1128,6 +1206,118 @@ mod tests {
             handler["headers"]["request"]["set"]["Host"][0],
             "api.openai.com"
         );
+    }
+
+    #[test]
+    fn inherits_and_overrides_stack_trusted_proxies() {
+        let parsed = parse_stack(
+            r#"
+services:
+  web:
+    image: nginx
+x-swarmlite:
+  tls: disabled
+  http: serve
+  trusted_proxies:
+    - private_ranges
+    - 192.0.2.10
+  http_routes:
+    - hostnames: [inherited.example.com]
+      rules:
+        - backend: { host: upstream.example.com, port: 80 }
+    - hostnames: [overridden.example.com]
+      trusted_proxies: [203.0.113.0/24]
+      rules:
+        - backend: { host: upstream.example.com, port: 80 }
+    - hostnames: [disabled.example.com]
+      trusted_proxies: []
+      rules:
+        - backend: { host: upstream.example.com, port: 80 }
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            parsed
+                .gateway
+                .trusted_proxies
+                .contains(&"10.0.0.0/8".to_owned())
+        );
+        assert!(
+            parsed
+                .gateway
+                .trusted_proxies
+                .contains(&"192.0.2.10".to_owned())
+        );
+        let value = serde_json::to_value(generate(
+            [("demo", &parsed.gateway)],
+            &[":80".into()],
+            |_, _, _| Vec::new(),
+        ))
+        .unwrap();
+        let proxy_for = |hostname: &str| {
+            value["routes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|route| route["match"][0]["host"] == json!([hostname]))
+                .unwrap()["handle"][0]
+                .clone()
+        };
+
+        let inherited = proxy_for("inherited.example.com");
+        assert!(
+            inherited["trusted_proxies"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("fd00::/8"))
+        );
+        assert_eq!(
+            proxy_for("overridden.example.com")["trusted_proxies"],
+            json!(["203.0.113.0/24"])
+        );
+        assert!(
+            proxy_for("disabled.example.com")
+                .get("trusted_proxies")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_stack_and_route_trusted_proxies() {
+        for (yaml, expected) in [
+            (
+                r#"
+services:
+  web:
+    image: nginx
+x-swarmlite:
+  trusted_proxies: [example.com]
+  http_routes:
+    - hostnames: [example.com]
+      rules:
+        - backend: { host: upstream.example.com, port: 80 }
+"#,
+                "invalid trusted_proxies",
+            ),
+            (
+                r#"
+services:
+  web:
+    image: nginx
+x-swarmlite:
+  http_routes:
+    - hostnames: [example.com]
+      trusted_proxies: [10.0.0.0/33]
+      rules:
+        - backend: { host: upstream.example.com, port: 80 }
+"#,
+                "http_routes[0].trusted_proxies",
+            ),
+        ] {
+            let error = parse_stack(yaml).unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
     }
 
     #[test]

@@ -807,6 +807,7 @@ mod tests {
                         canonical_hostname: None,
                         tls: None,
                         http: None,
+                        trusted_proxies: None,
                         rules: vec![HttpRouteRule {
                             matches: Vec::new(),
                             rewrite: None,

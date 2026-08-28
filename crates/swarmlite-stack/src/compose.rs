@@ -74,6 +74,8 @@ struct RawSwarmlite {
     #[serde(default)]
     http: GatewayHttpMode,
     #[serde(default)]
+    trusted_proxies: Vec<String>,
+    #[serde(default)]
     http_routes: Vec<HttpRouteSpec>,
 }
 
@@ -89,6 +91,7 @@ impl RawSwarmlite {
         StackGatewaySpec {
             tls: self.tls,
             http: self.http,
+            trusted_proxies: self.trusted_proxies,
             http_routes: self.http_routes,
         }
     }

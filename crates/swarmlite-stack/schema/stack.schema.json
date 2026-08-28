@@ -363,6 +363,11 @@
           "$ref": "#/$defs/httpMode",
           "default": "redirect"
         },
+        "trusted_proxies": {
+          "$ref": "#/$defs/trustedProxies",
+          "default": [],
+          "description": "Default trusted proxy IP addresses and CIDR ranges inherited by every HTTP route in this Stack. A route-level value overrides this list."
+        },
         "http_routes": {
           "type": "array",
           "items": { "$ref": "#/$defs/httpRoute" },
@@ -397,6 +402,15 @@
       "type": "string",
       "enum": ["redirect", "serve", "disabled"]
     },
+    "trustedProxies": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "IP addresses, CIDR ranges, or the private_ranges shortcut whose incoming X-Forwarded-* headers are trusted."
+    },
     "httpRoute": {
       "type": "object",
       "required": ["hostnames", "rules"],
@@ -414,6 +428,10 @@
         },
         "tls": { "$ref": "#/$defs/tlsMode" },
         "http": { "$ref": "#/$defs/httpMode" },
+        "trusted_proxies": {
+          "$ref": "#/$defs/trustedProxies",
+          "description": "Overrides x-swarmlite.trusted_proxies for this route. An empty list disables the inherited value."
+        },
         "rules": {
           "type": "array",
           "minItems": 1,

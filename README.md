@@ -653,6 +653,29 @@ ephemeral host port for each routed task. `backend.host` routes to an external D
 requires `port`. Both backend forms support `preserve_host`; `protocol` may be `http`, `https`, or
 `h2c`.
 
+When the Gateway is behind another trusted reverse proxy or load balancer, declare its IP addresses
+or CIDR ranges at the Stack level. Every route inherits this value; a route can replace it, or use
+an empty list to disable the inherited value:
+
+```yaml
+x-swarmlite:
+  trusted_proxies:
+    - private_ranges
+    - 192.0.2.10
+  http_routes:
+    - hostnames: [example.com]
+      rules:
+        - backend: { service: api }
+    - hostnames: [public.example.com]
+      trusted_proxies: []
+      rules:
+        - backend: { service: api }
+```
+
+`private_ranges` expands to Caddy's private IPv4, loopback, and local IPv6 ranges. Swarmlite writes
+the effective list to each Caddy `reverse_proxy` handler, so trust is scoped to the declaring Stack
+and route. Only trust proxy addresses that untrusted clients cannot reach or impersonate.
+
 For replicated routed Services, prefer `expose`. Fixed `ports.published` values are rejected so a
 `start-first` replacement can run beside the old task on the same node without a host-port
 collision.

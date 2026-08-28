@@ -33,6 +33,11 @@ route backend with arbitrary keys and ports in the sibling `services` map.
 Set `x-swarmlite.name` to let `swarmlite deploy` use a Stack name from the document. An explicit
 command-line Stack name takes precedence.
 
+`x-swarmlite.trusted_proxies` supplies the default IP/CIDR list for every route's generated Caddy
+`reverse_proxy` handler. `http_routes[].trusted_proxies` overrides that default; an explicit empty
+list disables it for that route. The Caddy-compatible `private_ranges` shortcut is expanded during
+normalization.
+
 `x-swarmlite.registries.<host>` accepts a required `username` and `password`. The parser keeps
 credentials separate from normalized Service specifications and redacts passwords from debug
 output. The main crate performs authoritative registry-host and credential validation before
