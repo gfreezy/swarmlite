@@ -79,6 +79,7 @@ impl Controller {
                         node_id: node_id.to_owned(),
                         observed: report.observed.clone(),
                         ports: report.ports.clone(),
+                        config_digests: report.config_digests.clone(),
                         container_id: report.container_id.clone(),
                     })
                 });
@@ -120,6 +121,10 @@ impl Controller {
                         });
                     if ports_resolved && task.ports != report.ports {
                         task.ports.clone_from(&report.ports);
+                        changed = true;
+                    }
+                    if task.config_digests.is_empty() && !report.config_digests.is_empty() {
+                        task.config_digests.clone_from(&report.config_digests);
                         changed = true;
                     }
                     if task.desired == DesiredTaskState::Running

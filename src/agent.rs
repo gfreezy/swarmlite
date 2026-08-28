@@ -1,26 +1,29 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
+    path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     client::ControllerClient,
     config::AgentConfig,
+    config_files::ConfigCache,
     data_plane::{DATA_STREAM_WRITE_TIMEOUT, DataChannel, DataFrame, MAX_DATA_PAYLOAD_BYTES},
     local_state::{AgentFence, FENCE_KEY, LocalState},
     model::{
         AgentCommand, AgentCommandAck, AgentCommandOperation, AgentCommandPollResponse,
-        AgentCommandResult, AgentDataStream, AgentDataStreamOperation, GatewayReport,
-        HeartbeatResponse, ImageResolutionProgress, ImageResolutionReport,
-        ImageResolutionServiceReport, NodeControl, NodeHeartbeat, NodeRecord, ObservedTaskState,
-        TaskReconcilePhase, TaskReconcileProgress, TaskReconcileReport, TaskReport,
+        AgentCommandResult, AgentDataStream, AgentDataStreamOperation,
+        CONFIG_GC_GRACE_PERIOD_SECONDS, GatewayReport, HeartbeatResponse, ImageResolutionProgress,
+        ImageResolutionReport, ImageResolutionServiceReport, MAX_CONFIG_FILE_BYTES, NodeControl,
+        NodeHeartbeat, NodeRecord, ObservedTaskState, TaskReconcilePhase, TaskReconcileProgress,
+        TaskReconcileReport, TaskReport,
     },
     registry::RegistryCredentialStore,
     runtime::{
@@ -100,9 +103,13 @@ async fn run_with_runtime<R: ContainerRuntime>(
     let runtime = Arc::new(runtime);
     let reconcile_runtime = Arc::clone(&runtime);
     let reconcile_cluster_id = config.cluster_id.clone();
+    let reconcile_client = client.clone();
+    let config_cache = ConfigCache::new(config.config_dir.clone());
     tokio::spawn(async move {
         reconciliation_loop(
             reconcile_runtime,
+            reconcile_client,
+            config_cache,
             assignments_rx,
             reconcile_cluster_id,
             reconciliation_state,
@@ -164,6 +171,7 @@ async fn run_with_runtime<R: ContainerRuntime>(
                     revision: container.revision,
                     spec_hash: container.spec_hash.clone(),
                     ports: container.ports.clone(),
+                    config_digests: container.config_digests.clone(),
                 })
                 .collect(),
             task_inventory_error,
@@ -501,6 +509,8 @@ async fn publish_command_result(
 
 async fn reconciliation_loop<R: ContainerRuntime>(
     runtime: Arc<R>,
+    client: ControllerClient,
+    config_cache: ConfigCache,
     mut assignments: tokio::sync::watch::Receiver<Option<HeartbeatResponse>>,
     cluster_id: String,
     state: ReconciliationState,
@@ -577,15 +587,82 @@ async fn reconciliation_loop<R: ContainerRuntime>(
             &state.image_results,
             &state.events,
         );
-        let reports = reconcile_containers_with_progress(
-            runtime.as_ref(),
+        let config_errors = prepare_assignment_configs(
+            &client,
+            &config_cache,
             &existing,
             &response,
             Some(&progress),
         )
         .await;
+        let reports = reconcile_containers_with_progress(
+            runtime.as_ref(),
+            &existing,
+            &response,
+            Some(&progress),
+            &config_errors,
+        )
+        .await;
         publish_reconcile_results(&response, reports, &state.task_results, &state.events);
+        let referenced_paths = referenced_config_cache_paths(&config_cache, &existing, &response);
+        let grace_period_ms =
+            i64::try_from(CONFIG_GC_GRACE_PERIOD_SECONDS.saturating_mul(1_000)).unwrap_or(i64::MAX);
+        match config_cache
+            .gc_at(&referenced_paths, unix_ms(), grace_period_ms)
+            .await
+        {
+            Ok(stats) if stats.failures > 0 => warn!(
+                referenced = stats.referenced,
+                marked = stats.marked,
+                retained_for_grace = stats.retained_for_grace,
+                deleted = stats.deleted,
+                failures = stats.failures,
+                "Agent config cache garbage collection had file deletion failures"
+            ),
+            Ok(stats) if stats.marked > 0 || stats.deleted > 0 => info!(
+                referenced = stats.referenced,
+                marked = stats.marked,
+                retained_for_grace = stats.retained_for_grace,
+                deleted = stats.deleted,
+                failures = stats.failures,
+                "reconciled Agent config cache garbage collection"
+            ),
+            Ok(stats) if stats.retained_for_grace > 0 => debug!(
+                referenced = stats.referenced,
+                retained_for_grace = stats.retained_for_grace,
+                "Agent config cache garbage collection retained grace-period candidates"
+            ),
+            Ok(_) => {}
+            Err(error) => warn!(%error, "Agent config cache garbage collection failed"),
+        }
     }
+}
+
+fn referenced_config_cache_paths(
+    cache: &ConfigCache,
+    existing: &HashMap<String, ManagedContainer>,
+    response: &HeartbeatResponse,
+) -> BTreeSet<PathBuf> {
+    response
+        .assignments
+        .iter()
+        .flat_map(|assignment| assignment.spec.configs.iter())
+        .map(|mount| cache.host_path(mount))
+        .chain(
+            existing
+                .values()
+                .flat_map(|container| container.config_cache_paths.iter().cloned()),
+        )
+        .collect()
+}
+
+fn unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
 }
 
 #[derive(Clone)]
@@ -818,7 +895,7 @@ async fn reconcile_containers<R: ContainerRuntime>(
     existing: &HashMap<String, ManagedContainer>,
     response: &HeartbeatResponse,
 ) -> Vec<TaskReconcileReport> {
-    reconcile_containers_with_progress(runtime, existing, response, None).await
+    reconcile_containers_with_progress(runtime, existing, response, None, &HashMap::new()).await
 }
 
 async fn reconcile_containers_with_progress<R: ContainerRuntime>(
@@ -826,6 +903,7 @@ async fn reconcile_containers_with_progress<R: ContainerRuntime>(
     existing: &HashMap<String, ManagedContainer>,
     response: &HeartbeatResponse,
     progress: Option<&ReconcileProgressPublisher>,
+    config_errors: &HashMap<String, String>,
 ) -> Vec<TaskReconcileReport> {
     let mut reports = Vec::new();
     for removal in &response.remove_tasks {
@@ -859,6 +937,17 @@ async fn reconcile_containers_with_progress<R: ContainerRuntime>(
                 TaskReconcilePhase::Verify,
                 Ok(()),
             ));
+            continue;
+        }
+        if let Some(message) = config_errors.get(&assignment.id) {
+            reporter.report(TaskReconcilePhase::Config);
+            reports.push(TaskReconcileReport {
+                task_id: assignment.id.clone(),
+                desired_generation: assignment.deployment_generation,
+                applied_generation: None,
+                phase: TaskReconcilePhase::Config,
+                error: Some(message.clone()),
+            });
             continue;
         }
         let (phase, result) = match existing.get(&assignment.id) {
@@ -926,6 +1015,83 @@ async fn reconcile_containers_with_progress<R: ContainerRuntime>(
         ));
     }
     reports
+}
+
+async fn prepare_assignment_configs(
+    client: &ControllerClient,
+    cache: &ConfigCache,
+    existing: &HashMap<String, ManagedContainer>,
+    response: &HeartbeatResponse,
+    progress: Option<&ReconcileProgressPublisher>,
+) -> HashMap<String, String> {
+    let mut downloads = HashMap::<String, Result<Vec<u8>, String>>::new();
+    let mut errors = HashMap::new();
+    for assignment in &response.assignments {
+        if assignment.desired != crate::model::DesiredTaskState::Running
+            || assignment.spec.configs.is_empty()
+            || !assignment_requires_runtime_change(existing.get(&assignment.id), assignment)
+        {
+            continue;
+        }
+        let reporter = progress.map_or_else(RuntimeTaskProgress::default, |progress| {
+            progress.reporter(&assignment.id, assignment.deployment_generation)
+        });
+        reporter.report(TaskReconcilePhase::Config);
+        for mount in &assignment.spec.configs {
+            if cache.is_ready(mount).await {
+                continue;
+            }
+            if !downloads.contains_key(&mount.digest) {
+                let result = client
+                    .get_bytes(&format!("/v1/configs/{}", mount.digest))
+                    .await
+                    .map_err(|error| {
+                        format!("failed to download config {:?}: {error}", mount.source)
+                    })
+                    .and_then(|contents| {
+                        if contents.len() > MAX_CONFIG_FILE_BYTES {
+                            Err(format!(
+                                "config {:?} exceeded the {MAX_CONFIG_FILE_BYTES}-byte Agent limit",
+                                mount.source
+                            ))
+                        } else {
+                            Ok(contents)
+                        }
+                    });
+                downloads.insert(mount.digest.clone(), result);
+            }
+            let result = match downloads.get(&mount.digest).expect("inserted above") {
+                Ok(contents) => cache
+                    .materialize(mount, contents)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| format!("{error:#}")),
+                Err(message) => Err(message.clone()),
+            };
+            if let Err(message) = result {
+                errors.insert(assignment.id.clone(), message);
+                break;
+            }
+        }
+    }
+    errors
+}
+
+fn assignment_requires_runtime_change(
+    existing: Option<&ManagedContainer>,
+    assignment: &crate::model::TaskAssignment,
+) -> bool {
+    match existing {
+        None => true,
+        Some(container) => {
+            !container.running
+                || container.observed == ObservedTaskState::Failed
+                || container.revision.map_or_else(
+                    || container.spec_hash.as_deref() != Some(&assignment.spec_hash),
+                    |revision| revision != assignment.revision,
+                )
+        }
+    }
 }
 
 fn reconcile_report(
@@ -1124,6 +1290,8 @@ mod tests {
             slot: Some(0),
             spec_hash: Some("hash".into()),
             ports: Vec::new(),
+            config_digests: Vec::new(),
+            config_cache_paths: Vec::new(),
         }
     }
 
@@ -1327,6 +1495,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_preparation_failure_preserves_the_existing_container() {
+        let runtime = FakeRuntime::default();
+        let directory = tempfile::tempdir().unwrap();
+        let cache = ConfigCache::new(directory.path().join("configs"));
+        let old_cache_path = directory.path().join("configs/mounts/old-config");
+        let mut old_container = managed("task-1");
+        old_container.config_cache_paths = vec![old_cache_path.clone()];
+        let existing = HashMap::from([("task-1".into(), old_container)]);
+        let response = HeartbeatResponse {
+            generation: 2,
+            cluster: test_cluster(),
+            assignments: vec![crate::model::TaskAssignment {
+                id: "task-1".into(),
+                cluster_id: "cluster-test".into(),
+                stack: "demo".into(),
+                service: "web".into(),
+                service_id: "demo.web".into(),
+                revision: 2,
+                slot: 0,
+                desired: crate::model::DesiredTaskState::Running,
+                spec: crate::model::ServiceSpec {
+                    image: "nginx:alpine".into(),
+                    pull_policy: Default::default(),
+                    command: Vec::new(),
+                    entrypoint: Vec::new(),
+                    environment: Vec::new(),
+                    expose: Vec::new(),
+                    ports: Vec::new(),
+                    volumes: Vec::new(),
+                    configs: vec![crate::model::ServiceConfigMount {
+                        source: "app-config".into(),
+                        target: "/etc/app/config.yaml".into(),
+                        uid: None,
+                        gid: None,
+                        mode: 0o444,
+                        digest: "a".repeat(64),
+                    }],
+                    container_labels: Default::default(),
+                    service_labels: Default::default(),
+                    healthcheck: None,
+                    replicas: 1,
+                    constraints: Vec::new(),
+                    max_surge: 1,
+                    stop_grace_period_seconds: 10,
+                },
+                ports: Vec::new(),
+                generation: 2,
+                deployment_generation: 2,
+                spec_hash: "new-hash".into(),
+                image_resolved: false,
+            }],
+            image_assignments: Vec::new(),
+            gateway_enabled: false,
+            labels: Default::default(),
+            remove_tasks: Vec::new(),
+            gateway_config: None,
+            registry_credentials: Default::default(),
+            registry_credentials_hash: String::new(),
+        };
+        let config_errors = HashMap::from([("task-1".into(), "download failed".into())]);
+
+        let reports = reconcile_containers_with_progress(
+            &runtime,
+            &existing,
+            &response,
+            None,
+            &config_errors,
+        )
+        .await;
+
+        assert!(runtime.removed.lock().unwrap().is_empty());
+        assert!(runtime.created.lock().unwrap().is_empty());
+        assert!(runtime.started.lock().unwrap().is_empty());
+        assert_eq!(reports[0].phase, TaskReconcilePhase::Config);
+        assert_eq!(reports[0].error.as_deref(), Some("download failed"));
+        let referenced = referenced_config_cache_paths(&cache, &existing, &response);
+        assert!(referenced.contains(&old_cache_path));
+        assert!(referenced.contains(&cache.host_path(&response.assignments[0].spec.configs[0])));
+    }
+
+    #[tokio::test]
     async fn starts_a_matching_stopped_recovered_container_in_place() {
         let runtime = FakeRuntime::default();
         let mut container = managed("task-1");
@@ -1363,6 +1612,7 @@ mod tests {
                         protocol: "tcp".into(),
                     }],
                     volumes: Vec::new(),
+                    configs: Vec::new(),
                     container_labels: Default::default(),
                     service_labels: Default::default(),
                     healthcheck: None,
@@ -1431,6 +1681,7 @@ mod tests {
                     expose: Vec::new(),
                     ports: Vec::new(),
                     volumes: Vec::new(),
+                    configs: Vec::new(),
                     container_labels: Default::default(),
                     service_labels: Default::default(),
                     healthcheck: None,
@@ -1487,6 +1738,7 @@ mod tests {
                     expose: Vec::new(),
                     ports: Vec::new(),
                     volumes: Vec::new(),
+                    configs: Vec::new(),
                     container_labels: Default::default(),
                     service_labels: Default::default(),
                     healthcheck: None,

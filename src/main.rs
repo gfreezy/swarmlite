@@ -1,20 +1,23 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     io::{IsTerminal, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
 };
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use swarmlite::{
     client::ControllerClient,
     config::{DEFAULT_CONTROLLER_PORT, InstalledNodeConfig, RuntimeKind, SYSTEM_CONFIG_PATH},
     model::{
         CLUSTER_SCHEMA_VERSION, ClusterConfigResponse, ClusterConfigUpdate, ClusterGatewayConfig,
-        ClusterSettings, DEFAULT_GATEWAY_IMAGE, NodeGatewayResponse, NodeGatewayUpdate,
+        ClusterSettings, ConfigBlobCheckRequest, ConfigBlobCheckResponse, DEFAULT_GATEWAY_IMAGE,
+        MAX_CONFIG_FILE_BYTES, MAX_STACK_CONFIG_BYTES, NodeGatewayResponse, NodeGatewayUpdate,
         NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, RegistryLoginRequest,
-        RegistryLoginResponse, StackDeploymentResponse, StackDeploymentStatus,
-        StackValidationResponse,
+        RegistryLoginResponse, StackApplyRequest, StackConfigPayload, StackDeploymentResponse,
+        StackDeploymentStatus, StackValidationResponse, config_digest,
     },
     node, registry,
 };
@@ -955,6 +958,9 @@ fn deployment_stage(
     if reached(TaskReconcilePhase::Pull) {
         return "pulling images";
     }
+    if reached(TaskReconcilePhase::Config) {
+        return "preparing configs";
+    }
     if reached(TaskReconcilePhase::Inspect) {
         return "inspecting runtime";
     }
@@ -1193,6 +1199,7 @@ fn task_phase_label(phase: swarmlite::model::TaskReconcilePhase) -> &'static str
     use swarmlite::model::TaskReconcilePhase;
     match phase {
         TaskReconcilePhase::Inspect => "inspect",
+        TaskReconcilePhase::Config => "config",
         TaskReconcilePhase::Pull => "pull",
         TaskReconcilePhase::Create => "create",
         TaskReconcilePhase::Replace => "replace",
@@ -1309,35 +1316,127 @@ async fn deploy(
         .await
         .with_context(|| format!("failed to read Stack file {}", file.display()))?;
     let document = swarmlite_stack::parse_stack_document(&stack)?;
+    let request = stack_apply_request(client, &file, stack, &document.configs).await?;
     let name = resolve_stack_name(name, document.name)?;
     if dry_run {
-        let body = client
-            .send_text(
+        let validation: StackValidationResponse = client
+            .send_json(
                 reqwest::Method::PUT,
                 &format!("/v1/stacks/{name}/validate"),
-                Some("application/x-yaml"),
-                Some(stack),
+                Some(&request),
             )
             .await?;
-        let validation: StackValidationResponse = serde_json::from_str(&body)?;
         println!("{}", serde_json::to_string_pretty(&validation)?);
         return Ok(());
     }
-    let body = client
-        .send_text(
+    let deployment: StackDeploymentResponse = client
+        .send_json(
             reqwest::Method::PUT,
             &format!("/v1/stacks/{name}"),
-            Some("application/x-yaml"),
-            Some(stack),
+            Some(&request),
         )
         .await?;
-    let deployment: StackDeploymentResponse = serde_json::from_str(&body)?;
     let deployment =
         finish_deployment(client, deployment, detach, DeploymentOperation::Deploy).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&deployment)?);
     }
     Ok(())
+}
+
+async fn stack_apply_request(
+    client: &ControllerClient,
+    stack_file: &Path,
+    yaml: String,
+    configs: &BTreeMap<String, swarmlite_stack::StackConfigSource>,
+) -> Result<StackApplyRequest> {
+    let mut request = local_stack_apply_request(stack_file, yaml, configs).await?;
+    if request.configs.is_empty() {
+        return Ok(request);
+    }
+    let check = ConfigBlobCheckRequest {
+        digests: request
+            .configs
+            .values()
+            .map(|payload| payload.digest.clone())
+            .collect(),
+    };
+    let response: ConfigBlobCheckResponse = client
+        .send_json(reqwest::Method::POST, "/v1/configs/check", Some(&check))
+        .await?;
+    retain_missing_config_contents(&mut request, &response.missing);
+    Ok(request)
+}
+
+fn retain_missing_config_contents(request: &mut StackApplyRequest, missing: &BTreeSet<String>) {
+    let mut included = BTreeSet::new();
+    for payload in request.configs.values_mut() {
+        if !missing.contains(&payload.digest) || !included.insert(payload.digest.clone()) {
+            payload.data_base64 = None;
+        }
+    }
+}
+
+async fn local_stack_apply_request(
+    stack_file: &Path,
+    yaml: String,
+    configs: &BTreeMap<String, swarmlite_stack::StackConfigSource>,
+) -> Result<StackApplyRequest> {
+    let base = stack_file
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut payloads = BTreeMap::new();
+    let mut total_bytes = 0_usize;
+    for (name, config) in configs {
+        let declared = Path::new(&config.file);
+        let path = if declared.is_absolute() {
+            declared.to_owned()
+        } else {
+            base.join(declared)
+        };
+        let metadata = tokio::fs::metadata(&path)
+            .await
+            .with_context(|| format!("failed to read config {name:?} from {}", path.display()))?;
+        if !metadata.is_file() {
+            bail!(
+                "config {name:?} must reference a regular file: {}",
+                path.display()
+            );
+        }
+        let size = usize::try_from(metadata.len())
+            .with_context(|| format!("config {name:?} is too large"))?;
+        if size > MAX_CONFIG_FILE_BYTES {
+            bail!(
+                "config {name:?} is {size} bytes; each config may contain at most {MAX_CONFIG_FILE_BYTES} bytes"
+            );
+        }
+        total_bytes = total_bytes
+            .checked_add(size)
+            .context("total config size overflow")?;
+        if total_bytes > MAX_STACK_CONFIG_BYTES {
+            bail!(
+                "Stack configs contain {total_bytes} bytes; at most {MAX_STACK_CONFIG_BYTES} bytes may be uploaded per deployment"
+            );
+        }
+        let contents = tokio::fs::read(&path)
+            .await
+            .with_context(|| format!("failed to read config {name:?} from {}", path.display()))?;
+        if contents.len() != size {
+            bail!("config {name:?} changed while it was being read; retry the deployment");
+        }
+        payloads.insert(
+            name.clone(),
+            StackConfigPayload {
+                digest: config_digest(&contents),
+                data_base64: Some(BASE64_STANDARD.encode(contents)),
+            },
+        );
+    }
+    Ok(StackApplyRequest {
+        yaml,
+        configs: payloads,
+    })
 }
 
 fn resolve_stack_name(command_line: Option<String>, document: Option<String>) -> Result<String> {
@@ -1426,8 +1525,12 @@ async fn status(client: &ControllerClient) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        path::PathBuf,
+    };
 
+    use base64::Engine as _;
     use clap::{CommandFactory, Parser};
     use swarmlite::{
         config::DEFAULT_CONTROLLER_PORT,
@@ -1440,7 +1543,8 @@ mod tests {
 
     use super::{
         Cli, Command, DeploymentOperation, DeploymentProgressRenderer, deployment_progress_summary,
-        deployment_terminal_progress_summary, resolve_stack_name, write_terminal_progress,
+        deployment_terminal_progress_summary, local_stack_apply_request, resolve_stack_name,
+        retain_missing_config_contents, write_terminal_progress,
     };
 
     #[test]
@@ -1668,6 +1772,67 @@ mod tests {
             "embedded"
         );
         assert!(resolve_stack_name(None, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn stack_configs_are_loaded_relative_to_the_stack_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let stack_file = directory.path().join("nested/swarmlite.yaml");
+        let config_file = directory.path().join("nested/config/app.yaml");
+        tokio::fs::create_dir_all(config_file.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&config_file, b"environment: production\n")
+            .await
+            .unwrap();
+        let request = local_stack_apply_request(
+            &stack_file,
+            "services: {}\n".into(),
+            &BTreeMap::from([(
+                "app-config".into(),
+                swarmlite_stack::StackConfigSource {
+                    file: "./config/app.yaml".into(),
+                },
+            )]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(request.yaml, "services: {}\n");
+        assert_eq!(
+            super::BASE64_STANDARD
+                .decode(request.configs["app-config"].data_base64.as_ref().unwrap(),)
+                .unwrap(),
+            b"environment: production\n"
+        );
+        assert_eq!(
+            request.configs["app-config"].digest,
+            swarmlite::model::config_digest(b"environment: production\n")
+        );
+    }
+
+    #[test]
+    fn repeated_config_digests_upload_only_when_missing_and_only_once() {
+        let missing_digest = "a".repeat(64);
+        let known_digest = "b".repeat(64);
+        let payload = |digest: String| swarmlite::model::StackConfigPayload {
+            digest,
+            data_base64: Some("Y29uZmln".into()),
+        };
+        let mut request = swarmlite::model::StackApplyRequest {
+            yaml: "services: {}\n".into(),
+            configs: BTreeMap::from([
+                ("first".into(), payload(missing_digest.clone())),
+                ("known".into(), payload(known_digest)),
+                ("second".into(), payload(missing_digest.clone())),
+            ]),
+        };
+
+        retain_missing_config_contents(&mut request, &BTreeSet::from([missing_digest.clone()]));
+
+        assert!(request.configs["first"].data_base64.is_some());
+        assert!(request.configs["known"].data_base64.is_none());
+        assert!(request.configs["second"].data_base64.is_none());
     }
 
     #[test]

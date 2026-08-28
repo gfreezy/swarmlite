@@ -10,8 +10,8 @@ use crate::{
     },
     model::{
         CLUSTER_SCHEMA_VERSION, ClusterGatewayConfig, ImageResolutionServiceReport, KvLockStatus,
-        NodeRecord, PortBinding, PullPolicy, ServicePort, ServiceSpec, StackGatewaySpec,
-        TaskRecord, TaskReport,
+        NodeRecord, PortBinding, PullPolicy, ServiceConfigMount, ServicePort, ServiceSpec,
+        StackGatewaySpec, TaskRecord, TaskReport,
     },
 };
 
@@ -562,6 +562,7 @@ fn image_test_heartbeat_on(
             revision: Some(task.revision),
             spec_hash: Some("current-spec".into()),
             ports: task.ports.clone(),
+            config_digests: task.config_digests.clone(),
         }],
         task_inventory_error: None,
         task_results: desired_generation
@@ -612,6 +613,106 @@ async fn prepare_image_redeploy(
     task.observed = ObservedTaskState::Healthy;
     task.container_id = Some("container-web".into());
     (parsed, task.clone(), revision)
+}
+
+#[tokio::test]
+async fn config_digest_changes_roll_the_service_but_identical_content_does_not() {
+    let (controller, _, _directory) = test_controller("config-rollout-test").await;
+    register_live_node(&controller).await;
+    let mut parsed = parsed_test_stack();
+    parsed.services.get_mut("web").unwrap().configs = vec![ServiceConfigMount {
+        source: "index-html".into(),
+        target: "/usr/share/nginx/html/index.html".into(),
+        uid: None,
+        gid: None,
+        mode: 0o444,
+        digest: "a".repeat(64),
+    }];
+    controller.apply("demo", parsed.clone()).await.unwrap();
+    let initial_revision = {
+        let mut inner = controller.inner.lock().await;
+        inner
+            .state
+            .stacks
+            .get_mut("demo")
+            .unwrap()
+            .deployment
+            .as_mut()
+            .unwrap()
+            .status = StackDeploymentStatus::Healthy;
+        inner.state.services["demo.web"].revision
+    };
+
+    controller.apply("demo", parsed.clone()).await.unwrap();
+    {
+        let mut inner = controller.inner.lock().await;
+        assert_eq!(inner.state.services["demo.web"].revision, initial_revision);
+        inner
+            .state
+            .stacks
+            .get_mut("demo")
+            .unwrap()
+            .deployment
+            .as_mut()
+            .unwrap()
+            .status = StackDeploymentStatus::Healthy;
+    }
+
+    parsed.services.get_mut("web").unwrap().configs[0].digest = "b".repeat(64);
+    controller.apply("demo", parsed).await.unwrap();
+
+    let inner = controller.inner.lock().await;
+    assert_eq!(
+        inner.state.services["demo.web"].revision,
+        initial_revision + 1
+    );
+    let referenced = lifecycle::referenced_config_digests(&inner.state);
+    assert!(referenced.contains(&"a".repeat(64)));
+    assert!(referenced.contains(&"b".repeat(64)));
+    assert!(inner.state.tasks.values().any(|task| {
+        task.revision == initial_revision && task.config_digests == vec!["a".repeat(64)]
+    }));
+}
+
+#[test]
+fn config_blob_references_include_offline_and_recovery_containers() {
+    let mut state = ClusterState::default();
+    let mut service = test_service();
+    service.spec.configs = vec![ServiceConfigMount {
+        source: "current".into(),
+        target: "/etc/current".into(),
+        uid: None,
+        gid: None,
+        mode: 0o444,
+        digest: "c".repeat(64),
+    }];
+    state.services.insert(service.id.clone(), service);
+    let mut offline = draining_task();
+    offline.desired = DesiredTaskState::Stopped;
+    offline.observed = ObservedTaskState::Lost;
+    offline.config_digests = vec!["a".repeat(64)];
+    state.tasks.insert(offline.id.clone(), offline);
+    state.unclaimed_tasks.insert(
+        "rollback-container".into(),
+        UnclaimedTask {
+            id: "rollback-container".into(),
+            stack: "demo".into(),
+            service: "web".into(),
+            slot: 0,
+            revision: 1,
+            spec_hash: "old-spec".into(),
+            node_id: "offline-node".into(),
+            observed: ObservedTaskState::Healthy,
+            ports: Vec::new(),
+            config_digests: vec!["b".repeat(64)],
+            container_id: Some("container-old".into()),
+        },
+    );
+
+    assert_eq!(
+        lifecycle::referenced_config_digests(&state),
+        BTreeSet::from(["a".repeat(64), "b".repeat(64), "c".repeat(64)])
+    );
 }
 
 #[tokio::test]
@@ -1084,6 +1185,7 @@ async fn deployment_waits_for_agent_application_and_health() {
                     revision: Some(task.revision),
                     spec_hash: Some(service_spec_hash(&service.spec)),
                     ports: reported_ports,
+                    config_digests: task.config_digests.clone(),
                 }],
                 task_inventory_error: None,
                 task_results: vec![TaskReconcileReport {
@@ -1197,6 +1299,7 @@ x-swarmlite:
         revision: Some(task.revision),
         spec_hash: Some(spec_hash),
         ports: reported_ports,
+        config_digests: task.config_digests.clone(),
     };
     let task_result = TaskReconcileReport {
         task_id: task.id,
@@ -1363,6 +1466,7 @@ async fn failed_container_inventory_does_not_fail_stack_removal() {
                     revision: Some(task.revision),
                     spec_hash: Some(service_spec_hash(&test_service().spec)),
                     ports: task.ports,
+                    config_digests: task.config_digests,
                 }],
                 task_inventory_error: None,
                 task_results: Vec::new(),
@@ -1668,6 +1772,7 @@ async fn caddy_acknowledgement_starts_drain_deadline() {
             published: Some(20_001),
             protocol: "tcp".into(),
         }],
+        config_digests: Vec::new(),
     };
     let desired = controller
         .heartbeat(
@@ -1806,6 +1911,7 @@ fn test_service() -> ServiceRecord {
                 protocol: "tcp".into(),
             }],
             volumes: Vec::new(),
+            configs: Vec::new(),
             container_labels: BTreeMap::new(),
             service_labels: BTreeMap::new(),
             healthcheck: None,
@@ -1849,6 +1955,7 @@ async fn heartbeat_then_deploy_adopts_the_existing_container() {
                         published: Some(20_001),
                         protocol: "tcp".into(),
                     }],
+                    config_digests: Vec::new(),
                 }],
                 task_inventory_error: None,
                 task_results: Vec::new(),
@@ -1907,6 +2014,7 @@ async fn recovery_restores_the_latest_service_revision_and_leaves_old_tasks_uncl
             published: Some(20_001 + u16::try_from(slot).unwrap()),
             protocol: "tcp".into(),
         }],
+        config_digests: Vec::new(),
     };
     controller
         .heartbeat(
@@ -2000,6 +2108,7 @@ async fn recovery_ignores_invalid_service_revisions() {
                             published: Some(20_001),
                             protocol: "tcp".into(),
                         }],
+                        config_digests: Vec::new(),
                     })
                     .collect(),
                 task_inventory_error: None,
@@ -2045,6 +2154,7 @@ fn draining_task() -> TaskRecord {
             published: Some(20_001),
             protocol: "tcp".into(),
         }],
+        config_digests: Vec::new(),
         container_id: Some("container-old".into()),
         drain_until_unix_ms: None,
         applied_generation: None,

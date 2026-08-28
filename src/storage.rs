@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    time::Duration,
+};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -12,6 +16,7 @@ use crate::{
         PortBinding, RegistryCredential, ServiceRecord, StackRecord, TaskRecord,
     },
 };
+use swarmlite_stack::config_digest;
 
 const LEGACY_PERSISTED_SCHEMA_VERSION: u32 = 7;
 const PREVIOUS_PERSISTED_SCHEMA_VERSION: u32 = 8;
@@ -100,7 +105,17 @@ struct PersistedTaskRecord {
     node_id: String,
     desired: DesiredTaskState,
     ports: Vec<PortBinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    config_digests: Vec<String>,
     drain_until_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ConfigBlobGcStats {
+    pub referenced: usize,
+    pub marked: usize,
+    pub retained_for_grace: usize,
+    pub deleted: usize,
 }
 
 /// SQLite-backed desired-state repository. Runtime heartbeat observations are
@@ -129,9 +144,38 @@ impl StateRepository {
                          schema_version INTEGER NOT NULL,
                          cluster_id TEXT NOT NULL,
                          document BLOB NOT NULL
+                     ) STRICT;
+                     CREATE TABLE IF NOT EXISTS stack_config_blobs (
+                         cluster_id TEXT NOT NULL,
+                         digest TEXT NOT NULL CHECK (length(digest) = 64),
+                         content BLOB NOT NULL,
+                         created_at_unix_ms INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+                         unreferenced_since_unix_ms INTEGER,
+                         PRIMARY KEY (cluster_id, digest)
                      ) STRICT;",
                 )
                 .map_err(backend)?;
+            let has_gc_timestamp = {
+                let mut statement = connection
+                    .prepare("PRAGMA table_info(stack_config_blobs)")
+                    .map_err(backend)?;
+                statement
+                    .query_map([], |row| row.get::<_, String>(1))
+                    .map_err(backend)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(backend)?
+                    .iter()
+                    .any(|column| column == "unreferenced_since_unix_ms")
+            };
+            if !has_gc_timestamp {
+                connection
+                    .execute(
+                        "ALTER TABLE stack_config_blobs
+                         ADD COLUMN unreferenced_since_unix_ms INTEGER",
+                        [],
+                    )
+                    .map_err(backend)?;
+            }
             Ok(())
         })?;
         Ok(repository)
@@ -252,6 +296,195 @@ impl StateRepository {
 
     pub(crate) fn kv_repository(&self) -> KvRepository {
         self.kv_repository.clone()
+    }
+
+    pub(crate) fn put_config_blobs(&self, blobs: &BTreeMap<String, Vec<u8>>) -> StorageResult<()> {
+        self.with_connection(|connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(backend)?;
+            for (digest, content) in blobs {
+                if config_digest(content) != *digest {
+                    return Err(StorageError::InvalidData(format!(
+                        "config blob {digest:?} does not match its SHA-256 digest"
+                    )));
+                }
+                let existing = transaction
+                    .query_row(
+                        "SELECT content FROM stack_config_blobs
+                         WHERE cluster_id = ?1 AND digest = ?2",
+                        params![self.cluster.cluster_id, digest],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )
+                    .optional()
+                    .map_err(backend)?;
+                match existing {
+                    Some(existing) if existing != *content => {
+                        return Err(StorageError::InvalidData(format!(
+                            "config blob digest collision for {digest}"
+                        )));
+                    }
+                    Some(_) => {
+                        transaction
+                            .execute(
+                                "UPDATE stack_config_blobs
+                                 SET unreferenced_since_unix_ms = NULL
+                                 WHERE cluster_id = ?1 AND digest = ?2",
+                                params![self.cluster.cluster_id, digest],
+                            )
+                            .map_err(backend)?;
+                    }
+                    None => {
+                        transaction
+                            .execute(
+                                "INSERT INTO stack_config_blobs(cluster_id, digest, content)
+                                 VALUES (?1, ?2, ?3)",
+                                params![self.cluster.cluster_id, digest, content],
+                            )
+                            .map_err(backend)?;
+                    }
+                }
+            }
+            transaction.commit().map_err(backend)?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn get_config_blob(&self, digest: &str) -> StorageResult<Option<Vec<u8>>> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT content FROM stack_config_blobs
+                     WHERE cluster_id = ?1 AND digest = ?2",
+                    params![self.cluster.cluster_id, digest],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(backend)
+        })
+    }
+
+    pub(crate) fn pin_config_blobs(&self, digests: &BTreeSet<String>) -> StorageResult<()> {
+        self.with_connection(|connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(backend)?;
+            for digest in digests {
+                let changed = transaction
+                    .execute(
+                        "UPDATE stack_config_blobs
+                         SET unreferenced_since_unix_ms = NULL
+                         WHERE cluster_id = ?1 AND digest = ?2",
+                        params![self.cluster.cluster_id, digest],
+                    )
+                    .map_err(backend)?;
+                if changed != 1 {
+                    return Err(StorageError::InvalidData(format!(
+                        "config blob {digest:?} disappeared before the Stack was applied"
+                    )));
+                }
+            }
+            transaction.commit().map_err(backend)?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn config_blob_size(&self, digest: &str) -> StorageResult<Option<usize>> {
+        self.with_connection(|connection| {
+            let size = connection
+                .query_row(
+                    "SELECT length(content) FROM stack_config_blobs
+                     WHERE cluster_id = ?1 AND digest = ?2",
+                    params![self.cluster.cluster_id, digest],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(backend)?;
+            size.map(|size| {
+                usize::try_from(size).map_err(|_| {
+                    StorageError::InvalidData(format!(
+                        "config blob {digest:?} has an invalid stored size"
+                    ))
+                })
+            })
+            .transpose()
+        })
+    }
+
+    pub(crate) fn gc_config_blobs(
+        &self,
+        referenced: &BTreeSet<String>,
+        now_unix_ms: i64,
+        grace_period_ms: i64,
+    ) -> StorageResult<ConfigBlobGcStats> {
+        if grace_period_ms < 0 {
+            return Err(StorageError::InvalidData(
+                "config blob GC grace period must not be negative".into(),
+            ));
+        }
+        self.with_connection(|connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(backend)?;
+            let entries = {
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT digest, unreferenced_since_unix_ms
+                         FROM stack_config_blobs WHERE cluster_id = ?1",
+                    )
+                    .map_err(backend)?;
+                statement
+                    .query_map(params![self.cluster.cluster_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+                    })
+                    .map_err(backend)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(backend)?
+            };
+            let mut stats = ConfigBlobGcStats::default();
+            for (digest, unreferenced_since) in entries {
+                if referenced.contains(&digest) {
+                    stats.referenced += 1;
+                    if unreferenced_since.is_some() {
+                        transaction
+                            .execute(
+                                "UPDATE stack_config_blobs
+                                 SET unreferenced_since_unix_ms = NULL
+                                 WHERE cluster_id = ?1 AND digest = ?2",
+                                params![self.cluster.cluster_id, digest],
+                            )
+                            .map_err(backend)?;
+                    }
+                    continue;
+                }
+                match unreferenced_since {
+                    None => {
+                        transaction
+                            .execute(
+                                "UPDATE stack_config_blobs
+                                 SET unreferenced_since_unix_ms = ?3
+                                 WHERE cluster_id = ?1 AND digest = ?2",
+                                params![self.cluster.cluster_id, digest, now_unix_ms],
+                            )
+                            .map_err(backend)?;
+                        stats.marked += 1;
+                    }
+                    Some(since) if now_unix_ms.saturating_sub(since) >= grace_period_ms => {
+                        transaction
+                            .execute(
+                                "DELETE FROM stack_config_blobs
+                                 WHERE cluster_id = ?1 AND digest = ?2",
+                                params![self.cluster.cluster_id, digest],
+                            )
+                            .map_err(backend)?;
+                        stats.deleted += 1;
+                    }
+                    Some(_) => stats.retained_for_grace += 1,
+                }
+            }
+            transaction.commit().map_err(backend)?;
+            Ok(stats)
+        })
     }
 
     fn with_connection<T>(
@@ -454,6 +687,7 @@ impl PersistedTaskRecord {
             node_id: task.node_id.clone(),
             desired: task.desired.clone(),
             ports: task.ports.clone(),
+            config_digests: task.config_digests.clone(),
             drain_until_unix_ms: task.drain_until_unix_ms,
         }
     }
@@ -468,6 +702,7 @@ impl PersistedTaskRecord {
             desired: self.desired,
             observed: ObservedTaskState::Pending,
             ports: self.ports,
+            config_digests: self.config_digests,
             container_id: None,
             drain_until_unix_ms: self.drain_until_unix_ms,
             applied_generation: None,
@@ -504,6 +739,162 @@ mod tests {
             controller_port: 19090,
             gateway: ClusterGatewayConfig::default(),
         }
+    }
+
+    #[test]
+    fn persists_content_addressed_stack_configs() {
+        let directory = tempfile::tempdir().unwrap();
+        let cluster = cluster();
+        let contents = b"production: true\n".to_vec();
+        let digest = crate::model::config_digest(&contents);
+        let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
+        repository
+            .put_config_blobs(&BTreeMap::from([(digest.clone(), contents.clone())]))
+            .unwrap();
+        repository
+            .put_config_blobs(&BTreeMap::from([(digest.clone(), contents.clone())]))
+            .unwrap();
+        assert_eq!(
+            repository.get_config_blob(&digest).unwrap(),
+            Some(contents.clone())
+        );
+        assert_eq!(
+            repository.config_blob_size(&digest).unwrap(),
+            Some(contents.len())
+        );
+
+        let reopened = StateRepository::open(directory.path(), cluster).unwrap();
+        assert_eq!(reopened.get_config_blob(&digest).unwrap(), Some(contents));
+        assert!(matches!(
+            reopened.put_config_blobs(&BTreeMap::from([(digest, b"corrupt".to_vec())])),
+            Err(StorageError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn config_blob_gc_persists_grace_period_and_cancels_deletion_when_referenced_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let cluster = cluster();
+        let contents_a = b"config-a".to_vec();
+        let contents_b = b"config-b".to_vec();
+        let contents_c = b"config-c".to_vec();
+        let digest_a = crate::model::config_digest(&contents_a);
+        let digest_b = crate::model::config_digest(&contents_b);
+        let digest_c = crate::model::config_digest(&contents_c);
+        let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
+        repository
+            .put_config_blobs(&BTreeMap::from([
+                (digest_a.clone(), contents_a),
+                (digest_b.clone(), contents_b),
+                (digest_c.clone(), contents_c),
+            ]))
+            .unwrap();
+
+        let stats = repository
+            .gc_config_blobs(
+                &BTreeSet::from([digest_a.clone(), digest_b.clone()]),
+                1_000,
+                100,
+            )
+            .unwrap();
+        assert_eq!(stats.referenced, 2);
+        assert_eq!(stats.marked, 1);
+        assert_eq!(stats.deleted, 0);
+
+        let stats = repository
+            .gc_config_blobs(&BTreeSet::from([digest_a.clone()]), 1_050, 100)
+            .unwrap();
+        assert_eq!(stats.marked, 1);
+        assert_eq!(stats.retained_for_grace, 1);
+        assert!(repository.get_config_blob(&digest_c).unwrap().is_some());
+        drop(repository);
+
+        let reopened = StateRepository::open(directory.path(), cluster).unwrap();
+        let stats = reopened
+            .gc_config_blobs(
+                &BTreeSet::from([digest_a.clone(), digest_b.clone()]),
+                1_099,
+                100,
+            )
+            .unwrap();
+        assert_eq!(stats.retained_for_grace, 1);
+        assert!(reopened.get_config_blob(&digest_b).unwrap().is_some());
+        let stats = reopened
+            .gc_config_blobs(
+                &BTreeSet::from([digest_a.clone(), digest_b.clone()]),
+                1_100,
+                100,
+            )
+            .unwrap();
+        assert_eq!(stats.deleted, 1);
+        assert!(reopened.get_config_blob(&digest_c).unwrap().is_none());
+
+        reopened
+            .gc_config_blobs(&BTreeSet::from([digest_a.clone()]), 1_200, 100)
+            .unwrap();
+        let stats = reopened
+            .gc_config_blobs(&BTreeSet::from([digest_a]), 1_300, 100)
+            .unwrap();
+        assert_eq!(stats.deleted, 1);
+        assert!(reopened.get_config_blob(&digest_b).unwrap().is_none());
+    }
+
+    #[test]
+    fn adds_config_blob_gc_timestamp_to_existing_databases() {
+        let directory = tempfile::tempdir().unwrap();
+        let connection = Connection::open(directory.path().join(DATABASE_FILE)).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE stack_config_blobs (
+                     cluster_id TEXT NOT NULL,
+                     digest TEXT NOT NULL CHECK (length(digest) = 64),
+                     content BLOB NOT NULL,
+                     created_at_unix_ms INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+                     PRIMARY KEY (cluster_id, digest)
+                 ) STRICT;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let repository = StateRepository::open(directory.path(), cluster()).unwrap();
+        let contents = b"legacy-config".to_vec();
+        let digest = crate::model::config_digest(&contents);
+        repository
+            .put_config_blobs(&BTreeMap::from([(digest.clone(), contents)]))
+            .unwrap();
+        assert_eq!(
+            repository
+                .gc_config_blobs(&BTreeSet::new(), 1_000, 100)
+                .unwrap()
+                .marked,
+            1
+        );
+        assert!(repository.get_config_blob(&digest).unwrap().is_some());
+    }
+
+    #[test]
+    fn pinning_a_blob_cancels_an_expired_gc_candidate_before_apply() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = StateRepository::open(directory.path(), cluster()).unwrap();
+        let contents = b"rollback-config".to_vec();
+        let digest = crate::model::config_digest(&contents);
+        repository
+            .put_config_blobs(&BTreeMap::from([(digest.clone(), contents)]))
+            .unwrap();
+        repository
+            .gc_config_blobs(&BTreeSet::new(), 1_000, 100)
+            .unwrap();
+
+        repository
+            .pin_config_blobs(&BTreeSet::from([digest.clone()]))
+            .unwrap();
+        let stats = repository
+            .gc_config_blobs(&BTreeSet::new(), 2_000, 100)
+            .unwrap();
+
+        assert_eq!(stats.marked, 1);
+        assert_eq!(stats.deleted, 0);
+        assert!(repository.get_config_blob(&digest).unwrap().is_some());
     }
 
     #[tokio::test]
@@ -584,6 +975,7 @@ mod tests {
                     expose: Vec::new(),
                     ports: Vec::new(),
                     volumes: Vec::new(),
+                    configs: Vec::new(),
                     container_labels: Default::default(),
                     service_labels: Default::default(),
                     healthcheck: None,
@@ -606,6 +998,7 @@ mod tests {
                 desired: DesiredTaskState::Running,
                 observed: ObservedTaskState::Healthy,
                 ports: Vec::new(),
+                config_digests: vec!["a".repeat(64)],
                 container_id: Some("container-1".into()),
                 drain_until_unix_ms: None,
                 applied_generation: Some(2),
@@ -647,6 +1040,10 @@ mod tests {
             ObservedTaskState::Pending
         );
         assert!(loaded.state.tasks["task-1"].container_id.is_none());
+        assert_eq!(
+            loaded.state.tasks["task-1"].config_digests,
+            vec!["a".repeat(64)]
+        );
         assert_eq!(
             loaded.state.registry_credentials["ghcr.io"].password,
             "private-token"

@@ -3,6 +3,7 @@
 `swarmlite-stack` owns Swarmlite's Stack configuration domain:
 
 - Docker Compose/Swarm-compatible `services` parsing and normalization;
+- Compose-compatible file-backed `configs` declarations and Service mounts;
 - the internal `ServiceSpec`, port, and healthcheck models;
 - the `x-swarmlite` routing data model;
 - the optional `x-swarmlite.name` default used by the deploy CLI;
@@ -41,6 +42,7 @@ rejected instead of being silently ignored. The complete supported surface is:
 | `expose` | Internal target number or `target[/tcp|udp]`; port ranges are not supported |
 | `ports` | Target number, `target[/tcp|udp]`, or long syntax with `target` and optional `protocol`; Docker assigns the host port |
 | `volumes` | Docker short bind syntax, or long syntax with `target`, optional `source` and `read_only` |
+| `configs` | Top-level config name, or long syntax with `source`, optional absolute `target`, numeric `uid`/`gid`, and octal `mode` |
 | `healthcheck` | `test`, `disable`, `interval`, `timeout`, `retries`, `start_period`, and `start_interval` |
 | `stop_grace_period` | Human-readable duration; defaults to `10s` |
 | `deploy.mode` | Only `replicated` |
@@ -56,7 +58,11 @@ explicit declared target. External `backend.host` routes always require `port`.
 Fixed `published` values are rejected. Docker assigns an ephemeral host port so replicated and
 `start-first` Services can run old and replacement tasks on the same node without a port collision.
 
+Top-level `configs.<name>.file` paths are resolved by the CLI relative to the Stack file. Config
+contents are uploaded separately from the Compose YAML and resolved to immutable SHA-256 digests
+before the normalized Service specifications are persisted. External configs are not supported.
+
 See [../../examples/services-all.yaml](../../examples/services-all.yaml) for every accepted shape in
-one Stack file. Fields such as `build`, `depends_on`, `networks`, `restart`, `resources`, `configs`,
-and `secrets` are not currently implemented. Compatibility-only `ports.mode` and `volumes.type`
-are also rejected because Swarmlite does not preserve or interpret them.
+one Stack file. Fields such as `build`, `depends_on`, `networks`, `restart`, `resources`, and
+`secrets` are not currently implemented. Compatibility-only `ports.mode` and `volumes.type` are
+also rejected because Swarmlite does not preserve or interpret them.

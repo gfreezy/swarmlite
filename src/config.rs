@@ -110,6 +110,7 @@ pub struct AgentConfig {
     pub heartbeat_interval_seconds: u64,
     pub port_range: PortRangeConfig,
     pub gateway_enabled: bool,
+    pub config_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

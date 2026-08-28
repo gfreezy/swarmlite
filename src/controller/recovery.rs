@@ -97,6 +97,7 @@ pub(super) fn adopt_unclaimed_tasks(state: &mut ClusterState, stack_name: &str) 
                     desired: DesiredTaskState::Running,
                     observed: candidate.observed,
                     ports: candidate.ports,
+                    config_digests: candidate.config_digests,
                     container_id: candidate.container_id,
                     drain_until_unix_ms: None,
                     applied_generation: None,

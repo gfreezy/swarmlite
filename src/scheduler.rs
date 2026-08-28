@@ -6,7 +6,7 @@ use crate::{
     gateway,
     model::{
         ClusterState, DesiredTaskState, NodeRecord, ObservedTaskState, PortBinding, ServicePort,
-        ServiceRecord, ServiceSpec, TaskRecord,
+        ServiceRecord, ServiceSpec, TaskRecord, service_config_digests,
     },
 };
 
@@ -280,6 +280,7 @@ fn schedule_task(
         desired: DesiredTaskState::Running,
         observed: ObservedTaskState::Pending,
         ports,
+        config_digests: service_config_digests(&service.spec),
         container_id: None,
         drain_until_unix_ms: None,
         applied_generation: None,
@@ -420,6 +421,7 @@ mod tests {
                     protocol: "tcp".into(),
                 }],
                 volumes: vec![],
+                configs: vec![],
                 container_labels: BTreeMap::new(),
                 service_labels: BTreeMap::new(),
                 healthcheck: None,
@@ -709,6 +711,7 @@ mod tests {
                     published: Some(20_000),
                     protocol: "tcp".into(),
                 }],
+                config_digests: Vec::new(),
                 container_id: Some("old-container".into()),
             },
         );

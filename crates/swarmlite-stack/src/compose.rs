@@ -1,12 +1,15 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_yaml::Value;
 
 use crate::{
-    GatewayHttpMode, GatewayTlsMode, HealthcheckSpec, HttpRouteSpec, PullPolicy, ServicePort,
-    ServiceSpec, StackGatewaySpec,
+    GatewayHttpMode, GatewayTlsMode, HealthcheckSpec, HttpRouteSpec, PullPolicy,
+    ServiceConfigMount, ServicePort, ServiceSpec, StackGatewaySpec,
 };
 
 #[derive(Debug, Clone)]
@@ -19,13 +22,27 @@ pub struct ParsedStack {
 pub struct ParsedStackDocument {
     pub name: Option<String>,
     pub stack: ParsedStack,
+    pub configs: BTreeMap<String, StackConfigSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackConfigSource {
+    pub file: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawStack {
     services: BTreeMap<String, RawService>,
+    #[serde(default)]
+    configs: BTreeMap<String, RawConfigSource>,
     #[serde(rename = "x-swarmlite", default)]
     swarmlite: RawSwarmlite,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfigSource {
+    file: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -68,6 +85,8 @@ struct RawService {
     ports: Vec<PortValue>,
     #[serde(default)]
     volumes: Vec<VolumeValue>,
+    #[serde(default)]
+    configs: Vec<ConfigValue>,
     #[serde(default)]
     deploy: RawDeploy,
     healthcheck: Option<RawHealthcheck>,
@@ -212,6 +231,23 @@ struct LongVolume {
     read_only: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ConfigValue {
+    Short(String),
+    Long(LongConfig),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LongConfig {
+    source: String,
+    target: Option<String>,
+    uid: Option<String>,
+    gid: Option<String>,
+    mode: Option<Value>,
+}
+
 pub fn parse_stack(yaml: &str) -> Result<ParsedStack> {
     Ok(parse_stack_document(yaml)?.stack)
 }
@@ -226,11 +262,17 @@ pub fn parse_stack_document(yaml: &str) -> Result<ParsedStackDocument> {
         crate::validate_stack_name(name).context("invalid x-swarmlite.name")?;
     }
 
+    let configs = raw
+        .configs
+        .into_iter()
+        .map(|(name, source)| normalize_config_source(&name, source).map(|source| (name, source)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
     let services: BTreeMap<String, ServiceSpec> = raw
         .services
         .into_iter()
         .map(|(name, service)| normalize_service(&name, service).map(|spec| (name, spec)))
         .collect::<Result<_>>()?;
+    validate_service_configs(&services, &configs)?;
     let name = raw.swarmlite.name.take();
     let mut gateway = raw.swarmlite.gateway();
     crate::validate_and_normalize(&mut gateway, &services)
@@ -238,6 +280,7 @@ pub fn parse_stack_document(yaml: &str) -> Result<ParsedStackDocument> {
     Ok(ParsedStackDocument {
         name,
         stack: ParsedStack { services, gateway },
+        configs,
     })
 }
 
@@ -288,6 +331,11 @@ fn normalize_service(name: &str, raw: RawService) -> Result<ServiceSpec> {
         .into_iter()
         .map(normalize_volume)
         .collect::<Result<Vec<_>>>()?;
+    let configs = raw
+        .configs
+        .into_iter()
+        .map(|value| normalize_config_mount(name, value))
+        .collect::<Result<Vec<_>>>()?;
     let stop_grace_period_seconds = raw
         .stop_grace_period
         .as_deref()
@@ -314,6 +362,7 @@ fn normalize_service(name: &str, raw: RawService) -> Result<ServiceSpec> {
         expose,
         ports,
         volumes,
+        configs,
         container_labels: raw.labels.into_map()?,
         service_labels: raw.deploy.labels.into_map()?,
         healthcheck: raw
@@ -326,6 +375,184 @@ fn normalize_service(name: &str, raw: RawService) -> Result<ServiceSpec> {
         stop_grace_period_seconds,
     };
     Ok(spec)
+}
+
+fn normalize_config_source(name: &str, raw: RawConfigSource) -> Result<StackConfigSource> {
+    validate_config_name(name)?;
+    if raw.file.trim().is_empty() {
+        bail!("config {name}: file must not be empty");
+    }
+    Ok(StackConfigSource { file: raw.file })
+}
+
+fn normalize_config_mount(service: &str, value: ConfigValue) -> Result<ServiceConfigMount> {
+    let (source, target, uid, gid, mode) = match value {
+        ConfigValue::Short(source) => {
+            let target = format!("/{source}");
+            (source, target, None, None, 0o444)
+        }
+        ConfigValue::Long(config) => {
+            let target = config
+                .target
+                .unwrap_or_else(|| format!("/{}", config.source));
+            let uid = parse_config_owner(service, "uid", config.uid)?;
+            let gid = parse_config_owner(service, "gid", config.gid)?;
+            let mode = parse_config_mode(service, config.mode)?;
+            (config.source, target, uid, gid, mode)
+        }
+    };
+    validate_config_name(&source)
+        .with_context(|| format!("service {service}: invalid config source"))?;
+    validate_config_target(service, &target)?;
+    Ok(ServiceConfigMount {
+        source,
+        target,
+        uid,
+        gid,
+        // Compose Configs are immutable; writable bits must be ignored.
+        mode: mode & !0o222,
+        digest: String::new(),
+    })
+}
+
+fn parse_config_owner(service: &str, field: &str, value: Option<String>) -> Result<Option<u32>> {
+    value
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .with_context(|| format!("service {service}: config {field} must be a numeric ID"))
+        })
+        .transpose()
+}
+
+fn parse_config_mode(service: &str, value: Option<Value>) -> Result<u32> {
+    let Some(value) = value else {
+        return Ok(0o444);
+    };
+    let invalid = || {
+        anyhow::anyhow!(
+            "service {service}: config mode must be octal permissions between 0000 and 7777"
+        )
+    };
+    let mode = match value {
+        Value::String(value) => {
+            let value = value
+                .strip_prefix("0o")
+                .or_else(|| value.strip_prefix("0O"))
+                .unwrap_or(&value);
+            u32::from_str_radix(value, 8).map_err(|_| invalid())?
+        }
+        Value::Number(value) => {
+            let value = value.as_u64().ok_or_else(invalid)?;
+            let digits = value.to_string();
+            if digits.bytes().all(|digit| matches!(digit, b'0'..=b'7')) {
+                u32::from_str_radix(&digits, 8).map_err(|_| invalid())?
+            } else {
+                u32::try_from(value).map_err(|_| invalid())?
+            }
+        }
+        _ => return Err(invalid()),
+    };
+    if mode > 0o7777 {
+        return Err(invalid());
+    }
+    Ok(mode)
+}
+
+fn validate_config_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.'))
+    {
+        bail!("config name may contain only letters, numbers, '.', '-' and '_'");
+    }
+    Ok(())
+}
+
+fn validate_config_target(service: &str, target: &str) -> Result<()> {
+    let path = std::path::Path::new(target);
+    if target == "/"
+        || !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!(
+            "service {service}: config target must be an absolute container file path without '..': {target}"
+        );
+    }
+    Ok(())
+}
+
+fn validate_service_configs(
+    services: &BTreeMap<String, ServiceSpec>,
+    configs: &BTreeMap<String, StackConfigSource>,
+) -> Result<()> {
+    for (service_name, service) in services {
+        let mut targets = BTreeSet::new();
+        for config in &service.configs {
+            if !configs.contains_key(&config.source) {
+                bail!(
+                    "service {service_name}: config {:?} is not defined in the top-level configs",
+                    config.source
+                );
+            }
+            if !targets.insert(config.target.as_str()) {
+                bail!(
+                    "service {service_name}: duplicate config target {:?}",
+                    config.target
+                );
+            }
+            if service
+                .volumes
+                .iter()
+                .any(|volume| volume_target(volume) == config.target)
+            {
+                bail!(
+                    "service {service_name}: config and volume both target {:?}",
+                    config.target
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn volume_target(volume: &str) -> &str {
+    let mut parts = volume.rsplit(':');
+    let last = parts.next().unwrap_or(volume);
+    if matches!(last, "ro" | "rw") {
+        parts.next().unwrap_or(last)
+    } else if volume.contains(':') {
+        last
+    } else {
+        volume
+    }
+}
+
+pub fn resolve_config_digests(
+    stack: &mut ParsedStack,
+    digests: &BTreeMap<String, String>,
+) -> Result<()> {
+    for (service_name, service) in &mut stack.services {
+        for config in &mut service.configs {
+            let digest = digests.get(&config.source).with_context(|| {
+                format!(
+                    "service {service_name}: uploaded content for config {:?} is missing",
+                    config.source
+                )
+            })?;
+            if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                bail!(
+                    "service {service_name}: config {:?} has an invalid SHA-256 digest",
+                    config.source
+                );
+            }
+            config.digest = digest.to_ascii_lowercase();
+        }
+    }
+    Ok(())
 }
 
 fn normalize_expose(value: ExposeValue) -> Result<ServicePort> {
@@ -512,6 +739,7 @@ mod tests {
             include_str!("../../../examples/stack-standalone.yaml"),
             include_str!("../../../examples/routing-all.yaml"),
             include_str!("../../../examples/services-all.yaml"),
+            include_str!("../../../examples/configs.yaml"),
         ] {
             assert!(!yaml.lines().any(|line| line.starts_with("version:")));
             parse_stack(yaml).unwrap();
@@ -606,6 +834,134 @@ x-swarmlite:
         assert_eq!(rule.backend.service.as_deref(), Some("web"));
         assert_eq!(rule.backend.port, 80);
         assert_eq!(rule.matches[0].path, "/api");
+    }
+
+    #[test]
+    fn parses_compose_config_short_and_long_syntax() {
+        let mut document = parse_stack_document(
+            r#"
+services:
+  web:
+    image: nginx
+    configs:
+      - default-config
+      - source: executable-config
+        target: /usr/local/bin/configure
+        uid: "103"
+        gid: "104"
+        mode: 0555
+configs:
+  default-config:
+    file: ./default.conf
+  executable-config:
+    file: ./configure
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(document.configs["default-config"].file, "./default.conf");
+        let configs = &document.stack.services["web"].configs;
+        assert_eq!(configs[0].source, "default-config");
+        assert_eq!(configs[0].target, "/default-config");
+        assert_eq!(configs[0].mode, 0o444);
+        assert_eq!(configs[1].target, "/usr/local/bin/configure");
+        assert_eq!(configs[1].uid, Some(103));
+        assert_eq!(configs[1].gid, Some(104));
+        assert_eq!(configs[1].mode, 0o555);
+        assert!(configs.iter().all(|config| config.digest.is_empty()));
+
+        resolve_config_digests(
+            &mut document.stack,
+            &BTreeMap::from([
+                ("default-config".into(), "a".repeat(64)),
+                ("executable-config".into(), "b".repeat(64)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            document.stack.services["web"].configs[0].digest,
+            "a".repeat(64)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_compose_config_references_and_targets() {
+        for (yaml, expected) in [
+            (
+                r#"
+services:
+  web:
+    image: nginx
+    configs: [missing]
+"#,
+                "is not defined in the top-level configs",
+            ),
+            (
+                r#"
+services:
+  web:
+    image: nginx
+    configs:
+      - source: app-config
+        target: relative.conf
+configs:
+  app-config:
+    file: ./app.conf
+"#,
+                "must be an absolute container file path",
+            ),
+            (
+                r#"
+services:
+  web:
+    image: nginx
+    volumes: [data:/etc/app.conf]
+    configs:
+      - source: app-config
+        target: /etc/app.conf
+configs:
+  app-config:
+    file: ./app.conf
+"#,
+                "config and volume both target",
+            ),
+        ] {
+            let error = parse_stack_document(yaml).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(expected),
+                "unexpected error: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_content_digest_participates_in_the_service_spec_hash() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx
+    configs: [index-html]
+configs:
+  index-html:
+    file: ./index.html
+"#;
+        let mut first = parse_stack_document(yaml).unwrap().stack;
+        let mut second = first.clone();
+        resolve_config_digests(
+            &mut first,
+            &BTreeMap::from([("index-html".into(), "a".repeat(64))]),
+        )
+        .unwrap();
+        resolve_config_digests(
+            &mut second,
+            &BTreeMap::from([("index-html".into(), "b".repeat(64))]),
+        )
+        .unwrap();
+
+        assert_ne!(
+            crate::service_spec_hash(&first.services["web"]),
+            crate::service_spec_hash(&second.services["web"])
+        );
     }
 
     #[test]

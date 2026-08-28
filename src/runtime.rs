@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -26,6 +27,7 @@ use tracing::{info, warn};
 
 use crate::{
     config::{ResolvedRuntimeConfig, RuntimeKind},
+    config_files::config_mount_host_path,
     data_plane::MAX_DATA_PAYLOAD_BYTES,
     gateway,
     model::{
@@ -60,6 +62,7 @@ const SPEC_HASH_LABEL: &str = "io.swarmlite.spec_sha256";
 const PORTS_LABEL: &str = "io.swarmlite.ports";
 const REVISION_LABEL: &str = "io.swarmlite.revision";
 const STOP_GRACE_LABEL: &str = "io.swarmlite.stop_grace_seconds";
+const CONFIG_REFS_LABEL: &str = "io.swarmlite.config_refs";
 
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeSystemInfo {
@@ -82,6 +85,8 @@ pub struct ManagedContainer {
     pub slot: Option<u32>,
     pub spec_hash: Option<String>,
     pub ports: Vec<PortBinding>,
+    pub config_digests: Vec<String>,
+    pub config_cache_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,23 +233,26 @@ pub struct DockerCompatibleRuntime {
     kind: RuntimeKind,
     socket: String,
     registry_credentials: Option<RegistryCredentialStore>,
+    config_root: Option<PathBuf>,
 }
 
 impl DockerCompatibleRuntime {
     pub fn connect(config: &ResolvedRuntimeConfig) -> Result<Self> {
-        Self::connect_inner(config, None)
+        Self::connect_inner(config, None, None)
     }
 
     pub(crate) fn connect_with_registry_credentials(
         config: &ResolvedRuntimeConfig,
         registry_credentials: RegistryCredentialStore,
+        config_root: PathBuf,
     ) -> Result<Self> {
-        Self::connect_inner(config, Some(registry_credentials))
+        Self::connect_inner(config, Some(registry_credentials), Some(config_root))
     }
 
     fn connect_inner(
         config: &ResolvedRuntimeConfig,
         registry_credentials: Option<RegistryCredentialStore>,
+        config_root: Option<PathBuf>,
     ) -> Result<Self> {
         let client = Docker::connect_with_socket(&config.socket, 120, API_DEFAULT_VERSION)
             .with_context(|| {
@@ -258,6 +266,7 @@ impl DockerCompatibleRuntime {
             kind: config.kind,
             socket: config.socket.clone(),
             registry_credentials,
+            config_root,
         })
     }
 
@@ -761,6 +770,38 @@ impl ContainerRuntime for DockerCompatibleRuntime {
                 .and_then(|value| serde_json::from_str(value).ok())
                 .map(|ports| resolved_container_ports(&inspect, ports))
                 .unwrap_or_default();
+            let config_mounts = labels
+                .get(CONFIG_REFS_LABEL)
+                .and_then(|value| {
+                    serde_json::from_str::<Vec<crate::model::ServiceConfigMount>>(value).ok()
+                })
+                .unwrap_or_default();
+            let mut config_digests = config_mounts
+                .iter()
+                .map(|config| config.digest.clone())
+                .collect::<BTreeSet<_>>();
+            let mut config_cache_paths = BTreeSet::new();
+            if let Some(config_root) = self.config_root.as_deref() {
+                config_cache_paths.extend(
+                    config_mounts
+                        .iter()
+                        .map(|config| config_mount_host_path(config_root, config)),
+                );
+                let mounts_root = config_root.join("mounts");
+                for mount in inspect.mounts.as_deref().unwrap_or_default() {
+                    let Some(source) = mount.source.as_deref() else {
+                        continue;
+                    };
+                    let source = PathBuf::from(source);
+                    if !source.starts_with(&mounts_root) {
+                        continue;
+                    }
+                    if let Some(digest) = config_digest_from_cache_path(&source) {
+                        config_digests.insert(digest);
+                    }
+                    config_cache_paths.insert(source);
+                }
+            }
             result.insert(
                 task_id.clone(),
                 ManagedContainer {
@@ -777,6 +818,8 @@ impl ContainerRuntime for DockerCompatibleRuntime {
                     slot: labels.get(SLOT_LABEL).and_then(|value| value.parse().ok()),
                     spec_hash: labels.get(SPEC_HASH_LABEL).cloned(),
                     ports,
+                    config_digests: config_digests.into_iter().collect(),
+                    config_cache_paths: config_cache_paths.into_iter().collect(),
                 },
             );
         }
@@ -827,8 +870,9 @@ impl ContainerRuntime for DockerCompatibleRuntime {
             .into_iter()
             .collect::<Vec<_>>();
         let labels = task_labels(assignment)?;
+        let binds = task_binds(assignment, self.config_root.as_deref())?;
         let host_config = HostConfig {
-            binds: (!assignment.spec.volumes.is_empty()).then_some(assignment.spec.volumes.clone()),
+            binds: (!binds.is_empty()).then_some(binds),
             port_bindings: (!port_bindings.is_empty()).then_some(port_bindings),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
@@ -984,6 +1028,23 @@ impl ContainerRuntime for DockerCompatibleRuntime {
     }
 }
 
+fn task_binds(assignment: &TaskAssignment, config_root: Option<&Path>) -> Result<Vec<String>> {
+    let mut binds = assignment.spec.volumes.clone();
+    if assignment.spec.configs.is_empty() {
+        return Ok(binds);
+    }
+    let config_root = config_root
+        .context("container runtime was not configured with a local Config cache for this Agent")?;
+    for config in &assignment.spec.configs {
+        let host_path = config_mount_host_path(config_root, config);
+        let host_path = host_path
+            .to_str()
+            .with_context(|| format!("config cache path is not UTF-8: {}", host_path.display()))?;
+        binds.push(format!("{host_path}:{}:ro", config.target));
+    }
+    Ok(binds)
+}
+
 fn resolved_container_ports(
     inspect: &bollard::models::ContainerInspectResponse,
     expected: Vec<PortBinding>,
@@ -1104,7 +1165,19 @@ fn task_labels(assignment: &TaskAssignment) -> Result<HashMap<String, String>> {
             assignment.spec.stop_grace_period_seconds.to_string(),
         ),
     ]);
+    if !assignment.spec.configs.is_empty() {
+        labels.insert(
+            CONFIG_REFS_LABEL.to_owned(),
+            serde_json::to_string(&assignment.spec.configs)?,
+        );
+    }
     Ok(labels)
+}
+
+fn config_digest_from_cache_path(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let digest = name.get(..64)?;
+    (digest.bytes().all(|byte| byte.is_ascii_hexdigit())).then(|| digest.to_ascii_lowercase())
 }
 
 fn observed_state(state: bollard::models::ContainerState) -> ObservedTaskState {
@@ -1140,7 +1213,7 @@ fn sanitize_name(value: &str) -> String {
 mod tests {
     use std::collections::BTreeMap;
 
-    use crate::model::{ServicePort, ServiceSpec};
+    use crate::model::{ServiceConfigMount, ServicePort, ServiceSpec};
 
     use super::*;
 
@@ -1315,6 +1388,7 @@ mod tests {
                 expose: Vec::new(),
                 ports: Vec::new(),
                 volumes: Vec::new(),
+                configs: Vec::new(),
                 container_labels: BTreeMap::from([(CLUSTER_LABEL.to_owned(), "user-value".into())]),
                 service_labels: BTreeMap::new(),
                 healthcheck: None,
@@ -1350,6 +1424,80 @@ mod tests {
     }
 
     #[test]
+    fn mounts_cached_stack_configs_read_only_alongside_volumes() {
+        let digest = "a".repeat(64);
+        let assignment = TaskAssignment {
+            id: "task-1".into(),
+            cluster_id: "cluster-old".into(),
+            stack: "demo".into(),
+            service: "web".into(),
+            service_id: "demo.web".into(),
+            revision: 1,
+            slot: 0,
+            desired: crate::model::DesiredTaskState::Running,
+            spec: ServiceSpec {
+                image: "nginx:alpine".into(),
+                pull_policy: Default::default(),
+                command: Vec::new(),
+                entrypoint: Vec::new(),
+                environment: Vec::new(),
+                expose: Vec::new(),
+                ports: Vec::new(),
+                volumes: vec!["data:/data".into()],
+                configs: vec![ServiceConfigMount {
+                    source: "nginx-config".into(),
+                    target: "/etc/nginx/conf.d/default.conf".into(),
+                    uid: None,
+                    gid: None,
+                    mode: 0o444,
+                    digest,
+                }],
+                container_labels: BTreeMap::new(),
+                service_labels: BTreeMap::new(),
+                healthcheck: None,
+                replicas: 1,
+                constraints: Vec::new(),
+                max_surge: 1,
+                stop_grace_period_seconds: 10,
+            },
+            ports: Vec::new(),
+            generation: 1,
+            deployment_generation: 1,
+            spec_hash: "hash".into(),
+            image_resolved: false,
+        };
+        let root = Path::new("/var/lib/swarmlite/configs");
+
+        let binds = task_binds(&assignment, Some(root)).unwrap();
+
+        assert_eq!(binds[0], "data:/data");
+        assert_eq!(
+            binds[1],
+            format!(
+                "{}:/etc/nginx/conf.d/default.conf:ro",
+                config_mount_host_path(root, &assignment.spec.configs[0]).display()
+            )
+        );
+        let labels = task_labels(&assignment).unwrap();
+        let persisted: Vec<ServiceConfigMount> =
+            serde_json::from_str(&labels[CONFIG_REFS_LABEL]).unwrap();
+        assert_eq!(persisted, assignment.spec.configs);
+        assert!(task_binds(&assignment, None).is_err());
+
+        let mut without_config = assignment;
+        without_config.spec.configs.clear();
+        assert_eq!(
+            task_binds(&without_config, Some(root)).unwrap(),
+            vec!["data:/data"]
+        );
+        assert!(
+            !task_labels(&without_config)
+                .unwrap()
+                .contains_key(CONFIG_REFS_LABEL)
+        );
+    }
+
+    #[test]
     fn lets_docker_allocate_and_then_reads_the_published_port() {
         let assignment = TaskAssignment {
             id: "task-1".into(),
@@ -1373,6 +1521,7 @@ mod tests {
                     protocol: "tcp".into(),
                 }],
                 volumes: Vec::new(),
+                configs: Vec::new(),
                 container_labels: BTreeMap::new(),
                 service_labels: BTreeMap::new(),
                 healthcheck: None,

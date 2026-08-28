@@ -1,29 +1,34 @@
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use axum::{
     Json, Router,
     body::Bytes,
     extract::{Path, Query, State, WebSocketUpgrade},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::Deserialize;
 use serde_json::json;
 use tracing::error;
 
 use crate::model::{
     AgentCommandAck, AgentCommandPollResponse, AgentCommandResult, BootstrapResponse,
-    ClusterConfigResponse, ClusterConfigUpdate, DataSessionCreateResponse, DataSessionOperation,
-    HeartbeatResponse, JoinRequest, JoinResponse, KvDeleteRequest, KvListResponse,
-    KvLockAcquireRequest, KvLockAcquireResponse, KvLockMutationRequest, KvObjectResponse,
-    KvPutRequest, KvStatResponse, NodeGatewayResponse, NodeGatewayUpdate, NodeHeartbeat,
+    ClusterConfigResponse, ClusterConfigUpdate, ConfigBlobCheckRequest, ConfigBlobCheckResponse,
+    DataSessionCreateResponse, DataSessionOperation, HeartbeatResponse, JoinRequest, JoinResponse,
+    KvDeleteRequest, KvListResponse, KvLockAcquireRequest, KvLockAcquireResponse,
+    KvLockMutationRequest, KvObjectResponse, KvPutRequest, KvStatResponse, MAX_CONFIG_FILE_BYTES,
+    MAX_STACK_CONFIG_BYTES, NodeGatewayResponse, NodeGatewayUpdate, NodeHeartbeat,
     NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, RegistryLoginRequest,
     RegistryLoginResponse, ServiceInspectResponse, ServiceListResponse, ServiceScaleRequest,
-    StackDeploymentResponse, StackListResponse, StackValidationResponse, StatusResponse,
-    TaskListResponse,
+    StackApplyRequest, StackDeploymentResponse, StackListResponse, StackValidationResponse,
+    StatusResponse, TaskListResponse,
 };
-use swarmlite_stack::parse_stack;
+use swarmlite_stack::{config_digest, parse_stack_document, resolve_config_digests};
 
 use super::{Controller, ControllerError};
 
@@ -42,6 +47,8 @@ pub(super) fn router(controller: Arc<Controller>) -> Router {
         .route("/v1/stacks/{name}/validate", put(validate_stack))
         .route("/v1/stacks/{name}/tasks", get(stack_tasks))
         .route("/v1/stacks/{name}/deployment", get(stack_deployment))
+        .route("/v1/configs/check", post(check_config_blobs))
+        .route("/v1/configs/{digest}", get(get_config_blob))
         .route("/v1/services", get(list_services))
         .route("/v1/services/{target}", get(inspect_service))
         .route("/v1/services/{target}/tasks", get(service_tasks))
@@ -205,9 +212,15 @@ async fn apply_stack(
     body: Bytes,
 ) -> Result<Json<StackDeploymentResponse>, ControllerError> {
     require_auth(&controller, &headers)?;
-    let yaml =
-        std::str::from_utf8(&body).map_err(|error| ControllerError::Invalid(error.to_string()))?;
-    let parsed = parse_stack(yaml).map_err(|error| ControllerError::Invalid(error.to_string()))?;
+    let request = parse_stack_apply_body(&headers, &body)?;
+    let (parsed, blobs) = prepare_stack_apply(request, &controller.repository)?;
+    let config_digests = parsed
+        .services
+        .values()
+        .flat_map(|service| service.configs.iter().map(|config| config.digest.clone()))
+        .collect::<BTreeSet<_>>();
+    controller.repository.put_config_blobs(&blobs)?;
+    controller.repository.pin_config_blobs(&config_digests)?;
     controller.apply(&name, parsed).await.map(Json)
 }
 
@@ -218,14 +231,168 @@ async fn validate_stack(
     body: Bytes,
 ) -> Result<Json<StackValidationResponse>, ControllerError> {
     require_auth(&controller, &headers)?;
-    let yaml =
-        std::str::from_utf8(&body).map_err(|error| ControllerError::Invalid(error.to_string()))?;
-    let parsed = parse_stack(yaml).map_err(|error| ControllerError::Invalid(error.to_string()))?;
+    let request = parse_stack_apply_body(&headers, &body)?;
+    let (parsed, _blobs) = prepare_stack_apply(request, &controller.repository)?;
     controller.validate_apply(&name, &parsed).await?;
     Ok(Json(StackValidationResponse {
         stack: name,
         valid: true,
     }))
+}
+
+async fn get_config_blob(
+    State(controller): State<Arc<Controller>>,
+    Path(digest): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, ControllerError> {
+    require_auth(&controller, &headers)?;
+    let digest = normalize_config_digest(&digest)?;
+    let contents = controller
+        .repository
+        .get_config_blob(&digest)?
+        .ok_or_else(|| ControllerError::NotFound(format!("config {digest:?} not found")))?;
+    let mut response = Response::new(axum::body::Body::from(contents));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, immutable"),
+    );
+    Ok(response)
+}
+
+async fn check_config_blobs(
+    State(controller): State<Arc<Controller>>,
+    headers: HeaderMap,
+    Json(request): Json<ConfigBlobCheckRequest>,
+) -> Result<Json<ConfigBlobCheckResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    let mut missing = std::collections::BTreeSet::new();
+    for digest in request.digests {
+        let digest = normalize_config_digest(&digest)?;
+        if controller.repository.config_blob_size(&digest)?.is_none() {
+            missing.insert(digest);
+        }
+    }
+    Ok(Json(ConfigBlobCheckResponse { missing }))
+}
+
+fn normalize_config_digest(digest: &str) -> Result<String, ControllerError> {
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ControllerError::Invalid(
+            "config digest must be a 64-character SHA-256 value".into(),
+        ));
+    }
+    Ok(digest.to_ascii_lowercase())
+}
+
+fn parse_stack_apply_body(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<StackApplyRequest, ControllerError> {
+    let is_json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+    if is_json {
+        serde_json::from_slice(body).map_err(|error| ControllerError::Invalid(error.to_string()))
+    } else {
+        let yaml = std::str::from_utf8(body)
+            .map_err(|error| ControllerError::Invalid(error.to_string()))?;
+        Ok(StackApplyRequest {
+            yaml: yaml.to_owned(),
+            configs: Default::default(),
+        })
+    }
+}
+
+fn prepare_stack_apply(
+    request: StackApplyRequest,
+    repository: &crate::storage::StateRepository,
+) -> Result<(swarmlite_stack::ParsedStack, BTreeMap<String, Vec<u8>>), ControllerError> {
+    let document = parse_stack_document(&request.yaml)
+        .map_err(|error| ControllerError::Invalid(format!("{error:#}")))?;
+    for name in request.configs.keys() {
+        if !document.configs.contains_key(name) {
+            return Err(ControllerError::Invalid(format!(
+                "uploaded config {name:?} is not declared by the Stack"
+            )));
+        }
+    }
+
+    let mut blobs = BTreeMap::new();
+    for (name, payload) in &request.configs {
+        let digest = normalize_config_digest(&payload.digest)?;
+        let Some(data_base64) = &payload.data_base64 else {
+            continue;
+        };
+        let contents = BASE64_STANDARD.decode(data_base64).map_err(|_| {
+            ControllerError::Invalid(format!("config {name:?} is not valid Base64"))
+        })?;
+        if config_digest(&contents) != digest {
+            return Err(ControllerError::Invalid(format!(
+                "config {name:?} contents do not match digest {digest}"
+            )));
+        }
+        if contents.len() > MAX_CONFIG_FILE_BYTES {
+            return Err(ControllerError::Invalid(format!(
+                "config {name:?} contains {} bytes; each config may contain at most {MAX_CONFIG_FILE_BYTES} bytes",
+                contents.len()
+            )));
+        }
+        match blobs.entry(digest) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(contents);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &contents => {
+                return Err(ControllerError::Invalid(format!(
+                    "multiple config payloads claim digest {:?} with different contents",
+                    entry.key()
+                )));
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
+        }
+    }
+
+    let mut total_bytes = 0_usize;
+    let mut digests = BTreeMap::new();
+    for name in document.configs.keys() {
+        let payload = request.configs.get(name).ok_or_else(|| {
+            ControllerError::Invalid(format!(
+                "config {name:?} has no local digest; deploy with a current Swarmlite CLI"
+            ))
+        })?;
+        let digest = normalize_config_digest(&payload.digest)?;
+        let size = match blobs.get(&digest) {
+            Some(contents) => contents.len(),
+            None => repository.config_blob_size(&digest)?.ok_or_else(|| {
+                ControllerError::Invalid(format!(
+                    "config {name:?} digest {digest} is missing from the Controller; retry the deployment so the CLI uploads it"
+                ))
+            })?,
+        };
+        if size > MAX_CONFIG_FILE_BYTES {
+            return Err(ControllerError::Invalid(format!(
+                "config {name:?} contains {size} bytes; each config may contain at most {MAX_CONFIG_FILE_BYTES} bytes"
+            )));
+        }
+        total_bytes = total_bytes
+            .checked_add(size)
+            .ok_or_else(|| ControllerError::Invalid("total config size overflow".into()))?;
+        if total_bytes > MAX_STACK_CONFIG_BYTES {
+            return Err(ControllerError::Invalid(format!(
+                "Stack configs contain {total_bytes} bytes; at most {MAX_STACK_CONFIG_BYTES} bytes may be uploaded per deployment"
+            )));
+        }
+        digests.insert(name.clone(), digest);
+    }
+
+    let mut stack = document.stack;
+    resolve_config_digests(&mut stack, &digests)
+        .map_err(|error| ControllerError::Invalid(format!("{error:#}")))?;
+    Ok((stack, blobs))
 }
 
 async fn list_stacks(
@@ -605,4 +772,130 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
             difference | (left ^ right)
         })
         == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        model::{
+            CLUSTER_SCHEMA_VERSION, ClusterGatewayConfig, ClusterSettings, StackConfigPayload,
+        },
+        storage::StateRepository,
+    };
+
+    const YAML: &str = r#"
+services:
+  web:
+    image: nginx
+    configs:
+      - source: nginx-config
+        target: /etc/nginx/conf.d/default.conf
+configs:
+  nginx-config:
+    file: ./default.conf
+"#;
+
+    fn repository() -> (tempfile::TempDir, StateRepository) {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = StateRepository::open(
+            directory.path(),
+            ClusterSettings {
+                schema_version: CLUSTER_SCHEMA_VERSION,
+                cluster_id: "config-api-test".into(),
+                controller_id: "controller-test".into(),
+                controller_port: crate::config::DEFAULT_CONTROLLER_PORT,
+                gateway: ClusterGatewayConfig::default(),
+            },
+        )
+        .unwrap();
+        (directory, repository)
+    }
+
+    #[test]
+    fn resolves_uploaded_config_content_into_service_digest() {
+        let contents = b"server { listen 80; }\n";
+        let digest = config_digest(contents);
+        let (_directory, repository) = repository();
+        let (stack, blobs) = prepare_stack_apply(
+            StackApplyRequest {
+                yaml: YAML.into(),
+                configs: BTreeMap::from([(
+                    "nginx-config".into(),
+                    StackConfigPayload {
+                        digest: digest.clone(),
+                        data_base64: Some(BASE64_STANDARD.encode(contents)),
+                    },
+                )]),
+            },
+            &repository,
+        )
+        .unwrap();
+        assert_eq!(stack.services["web"].configs[0].digest, digest);
+        assert_eq!(blobs[&digest], contents);
+    }
+
+    #[test]
+    fn resolves_digest_only_config_when_controller_already_has_the_blob() {
+        let contents = b"server { listen 80; }\n".to_vec();
+        let digest = config_digest(&contents);
+        let (_directory, repository) = repository();
+        repository
+            .put_config_blobs(&BTreeMap::from([(digest.clone(), contents)]))
+            .unwrap();
+
+        let (stack, blobs) = prepare_stack_apply(
+            StackApplyRequest {
+                yaml: YAML.into(),
+                configs: BTreeMap::from([(
+                    "nginx-config".into(),
+                    StackConfigPayload {
+                        digest: digest.clone(),
+                        data_base64: None,
+                    },
+                )]),
+            },
+            &repository,
+        )
+        .unwrap();
+
+        assert_eq!(stack.services["web"].configs[0].digest, digest);
+        assert!(blobs.is_empty());
+    }
+
+    #[test]
+    fn rejects_config_file_that_was_not_uploaded() {
+        let (_directory, repository) = repository();
+        assert!(matches!(
+            prepare_stack_apply(
+                StackApplyRequest {
+                    yaml: YAML.into(),
+                    configs: BTreeMap::new(),
+                },
+                &repository,
+            ),
+            Err(ControllerError::Invalid(message)) if message.contains("no local digest")
+        ));
+    }
+
+    #[test]
+    fn rejects_digest_only_config_missing_from_controller_storage() {
+        let (_directory, repository) = repository();
+        assert!(matches!(
+            prepare_stack_apply(
+                StackApplyRequest {
+                    yaml: YAML.into(),
+                    configs: BTreeMap::from([(
+                        "nginx-config".into(),
+                        StackConfigPayload {
+                            digest: "a".repeat(64),
+                            data_base64: None,
+                        },
+                    )]),
+                },
+                &repository,
+            ),
+            Err(ControllerError::Invalid(message)) if message.contains("missing from the Controller")
+        ));
+    }
 }

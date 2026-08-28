@@ -11,7 +11,10 @@ use sha2::{Digest, Sha256};
 
 mod compose;
 
-pub use compose::{ParsedStack, ParsedStackDocument, parse_stack, parse_stack_document};
+pub use compose::{
+    ParsedStack, ParsedStackDocument, StackConfigSource, parse_stack, parse_stack_document,
+    resolve_config_digests,
+};
 
 pub fn validate_stack_name(name: &str) -> Result<()> {
     if name.is_empty()
@@ -36,6 +39,8 @@ pub struct ServiceSpec {
     pub expose: Vec<ServicePort>,
     pub ports: Vec<ServicePort>,
     pub volumes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub configs: Vec<ServiceConfigMount>,
     pub container_labels: BTreeMap<String, String>,
     pub service_labels: BTreeMap<String, String>,
     pub healthcheck: Option<HealthcheckSpec>,
@@ -43,6 +48,20 @@ pub struct ServiceSpec {
     pub constraints: Vec<String>,
     pub max_surge: u32,
     pub stop_grace_period_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceConfigMount {
+    pub source: String,
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gid: Option<u32>,
+    pub mode: u32,
+    /// Resolved by the Controller from the contents uploaded with the Stack.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub digest: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,6 +102,11 @@ fn image_uses_latest_tag(image: &str) -> bool {
 pub fn service_spec_hash(spec: &ServiceSpec) -> String {
     let encoded = serde_json::to_vec(spec).expect("ServiceSpec serialization cannot fail");
     let digest = Sha256::digest(encoded);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+pub fn config_digest(contents: &[u8]) -> String {
+    let digest = Sha256::digest(contents);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -920,6 +944,7 @@ mod tests {
                 .collect(),
             ports: Vec::new(),
             volumes: Vec::new(),
+            configs: Vec::new(),
             container_labels: BTreeMap::new(),
             service_labels: BTreeMap::new(),
             healthcheck: None,

@@ -12,34 +12,34 @@ use tokio::{
     sync::{Mutex, watch},
 };
 use tower_http::trace::TraceLayer;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const MIN_KV_LOCK_LEASE_MS: u64 = 1_000;
 const MAX_KV_LOCK_LEASE_MS: u64 = 300_000;
-const MAX_HTTP_BODY_BYTES: usize = 6 * 1024 * 1024;
+const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 use crate::{
     config::ControllerConfig,
     gateway, kv,
     model::{
-        BootstrapResponse, ClusterConfigResponse, ClusterConfigUpdate, ClusterSettings,
-        ClusterState, DataSessionCreateResponse, DataSessionOperation, DataSessionStream,
-        DeploymentImageResolutionNodeRecord, DeploymentImageResolutionRecord, DesiredTaskState,
-        GatewayAssignment, GatewayReport, GatewayStatus, HeartbeatResponse,
-        ImageResolutionAssignment, ImageResolutionProgress, ImageResolutionReport,
-        ImageResolutionServiceAssignment, ImageResolutionStatus, JoinRequest, JoinResponse,
-        KvDeleteRequest, KvListResponse, KvLockAcquireRequest, KvLockAcquireResponse,
-        KvLockMutationRequest, KvObjectResponse, KvPutRequest, KvStatResponse, NodeGatewayResponse,
-        NodeGatewayUpdate, NodeHeartbeat, NodeLabelRemoveRequest, NodeLabelSetRequest,
-        NodeLabelsResponse, NodeMember, ObservedTaskState, RegistryLoginRequest,
-        RegistryLoginResponse, ServiceInspectResponse, ServiceListResponse, ServiceRecord,
-        ServiceSummary, StackDeploymentError, StackDeploymentGatewayProgress,
-        StackDeploymentImageProgress, StackDeploymentRecord, StackDeploymentResponse,
-        StackDeploymentServiceProgress, StackDeploymentStatus, StackDeploymentTaskPhaseProgress,
-        StackListResponse, StackRecord, StackSummary, StatusResponse, TaskAssignment,
-        TaskListResponse, TaskReconcileError, TaskReconcileProgress, TaskReconcileReport,
-        TaskRecord, TaskRemovalAssignment, TaskSummary, UnclaimedTask, service_spec_hash,
-        valid_gateway_image,
+        BootstrapResponse, CONFIG_GC_GRACE_PERIOD_SECONDS, ClusterConfigResponse,
+        ClusterConfigUpdate, ClusterSettings, ClusterState, DataSessionCreateResponse,
+        DataSessionOperation, DataSessionStream, DeploymentImageResolutionNodeRecord,
+        DeploymentImageResolutionRecord, DesiredTaskState, GatewayAssignment, GatewayReport,
+        GatewayStatus, HeartbeatResponse, ImageResolutionAssignment, ImageResolutionProgress,
+        ImageResolutionReport, ImageResolutionServiceAssignment, ImageResolutionStatus,
+        JoinRequest, JoinResponse, KvDeleteRequest, KvListResponse, KvLockAcquireRequest,
+        KvLockAcquireResponse, KvLockMutationRequest, KvObjectResponse, KvPutRequest,
+        KvStatResponse, NodeGatewayResponse, NodeGatewayUpdate, NodeHeartbeat,
+        NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, NodeMember,
+        ObservedTaskState, RegistryLoginRequest, RegistryLoginResponse, ServiceInspectResponse,
+        ServiceListResponse, ServiceRecord, ServiceSummary, StackDeploymentError,
+        StackDeploymentGatewayProgress, StackDeploymentImageProgress, StackDeploymentRecord,
+        StackDeploymentResponse, StackDeploymentServiceProgress, StackDeploymentStatus,
+        StackDeploymentTaskPhaseProgress, StackListResponse, StackRecord, StackSummary,
+        StatusResponse, TaskAssignment, TaskListResponse, TaskReconcileError,
+        TaskReconcileProgress, TaskReconcileReport, TaskRecord, TaskRemovalAssignment, TaskSummary,
+        UnclaimedTask, service_spec_hash, valid_gateway_image,
     },
     scheduler,
     storage::{StateRepository, StorageError},

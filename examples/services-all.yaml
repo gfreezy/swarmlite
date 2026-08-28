@@ -26,6 +26,13 @@ services:
       - source: /srv/example/api-config
         target: /etc/api
         read_only: true
+    configs:
+      - api-settings
+      - source: api-settings
+        target: /etc/api/settings-copy.yaml
+        uid: "103"
+        gid: "104"
+        mode: 0444
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
       interval: 10s
@@ -67,3 +74,7 @@ services:
         - com.example.owner=platform
       update_config:
         order: stop-first
+
+configs:
+  api-settings:
+    file: ./configs/api-settings.yaml

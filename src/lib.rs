@@ -1,6 +1,7 @@
 mod agent;
 pub mod client;
 pub mod config;
+mod config_files;
 mod controller;
 pub mod data_plane;
 mod database;

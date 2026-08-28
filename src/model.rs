@@ -1,14 +1,58 @@
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use serde::{Deserialize, Serialize};
 pub use swarmlite_stack::{
     GatewayHttpMode, GatewayTlsMode, HealthcheckSpec, HttpBackend, HttpBackendProtocol,
     HttpPathMatch, HttpPathMatchType, HttpPathRewrite, HttpRouteRule, HttpRouteSpec, PullPolicy,
-    ServicePort, ServiceSpec, StackGatewaySpec, service_spec_hash,
+    ServiceConfigMount, ServicePort, ServiceSpec, StackGatewaySpec, config_digest,
+    service_spec_hash,
 };
 
 pub const CLUSTER_SCHEMA_VERSION: u32 = 7;
 pub const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/gfreezy/swarmlite-caddy:latest";
+pub const MAX_CONFIG_FILE_BYTES: usize = 1024 * 1024;
+pub const MAX_STACK_CONFIG_BYTES: usize = 8 * 1024 * 1024;
+pub const CONFIG_GC_GRACE_PERIOD_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+pub fn service_config_digests(spec: &ServiceSpec) -> Vec<String> {
+    spec.configs
+        .iter()
+        .map(|config| config.digest.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StackApplyRequest {
+    pub yaml: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub configs: BTreeMap<String, StackConfigPayload>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StackConfigPayload {
+    pub digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_base64: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigBlobCheckRequest {
+    pub digests: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigBlobCheckResponse {
+    pub missing: BTreeSet<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClusterGatewayConfig {
@@ -282,6 +326,8 @@ pub struct TaskRecord {
     pub desired: DesiredTaskState,
     pub observed: ObservedTaskState,
     pub ports: Vec<PortBinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_digests: Vec<String>,
     pub container_id: Option<String>,
     pub drain_until_unix_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -355,6 +401,8 @@ pub struct UnclaimedTask {
     pub node_id: String,
     pub observed: ObservedTaskState,
     pub ports: Vec<PortBinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_digests: Vec<String>,
     pub container_id: Option<String>,
 }
 
@@ -398,6 +446,7 @@ pub struct TaskReconcileReport {
 #[serde(rename_all = "snake_case")]
 pub enum TaskReconcilePhase {
     Inspect,
+    Config,
     Pull,
     Create,
     Replace,
@@ -427,6 +476,8 @@ pub struct TaskReport {
     pub revision: Option<u64>,
     pub spec_hash: Option<String>,
     pub ports: Vec<PortBinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_digests: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

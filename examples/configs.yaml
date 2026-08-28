@@ -1,0 +1,16 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/gfreezy/swarmlite/main/crates/swarmlite-stack/schema/stack.schema.json
+services:
+  web:
+    image: nginx:alpine
+    configs:
+      - source: index-html
+        target: /usr/share/nginx/html/index.html
+        mode: 0444
+    deploy:
+      replicas: 1
+      update_config:
+        order: start-first
+
+configs:
+  index-html:
+    file: ./configs/index.html

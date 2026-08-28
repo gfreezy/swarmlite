@@ -462,8 +462,9 @@ convergence by default and support `--detach`. `restart` increments the Service 
 performs the configured rolling replacement.
 
 While waiting, `deploy`, `scale`, and `restart` report image checking, pulling and comparison as
-well as Agent milestones such as `create`, `start`, and `verify`, together with per-Service applied
-and healthy replica progress. Image checks finish as `unchanged`, `skipped`, or `changed/updating`.
+well as Agent milestones such as `config`, `create`, `start`, and `verify`, together with
+per-Service applied and healthy replica progress. Image checks finish as `unchanged`, `skipped`,
+or `changed/updating`.
 `rm` reports `stop` and `remove` milestones and the number of Tasks still pending removal. Routed
 deployments also report how many gateway nodes have applied the latest configuration and do not
 complete until all enabled gateways have converged. In an interactive terminal, progress is
@@ -539,6 +540,55 @@ Associate a file with the schema using:
 
 See [`examples/services-all.yaml`](examples/services-all.yaml) for accepted Service fields and
 [`examples/routing-all.yaml`](examples/routing-all.yaml) for complete routing examples.
+
+### Mount config files
+
+Use standard Compose `configs` when a file beside the Stack file must be distributed to every node
+running a Service:
+
+```yaml
+services:
+  app:
+    image: example/app:1.0
+    configs:
+      - source: app-config
+        target: /etc/app/config.yaml
+        uid: "103"
+        gid: "104"
+        mode: 0444
+
+configs:
+  app-config:
+    file: ./config.yaml
+```
+
+The deploy CLI resolves `file` relative to the Stack file, uploads its exact bytes, and the
+Controller stores them by SHA-256 digest. Each Agent verifies and atomically caches the bytes,
+then bind-mounts the cached file at `target` as read-only. Short syntax (`configs: [app-config]`)
+mounts the file at `/app-config` with mode `0444`. Writable mode bits are ignored. `uid` and `gid`,
+when set, must be numeric IDs and require the Agent process to have permission to apply them.
+
+Before applying a Stack, the CLI computes every digest locally and asks the Controller which blobs
+are missing. Known digests are sent as references only; file contents are uploaded once, and equal
+contents declared under multiple config names share one upload and one stored blob.
+
+Changing the file contents changes the Service specification and uses the existing safe rolling
+update policy. Redeploying identical bytes does not restart containers. Docker or Podman can
+restart a container with the same persistent node cache and bind mount; when a task moves to a new
+node, that Agent downloads and verifies the digest before creating the container. A download or
+cache error fails that task's `config` phase before the Agent replaces its existing container.
+
+Config cleanup is reference-aware and delayed by seven days. The Controller retains digests used
+by current Services, rolling or stopped Tasks (including Tasks on offline nodes), and recovery
+containers. Once a blob becomes unreferenced, its grace-period timestamp is persisted in SQLite;
+becoming referenced again cancels deletion. Agents likewise retain cache files used by current
+assignments or any managed Docker/Podman container, persist candidate timestamps in the node data
+directory, and only delete expired orphan files. GC failures are logged and never fail a deploy or
+container reconciliation.
+
+Each config is limited to 1 MiB and one deployment may upload at most 8 MiB of config bytes.
+File-backed configs are supported; Compose external configs are not. See
+[`examples/configs.yaml`](examples/configs.yaml) for a runnable Nginx example.
 
 ### Publish HTTP and HTTPS routes
 
@@ -641,10 +691,11 @@ Each node stores durable state in one `swarmlite.sqlite` database. The Linux ins
 `/var/lib/swarmlite/swarmlite.sqlite`; foreground user mode defaults to
 `$XDG_STATE_HOME/swarmlite` or `$HOME/.local/state/swarmlite`.
 
-Agent nodes use local-state tables. The Controller database also stores cluster settings, member
-Gateway switches and labels, Stacks, deployment outcomes, normalized Service specifications,
-desired task assignments, allocated ports, drain deadlines, registry credentials, and KV data.
-Heartbeat liveness and observed runtime state are rebuilt from Agents.
+Agent nodes use local-state tables and keep verified config files under their persistent data
+directory. The Controller database also stores cluster settings, member Gateway switches and
+labels, Stacks, deployment outcomes, normalized Service specifications, content-addressed config
+blobs, desired task assignments, allocated ports, drain deadlines, registry credentials, and KV
+data. Heartbeat liveness and observed runtime state are rebuilt from Agents.
 
 ### Back up the Controller
 
@@ -770,7 +821,7 @@ There are no separate public `controller`, `agent`, or `gateway` runtime command
 - The Controller is a single point of control-plane availability and cannot change in place.
 - There is no overlay network, service VIP, routing mesh, or cross-node DNS.
 - Only replicated Services are supported; `deploy.mode: global` is rejected.
-- Compose `build`, `configs`, `secrets`, resource reservations, and autoscaling are not supported.
+- Compose `build`, external `configs`, `secrets`, resource reservations, and autoscaling are not supported.
 - Named volumes and bind mounts remain node-local.
 - `stats` and interactive `exec` are not implemented yet.
 - Gateway routing supports the documented host/path/rewrite/backend model, not arbitrary Caddy

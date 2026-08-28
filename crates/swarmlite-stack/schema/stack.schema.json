@@ -10,6 +10,11 @@
       "minProperties": 1,
       "additionalProperties": { "$ref": "#/$defs/service" }
     },
+    "configs": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/configSource" },
+      "description": "Compose config objects backed by files uploaded with the Stack."
+    },
     "x-swarmlite": { "$ref": "#/$defs/swarmlite" }
   },
   "additionalProperties": true,
@@ -62,6 +67,12 @@
           "items": { "$ref": "#/$defs/serviceVolume" },
           "default": [],
           "description": "Node-local named volumes, bind mounts, or anonymous volumes."
+        },
+        "configs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/serviceConfig" },
+          "default": [],
+          "description": "Files declared by the top-level configs map and mounted read-only into the container."
         },
         "healthcheck": {
           "$ref": "#/$defs/healthcheck"
@@ -179,6 +190,55 @@
         "read_only": {
           "type": "boolean",
           "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "configSource": {
+      "type": "object",
+      "required": ["file"],
+      "properties": {
+        "file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Path resolved relative to the Stack file and uploaded by the deploy CLI."
+        }
+      },
+      "additionalProperties": false
+    },
+    "serviceConfig": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "description": "Top-level config name; mounted at /<name> with mode 0444."
+        },
+        { "$ref": "#/$defs/serviceConfigLong" }
+      ]
+    },
+    "serviceConfigLong": {
+      "type": "object",
+      "required": ["source"],
+      "properties": {
+        "source": { "type": "string", "minLength": 1 },
+        "target": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute file path inside the container; defaults to /<source>."
+        },
+        "uid": {
+          "type": "string",
+          "pattern": "^[0-9]+$",
+          "description": "Numeric owner ID applied on the Agent cache file."
+        },
+        "gid": {
+          "type": "string",
+          "pattern": "^[0-9]+$",
+          "description": "Numeric group ID applied on the Agent cache file."
+        },
+        "mode": {
+          "type": ["string", "integer"],
+          "description": "Octal file mode. Writable bits are ignored because configs are immutable."
         }
       },
       "additionalProperties": false

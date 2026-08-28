@@ -223,9 +223,11 @@ pub async fn run(options: ServeOptions) -> Result<()> {
         settings.runtime.as_ref(),
     );
     let registry_credentials = RegistryCredentialStore::new(local_state.clone());
+    let config_dir = options.data_dir.join("configs");
     let runtime = DockerCompatibleRuntime::connect_with_registry_credentials(
         &runtime_config.resolve()?,
         registry_credentials.clone(),
+        config_dir.clone(),
     )?;
     let initial_gateway_report = gateway_operation_report(
         "failed to reconcile gateway during node startup",
@@ -258,6 +260,7 @@ pub async fn run(options: ServeOptions) -> Result<()> {
         heartbeat_interval_seconds: 2,
         port_range: PortRangeConfig::default(),
         gateway_enabled: settings.gateway_enabled,
+        config_dir,
     };
     let initial_control = NodeControl {
         cluster: settings.cluster.clone(),

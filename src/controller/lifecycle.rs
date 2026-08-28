@@ -113,12 +113,36 @@ impl Controller {
         let mut inner = self.inner.lock().await;
         let live = current_live_nodes(&inner, self.config.node_timeout_seconds);
         let previous = inner.state.clone();
-        let mut changed = scheduler::finish_drains(&mut inner.state, unix_ms());
+        let now_unix_ms = unix_ms();
+        let mut changed = scheduler::finish_drains(&mut inner.state, now_unix_ms);
         changed |= scheduler::reconcile(&mut inner.state, &live);
-        changed |= self.refresh_stack_deployments_locked(&mut inner, unix_ms())?;
+        changed |= self.refresh_stack_deployments_locked(&mut inner, now_unix_ms)?;
         if changed && let Err(error) = self.commit_locked(&mut inner).await {
             inner.state = previous;
             return Err(error);
+        }
+        let config_digests = referenced_config_digests(&inner.state);
+        drop(inner);
+        let grace_period_ms =
+            i64::try_from(CONFIG_GC_GRACE_PERIOD_SECONDS.saturating_mul(1_000)).unwrap_or(i64::MAX);
+        match self
+            .repository
+            .gc_config_blobs(&config_digests, now_unix_ms, grace_period_ms)
+        {
+            Ok(stats) if stats.marked > 0 || stats.deleted > 0 => info!(
+                referenced = stats.referenced,
+                marked = stats.marked,
+                retained_for_grace = stats.retained_for_grace,
+                deleted = stats.deleted,
+                "reconciled Controller config blob garbage collection"
+            ),
+            Ok(stats) if stats.retained_for_grace > 0 => debug!(
+                referenced = stats.referenced,
+                retained_for_grace = stats.retained_for_grace,
+                "Controller config blob garbage collection retained grace-period candidates"
+            ),
+            Ok(_) => {}
+            Err(error) => warn!(%error, "Controller config blob garbage collection failed"),
         }
         Ok(())
     }
@@ -153,4 +177,30 @@ impl Controller {
         inner.status_revision = inner.status_revision.saturating_add(1);
         self.status_changes.send_replace(inner.status_revision);
     }
+}
+
+pub(super) fn referenced_config_digests(state: &ClusterState) -> BTreeSet<String> {
+    state
+        .services
+        .values()
+        .flat_map(|service| {
+            service
+                .spec
+                .configs
+                .iter()
+                .map(|config| config.digest.clone())
+        })
+        .chain(
+            state
+                .tasks
+                .values()
+                .flat_map(|task| task.config_digests.iter().cloned()),
+        )
+        .chain(
+            state
+                .unclaimed_tasks
+                .values()
+                .flat_map(|task| task.config_digests.iter().cloned()),
+        )
+        .collect()
 }

@@ -114,6 +114,18 @@ impl ControllerClient {
             })
     }
 
+    pub async fn get_bytes(&self, path: &str) -> Result<Vec<u8>, ControllerClientError> {
+        self.checked(self.request(Method::GET, path), path)
+            .await?
+            .bytes()
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(|source| ControllerClientError::InvalidResponse {
+                endpoint: self.endpoint(path),
+                source,
+            })
+    }
+
     pub async fn connect_data_websocket(
         &self,
         path: &str,
