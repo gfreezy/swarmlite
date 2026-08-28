@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 use crate::model::ClusterSettings;
 
 pub const DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS: u64 = 10;
-pub const DEFAULT_DEPLOYMENT_TIMEOUT_SECONDS: u64 = 300;
 pub const DEFAULT_CONTROLLER_PORT: u16 = 17_080;
 pub const SYSTEM_CONFIG_PATH: &str = "/etc/swarmlite/runtime.env";
 
@@ -96,7 +95,6 @@ pub struct ControllerConfig {
     pub node_timeout_seconds: u64,
     pub reconcile_interval_seconds: u64,
     pub gateway_drain_timeout_seconds: u64,
-    pub deployment_timeout_seconds: u64,
     pub cluster: ClusterSettings,
 }
 

@@ -16,8 +16,9 @@ use swarmlite::{
         ClusterSettings, ConfigBlobCheckRequest, ConfigBlobCheckResponse, DEFAULT_GATEWAY_IMAGE,
         MAX_CONFIG_FILE_BYTES, MAX_STACK_CONFIG_BYTES, NodeGatewayResponse, NodeGatewayUpdate,
         NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, RegistryLoginRequest,
-        RegistryLoginResponse, StackApplyRequest, StackConfigPayload, StackDeploymentResponse,
-        StackDeploymentStatus, StackValidationResponse, StatusResponse, config_digest,
+        RegistryLoginResponse, StackApplyRequest, StackConfigPayload, StackDeploymentListResponse,
+        StackDeploymentResponse, StackDeploymentStatus, StackRollbackRequest,
+        StackValidationResponse, StatusResponse, config_digest,
     },
     node, registry,
 };
@@ -110,6 +111,11 @@ enum Command {
     Deploy {
         #[command(flatten)]
         options: cluster_cli::DeployArgs,
+    },
+    /// Inspect, attach to, retry, or roll back Stack deployments.
+    Deployment {
+        #[command(subcommand)]
+        action: DeploymentCommand,
     },
     /// List cluster services, optionally limited to one Stack.
     Ls {
@@ -249,9 +255,69 @@ enum RegistryCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum DeploymentCommand {
+    /// Show one deployment; defaults to the current generation.
+    Status {
+        stack: String,
+        #[arg(long)]
+        generation: Option<u64>,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        connection: ConnectionArgs,
+    },
+    /// List the current deployment and archived generations.
+    History {
+        stack: String,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        connection: ConnectionArgs,
+    },
+    /// Follow one deployment; defaults to the current generation.
+    Attach {
+        stack: String,
+        #[arg(long)]
+        generation: Option<u64>,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        connection: ConnectionArgs,
+    },
+    /// Retry the current stalled, blocked, or failed generation.
+    Retry {
+        stack: String,
+        #[arg(short = 'd', long)]
+        detach: bool,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        connection: ConnectionArgs,
+    },
+    /// Create a new deployment from a previous snapshot.
+    Rollback {
+        stack: String,
+        /// Generation to restore; defaults to the latest previous healthy generation.
+        #[arg(long = "to-generation")]
+        generation: Option<u64>,
+        #[arg(short = 'd', long)]
+        detach: bool,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        connection: ConnectionArgs,
+    },
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ConfigKey {
     GatewayImage,
+    DeploymentProgressDeadlineSeconds,
+    ImagePullIdleTimeoutSeconds,
+    ImagePullMaxAttempts,
+    ImagePullInitialBackoffSeconds,
+    ImagePullMaxBackoffSeconds,
 }
 
 #[derive(Debug, Args)]
@@ -341,6 +407,7 @@ async fn run() -> Result<()> {
                         .gateway_image
                         .unwrap_or_else(|| DEFAULT_GATEWAY_IMAGE.to_owned()),
                 },
+                deployment: Default::default(),
             };
             let message = node::init(node::InitOptions {
                 data_dir,
@@ -419,10 +486,45 @@ async fn run() -> Result<()> {
                     value,
                     connection,
                 } => {
-                    let update = match key {
-                        ConfigKey::GatewayImage => ClusterConfigUpdate {
-                            gateway_image: Some(value),
-                        },
+                    let mut update = ClusterConfigUpdate {
+                        gateway_image: None,
+                        deployment_progress_deadline_seconds: None,
+                        image_pull_idle_timeout_seconds: None,
+                        image_pull_max_attempts: None,
+                        image_pull_initial_backoff_seconds: None,
+                        image_pull_max_backoff_seconds: None,
+                    };
+                    match key {
+                        ConfigKey::GatewayImage => update.gateway_image = Some(value),
+                        ConfigKey::DeploymentProgressDeadlineSeconds => update
+                            .deployment_progress_deadline_seconds =
+                            Some(value.parse().context(
+                                "deployment-progress-deadline-seconds must be a positive integer",
+                            )?),
+                        ConfigKey::ImagePullIdleTimeoutSeconds => {
+                            update.image_pull_idle_timeout_seconds = Some(value.parse().context(
+                                "image-pull-idle-timeout-seconds must be a positive integer",
+                            )?)
+                        }
+                        ConfigKey::ImagePullMaxAttempts => {
+                            update.image_pull_max_attempts =
+                                Some(value.parse().context(
+                                    "image-pull-max-attempts must be a positive integer",
+                                )?)
+                        }
+                        ConfigKey::ImagePullInitialBackoffSeconds => {
+                            update.image_pull_initial_backoff_seconds =
+                                Some(value.parse().context(
+                                    "image-pull-initial-backoff-seconds must be an integer",
+                                )?)
+                        }
+                        ConfigKey::ImagePullMaxBackoffSeconds => {
+                            update.image_pull_max_backoff_seconds = Some(
+                                value
+                                    .parse()
+                                    .context("image-pull-max-backoff-seconds must be an integer")?,
+                            )
+                        }
                     };
                     (connection, Some(update))
                 }
@@ -519,6 +621,7 @@ async fn run() -> Result<()> {
             }
         },
         Command::Deploy { options } => cluster_cli::run_deploy(&data_dir, options).await,
+        Command::Deployment { action } => run_deployment_command(&data_dir, action).await,
         Command::Ls { options } => cluster_cli::run_list(&data_dir, options).await,
         Command::Ps { options } => cluster_cli::run_ps(&data_dir, options).await,
         Command::Inspect { options } => cluster_cli::run_inspect(&data_dir, options).await,
@@ -554,6 +657,190 @@ async fn read_registry_password() -> Result<String> {
     Ok(password)
 }
 
+async fn run_deployment_command(data_dir: &Path, action: DeploymentCommand) -> Result<()> {
+    let (stack, connection) = match &action {
+        DeploymentCommand::Status {
+            stack, connection, ..
+        }
+        | DeploymentCommand::History {
+            stack, connection, ..
+        }
+        | DeploymentCommand::Attach {
+            stack, connection, ..
+        }
+        | DeploymentCommand::Retry {
+            stack, connection, ..
+        }
+        | DeploymentCommand::Rollback {
+            stack, connection, ..
+        } => (stack.clone(), connection),
+    };
+    let client = connection::resolve(
+        data_dir,
+        connection.controller.clone(),
+        connection.token.clone(),
+    )
+    .await?;
+    let encoded_stack = url::form_urlencoded::byte_serialize(stack.as_bytes()).collect::<String>();
+    match action {
+        DeploymentCommand::Status {
+            generation, json, ..
+        } => {
+            let deployment = get_deployment(&client, &encoded_stack, generation).await?;
+            print_deployment(&deployment, json)?;
+        }
+        DeploymentCommand::History { json, .. } => {
+            let deployments: StackDeploymentListResponse = client
+                .get_json(&format!("/v1/stacks/{encoded_stack}/deployments"))
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&deployments)?);
+            } else {
+                println!("GENERATION\tSTATUS\tRETRIES\tSTARTED\tLAST PROGRESS\tFINISHED");
+                if let Some(current) = deployments.current {
+                    println!(
+                        "{}\t{:?} (current)\t{}\t{}\t{}\t{}",
+                        current.generation,
+                        current.status,
+                        current.retry_revision,
+                        current.started_at_unix_ms,
+                        current.last_progress_at_unix_ms,
+                        current
+                            .finished_at_unix_ms
+                            .map_or_else(|| "-".into(), |value| value.to_string())
+                    );
+                }
+                for deployment in deployments.history {
+                    let status = deployment.superseded_by.map_or_else(
+                        || format!("{:?}", deployment.status),
+                        |generation| format!("{:?} by {generation}", deployment.status),
+                    );
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}",
+                        deployment.generation,
+                        status,
+                        deployment.retry_revision,
+                        deployment.started_at_unix_ms,
+                        deployment.last_progress_at_unix_ms,
+                        deployment
+                            .finished_at_unix_ms
+                            .map_or_else(|| "-".into(), |value| value.to_string())
+                    );
+                }
+            }
+        }
+        DeploymentCommand::Attach {
+            generation, json, ..
+        } => {
+            let deployment = get_deployment(&client, &encoded_stack, generation).await?;
+            let deployment = attach_deployment(&client, deployment).await?;
+            print_deployment(&deployment, json)?;
+        }
+        DeploymentCommand::Retry { detach, json, .. } => {
+            let deployment: StackDeploymentResponse = client
+                .send_json::<_, ()>(
+                    reqwest::Method::POST,
+                    &format!("/v1/stacks/{encoded_stack}/deployment/retry"),
+                    None,
+                )
+                .await?;
+            let deployment =
+                finish_deployment(&client, deployment, detach, DeploymentOperation::Retry).await?;
+            print_deployment(&deployment, json)?;
+        }
+        DeploymentCommand::Rollback {
+            generation,
+            detach,
+            json,
+            ..
+        } => {
+            let deployment: StackDeploymentResponse = client
+                .send_json(
+                    reqwest::Method::POST,
+                    &format!("/v1/stacks/{encoded_stack}/rollback"),
+                    Some(&StackRollbackRequest { generation }),
+                )
+                .await?;
+            let deployment =
+                finish_deployment(&client, deployment, detach, DeploymentOperation::Rollback)
+                    .await?;
+            print_deployment(&deployment, json)?;
+        }
+    }
+    Ok(())
+}
+
+async fn get_deployment(
+    client: &ControllerClient,
+    encoded_stack: &str,
+    generation: Option<u64>,
+) -> Result<StackDeploymentResponse> {
+    let query = generation.map_or_else(String::new, |generation| {
+        format!("?generation={generation}&wait_seconds=0")
+    });
+    let query = if query.is_empty() {
+        "?wait_seconds=0".to_owned()
+    } else {
+        query
+    };
+    Ok(client
+        .get_json(&format!("/v1/stacks/{encoded_stack}/deployment{query}"))
+        .await?)
+}
+
+async fn attach_deployment(
+    client: &ControllerClient,
+    deployment: StackDeploymentResponse,
+) -> Result<StackDeploymentResponse> {
+    let mut progress = DeploymentProgressRenderer::new();
+    let started = tokio::time::Instant::now();
+    progress.render(DeploymentOperation::Deploy, &deployment, started.elapsed());
+    let stack = deployment.stack.clone();
+    let deployment = wait_for_deployment(
+        client,
+        &stack,
+        deployment,
+        DeploymentOperation::Deploy,
+        started,
+        &mut progress,
+    )
+    .await?;
+    ensure_deployment_succeeded(&deployment)?;
+    Ok(deployment)
+}
+
+fn print_deployment(deployment: &StackDeploymentResponse, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(deployment)?);
+    } else {
+        println!(
+            "{}",
+            deployment_progress_summary(
+                DeploymentOperation::Deploy,
+                deployment,
+                std::time::Duration::ZERO,
+            )
+        );
+        println!(
+            "last progress: {}; progress deadline: {}s; retry revision: {}",
+            deployment.last_progress_at_unix_ms,
+            deployment.progress_deadline_seconds,
+            deployment.retry_revision
+        );
+        if let Some(generation) = deployment.superseded_by {
+            println!("superseded by generation {generation}");
+        }
+        for condition in deployment
+            .conditions
+            .iter()
+            .filter(|condition| condition.resolved_at_unix_ms.is_none())
+        {
+            println!("condition {:?}: {}", condition.kind, condition.message);
+        }
+    }
+    Ok(())
+}
+
 async fn finish_deployment(
     client: &ControllerClient,
     mut deployment: StackDeploymentResponse,
@@ -584,6 +871,8 @@ async fn finish_deployment(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeploymentOperation {
     Deploy,
+    Retry,
+    Rollback,
     Scale,
     Restart,
     Remove,
@@ -593,6 +882,8 @@ impl DeploymentOperation {
     fn label(self) -> &'static str {
         match self {
             Self::Deploy => "deploy",
+            Self::Retry => "retry",
+            Self::Rollback => "rollback",
             Self::Scale => "scale",
             Self::Restart => "restart",
             Self::Remove => "remove",
@@ -681,7 +972,7 @@ impl DeploymentProgressRenderer {
             return;
         }
 
-        let complete = deployment.status != StackDeploymentStatus::Deploying;
+        let complete = deployment.status != StackDeploymentStatus::Reconciling;
         let line = deployment_terminal_progress_summary(
             operation, deployment, elapsed, self.frame, self.color,
         );
@@ -738,34 +1029,42 @@ fn deployment_terminal_progress_summary(
     color: bool,
 ) -> String {
     let (symbol, symbol_color) = match deployment.status {
-        StackDeploymentStatus::Deploying => {
+        StackDeploymentStatus::Reconciling => {
             (PROGRESS_SPINNER[frame % PROGRESS_SPINNER.len()], "36")
         }
         StackDeploymentStatus::Healthy => ("✓", "32"),
-        StackDeploymentStatus::Failed | StackDeploymentStatus::TimedOut => ("✗", "31"),
+        StackDeploymentStatus::Stalled | StackDeploymentStatus::Blocked => ("!", "33"),
+        StackDeploymentStatus::Failed => ("✗", "31"),
+        StackDeploymentStatus::Superseded => ("↷", "2"),
     };
     let action = match deployment.status {
-        StackDeploymentStatus::Deploying => match operation {
+        StackDeploymentStatus::Reconciling => match operation {
             DeploymentOperation::Deploy => "deploying",
+            DeploymentOperation::Retry => "retrying",
+            DeploymentOperation::Rollback => "rolling back",
             DeploymentOperation::Scale => "scaling",
             DeploymentOperation::Restart => "restarting",
             DeploymentOperation::Remove => "removing",
         },
         StackDeploymentStatus::Healthy => match operation {
             DeploymentOperation::Deploy => "deploy complete",
+            DeploymentOperation::Retry => "retry complete",
+            DeploymentOperation::Rollback => "rollback complete",
             DeploymentOperation::Scale => "scale complete",
             DeploymentOperation::Restart => "restart complete",
             DeploymentOperation::Remove => "remove complete",
         },
         StackDeploymentStatus::Failed => "failed",
-        StackDeploymentStatus::TimedOut => "timed out",
+        StackDeploymentStatus::Stalled => "stalled",
+        StackDeploymentStatus::Blocked => "blocked",
+        StackDeploymentStatus::Superseded => "superseded",
     };
     let mut parts = vec![format!(
         "{} {}",
         ansi(color, symbol_color, symbol),
         ansi(color, "1", compact_name(&deployment.stack))
     )];
-    if deployment.status == StackDeploymentStatus::Deploying {
+    if deployment.status == StackDeploymentStatus::Reconciling {
         parts.push(ansi(color, "36", deployment_stage(operation, deployment)));
     } else {
         parts.push(ansi(color, symbol_color, action));
@@ -834,7 +1133,7 @@ fn deployment_terminal_progress_summary(
             )
         };
         if gateway.applied_nodes < gateway.total_nodes
-            || deployment.status != StackDeploymentStatus::Deploying
+            || deployment.status != StackDeploymentStatus::Reconciling
         {
             parts.push(ansi(
                 color,
@@ -1081,10 +1380,12 @@ fn deployment_progress_summary(
 ) -> String {
     let elapsed = format!("{:.1}s", elapsed.as_secs_f64());
     let status = match deployment.status {
-        StackDeploymentStatus::Deploying => "deploying",
+        StackDeploymentStatus::Reconciling => "deploying",
         StackDeploymentStatus::Healthy => "healthy",
         StackDeploymentStatus::Failed => "failed",
-        StackDeploymentStatus::TimedOut => "timed out",
+        StackDeploymentStatus::Stalled => "stalled",
+        StackDeploymentStatus::Blocked => "blocked",
+        StackDeploymentStatus::Superseded => "superseded",
     };
     let phases = deployment
         .task_phases
@@ -1127,10 +1428,12 @@ fn deployment_progress_summary(
     });
     if operation == DeploymentOperation::Remove {
         let status = match deployment.status {
-            StackDeploymentStatus::Deploying => "removing",
+            StackDeploymentStatus::Reconciling => "removing",
             StackDeploymentStatus::Healthy => "complete",
             StackDeploymentStatus::Failed => "failed",
-            StackDeploymentStatus::TimedOut => "timed out",
+            StackDeploymentStatus::Stalled => "stalled",
+            StackDeploymentStatus::Blocked => "blocked",
+            StackDeploymentStatus::Superseded => "superseded",
         };
         return format!(
             "{}: remove generation {} {}: {} task(s) remaining{}{}{} ({elapsed})",
@@ -1220,7 +1523,10 @@ fn task_phase_label(phase: swarmlite::model::TaskReconcilePhase) -> &'static str
 fn ensure_deployment_succeeded(deployment: &StackDeploymentResponse) -> Result<()> {
     if !matches!(
         deployment.status,
-        StackDeploymentStatus::Failed | StackDeploymentStatus::TimedOut
+        StackDeploymentStatus::Failed
+            | StackDeploymentStatus::Stalled
+            | StackDeploymentStatus::Blocked
+            | StackDeploymentStatus::Superseded
     ) {
         return Ok(());
     }
@@ -1257,7 +1563,9 @@ fn ensure_deployment_succeeded(deployment: &StackDeploymentResponse) -> Result<(
         deployment.stack,
         match deployment.status {
             StackDeploymentStatus::Failed => "failed",
-            StackDeploymentStatus::TimedOut => "timed out",
+            StackDeploymentStatus::Stalled => "stalled",
+            StackDeploymentStatus::Blocked => "blocked",
+            StackDeploymentStatus::Superseded => "was superseded",
             _ => unreachable!(),
         },
         if details.is_empty() {
@@ -1318,6 +1626,7 @@ async fn deploy(
     detach: bool,
     dry_run: bool,
     json: bool,
+    replace: bool,
 ) -> Result<()> {
     let stack = tokio::fs::read_to_string(&file)
         .await
@@ -1339,7 +1648,10 @@ async fn deploy(
     let deployment: StackDeploymentResponse = client
         .send_json(
             reqwest::Method::PUT,
-            &format!("/v1/stacks/{name}"),
+            &format!(
+                "/v1/stacks/{name}{}",
+                if replace { "?replace=true" } else { "" }
+            ),
             Some(&request),
         )
         .await?;
@@ -1460,19 +1772,11 @@ async fn wait_for_deployment(
     started: tokio::time::Instant,
     progress: &mut DeploymentProgressRenderer,
 ) -> Result<StackDeploymentResponse> {
-    const CLIENT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(330);
     const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
-    let deadline = tokio::time::Instant::now() + CLIENT_WAIT_TIMEOUT;
-    let mut last_error: Option<anyhow::Error> = None;
     let mut progress_tick = tokio::time::interval(progress.refresh_interval());
     progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     progress_tick.tick().await;
-    while deployment.status == StackDeploymentStatus::Deploying {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(last_error.unwrap_or_else(|| {
-                anyhow::anyhow!("timed out waiting for stack {stack_name:?} deployment")
-            }));
-        }
+    while deployment.status == StackDeploymentStatus::Reconciling {
         let path = format!(
             "/v1/stacks/{stack_name}/deployment?generation={}&after_revision={}&wait_seconds=25",
             deployment.generation, deployment.revision
@@ -1500,7 +1804,6 @@ async fn wait_for_deployment(
                     || deployment.gateway != next.gateway
                     || deployment.errors != next.errors;
                 deployment = next;
-                last_error = None;
                 if progress_changed {
                     progress.render(operation, &deployment, started.elapsed());
                 }
@@ -1510,14 +1813,12 @@ async fn wait_for_deployment(
                 progress.warning(&format!(
                     "{stack_name}: controller unavailable; retrying: {error}"
                 ));
-                last_error = Some(error);
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             Ok(Err(error)) => return Err(error.into()),
             Err(_) => {
                 let error = anyhow::anyhow!("controller deployment watch timed out");
                 progress.warning(&format!("{stack_name}: {error}; retrying"));
-                last_error = Some(error);
             }
         }
     }
@@ -1808,9 +2109,11 @@ fn task_summary_color(response: &StatusResponse) -> &'static str {
 fn format_deployment_summary(response: &StatusResponse) -> String {
     let states = [
         (StackDeploymentStatus::Healthy, "healthy"),
-        (StackDeploymentStatus::Deploying, "deploying"),
+        (StackDeploymentStatus::Reconciling, "deploying"),
         (StackDeploymentStatus::Failed, "failed"),
-        (StackDeploymentStatus::TimedOut, "timed out"),
+        (StackDeploymentStatus::Stalled, "stalled"),
+        (StackDeploymentStatus::Blocked, "blocked"),
+        (StackDeploymentStatus::Superseded, "superseded"),
     ];
     let details = states
         .iter()
@@ -1842,14 +2145,16 @@ fn deployment_summary_color(response: &StatusResponse) -> &'static str {
     if deployments.iter().any(|deployment| {
         matches!(
             deployment.status,
-            StackDeploymentStatus::Failed | StackDeploymentStatus::TimedOut
+            StackDeploymentStatus::Failed | StackDeploymentStatus::Blocked
         )
     }) {
         "31"
-    } else if deployments
-        .iter()
-        .any(|deployment| deployment.status == StackDeploymentStatus::Deploying)
-    {
+    } else if deployments.iter().any(|deployment| {
+        matches!(
+            deployment.status,
+            StackDeploymentStatus::Reconciling | StackDeploymentStatus::Stalled
+        )
+    }) {
         "33"
     } else if deployments.is_empty() {
         "2"
@@ -1972,6 +2277,7 @@ mod tests {
         assert_eq!(options.stack, None);
         assert!(!options.dry_run);
         assert!(!options.json);
+        assert!(!options.replace);
         assert!(matches!(
             parse(&["--detach"]).command,
             Command::Deploy { .. }
@@ -1981,6 +2287,11 @@ mod tests {
         };
         assert!(options.dry_run);
         assert!(Cli::try_parse_from(["swarmlite", "deploy", "--dry-run", "--detach"]).is_err());
+        assert!(Cli::try_parse_from(["swarmlite", "deploy", "--dry-run", "--replace"]).is_err());
+        let Command::Deploy { options } = parse(&["--replace"]).command else {
+            panic!("expected deploy command");
+        };
+        assert!(options.replace);
         let Command::Deploy { options } = parse(&["--json"]).command else {
             panic!("expected deploy command");
         };
@@ -1998,9 +2309,13 @@ mod tests {
             stack: "demo".into(),
             generation: 7,
             revision: 1,
-            status: StackDeploymentStatus::Deploying,
+            status: StackDeploymentStatus::Reconciling,
             started_at_unix_ms: 0,
+            last_progress_at_unix_ms: 0,
+            progress_deadline_seconds: 300,
             finished_at_unix_ms: None,
+            superseded_by: None,
+            retry_revision: 0,
             services: vec![StackDeploymentServiceProgress {
                 service: "web".into(),
                 replicas: 3,
@@ -2019,6 +2334,7 @@ mod tests {
                 total_nodes: 1,
                 errors: Default::default(),
             }),
+            conditions: Vec::new(),
             errors: Vec::new(),
         };
         assert_eq!(
@@ -2109,9 +2425,13 @@ mod tests {
             stack: "demo".into(),
             generation: 2,
             revision: 1,
-            status: StackDeploymentStatus::Deploying,
+            status: StackDeploymentStatus::Reconciling,
             started_at_unix_ms: 0,
+            last_progress_at_unix_ms: 0,
+            progress_deadline_seconds: 300,
             finished_at_unix_ms: None,
+            superseded_by: None,
+            retry_revision: 0,
             services: vec![StackDeploymentServiceProgress {
                 service: "web".into(),
                 replicas: 1,
@@ -2128,6 +2448,7 @@ mod tests {
                 total_nodes: 1,
             }],
             gateway: None,
+            conditions: Vec::new(),
             errors: Vec::new(),
         };
         let plain = deployment_progress_summary(
@@ -2265,6 +2586,31 @@ mod tests {
         assert!(Cli::try_parse_from(["swarmlite", "restart", "demo.web",]).is_ok());
         assert!(Cli::try_parse_from(["swarmlite", "rm", "demo", "other",]).is_ok());
         assert!(Cli::try_parse_from(["swarmlite", "rm", "--json", "demo",]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "deployment", "status", "demo"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "swarmlite",
+                "deployment",
+                "attach",
+                "demo",
+                "--generation",
+                "42",
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["swarmlite", "deployment", "history", "demo"]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "deployment", "retry", "demo"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "swarmlite",
+                "deployment",
+                "rollback",
+                "demo",
+                "--to-generation",
+                "40",
+            ])
+            .is_ok()
+        );
         assert!(Cli::try_parse_from(["swarmlite", "stack", "ls"]).is_err());
         assert!(Cli::try_parse_from(["swarmlite", "service", "ls"]).is_err());
     }
@@ -2286,7 +2632,15 @@ mod tests {
         assert!(names.contains(&"node"));
         assert!(names.contains(&"registry"));
         for name in [
-            "deploy", "ls", "ps", "inspect", "logs", "scale", "restart", "rm",
+            "deploy",
+            "deployment",
+            "ls",
+            "ps",
+            "inspect",
+            "logs",
+            "scale",
+            "restart",
+            "rm",
         ] {
             assert!(names.contains(&name));
         }
@@ -2496,6 +2850,20 @@ mod tests {
                 "ghcr.io/example/caddy:v1",
             ])
             .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "swarmlite",
+                "config",
+                "set",
+                "deployment-progress-deadline-seconds",
+                "600",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["swarmlite", "config", "set", "image-pull-max-attempts", "5",])
+                .is_ok()
         );
         assert!(Cli::try_parse_from(["swarmlite", "config", "set", "unknown", "3"]).is_err());
     }

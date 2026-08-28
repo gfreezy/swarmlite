@@ -36,6 +36,9 @@ pub(super) struct DeployArgs {
     /// Return after the Controller accepts the desired state.
     #[arg(short = 'd', long)]
     detach: bool,
+    /// Supersede an active deployment for this Stack.
+    #[arg(long, conflicts_with = "dry_run")]
+    pub(super) replace: bool,
     /// Validate the Stack without changing cluster state.
     #[arg(long, conflicts_with = "detach")]
     pub(super) dry_run: bool,
@@ -139,6 +142,7 @@ pub(super) async fn run_deploy(data_dir: &Path, args: DeployArgs) -> Result<()> 
         args.detach,
         args.dry_run,
         args.json,
+        args.replace,
     )
     .await
 }

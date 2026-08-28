@@ -62,7 +62,8 @@ curl http://127.0.0.1:8088
 ```
 
 `deploy` waits for the desired state to become healthy. Add `--detach` when you only want to wait
-until the Controller has accepted the deployment.
+until the Controller has accepted the deployment. Closing or interrupting the CLI only detaches
+the client; it does not cancel the Controller's desired state.
 
 ### 4. Operate the application
 
@@ -75,6 +76,7 @@ sudo swarmlite logs --tail 200 demo.web
 sudo swarmlite logs --tail 200 demo.web.1
 sudo swarmlite scale demo.web=3
 sudo swarmlite restart demo.web
+sudo swarmlite deployment status demo
 sudo swarmlite rm demo
 ```
 
@@ -489,6 +491,26 @@ sudo swarmlite connection-info --json
 convergence by default and support `--detach`. `restart` increments the Service revision and
 performs the configured rolling replacement.
 
+Deployment observation and recovery are separate from the process that submitted the change:
+
+```bash
+swarmlite deployment status demo             # current generation
+swarmlite deployment status demo --generation 42
+swarmlite deployment attach demo             # follow the current generation
+swarmlite deployment history demo
+swarmlite deployment retry demo              # retry the same generation
+swarmlite deployment rollback demo            # latest previous healthy snapshot
+swarmlite deployment rollback demo --to-generation 40
+swarmlite deploy --replace                    # supersede an active generation
+```
+
+`attach` reconnects through long-poll requests and has no fixed overall client timeout. Pressing
+Ctrl-C or losing SSH only stops that observer; run `attach` again to continue. `retry` increments a
+retry revision on the same deployment generation, which makes Agents cancel stale reconcile work
+and execute the assignment again. `rollback` always creates a new generation from the selected
+persisted snapshot. `--replace` also creates a new generation and archives the previous active one
+as `superseded`.
+
 While waiting, `deploy`, `scale`, and `restart` report image checking, pulling and comparison as
 well as Agent milestones such as `config`, `create`, `start`, and `verify`, together with
 per-Service applied and healthy replica progress. Image checks finish as `unchanged`, `skipped`,
@@ -509,9 +531,32 @@ print its validation response as JSON.
 obsolete tasks have been removed. Runtime failures include their service, node, task, and execution
 phase, and make the command exit non-zero.
 
-Deployments that do not become healthy within five minutes are marked `timed_out`. The Controller
-accepts only one active deployment for a given Stack name; a concurrent update to the same Stack
-returns `409 Conflict`. Different Stacks may deploy independently.
+The five-minute default is a progress deadline, not a fixed deployment duration. The Controller
+updates `last_progress_at_unix_ms` when image bytes, Agent phases, task state, or Gateway
+acknowledgements advance. A generation with no observable progress for that interval becomes
+`stalled`; it remains active and automatically returns to `reconciling` if progress resumes.
+Errors that require operator action, such as registry authentication or an occupied host port,
+become `blocked`. Non-recoverable attempt errors become `failed`. Completed generations are
+`healthy`; explicitly replaced generations are `superseded`.
+
+Normal deploys accept only one active generation for a Stack and return `409 Conflict` when one is
+already `reconciling`, `stalled`, or `blocked`. Use `deployment attach`, fix the dependency and run
+`deployment retry`, or intentionally use `deploy --replace`. Different Stacks reconcile
+independently.
+
+Tune the cluster-wide progress and pull policies without changing Stack files:
+
+```bash
+swarmlite config set deployment-progress-deadline-seconds 600
+swarmlite config set image-pull-idle-timeout-seconds 90
+swarmlite config set image-pull-max-attempts 5
+swarmlite config set image-pull-initial-backoff-seconds 2
+swarmlite config set image-pull-max-backoff-seconds 60
+```
+
+Defaults are a 300-second progress deadline, a 60-second image-pull idle deadline, five attempts,
+and exponential backoff from 2 to 60 seconds. Policy updates are delivered to Agents in heartbeat
+responses; an in-flight pull keeps the policy snapshot with which it started.
 
 Control image pulls per Service with the Compose-style `pull_policy` field:
 
@@ -528,7 +573,8 @@ existing Tasks without pulling. `always`, plus `missing` with an omitted or `lat
 per node and image for that deployment and compares the pulled image ID with the image ID of each
 running container on that node. Equal IDs do not increment the Service revision or restart its
 containers. A different ID increments the revision once and uses the normal safe rolling-update
-path. Pull failures fail the deployment while leaving existing running containers in place.
+path. Pull streams are canceled when a newer deployment or retry assignment arrives. Exhausted
+pull failures block or fail the deployment while leaving existing running containers in place.
 `restart` remains an unconditional rolling replacement.
 
 During rolling updates, old healthy tasks remain routable until replacements are healthy and all
@@ -747,6 +793,14 @@ configuration in a volume mounted at `/config`. It starts with `--resume`, so ex
 survive temporary Controller unavailability. Cached HTTP responses use a third cluster-specific
 volume mounted at `/cache`, so cache entries survive Gateway container restarts and image changes.
 
+After Caddy accepts a complete configuration through `/load`, the Agent also writes a minimal
+structured recovery snapshot to `/config/swarmlite-recovery.json`. The snapshot contains the
+cluster ID, Gateway generation, each Stack's normalized route specification, and only the last
+successfully applied `node-address:published-port` upstreams. It is written through a temporary
+file, synchronized, and atomically renamed, so a failed publication cannot overwrite the previous
+last-known-good snapshot. Caddy's own persisted full JSON remains separate and is used only for
+local restart and disconnection continuity.
+
 The gateway image enables `caddy.storage.swarmlite`, `http.handlers.cache`, and
 `storages.cache.badger`. Local Caddy storage remains authoritative,
 while certificate objects are copied to the Controller KV API and certificate issuance uses
@@ -769,9 +823,15 @@ Each node stores durable state in one `swarmlite.sqlite` database. The Linux ins
 
 Agent nodes use local-state tables and keep verified config files under their persistent data
 directory. The Controller database also stores cluster settings, member Gateway switches and
-labels, Stacks, deployment outcomes, normalized Service specifications, content-addressed config
-blobs, desired task assignments, allocated ports, drain deadlines, registry credentials, and KV
-data. Heartbeat liveness and observed runtime state are rebuilt from Agents.
+labels, Stacks, deployment outcomes, normalized Service specifications, a complete per-Stack
+Gateway route directory, content-addressed config blobs, desired task assignments, allocated
+ports, drain deadlines, registry credentials, and KV data. Heartbeat liveness and observed runtime
+state are rebuilt from Agents.
+
+Deployment history and rollback snapshots are durable, and the Controller retains the 20 most
+recent archived generations per Stack. This deployment-state redesign intentionally bumps the
+cluster and control-plane schemas without a compatibility migration; an older Controller database
+is rejected and must be recovered or redeployed rather than opened in place.
 
 ### Back up the Controller
 
@@ -792,15 +852,28 @@ sudo swarmlite init --recover
 sudo systemctl start swarmlite
 ```
 
-Recovery detects the previous cluster ID, archives stale state under `recovery-backup/`, rebuilds a
-single-controller control plane, and rotates the join token. It never deletes or changes a
-container. Legacy `local.redb`, Raft, and split SQLite state are archived as well. Print the new
-join command, rejoin the other nodes, and redeploy the same Stack names and files:
+Recovery detects the previous cluster ID and Gateway image/listener settings, archives stale state
+under `recovery-backup/`, and then reads the structured route snapshot from the existing managed
+Gateway container. From all available valid snapshots it selects the highest generation; equal
+generations with different contents are a hard conflict. The selected route directory is imported
+into the new Controller database in one transaction before Controller or Gateway reconciliation
+can start. If no valid snapshot exists, recovery fails explicitly and will not start a Controller
+that could publish an empty Gateway configuration.
+
+Legacy `local.redb`, Raft, and split SQLite state are archived as well. Recovery rotates the join
+token but does not delete workload containers. Print the new join command, rejoin the other nodes,
+and redeploy the same Stack names and files:
 
 ```bash
 sudo swarmlite join-token
 sudo swarmlite deploy --compose-file stack.yaml demo
 ```
+
+Before a Stack is redeployed, its recovered route and old upstreams remain active. A normal deploy
+with the same Stack name atomically replaces that Stack's complete route fragment; Agent heartbeat
+and container inspection then replace the baseline upstreams with current node addresses and
+dynamically allocated published ports. A normal `swarmlite rm STACK` also removes a recovered
+route-only Stack that has not yet been redeployed.
 
 Matching containers are adopted using their cluster, Stack, Service, slot, normalized spec hash,
 ports, and Service revision. Matching stopped containers start in place; old or unmatched
@@ -819,8 +892,9 @@ normalized spec hash, and published ports. They do not contain the full Stack de
 
 The independent Gateway container carries stable cluster and component identity, advertise
 address, image, listener, schema, and token-fingerprint labels. It never stores the token itself.
-These labels allow recovery to identify a cluster and restore Gateway settings even when Caddy is
-the only managed container left.
+The labels restore cluster-level Gateway settings; the structured snapshot in its `/config`
+volume restores the complete per-Stack route directory even when Caddy is the only managed
+container left.
 
 Recovery first restores the highest valid Service revision, then adopts only containers at that
 revision. This allows an interrupted rolling update to complete without immediately replacing a
@@ -878,6 +952,8 @@ node label get|set|remove
                      read or update one node's placement labels
 registry login       store private registry credentials
 deploy               deploy or update a Stack
+deployment status|attach|history|retry|rollback
+                     inspect, follow, or recover Stack deployments
 ls [STACK]           list Services
 ps [TARGET]          list tasks, optionally for one Stack or Service
 inspect SERVICE      inspect a Service

@@ -25,8 +25,9 @@ use crate::model::{
     MAX_STACK_CONFIG_BYTES, NodeGatewayResponse, NodeGatewayUpdate, NodeHeartbeat,
     NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, RegistryCredential,
     RegistryLoginRequest, RegistryLoginResponse, ServiceInspectResponse, ServiceListResponse,
-    ServiceScaleRequest, StackApplyRequest, StackDeploymentResponse, StackListResponse,
-    StackValidationResponse, StatusResponse, TaskListResponse,
+    ServiceScaleRequest, StackApplyRequest, StackDeploymentListResponse, StackDeploymentResponse,
+    StackListResponse, StackRollbackRequest, StackValidationResponse, StatusResponse,
+    TaskListResponse,
 };
 use swarmlite_stack::{config_digest, parse_stack_document, resolve_config_digests};
 
@@ -47,6 +48,12 @@ pub(super) fn router(controller: Arc<Controller>) -> Router {
         .route("/v1/stacks/{name}/validate", put(validate_stack))
         .route("/v1/stacks/{name}/tasks", get(stack_tasks))
         .route("/v1/stacks/{name}/deployment", get(stack_deployment))
+        .route("/v1/stacks/{name}/deployments", get(stack_deployments))
+        .route(
+            "/v1/stacks/{name}/deployment/retry",
+            post(retry_stack_deployment),
+        )
+        .route("/v1/stacks/{name}/rollback", post(rollback_stack))
         .route("/v1/configs/check", post(check_config_blobs))
         .route("/v1/configs/{digest}", get(get_config_blob))
         .route("/v1/services", get(list_services))
@@ -208,6 +215,7 @@ async fn remove_node_label(
 async fn apply_stack(
     State(controller): State<Arc<Controller>>,
     Path(name): Path<String>,
+    Query(query): Query<StackApplyQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<StackDeploymentResponse>, ControllerError> {
@@ -226,9 +234,16 @@ async fn apply_stack(
     controller.repository.put_config_blobs(&blobs)?;
     controller.repository.pin_config_blobs(&config_digests)?;
     controller
-        .apply_with_registry_credentials(&name, parsed, registry_credentials)
+        .apply_with_registry_credentials_mode(&name, parsed, registry_credentials, query.replace)
         .await
         .map(Json)
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StackApplyQuery {
+    #[serde(default)]
+    replace: bool,
 }
 
 async fn validate_stack(
@@ -599,7 +614,8 @@ async fn agent_command_result(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StackDeploymentQuery {
-    generation: u64,
+    #[serde(default)]
+    generation: Option<u64>,
     #[serde(default)]
     after_revision: Option<u64>,
     #[serde(default = "default_deployment_wait_seconds")]
@@ -624,6 +640,37 @@ async fn stack_deployment(
             query.after_revision,
             std::time::Duration::from_secs(query.wait_seconds.min(30)),
         )
+        .await
+        .map(Json)
+}
+
+async fn stack_deployments(
+    State(controller): State<Arc<Controller>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<StackDeploymentListResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.list_stack_deployments(&name).await.map(Json)
+}
+
+async fn retry_stack_deployment(
+    State(controller): State<Arc<Controller>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<StackDeploymentResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.retry_stack_deployment(&name).await.map(Json)
+}
+
+async fn rollback_stack(
+    State(controller): State<Arc<Controller>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<StackRollbackRequest>,
+) -> Result<Json<StackDeploymentResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller
+        .rollback_stack(&name, request.generation)
         .await
         .map(Json)
 }
@@ -831,6 +878,7 @@ configs:
                 controller_id: "controller-test".into(),
                 controller_port: crate::config::DEFAULT_CONTROLLER_PORT,
                 gateway: ClusterGatewayConfig::default(),
+                deployment: Default::default(),
             },
         )
         .unwrap();

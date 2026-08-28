@@ -17,6 +17,13 @@ impl Controller {
             .collect();
 
         let mut changed = false;
+        let gateway_generation = if versioned.state.gateway_generation == 0 {
+            changed = true;
+            versioned.generation.max(1)
+        } else {
+            versioned.state.gateway_generation
+        };
+        versioned.state.gateway_generation = gateway_generation;
         for task in versioned.state.tasks.values_mut() {
             if task.desired == DesiredTaskState::Draining
                 && task.drain_until_unix_ms.take().is_some()
@@ -71,6 +78,11 @@ impl Controller {
             &versioned.cluster.gateway.listen,
             config.advertise_url.clone(),
         );
+        let gateway_snapshot = GatewayRecoverySnapshot::new(
+            versioned.cluster.cluster_id.clone(),
+            gateway_generation,
+            versioned.state.gateway_routes.clone(),
+        );
         let (status_changes, _) = tokio::sync::watch::channel(versioned.generation);
 
         info!(%controller_id, "single controller started");
@@ -89,8 +101,9 @@ impl Controller {
                 cluster: versioned.cluster,
                 state: versioned.state,
                 live_nodes,
-                gateway_generation: versioned.generation,
+                gateway_generation,
                 gateway_config,
+                gateway_snapshot,
                 gateway_reports: HashMap::new(),
                 task_progress: HashMap::new(),
             }),
@@ -116,6 +129,7 @@ impl Controller {
         let now_unix_ms = unix_ms();
         let mut changed = scheduler::finish_drains(&mut inner.state, now_unix_ms);
         changed |= scheduler::reconcile(&mut inner.state, &live);
+        changed |= gateway::refresh_ready_stack_routes(&mut inner.state);
         changed |= self.refresh_stack_deployments_locked(&mut inner, now_unix_ms)?;
         if changed && let Err(error) = self.commit_locked(&mut inner).await {
             inner.state = previous;
@@ -148,7 +162,9 @@ impl Controller {
     }
 
     pub(super) async fn commit_locked(&self, inner: &mut Inner) -> Result<(), StorageError> {
-        let (gateway_generation, gateway_config) = self.next_gateway_snapshot(inner)?;
+        let (gateway_generation, gateway_config, gateway_snapshot) =
+            self.next_gateway_snapshot(inner)?;
+        inner.state.gateway_generation = gateway_generation;
         let generation = self
             .repository
             .replace(inner.generation, &inner.cluster, &inner.state)
@@ -156,6 +172,7 @@ impl Controller {
         inner.generation = generation;
         inner.gateway_generation = gateway_generation;
         inner.gateway_config = gateway_config;
+        inner.gateway_snapshot = gateway_snapshot;
         self.notify_status_locked(inner);
         Ok(())
     }

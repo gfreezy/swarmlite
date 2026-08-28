@@ -824,6 +824,7 @@ mod tests {
                     ..Default::default()
                 },
                 deployment: None,
+                deployment_history: BTreeMap::new(),
             },
         );
     }

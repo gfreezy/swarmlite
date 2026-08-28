@@ -37,8 +37,12 @@ impl Controller {
         };
         node.gateway_enabled = gateway_enabled;
         node.labels.clone_from(&desired_labels);
+        let gateway_report_changed =
+            gateway_enabled && inner.gateway_reports.get(node_id) != Some(&gateway_report);
+        let gateway_report_applied = gateway_report.error.is_none()
+            && gateway_report.applied_generation == Some(inner.gateway_generation);
         if gateway_enabled {
-            soft_changed |= inner.gateway_reports.get(node_id) != Some(&gateway_report);
+            soft_changed |= gateway_report_changed;
             inner
                 .gateway_reports
                 .insert(node_id.to_owned(), gateway_report);
@@ -47,6 +51,18 @@ impl Controller {
         }
         inner.live_nodes.insert(node_id.to_owned(), Instant::now());
         inner.state.nodes.insert(node_id.to_owned(), node);
+        if gateway_report_changed && gateway_report_applied {
+            let now = unix_ms();
+            for stack in inner.state.stacks.values_mut() {
+                if let Some(deployment) = stack
+                    .deployment
+                    .as_mut()
+                    .filter(|deployment| deployment.wait_for_gateway)
+                {
+                    changed |= mark_deployment_progress_record(deployment, now);
+                }
+            }
+        }
 
         let reports: HashMap<_, _> = tasks
             .into_iter()
@@ -157,28 +173,51 @@ impl Controller {
             } else {
                 report.phase
             };
-            soft_changed |= apply_task_progress(
+            let (progress_changed, deployment_progressed) = apply_task_progress(
                 &mut inner,
                 node_id,
                 &TaskReconcileProgress {
                     task_id: report.task_id.clone(),
                     desired_generation: report.desired_generation,
                     phase,
+                    attempt: 0,
+                    current_bytes: None,
+                    total_bytes: None,
+                    updated_at_unix_ms: unix_ms(),
                 },
             );
+            soft_changed |= progress_changed;
+            changed |= deployment_progressed;
             let (task_changed, deployment_changed) =
                 apply_task_result(&mut inner.state, node_id, report);
             soft_changed |= task_changed;
             changed |= deployment_changed;
         }
         for progress in &image_progress {
-            changed |= apply_image_progress(&mut inner.state, node_id, progress);
+            let progress_changed = apply_image_progress(&mut inner.state, node_id, progress);
+            changed |= progress_changed;
+            changed |= mark_progress_for_generation(
+                &mut inner.state,
+                progress.deployment_generation,
+                progress.updated_at_unix_ms,
+            );
         }
         for report in &image_results {
-            changed |= apply_image_resolution_report(&mut inner.state, node_id, report);
+            let report_changed = apply_image_resolution_report(&mut inner.state, node_id, report);
+            changed |= report_changed;
+            if report_changed {
+                changed |= mark_progress_for_generation(
+                    &mut inner.state,
+                    report.deployment_generation,
+                    unix_ms(),
+                );
+            }
         }
         for progress in &task_progress {
-            soft_changed |= apply_task_progress(&mut inner, node_id, progress);
+            let (progress_changed, deployment_progressed) =
+                apply_task_progress(&mut inner, node_id, progress);
+            soft_changed |= progress_changed;
+            changed |= deployment_progressed;
         }
         let reported_failures = task_results
             .iter()
@@ -213,6 +252,7 @@ impl Controller {
 
         let live = current_live_nodes(&inner, self.config.node_timeout_seconds);
         changed |= scheduler::reconcile(&mut inner.state, &live);
+        changed |= gateway::refresh_ready_stack_routes(&mut inner.state);
         changed |= self.refresh_stack_deployments_locked(&mut inner, unix_ms())?;
         if changed && let Err(error) = self.commit_locked(&mut inner).await {
             inner.state = previous;
@@ -246,6 +286,12 @@ impl Controller {
                     .get(&service.stack)
                     .and_then(|stack| stack.deployment.as_ref())
                     .map_or(0, |deployment| deployment.generation);
+                let deployment_retry_revision = inner
+                    .state
+                    .stacks
+                    .get(&service.stack)
+                    .and_then(|stack| stack.deployment.as_ref())
+                    .map_or(0, |deployment| deployment.retry_revision);
                 Some(TaskAssignment {
                     id: task.id.clone(),
                     cluster_id: self.config.cluster.cluster_id.clone(),
@@ -259,6 +305,7 @@ impl Controller {
                     ports: task.ports.clone(),
                     generation,
                     deployment_generation,
+                    deployment_retry_revision,
                     spec_hash: service_spec_hash(&service.spec),
                     image_resolved: image_was_resolved_on_node(&inner.state, service, task),
                 })
@@ -356,7 +403,7 @@ fn image_assignments_for_node(
         .stacks
         .values()
         .filter_map(|stack| stack.deployment.as_ref())
-        .filter(|deployment| deployment.status == StackDeploymentStatus::Deploying)
+        .filter(|deployment| deployment.status.is_active())
     {
         for resolution in deployment
             .image_resolutions
@@ -414,27 +461,82 @@ fn image_was_resolved_on_node(
         })
 }
 
-fn apply_task_progress(inner: &mut Inner, node_id: &str, progress: &TaskReconcileProgress) -> bool {
+fn apply_task_progress(
+    inner: &mut Inner,
+    node_id: &str,
+    progress: &TaskReconcileProgress,
+) -> (bool, bool) {
     let Some(task) = inner
         .state
         .tasks
         .get(&progress.task_id)
         .filter(|task| task.node_id == node_id)
     else {
-        return false;
+        return (false, false);
     };
     let task_id = task.id.clone();
+    let stack_name = inner
+        .state
+        .services
+        .get(&task.service_id)
+        .map(|service| service.stack.clone());
     let Some(deployment_generation) = task_deployment_generation(&inner.state, &task_id) else {
-        return false;
+        return (false, false);
     };
     if progress.desired_generation != deployment_generation {
-        return false;
+        return (false, false);
     }
     let key = (task_id, progress.phase);
     if inner.task_progress.get(&key) == Some(progress) {
-        return false;
+        return (false, false);
     }
     inner.task_progress.insert(key, progress.clone());
+    let deployment_changed = stack_name.is_some_and(|stack_name| {
+        mark_deployment_progress(
+            &mut inner.state,
+            &stack_name,
+            deployment_generation,
+            progress.updated_at_unix_ms,
+        )
+    });
+    (true, deployment_changed)
+}
+
+fn mark_progress_for_generation(
+    state: &mut ClusterState,
+    generation: u64,
+    progress_at_unix_ms: i64,
+) -> bool {
+    let stack_name = state.stacks.iter().find_map(|(stack_name, stack)| {
+        stack
+            .deployment
+            .as_ref()
+            .filter(|deployment| deployment.generation == generation)
+            .map(|_| stack_name.clone())
+    });
+    stack_name.is_some_and(|stack_name| {
+        mark_deployment_progress(state, &stack_name, generation, progress_at_unix_ms)
+    })
+}
+
+fn mark_deployment_progress_record(
+    deployment: &mut StackDeploymentRecord,
+    progress_at_unix_ms: i64,
+) -> bool {
+    if !deployment.status.is_active() || progress_at_unix_ms <= deployment.last_progress_at_unix_ms
+    {
+        return false;
+    }
+    deployment.last_progress_at_unix_ms = progress_at_unix_ms;
+    if deployment.status == StackDeploymentStatus::Stalled {
+        deployment.status = StackDeploymentStatus::Reconciling;
+        for condition in deployment.conditions.iter_mut().filter(|condition| {
+            condition.kind == StackDeploymentConditionKind::ProgressDeadlineExceeded
+                && condition.resolved_at_unix_ms.is_none()
+        }) {
+            condition.resolved_at_unix_ms = Some(progress_at_unix_ms);
+        }
+    }
     true
 }
 

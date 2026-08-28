@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
+    io::{Cursor, Read},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -9,18 +10,20 @@ use anyhow::{Context, Result, bail};
 use bollard::{
     API_DEFAULT_VERSION, Docker,
     container::LogOutput,
+    exec::{CreateExecOptions, StartExecResults},
     models::{
         ContainerCreateBody, ContainerSummaryStateEnum, HealthConfig, HealthStatusEnum, HostConfig,
         PortBinding as DockerPortBinding, RestartPolicy, RestartPolicyNameEnum,
     },
     query_parameters::{
-        CreateContainerOptionsBuilder, CreateImageOptionsBuilder, ListContainersOptionsBuilder,
-        LogsOptionsBuilder, RemoveContainerOptionsBuilder, RemoveVolumeOptionsBuilder,
-        StopContainerOptionsBuilder,
+        CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
+        DownloadFromContainerOptionsBuilder, ListContainersOptionsBuilder, LogsOptionsBuilder,
+        RemoveContainerOptionsBuilder, RemoveVolumeOptionsBuilder, StopContainerOptionsBuilder,
+        UploadToContainerOptionsBuilder,
     },
 };
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -31,8 +34,9 @@ use crate::{
     data_plane::MAX_DATA_PAYLOAD_BYTES,
     gateway,
     model::{
-        ClusterState, GatewayAssignment, ImageResolutionStatus, ObservedTaskState, PortBinding,
-        PullPolicy, TaskAssignment, TaskReconcilePhase,
+        ClusterState, DeploymentPolicy, GatewayAssignment, GatewayRecoverySnapshot,
+        ImageResolutionStatus, ObservedTaskState, PortBinding, PullPolicy, TaskAssignment,
+        TaskReconcilePhase,
     },
     registry::RegistryCredentialStore,
 };
@@ -50,9 +54,12 @@ const GATEWAY_SCHEMA_LABEL: &str = "io.swarmlite.gateway_schema";
 const GATEWAY_IMAGE_LABEL: &str = "io.swarmlite.gateway_image";
 const GATEWAY_LISTEN_LABEL: &str = "io.swarmlite.gateway_listen";
 const GATEWAY_TOKEN_HASH_LABEL: &str = "io.swarmlite.gateway_token_sha256";
-const GATEWAY_SCHEMA: &str = "5";
+const GATEWAY_SCHEMA: &str = "6";
 const GATEWAY_CONTAINER_NAME: &str = "swarmlite-gateway";
 const GATEWAY_ADMIN_URL: &str = "http://127.0.0.1:2019";
+const GATEWAY_RECOVERY_PATH: &str = "/config/swarmlite-recovery.json";
+const GATEWAY_RECOVERY_TEMP_NAME: &str = ".swarmlite-recovery.json.tmp";
+const MAX_GATEWAY_RECOVERY_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 const TASK_LABEL: &str = "io.swarmlite.task_id";
 const SERVICE_LABEL: &str = "io.swarmlite.service_id";
 const STACK_LABEL: &str = "io.swarmlite.stack";
@@ -136,18 +143,40 @@ struct ExistingGatewayContainer {
 
 #[derive(Clone)]
 pub struct RuntimeTaskProgress {
-    callback: Arc<dyn Fn(TaskReconcilePhase) + Send + Sync>,
+    callback: Arc<dyn Fn(RuntimeTaskProgressUpdate) + Send + Sync>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeTaskProgressUpdate {
+    pub phase: TaskReconcilePhase,
+    pub attempt: u32,
+    pub current_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
 }
 
 impl RuntimeTaskProgress {
-    pub fn new(callback: impl Fn(TaskReconcilePhase) + Send + Sync + 'static) -> Self {
+    pub fn new(callback: impl Fn(RuntimeTaskProgressUpdate) + Send + Sync + 'static) -> Self {
         Self {
             callback: Arc::new(callback),
         }
     }
 
     pub fn report(&self, phase: TaskReconcilePhase) {
-        (self.callback)(phase);
+        (self.callback)(RuntimeTaskProgressUpdate {
+            phase,
+            attempt: 0,
+            current_bytes: None,
+            total_bytes: None,
+        });
+    }
+
+    pub fn report_pull(&self, attempt: u32, current_bytes: Option<u64>, total_bytes: Option<u64>) {
+        (self.callback)(RuntimeTaskProgressUpdate {
+            phase: TaskReconcilePhase::Pull,
+            attempt,
+            current_bytes,
+            total_bytes,
+        });
     }
 }
 
@@ -159,18 +188,40 @@ impl Default for RuntimeTaskProgress {
 
 #[derive(Clone)]
 pub struct RuntimeImageProgress {
-    callback: Arc<dyn Fn(ImageResolutionStatus) + Send + Sync>,
+    callback: Arc<dyn Fn(RuntimeImageProgressUpdate) + Send + Sync>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeImageProgressUpdate {
+    pub status: ImageResolutionStatus,
+    pub attempt: u32,
+    pub current_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
 }
 
 impl RuntimeImageProgress {
-    pub fn new(callback: impl Fn(ImageResolutionStatus) + Send + Sync + 'static) -> Self {
+    pub fn new(callback: impl Fn(RuntimeImageProgressUpdate) + Send + Sync + 'static) -> Self {
         Self {
             callback: Arc::new(callback),
         }
     }
 
     pub fn report(&self, status: ImageResolutionStatus) {
-        (self.callback)(status);
+        (self.callback)(RuntimeImageProgressUpdate {
+            status,
+            attempt: 0,
+            current_bytes: None,
+            total_bytes: None,
+        });
+    }
+
+    pub fn report_pull(&self, attempt: u32, current_bytes: Option<u64>, total_bytes: Option<u64>) {
+        (self.callback)(RuntimeImageProgressUpdate {
+            status: ImageResolutionStatus::Pulling,
+            attempt,
+            current_bytes,
+            total_bytes,
+        });
     }
 }
 
@@ -184,6 +235,8 @@ pub trait ContainerRuntime: Send + Sync + 'static {
     fn kind(&self) -> RuntimeKind;
 
     fn socket(&self) -> &str;
+
+    fn update_deployment_policy(&self, _policy: DeploymentPolicy) {}
 
     fn ping(&self) -> impl Future<Output = Result<()>> + Send;
 
@@ -234,25 +287,33 @@ pub struct DockerCompatibleRuntime {
     socket: String,
     registry_credentials: Option<RegistryCredentialStore>,
     config_root: Option<PathBuf>,
+    deployment_policy: Arc<std::sync::RwLock<DeploymentPolicy>>,
 }
 
 impl DockerCompatibleRuntime {
     pub fn connect(config: &ResolvedRuntimeConfig) -> Result<Self> {
-        Self::connect_inner(config, None, None)
+        Self::connect_inner(config, None, None, DeploymentPolicy::default())
     }
 
     pub(crate) fn connect_with_registry_credentials(
         config: &ResolvedRuntimeConfig,
         registry_credentials: RegistryCredentialStore,
         config_root: PathBuf,
+        deployment_policy: DeploymentPolicy,
     ) -> Result<Self> {
-        Self::connect_inner(config, Some(registry_credentials), Some(config_root))
+        Self::connect_inner(
+            config,
+            Some(registry_credentials),
+            Some(config_root),
+            deployment_policy,
+        )
     }
 
     fn connect_inner(
         config: &ResolvedRuntimeConfig,
         registry_credentials: Option<RegistryCredentialStore>,
         config_root: Option<PathBuf>,
+        deployment_policy: DeploymentPolicy,
     ) -> Result<Self> {
         let client = Docker::connect_with_socket(&config.socket, 120, API_DEFAULT_VERSION)
             .with_context(|| {
@@ -267,6 +328,7 @@ impl DockerCompatibleRuntime {
             socket: config.socket.clone(),
             registry_credentials,
             config_root,
+            deployment_policy: Arc::new(std::sync::RwLock::new(deployment_policy)),
         })
     }
 
@@ -394,14 +456,161 @@ impl DockerCompatibleRuntime {
     }
 
     pub(crate) async fn apply_gateway_config(&self, assignment: &GatewayAssignment) -> Result<()> {
+        if assignment.recovery_snapshot.generation != assignment.generation {
+            bail!(
+                "Gateway assignment generation {} does not match recovery snapshot generation {}",
+                assignment.generation,
+                assignment.recovery_snapshot.generation
+            );
+        }
+        let gateways = self.gateway_containers().await?;
+        let gateway = match gateways.as_slice() {
+            [gateway] => gateway,
+            [] => bail!("managed Gateway container is missing"),
+            _ => bail!("found multiple managed Gateway containers on this node"),
+        };
+        let cluster_id = gateway
+            .cluster_id
+            .as_deref()
+            .context("managed Gateway container has no cluster identity")?;
+        assignment
+            .recovery_snapshot
+            .validate_for_cluster(cluster_id)
+            .map_err(anyhow::Error::msg)?;
         let client = reqwest::Client::new();
         self.post_gateway_config(&client, "/load", &assignment.config)
+            .await?;
+        self.persist_gateway_recovery_snapshot(&assignment.recovery_snapshot)
             .await?;
         info!(
             generation = assignment.generation,
             runtime = %self.kind,
             "applied local gateway configuration"
         );
+        Ok(())
+    }
+
+    pub(crate) async fn gateway_recovery_snapshots(
+        &self,
+        cluster_id: &str,
+    ) -> Result<Vec<GatewayRecoverySnapshot>> {
+        let gateways = self.gateway_containers().await?;
+        let mut snapshots = Vec::new();
+        for gateway in gateways
+            .iter()
+            .filter(|gateway| gateway.cluster_id.as_deref() == Some(cluster_id))
+        {
+            match self.read_gateway_recovery_snapshot(&gateway.id).await {
+                Ok(snapshot) => snapshots.push(snapshot),
+                Err(error) => warn!(
+                    container = %gateway.id,
+                    %error,
+                    "ignoring invalid or missing Gateway recovery snapshot"
+                ),
+            }
+        }
+        Ok(snapshots)
+    }
+
+    async fn read_gateway_recovery_snapshot(
+        &self,
+        container_id: &str,
+    ) -> Result<GatewayRecoverySnapshot> {
+        let options = DownloadFromContainerOptionsBuilder::default()
+            .path(GATEWAY_RECOVERY_PATH)
+            .build();
+        let chunks = self
+            .client
+            .download_from_container(container_id, Some(options))
+            .try_collect::<Vec<_>>()
+            .await
+            .context("failed to download the Gateway recovery snapshot")?;
+        let archive_size = chunks.iter().map(Bytes::len).sum::<usize>();
+        if archive_size > MAX_GATEWAY_RECOVERY_SNAPSHOT_BYTES + 1024 * 1024 {
+            bail!("Gateway recovery snapshot archive is too large");
+        }
+        let mut archive_bytes = Vec::with_capacity(archive_size);
+        for chunk in chunks {
+            archive_bytes.extend_from_slice(&chunk);
+        }
+        let mut archive = tar::Archive::new(Cursor::new(archive_bytes));
+        let mut entries = archive
+            .entries()
+            .context("invalid Gateway recovery snapshot archive")?;
+        let mut entry = entries
+            .next()
+            .transpose()
+            .context("invalid Gateway recovery snapshot entry")?
+            .context("Gateway recovery snapshot archive is empty")?;
+        if entry.size() > MAX_GATEWAY_RECOVERY_SNAPSHOT_BYTES as u64 {
+            bail!("Gateway recovery snapshot is too large");
+        }
+        let mut payload = Vec::with_capacity(entry.size() as usize);
+        entry
+            .read_to_end(&mut payload)
+            .context("failed to read Gateway recovery snapshot")?;
+        serde_json::from_slice(&payload).context("invalid Gateway recovery snapshot JSON")
+    }
+
+    async fn persist_gateway_recovery_snapshot(
+        &self,
+        snapshot: &GatewayRecoverySnapshot,
+    ) -> Result<()> {
+        let payload = serde_json::to_vec(snapshot)?;
+        if payload.len() > MAX_GATEWAY_RECOVERY_SNAPSHOT_BYTES {
+            bail!("Gateway recovery snapshot is too large");
+        }
+        let archive = gateway_recovery_snapshot_archive(&payload)?;
+        let gateway = self
+            .gateway_containers()
+            .await?
+            .into_iter()
+            .find(|gateway| gateway.cluster_id.as_deref() == Some(&snapshot.cluster_id))
+            .context("managed Gateway container disappeared after Caddy accepted its config")?;
+        let options = UploadToContainerOptionsBuilder::default()
+            .path("/config")
+            .build();
+        self.client
+            .upload_to_container(
+                &gateway.id,
+                Some(options),
+                bollard::body_full(Bytes::from(archive)),
+            )
+            .await
+            .context("failed to upload temporary Gateway recovery snapshot")?;
+
+        let command = format!(
+            "sync; mv -f /config/{GATEWAY_RECOVERY_TEMP_NAME} {GATEWAY_RECOVERY_PATH}; sync"
+        );
+        let exec = self
+            .client
+            .create_exec(
+                &gateway.id,
+                CreateExecOptions {
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    cmd: Some(vec!["/bin/sh".to_owned(), "-ec".to_owned(), command]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .context("failed to prepare atomic Gateway recovery snapshot replacement")?;
+        let mut output_text = String::new();
+        if let StartExecResults::Attached { mut output, .. } =
+            self.client.start_exec(&exec.id, None).await?
+        {
+            while let Some(output) = output.next().await {
+                output_text.push_str(&output?.to_string());
+            }
+        }
+        let result = self.client.inspect_exec(&exec.id).await?;
+        if result.exit_code != Some(0) {
+            bail!(
+                "atomic Gateway recovery snapshot replacement failed with exit code {:?}: {}",
+                result.exit_code,
+                output_text.trim()
+            );
+        }
         Ok(())
     }
 
@@ -611,7 +820,12 @@ impl DockerCompatibleRuntime {
         Ok(())
     }
 
-    async fn ensure_image(&self, image: &str, pull_policy: PullPolicy) -> Result<()> {
+    async fn ensure_image(
+        &self,
+        image: &str,
+        pull_policy: PullPolicy,
+        progress: &RuntimeTaskProgress,
+    ) -> Result<()> {
         match pull_policy {
             PullPolicy::Never => {
                 return self
@@ -630,17 +844,74 @@ impl DockerCompatibleRuntime {
             }
             PullPolicy::Always | PullPolicy::Missing => {}
         }
-        self.pull_image(image).await
+        self.pull_image(image, |attempt, current, total| {
+            progress.report_pull(attempt, current, total);
+        })
+        .await
     }
 
     async fn ensure_image_if_missing(&self, image: &str) -> Result<()> {
         if self.client.inspect_image(image).await.is_ok() {
             return Ok(());
         }
-        self.pull_image(image).await
+        self.pull_image(image, |_, _, _| {}).await
     }
 
-    async fn pull_image(&self, image: &str) -> Result<()> {
+    async fn pull_image(
+        &self,
+        image: &str,
+        mut report: impl FnMut(u32, Option<u64>, Option<u64>),
+    ) -> Result<()> {
+        let policy = self
+            .deployment_policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let attempts = policy.image_pull_max_attempts.max(1);
+        let mut backoff_seconds = policy.image_pull_initial_backoff_seconds;
+        let maximum_backoff_seconds = policy.image_pull_max_backoff_seconds;
+        let idle_timeout =
+            std::time::Duration::from_secs(policy.image_pull_idle_timeout_seconds.max(1));
+        let mut last_error = None;
+        let mut attempted = 0;
+
+        for attempt in 1..=attempts {
+            attempted = attempt;
+            report(attempt, None, None);
+            match self
+                .pull_image_once(image, attempt, idle_timeout, &mut report)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    let retryable = image_pull_error_is_retryable(&error);
+                    last_error = Some(error);
+                    if attempt == attempts || !retryable {
+                        break;
+                    }
+                    warn!(
+                        image,
+                        attempt, attempts, backoff_seconds, "image pull attempt failed; retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff_seconds)).await;
+                    backoff_seconds = backoff_seconds
+                        .saturating_mul(2)
+                        .min(maximum_backoff_seconds);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("failed to pull {image}")))
+            .with_context(|| format!("failed to pull {image} after {attempted} attempt(s)"))
+    }
+
+    async fn pull_image_once(
+        &self,
+        image: &str,
+        attempt: u32,
+        idle_timeout: std::time::Duration,
+        report: &mut impl FnMut(u32, Option<u64>, Option<u64>),
+    ) -> Result<()> {
         let credentials = self
             .registry_credentials
             .as_ref()
@@ -651,8 +922,29 @@ impl DockerCompatibleRuntime {
             .from_image(image)
             .build();
         let mut pull = self.client.create_image(Some(options), None, credentials);
-        while let Some(item) = pull.next().await {
-            item.with_context(|| format!("failed to pull {image}"))?;
+        loop {
+            let item = tokio::time::timeout(idle_timeout, pull.next())
+                .await
+                .with_context(|| {
+                    format!(
+                        "image pull for {image} made no progress for {} seconds",
+                        idle_timeout.as_secs()
+                    )
+                })?;
+            let Some(item) = item else {
+                break;
+            };
+            let item = item.with_context(|| format!("failed to pull {image}"))?;
+            if let Some(message) = item.error_detail.and_then(|detail| detail.message) {
+                bail!("registry rejected image pull for {image}: {message}");
+            }
+            let (current, total) = item.progress_detail.map_or((None, None), |detail| {
+                (
+                    detail.current.and_then(|value| u64::try_from(value).ok()),
+                    detail.total.and_then(|value| u64::try_from(value).ok()),
+                )
+            });
+            report(attempt, current, total);
         }
         Ok(())
     }
@@ -666,6 +958,22 @@ impl DockerCompatibleRuntime {
             .filter(|id| !id.is_empty())
             .ok_or_else(|| anyhow::anyhow!("runtime did not report an image ID for {image}"))
     }
+}
+
+fn image_pull_error_is_retryable(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    ![
+        "unauthorized",
+        "authentication required",
+        "denied",
+        "forbidden",
+        "no basic auth credentials",
+        "manifest unknown",
+        "not found",
+        "invalid reference format",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 fn gateway_labels(spec: &GatewayContainerSpec) -> HashMap<String, String> {
@@ -699,6 +1007,19 @@ fn gateway_volume_names(cluster_id: &str) -> [String; 3] {
         format!("{prefix}-config"),
         format!("{prefix}-cache"),
     ]
+}
+
+fn gateway_recovery_snapshot_archive(payload: &[u8]) -> Result<Vec<u8>> {
+    let mut archive = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_path(GATEWAY_RECOVERY_TEMP_NAME)?;
+    header.set_size(payload.len() as u64);
+    header.set_mode(0o600);
+    header.set_mtime(0);
+    header.set_cksum();
+    archive.append(&header, payload)?;
+    archive.finish()?;
+    archive.into_inner().map_err(Into::into)
 }
 
 fn gateway_matches_spec(container: &ExistingGatewayContainer, spec: &GatewayContainerSpec) -> bool {
@@ -749,6 +1070,13 @@ impl ContainerRuntime for DockerCompatibleRuntime {
 
     fn socket(&self) -> &str {
         &self.socket
+    }
+
+    fn update_deployment_policy(&self, policy: DeploymentPolicy) {
+        *self
+            .deployment_policy
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = policy;
     }
 
     async fn ping(&self) -> Result<()> {
@@ -864,7 +1192,10 @@ impl ContainerRuntime for DockerCompatibleRuntime {
     async fn resolve_image(&self, image: &str, progress: &RuntimeImageProgress) -> Result<String> {
         progress.report(ImageResolutionStatus::Checking);
         progress.report(ImageResolutionStatus::Pulling);
-        self.pull_image(image).await?;
+        self.pull_image(image, |attempt, current, total| {
+            progress.report_pull(attempt, current, total);
+        })
+        .await?;
         progress.report(ImageResolutionStatus::Comparing);
         self.inspect_image_id(image).await
     }
@@ -885,8 +1216,12 @@ impl ContainerRuntime for DockerCompatibleRuntime {
             self.inspect_image_id(&assignment.spec.image).await?;
         } else {
             progress.report(TaskReconcilePhase::Pull);
-            self.ensure_image(&assignment.spec.image, assignment.spec.pull_policy)
-                .await?;
+            self.ensure_image(
+                &assignment.spec.image,
+                assignment.spec.pull_policy,
+                progress,
+            )
+            .await?;
         }
 
         let port_bindings = task_port_bindings(assignment);
@@ -1249,7 +1584,11 @@ fn sanitize_name(value: &str) -> String {
 mod tests {
     use std::{
         collections::BTreeMap,
-        sync::{Arc, Mutex},
+        convert::Infallible,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use axum::{
@@ -1298,6 +1637,87 @@ mod tests {
             .unwrap()
     }
 
+    async fn retrying_pull_docker_api(
+        State(calls): State<Arc<AtomicUsize>>,
+        method: Method,
+        uri: Uri,
+    ) -> axum::response::Response {
+        if method != Method::POST || !uri.path().ends_with("/images/create") {
+            return axum::response::Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::from(r#"{"message":"unexpected request"}"#))
+                .unwrap();
+        }
+        let attempt = calls.fetch_add(1, Ordering::Relaxed);
+        let body = if attempt == 0 {
+            r#"{"errorDetail":{"message":"temporary registry failure"}}
+"#
+        } else {
+            r#"{"status":"downloaded","progressDetail":{"current":64,"total":64}}
+"#
+        };
+        axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn denied_pull_docker_api(
+        State(calls): State<Arc<AtomicUsize>>,
+        method: Method,
+        uri: Uri,
+    ) -> axum::response::Response {
+        assert_eq!(method, Method::POST);
+        assert!(uri.path().ends_with("/images/create"));
+        calls.fetch_add(1, Ordering::Relaxed);
+        axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"errorDetail":{"message":"pull access denied"}}
+"#,
+            ))
+            .unwrap()
+    }
+
+    async fn stalled_pull_docker_api(method: Method, uri: Uri) -> axum::response::Response {
+        if method != Method::POST || !uri.path().ends_with("/images/create") {
+            return axum::response::Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::empty())
+                .unwrap();
+        }
+        let pending = futures_util::stream::pending::<Result<Bytes, Infallible>>();
+        axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from_stream(pending))
+            .unwrap()
+    }
+
+    async fn runtime_for_pull_api(
+        app: Router,
+        policy: DeploymentPolicy,
+    ) -> (DockerCompatibleRuntime, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let endpoint = format!("http://{address}");
+        let client = Docker::connect_with_http(&endpoint, 5, API_DEFAULT_VERSION).unwrap();
+        (
+            DockerCompatibleRuntime {
+                client,
+                kind: RuntimeKind::Docker,
+                socket: endpoint,
+                registry_credentials: None,
+                config_root: None,
+                deployment_policy: Arc::new(std::sync::RwLock::new(policy)),
+            },
+            server,
+        )
+    }
+
     async fn runtime_with_start_failure_api() -> (
         DockerCompatibleRuntime,
         Arc<Mutex<Vec<String>>>,
@@ -1319,6 +1739,7 @@ mod tests {
                 socket: endpoint,
                 registry_credentials: None,
                 config_root: None,
+                deployment_policy: Arc::new(std::sync::RwLock::new(DeploymentPolicy::default())),
             },
             calls,
             server,
@@ -1356,6 +1777,7 @@ mod tests {
             ports: Vec::new(),
             generation: 1,
             deployment_generation: 1,
+            deployment_retry_revision: 0,
             spec_hash: "hash".into(),
             image_resolved: true,
         }
@@ -1364,6 +1786,83 @@ mod tests {
     #[test]
     fn sanitizes_runtime_container_names() {
         assert_eq!(sanitize_name("demo/web:v1"), "demo-web-v1");
+    }
+
+    #[tokio::test]
+    async fn image_pull_retries_registry_stream_errors_and_reports_attempts() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .fallback(any(retrying_pull_docker_api))
+            .with_state(Arc::clone(&calls));
+        let policy = DeploymentPolicy {
+            image_pull_max_attempts: 2,
+            image_pull_initial_backoff_seconds: 0,
+            image_pull_max_backoff_seconds: 0,
+            ..DeploymentPolicy::default()
+        };
+        let (runtime, server) = runtime_for_pull_api(app, policy).await;
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&reports);
+        runtime
+            .pull_image(
+                "example.invalid/demo:latest",
+                move |attempt, current, total| {
+                    captured.lock().unwrap().push((attempt, current, total));
+                },
+            )
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let reports = reports.lock().unwrap();
+        assert!(reports.iter().any(|report| report.0 == 1));
+        assert!(
+            reports
+                .iter()
+                .any(|report| report == &(2, Some(64), Some(64)))
+        );
+    }
+
+    #[tokio::test]
+    async fn image_pull_fails_when_the_stream_exceeds_its_idle_deadline() {
+        let app = Router::new().fallback(any(stalled_pull_docker_api));
+        let policy = DeploymentPolicy {
+            image_pull_idle_timeout_seconds: 1,
+            image_pull_max_attempts: 1,
+            ..DeploymentPolicy::default()
+        };
+        let (runtime, server) = runtime_for_pull_api(app, policy).await;
+        let error = runtime
+            .pull_image("example.invalid/demo:latest", |_, _, _| {})
+            .await
+            .unwrap_err();
+        server.abort();
+
+        assert!(format!("{error:#}").contains("made no progress for 1 seconds"));
+    }
+
+    #[tokio::test]
+    async fn image_pull_does_not_retry_permanent_registry_rejections() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .fallback(any(denied_pull_docker_api))
+            .with_state(Arc::clone(&calls));
+        let policy = DeploymentPolicy {
+            image_pull_max_attempts: 5,
+            image_pull_initial_backoff_seconds: 0,
+            image_pull_max_backoff_seconds: 0,
+            ..DeploymentPolicy::default()
+        };
+        let (runtime, server) = runtime_for_pull_api(app, policy).await;
+        let error = runtime
+            .pull_image("example.invalid/private:latest", |_, _, _| {})
+            .await
+            .unwrap_err();
+        server.abort();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(format!("{error:#}").contains("after 1 attempt"));
     }
 
     #[tokio::test]
@@ -1545,6 +2044,25 @@ mod tests {
     }
 
     #[test]
+    fn gateway_recovery_archive_contains_only_the_atomic_temporary_file() {
+        let payload =
+            br#"{"format_version":1,"cluster_id":"cluster-a","generation":9,"stacks":{}}"#;
+        let encoded = gateway_recovery_snapshot_archive(payload).unwrap();
+        let mut archive = tar::Archive::new(std::io::Cursor::new(encoded));
+        let mut entries = archive.entries().unwrap();
+        let mut entry = entries.next().unwrap().unwrap();
+        assert_eq!(
+            entry.path().unwrap().as_ref(),
+            std::path::Path::new(GATEWAY_RECOVERY_TEMP_NAME)
+        );
+        let mut restored = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut restored).unwrap();
+        assert_eq!(restored, payload);
+        drop(entry);
+        assert!(entries.next().is_none());
+    }
+
+    #[test]
     fn gateway_bootstrap_persists_admin_updates() {
         let spec = GatewayContainerSpec {
             cluster_id: "cluster-old".into(),
@@ -1602,6 +2120,7 @@ mod tests {
             ports: Vec::new(),
             generation: 4,
             deployment_generation: 4,
+            deployment_retry_revision: 0,
             spec_hash: "abc123".into(),
             image_resolved: false,
         };
@@ -1665,6 +2184,7 @@ mod tests {
             ports: Vec::new(),
             generation: 1,
             deployment_generation: 1,
+            deployment_retry_revision: 0,
             spec_hash: "hash".into(),
             image_resolved: false,
         };
@@ -1739,6 +2259,7 @@ mod tests {
             }],
             generation: 1,
             deployment_generation: 1,
+            deployment_retry_revision: 0,
             spec_hash: "hash".into(),
             image_resolved: false,
         };

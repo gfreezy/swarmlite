@@ -25,18 +25,20 @@ use crate::{
         BootstrapResponse, CONFIG_GC_GRACE_PERIOD_SECONDS, ClusterConfigResponse,
         ClusterConfigUpdate, ClusterSettings, ClusterState, DataSessionCreateResponse,
         DataSessionOperation, DataSessionStream, DeploymentImageResolutionNodeRecord,
-        DeploymentImageResolutionRecord, DesiredTaskState, GatewayAssignment, GatewayReport,
-        GatewayStatus, HeartbeatResponse, ImageResolutionAssignment, ImageResolutionProgress,
-        ImageResolutionReport, ImageResolutionServiceAssignment, ImageResolutionStatus,
-        JoinRequest, JoinResponse, KvDeleteRequest, KvListResponse, KvLockAcquireRequest,
-        KvLockAcquireResponse, KvLockMutationRequest, KvObjectResponse, KvPutRequest,
-        KvStatResponse, NodeGatewayResponse, NodeGatewayUpdate, NodeHeartbeat,
-        NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, NodeMember,
-        ObservedTaskState, RegistryCredential, RegistryLoginRequest, RegistryLoginResponse,
-        ServiceInspectResponse, ServiceListResponse, ServiceRecord, ServiceSummary,
+        DeploymentImageResolutionRecord, DesiredTaskState, GatewayAssignment,
+        GatewayRecoverySnapshot, GatewayReport, GatewayStatus, HeartbeatResponse,
+        ImageResolutionAssignment, ImageResolutionProgress, ImageResolutionReport,
+        ImageResolutionServiceAssignment, ImageResolutionStatus, JoinRequest, JoinResponse,
+        KvDeleteRequest, KvListResponse, KvLockAcquireRequest, KvLockAcquireResponse,
+        KvLockMutationRequest, KvObjectResponse, KvPutRequest, KvStatResponse, NodeGatewayResponse,
+        NodeGatewayUpdate, NodeHeartbeat, NodeLabelRemoveRequest, NodeLabelSetRequest,
+        NodeLabelsResponse, NodeMember, ObservedTaskState, RegistryCredential,
+        RegistryLoginRequest, RegistryLoginResponse, ServiceInspectResponse, ServiceListResponse,
+        ServiceRecord, ServiceSummary, StackDeploymentCondition, StackDeploymentConditionKind,
         StackDeploymentError, StackDeploymentGatewayProgress, StackDeploymentImageProgress,
-        StackDeploymentRecord, StackDeploymentResponse, StackDeploymentServiceProgress,
-        StackDeploymentStatus, StackDeploymentTaskPhaseProgress, StackListResponse, StackRecord,
+        StackDeploymentListResponse, StackDeploymentRecord, StackDeploymentResponse,
+        StackDeploymentServiceProgress, StackDeploymentSnapshot, StackDeploymentStatus,
+        StackDeploymentSummary, StackDeploymentTaskPhaseProgress, StackListResponse, StackRecord,
         StackSummary, StatusResponse, TaskAssignment, TaskListResponse, TaskReconcileError,
         TaskReconcileProgress, TaskReconcileReport, TaskRecord, TaskRemovalAssignment, TaskSummary,
         UnclaimedTask, service_spec_hash, valid_gateway_image,
@@ -62,7 +64,10 @@ mod resources;
 mod sessions;
 mod stacks;
 
-use deployment::{apply_image_progress, apply_image_resolution_report, apply_task_result};
+use deployment::{
+    apply_image_progress, apply_image_resolution_report, apply_task_result,
+    mark_deployment_progress,
+};
 use membership::*;
 use recovery::*;
 use stacks::*;
@@ -106,6 +111,7 @@ struct Inner {
     live_nodes: HashMap<String, Instant>,
     gateway_generation: u64,
     gateway_config: serde_json::Value,
+    gateway_snapshot: GatewayRecoverySnapshot,
     gateway_reports: HashMap<String, GatewayReport>,
     task_progress: HashMap<(String, crate::model::TaskReconcilePhase), TaskReconcileProgress>,
 }

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::model::{ClusterState, ServiceRecord, StackGatewaySpec};
 use swarmlite_stack::ParsedStack;
@@ -98,6 +98,7 @@ pub(super) fn stack_is_active(state: &ClusterState, stack_name: &str) -> bool {
             .stacks
             .get(stack_name)
             .is_some_and(|stack| !stack.gateway.http_routes.is_empty())
+        || state.gateway_routes.contains_key(stack_name)
 }
 
 pub(super) fn target_matches_task(state: &ClusterState, target: &str) -> bool {
@@ -142,13 +143,16 @@ pub(super) fn validate_gateway_hostname_ownership(
         .iter()
         .flat_map(|route| route.hostnames.iter())
         .collect::<BTreeSet<_>>();
-    for stack in state
-        .stacks
-        .values()
-        .filter(|stack| stack.name != stack_name)
-    {
-        if let Some(hostname) = stack
-            .gateway
+    let mut owners = state
+        .gateway_routes
+        .iter()
+        .map(|(owner, stack)| (owner.as_str(), &stack.gateway))
+        .collect::<BTreeMap<_, _>>();
+    for (owner, stack) in &state.stacks {
+        owners.entry(owner).or_insert(&stack.gateway);
+    }
+    for (owner, gateway) in owners.into_iter().filter(|(owner, _)| *owner != stack_name) {
+        if let Some(hostname) = gateway
             .http_routes
             .iter()
             .flat_map(|route| route.hostnames.iter())
@@ -156,7 +160,7 @@ pub(super) fn validate_gateway_hostname_ownership(
         {
             return Err(ControllerError::Conflict(format!(
                 "gateway hostname {hostname:?} is already owned by stack {:?}",
-                stack.name
+                owner
             )));
         }
     }

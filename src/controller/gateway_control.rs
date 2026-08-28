@@ -9,6 +9,7 @@ impl Controller {
         enabled.then(|| GatewayAssignment {
             generation: inner.gateway_generation,
             config: inner.gateway_config.clone(),
+            recovery_snapshot: inner.gateway_snapshot.clone(),
         })
     }
 
@@ -23,9 +24,10 @@ impl Controller {
     pub(super) fn next_gateway_snapshot(
         &self,
         inner: &Inner,
-    ) -> Result<(u64, serde_json::Value), StorageError> {
+    ) -> Result<(u64, serde_json::Value, GatewayRecoverySnapshot), StorageError> {
         let config = self.rendered_gateway_config(inner);
-        let generation = if config == inner.gateway_config {
+        let snapshot_changed = inner.gateway_snapshot.stacks != inner.state.gateway_routes;
+        let generation = if config == inner.gateway_config && !snapshot_changed {
             inner.gateway_generation
         } else {
             inner
@@ -33,13 +35,19 @@ impl Controller {
                 .checked_add(1)
                 .ok_or_else(|| StorageError::Backend("gateway generation overflow".to_owned()))?
         };
-        Ok((generation, config))
+        let snapshot = GatewayRecoverySnapshot::new(
+            inner.cluster.cluster_id.clone(),
+            generation,
+            inner.state.gateway_routes.clone(),
+        );
+        Ok((generation, config, snapshot))
     }
 
     pub(super) fn refresh_gateway_snapshot(&self, inner: &mut Inner) -> Result<(), StorageError> {
-        let (generation, config) = self.next_gateway_snapshot(inner)?;
+        let (generation, config, snapshot) = self.next_gateway_snapshot(inner)?;
         inner.gateway_generation = generation;
         inner.gateway_config = config;
+        inner.gateway_snapshot = snapshot;
         Ok(())
     }
 

@@ -75,7 +75,7 @@ impl Controller {
         validate_stack_name(stack_name)?;
         let _deployment = self.begin_stack_deployment(stack_name)?;
         let inner = self.inner.lock().await;
-        validate_apply_locked(&inner, stack_name, &parsed.gateway)
+        validate_apply_locked(&inner, stack_name, &parsed.gateway, false)
     }
 
     #[cfg(test)]
@@ -88,11 +88,23 @@ impl Controller {
             .await
     }
 
+    #[cfg(test)]
     pub(super) async fn apply_with_registry_credentials(
         &self,
         stack_name: &str,
         parsed: ParsedStack,
         registry_credentials: BTreeMap<String, RegistryCredential>,
+    ) -> Result<StackDeploymentResponse, ControllerError> {
+        self.apply_with_registry_credentials_mode(stack_name, parsed, registry_credentials, false)
+            .await
+    }
+
+    pub(super) async fn apply_with_registry_credentials_mode(
+        &self,
+        stack_name: &str,
+        parsed: ParsedStack,
+        registry_credentials: BTreeMap<String, RegistryCredential>,
+        replace: bool,
     ) -> Result<StackDeploymentResponse, ControllerError> {
         validate_stack_name(stack_name)?;
         let _deployment = self.begin_stack_deployment(stack_name)?;
@@ -101,6 +113,7 @@ impl Controller {
             parsed,
             RevisionPolicy::DetectChanges,
             registry_credentials,
+            replace,
         )
         .await
     }
@@ -130,6 +143,7 @@ impl Controller {
             parsed,
             RevisionPolicy::Preserve(&service.name),
             BTreeMap::new(),
+            false,
         )
         .await
     }
@@ -152,6 +166,7 @@ impl Controller {
             parsed,
             RevisionPolicy::Force(&service.name),
             BTreeMap::new(),
+            false,
         )
         .await
     }
@@ -174,6 +189,7 @@ impl Controller {
             },
             RevisionPolicy::DetectChanges,
             BTreeMap::new(),
+            false,
         )
         .await
     }
@@ -184,13 +200,18 @@ impl Controller {
         parsed: ParsedStack,
         revision_policy: RevisionPolicy<'_>,
         registry_credentials: BTreeMap<String, RegistryCredential>,
+        replace: bool,
     ) -> Result<StackDeploymentResponse, ControllerError> {
         let ParsedStack {
             services,
             gateway: stack_gateway,
         } = parsed;
+        let snapshot = StackDeploymentSnapshot {
+            services: services.clone(),
+            gateway: stack_gateway.clone(),
+        };
         let mut inner = self.inner.lock().await;
-        validate_apply_locked(&inner, stack_name, &stack_gateway)?;
+        validate_apply_locked(&inner, stack_name, &stack_gateway, replace)?;
         let previous = inner.state.clone();
         inner
             .state
@@ -200,9 +221,16 @@ impl Controller {
         let started_at_unix_ms = unix_ms();
         let previous_gateway = inner
             .state
-            .stacks
+            .gateway_routes
             .get(stack_name)
             .map(|stack| stack.gateway.clone())
+            .or_else(|| {
+                inner
+                    .state
+                    .stacks
+                    .get(stack_name)
+                    .map(|stack| stack.gateway.clone())
+            })
             .unwrap_or_default();
         let live = current_live_nodes(&inner, self.config.node_timeout_seconds);
         let wait_for_gateway =
@@ -330,6 +358,30 @@ impl Controller {
                 }
             }
         }
+        let mut deployment_history = previous
+            .stacks
+            .get(stack_name)
+            .map(|stack| stack.deployment_history.clone())
+            .unwrap_or_default();
+        if let Some(mut previous_deployment) = previous
+            .stacks
+            .get(stack_name)
+            .and_then(|stack| stack.deployment.clone())
+        {
+            if previous_deployment.status.is_active() {
+                previous_deployment.status = StackDeploymentStatus::Superseded;
+                previous_deployment.finished_at_unix_ms = Some(started_at_unix_ms);
+                previous_deployment.superseded_by = Some(deployment_generation);
+            }
+            deployment_history.insert(previous_deployment.generation, previous_deployment);
+        }
+        while deployment_history.len() > 20 {
+            let Some(oldest) = deployment_history.keys().next().copied() else {
+                break;
+            };
+            deployment_history.remove(&oldest);
+        }
+        let progress_deadline_seconds = inner.cluster.deployment.progress_deadline_seconds;
         inner.state.stacks.insert(
             stack_name.to_owned(),
             StackRecord {
@@ -339,18 +391,26 @@ impl Controller {
                 gateway: stack_gateway,
                 deployment: Some(StackDeploymentRecord {
                     generation: deployment_generation,
-                    status: StackDeploymentStatus::Deploying,
+                    status: StackDeploymentStatus::Reconciling,
                     started_at_unix_ms,
+                    last_progress_at_unix_ms: started_at_unix_ms,
+                    progress_deadline_seconds,
                     wait_for_gateway,
                     finished_at_unix_ms: None,
+                    superseded_by: None,
+                    retry_revision: 0,
                     errors: Vec::new(),
                     image_resolutions,
+                    conditions: Vec::new(),
+                    snapshot,
                 }),
+                deployment_history,
             },
         );
         restore_unclaimed_service_revisions(&mut inner.state, &new_service_ids);
         adopt_unclaimed_tasks(&mut inner.state, stack_name);
         scheduler::reconcile(&mut inner.state, &live);
+        gateway::replace_stack_route(&mut inner.state, stack_name);
         if let Err(error) = self.refresh_stack_deployments_locked(&mut inner, unix_ms()) {
             inner.state = previous;
             return Err(error.into());
@@ -359,7 +419,7 @@ impl Controller {
             inner.state = previous;
             return Err(error.into());
         }
-        deployment_response(&inner, stack_name, deployment_generation)
+        deployment_response(&inner, stack_name, Some(deployment_generation))
     }
 
     pub(super) fn begin_stack_deployment(
@@ -384,7 +444,7 @@ impl Controller {
     pub(super) async fn wait_for_deployment(
         &self,
         stack_name: &str,
-        generation: u64,
+        generation: Option<u64>,
         after_revision: Option<u64>,
         wait: Duration,
     ) -> Result<StackDeploymentResponse, ControllerError> {
@@ -401,12 +461,182 @@ impl Controller {
         deployment_response(&inner, stack_name, generation)
     }
 
+    pub(super) async fn list_stack_deployments(
+        &self,
+        stack_name: &str,
+    ) -> Result<StackDeploymentListResponse, ControllerError> {
+        let inner = self.inner.lock().await;
+        let stack =
+            inner.state.stacks.get(stack_name).ok_or_else(|| {
+                ControllerError::NotFound(format!("stack {stack_name:?} not found"))
+            })?;
+        let current = stack
+            .deployment
+            .as_ref()
+            .map(|deployment| deployment_response(&inner, stack_name, Some(deployment.generation)))
+            .transpose()?;
+        let history = stack
+            .deployment_history
+            .values()
+            .rev()
+            .map(|deployment| StackDeploymentSummary {
+                generation: deployment.generation,
+                status: deployment.status,
+                started_at_unix_ms: deployment.started_at_unix_ms,
+                last_progress_at_unix_ms: deployment.last_progress_at_unix_ms,
+                progress_deadline_seconds: deployment.progress_deadline_seconds,
+                finished_at_unix_ms: deployment.finished_at_unix_ms,
+                superseded_by: deployment.superseded_by,
+                retry_revision: deployment.retry_revision,
+            })
+            .collect();
+        Ok(StackDeploymentListResponse {
+            stack: stack_name.to_owned(),
+            current,
+            history,
+        })
+    }
+
+    pub(super) async fn retry_stack_deployment(
+        &self,
+        stack_name: &str,
+    ) -> Result<StackDeploymentResponse, ControllerError> {
+        validate_stack_name(stack_name)?;
+        let _deployment = self.begin_stack_deployment(stack_name)?;
+        let mut inner = self.inner.lock().await;
+        let previous = inner.state.clone();
+        let now = unix_ms();
+        let service_ids = inner
+            .state
+            .stacks
+            .get(stack_name)
+            .ok_or_else(|| ControllerError::NotFound(format!("stack {stack_name:?} not found")))?
+            .services
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let generation = {
+            let deployment = inner
+                .state
+                .stacks
+                .get_mut(stack_name)
+                .and_then(|stack| stack.deployment.as_mut())
+                .ok_or_else(|| {
+                    ControllerError::NotFound(format!(
+                        "stack {stack_name:?} has no deployment to retry"
+                    ))
+                })?;
+            if !matches!(
+                deployment.status,
+                StackDeploymentStatus::Stalled
+                    | StackDeploymentStatus::Blocked
+                    | StackDeploymentStatus::Failed
+            ) {
+                return Err(ControllerError::Conflict(format!(
+                    "deployment {} for stack {stack_name:?} is {:?} and cannot be retried",
+                    deployment.generation, deployment.status
+                )));
+            }
+            deployment.retry_revision =
+                deployment.retry_revision.checked_add(1).ok_or_else(|| {
+                    ControllerError::Invalid("deployment retry revision overflow".into())
+                })?;
+            deployment.status = StackDeploymentStatus::Reconciling;
+            deployment.last_progress_at_unix_ms = now;
+            deployment.finished_at_unix_ms = None;
+            deployment.errors.clear();
+            for condition in deployment
+                .conditions
+                .iter_mut()
+                .filter(|condition| condition.resolved_at_unix_ms.is_none())
+            {
+                condition.resolved_at_unix_ms = Some(now);
+            }
+            for resolution in deployment.image_resolutions.values_mut() {
+                if resolution.status == ImageResolutionStatus::Failed {
+                    resolution.status = ImageResolutionStatus::Checking;
+                }
+                for node in resolution.nodes.values_mut() {
+                    if node.status == ImageResolutionStatus::Failed {
+                        node.status = ImageResolutionStatus::Checking;
+                        node.error = None;
+                    }
+                }
+            }
+            deployment.generation
+        };
+        for task in
+            inner.state.tasks.values_mut().filter(|task| {
+                service_ids.contains(&task.service_id) && task.reconcile_error.is_some()
+            })
+        {
+            task.reconcile_error = None;
+            task.applied_generation = None;
+            task.observed = ObservedTaskState::Pending;
+        }
+        if let Err(error) = self.commit_locked(&mut inner).await {
+            inner.state = previous;
+            return Err(error.into());
+        }
+        deployment_response(&inner, stack_name, Some(generation))
+    }
+
+    pub(super) async fn rollback_stack(
+        &self,
+        stack_name: &str,
+        generation: Option<u64>,
+    ) -> Result<StackDeploymentResponse, ControllerError> {
+        validate_stack_name(stack_name)?;
+        let _deployment = self.begin_stack_deployment(stack_name)?;
+        let snapshot = {
+            let inner = self.inner.lock().await;
+            let stack = inner.state.stacks.get(stack_name).ok_or_else(|| {
+                ControllerError::NotFound(format!("stack {stack_name:?} not found"))
+            })?;
+            let deployment = if let Some(generation) = generation {
+                stack
+                    .deployment
+                    .as_ref()
+                    .filter(|deployment| deployment.generation == generation)
+                    .or_else(|| stack.deployment_history.get(&generation))
+                    .ok_or_else(|| {
+                        ControllerError::NotFound(format!(
+                            "deployment generation {generation} for stack {stack_name:?} not found"
+                        ))
+                    })?
+            } else {
+                stack
+                    .deployment_history
+                    .values()
+                    .rev()
+                    .find(|deployment| deployment.status == StackDeploymentStatus::Healthy)
+                    .ok_or_else(|| {
+                        ControllerError::NotFound(format!(
+                            "stack {stack_name:?} has no previous healthy deployment"
+                        ))
+                    })?
+            };
+            deployment.snapshot.clone()
+        };
+        self.apply_guarded(
+            stack_name,
+            ParsedStack {
+                services: snapshot.services,
+                gateway: snapshot.gateway,
+            },
+            RevisionPolicy::DetectChanges,
+            BTreeMap::new(),
+            true,
+        )
+        .await
+    }
+
     pub(super) fn refresh_stack_deployments_locked(
         &self,
         inner: &mut Inner,
         now_unix_ms: i64,
     ) -> Result<bool, StorageError> {
-        let (gateway_generation, _) = self.next_gateway_snapshot(inner)?;
+        let (gateway_generation, _, _) = self.next_gateway_snapshot(inner)?;
         let enabled = inner
             .state
             .members
@@ -423,7 +653,6 @@ impl Controller {
         Ok(refresh_stack_deployments(
             &mut inner.state,
             now_unix_ms,
-            self.config.deployment_timeout_seconds,
             gateway_ready,
         ))
     }
@@ -433,13 +662,15 @@ fn validate_apply_locked(
     inner: &Inner,
     stack_name: &str,
     stack_gateway: &StackGatewaySpec,
+    replace: bool,
 ) -> Result<(), ControllerError> {
     if inner
         .state
         .stacks
         .get(stack_name)
         .and_then(|stack| stack.deployment.as_ref())
-        .is_some_and(|deployment| deployment.status == StackDeploymentStatus::Deploying)
+        .is_some_and(|deployment| deployment.status.is_active())
+        && !replace
     {
         return Err(ControllerError::Conflict(format!(
             "stack {stack_name:?} already has a deployment in progress"
@@ -466,7 +697,6 @@ fn validate_apply_locked(
 pub(super) fn refresh_stack_deployments(
     state: &mut ClusterState,
     now_unix_ms: i64,
-    timeout_seconds: u64,
     gateway_ready: bool,
 ) -> bool {
     let stack_names = state.stacks.keys().cloned().collect::<Vec<_>>();
@@ -479,17 +709,19 @@ pub(super) fn refresh_stack_deployments(
         else {
             continue;
         };
-        if deployment.status != StackDeploymentStatus::Deploying {
+        if deployment.status.is_terminal() {
             continue;
         }
         let next_status =
             if deployment_is_healthy(state, &stack_name, deployment.generation, gateway_ready) {
                 Some(StackDeploymentStatus::Healthy)
             } else {
+                let deadline_seconds = deployment.progress_deadline_seconds;
                 let timeout_ms =
-                    i64::try_from(timeout_seconds.saturating_mul(1_000)).unwrap_or(i64::MAX);
-                (now_unix_ms.saturating_sub(deployment.started_at_unix_ms) >= timeout_ms)
-                    .then_some(StackDeploymentStatus::TimedOut)
+                    i64::try_from(deadline_seconds.saturating_mul(1_000)).unwrap_or(i64::MAX);
+                (now_unix_ms.saturating_sub(deployment.last_progress_at_unix_ms) >= timeout_ms
+                    && deployment.status != StackDeploymentStatus::Stalled)
+                    .then_some(StackDeploymentStatus::Stalled)
             };
         if let Some(status) = next_status {
             let deployment = state
@@ -498,7 +730,32 @@ pub(super) fn refresh_stack_deployments(
                 .and_then(|stack| stack.deployment.as_mut())
                 .expect("deployment was present above");
             deployment.status = status;
-            deployment.finished_at_unix_ms = Some(now_unix_ms);
+            if status.is_terminal() {
+                if status == StackDeploymentStatus::Healthy {
+                    resolve_deployment_condition(
+                        deployment,
+                        StackDeploymentConditionKind::ProgressDeadlineExceeded,
+                        now_unix_ms,
+                    );
+                    resolve_deployment_condition(
+                        deployment,
+                        StackDeploymentConditionKind::UserActionRequired,
+                        now_unix_ms,
+                    );
+                }
+                deployment.finished_at_unix_ms = Some(now_unix_ms);
+            } else {
+                set_deployment_condition(
+                    deployment,
+                    StackDeploymentConditionKind::ProgressDeadlineExceeded,
+                    now_unix_ms,
+                    "no_progress".into(),
+                    format!(
+                        "deployment made no observable progress for {} seconds",
+                        deployment.progress_deadline_seconds
+                    ),
+                );
+            }
             changed = true;
         }
     }
@@ -570,10 +827,7 @@ pub(super) fn apply_task_result(
         .get_mut(&stack_name)
         .and_then(|stack| stack.deployment.as_mut())
         .expect("deployment was present above");
-    if !matches!(
-        deployment.status,
-        StackDeploymentStatus::Deploying | StackDeploymentStatus::Failed
-    ) {
+    if deployment.status.is_terminal() {
         return (soft_changed, false);
     }
     let error = StackDeploymentError {
@@ -588,9 +842,21 @@ pub(super) fn apply_task_result(
         deployment.errors.push(error);
         deployment_changed = true;
     }
-    if deployment.status == StackDeploymentStatus::Deploying {
-        deployment.status = StackDeploymentStatus::Failed;
-        deployment.finished_at_unix_ms = Some(unix_ms());
+    if deployment.status.is_active() {
+        let blocked = deployment_error_requires_user(message);
+        deployment.status = if blocked {
+            set_deployment_condition(
+                deployment,
+                StackDeploymentConditionKind::UserActionRequired,
+                unix_ms(),
+                "runtime_dependency".into(),
+                message.clone(),
+            );
+            StackDeploymentStatus::Blocked
+        } else {
+            StackDeploymentStatus::Failed
+        };
+        deployment.finished_at_unix_ms = (!blocked).then(unix_ms);
         deployment_changed = true;
     }
     (true, deployment_changed)
@@ -614,8 +880,7 @@ pub(super) fn apply_image_progress(
         .values_mut()
         .filter_map(|stack| stack.deployment.as_mut())
         .find(|deployment| {
-            deployment.generation == progress.deployment_generation
-                && deployment.status == StackDeploymentStatus::Deploying
+            deployment.generation == progress.deployment_generation && deployment.status.is_active()
         })
     else {
         return false;
@@ -659,7 +924,7 @@ pub(super) fn apply_image_resolution_report(
             .as_ref()
             .filter(|deployment| {
                 deployment.generation == report.deployment_generation
-                    && deployment.status == StackDeploymentStatus::Deploying
+                    && deployment.status.is_active()
             })
             .map(|_| stack_name.clone())
     }) else {
@@ -762,8 +1027,21 @@ pub(super) fn apply_image_resolution_report(
                 deployment.errors.push(error);
             }
         }
-        deployment.status = StackDeploymentStatus::Failed;
-        deployment.finished_at_unix_ms = Some(unix_ms());
+        let now = unix_ms();
+        if deployment_error_requires_user(&message) {
+            set_deployment_condition(
+                deployment,
+                StackDeploymentConditionKind::UserActionRequired,
+                now,
+                "image_pull_dependency".into(),
+                message,
+            );
+            deployment.status = StackDeploymentStatus::Blocked;
+            deployment.finished_at_unix_ms = None;
+        } else {
+            deployment.status = StackDeploymentStatus::Failed;
+            deployment.finished_at_unix_ms = Some(now);
+        }
         return true;
     }
 
@@ -900,56 +1178,86 @@ fn deployment_is_healthy(
 fn deployment_response(
     inner: &Inner,
     stack_name: &str,
-    generation: u64,
+    generation: Option<u64>,
 ) -> Result<StackDeploymentResponse, ControllerError> {
     let stack = inner
         .state
         .stacks
         .get(stack_name)
         .ok_or_else(|| ControllerError::NotFound(format!("stack {stack_name:?} not found")))?;
-    let deployment = stack
+    let generation = generation.or_else(|| {
+        stack
+            .deployment
+            .as_ref()
+            .map(|deployment| deployment.generation)
+    });
+    let generation = generation.ok_or_else(|| {
+        ControllerError::NotFound(format!("stack {stack_name:?} has no deployments"))
+    })?;
+    let (deployment, current) = if let Some(deployment) = stack
         .deployment
         .as_ref()
         .filter(|deployment| deployment.generation == generation)
-        .ok_or_else(|| {
-            ControllerError::NotFound(format!(
-                "deployment generation {generation} for stack {stack_name:?} not found"
-            ))
-        })?;
-    let services = stack
-        .services
-        .iter()
-        .filter_map(|service_id| inner.state.services.get(service_id))
-        .filter(|service| !service.deleted)
-        .map(|service| {
-            let tasks = inner.state.tasks.values().filter(|task| {
-                task.service_id == service.id
-                    && task.revision == service.revision
-                    && task.desired == DesiredTaskState::Running
-            });
-            let mut applied = 0_u32;
-            let mut healthy = 0_u32;
-            for task in tasks {
-                if task.applied_generation == Some(generation) {
-                    applied += 1;
-                    if task.observed == ObservedTaskState::Healthy {
-                        healthy += 1;
+    {
+        (deployment, true)
+    } else if let Some(deployment) = stack.deployment_history.get(&generation) {
+        (deployment, false)
+    } else {
+        return Err(ControllerError::NotFound(format!(
+            "deployment generation {generation} for stack {stack_name:?} not found"
+        )));
+    };
+    let services = if current {
+        stack
+            .services
+            .iter()
+            .filter_map(|service_id| inner.state.services.get(service_id))
+            .filter(|service| !service.deleted)
+            .map(|service| {
+                let tasks = inner.state.tasks.values().filter(|task| {
+                    task.service_id == service.id
+                        && task.revision == service.revision
+                        && task.desired == DesiredTaskState::Running
+                });
+                let mut applied = 0_u32;
+                let mut healthy = 0_u32;
+                for task in tasks {
+                    if task.applied_generation == Some(generation) {
+                        applied += 1;
+                        if task.observed == ObservedTaskState::Healthy {
+                            healthy += 1;
+                        }
                     }
                 }
-            }
-            StackDeploymentServiceProgress {
-                service: service.name.clone(),
-                replicas: service.spec.replicas,
-                applied,
-                healthy,
-            }
-        })
-        .collect();
+                StackDeploymentServiceProgress {
+                    service: service.name.clone(),
+                    replicas: service.spec.replicas,
+                    applied,
+                    healthy,
+                }
+            })
+            .collect()
+    } else {
+        deployment
+            .snapshot
+            .services
+            .iter()
+            .map(|(service, spec)| {
+                let converged = deployment.status == StackDeploymentStatus::Healthy;
+                StackDeploymentServiceProgress {
+                    service: service.clone(),
+                    replicas: spec.replicas,
+                    applied: if converged { spec.replicas } else { 0 },
+                    healthy: if converged { spec.replicas } else { 0 },
+                }
+            })
+            .collect()
+    };
     let mut task_phase_counts = BTreeMap::new();
     for progress in inner
         .task_progress
         .values()
-        .filter(|progress| progress.desired_generation == generation)
+        .filter(|progress| current && progress.desired_generation == generation)
     {
         let Some(task) = inner.state.tasks.get(&progress.task_id) else {
             continue;
@@ -983,27 +1291,31 @@ fn deployment_response(
             total_nodes: u32::try_from(resolution.nodes.len()).unwrap_or(u32::MAX),
         })
         .collect();
-    let pending_removals = u32::try_from(
-        inner
-            .state
-            .tasks
-            .values()
-            .filter(|task| {
-                let Some(service) = inner.state.services.get(&task.service_id) else {
-                    return false;
-                };
-                if service.stack != stack_name {
-                    return false;
-                }
-                let is_current = !service.deleted
-                    && task.revision == service.revision
-                    && task.desired == DesiredTaskState::Running;
-                !is_current && task.observed != ObservedTaskState::Lost
-            })
-            .count(),
-    )
-    .unwrap_or(u32::MAX);
-    let gateway = deployment.wait_for_gateway.then(|| {
+    let pending_removals = if current {
+        u32::try_from(
+            inner
+                .state
+                .tasks
+                .values()
+                .filter(|task| {
+                    let Some(service) = inner.state.services.get(&task.service_id) else {
+                        return false;
+                    };
+                    if service.stack != stack_name {
+                        return false;
+                    }
+                    let is_current = !service.deleted
+                        && task.revision == service.revision
+                        && task.desired == DesiredTaskState::Running;
+                    !is_current && task.observed != ObservedTaskState::Lost
+                })
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
+    } else {
+        0
+    };
+    let gateway = (current && deployment.wait_for_gateway).then(|| {
         let enabled = inner
             .state
             .members
@@ -1043,12 +1355,104 @@ fn deployment_response(
         revision: inner.status_revision,
         status: deployment.status,
         started_at_unix_ms: deployment.started_at_unix_ms,
+        last_progress_at_unix_ms: deployment.last_progress_at_unix_ms,
+        progress_deadline_seconds: deployment.progress_deadline_seconds,
         finished_at_unix_ms: deployment.finished_at_unix_ms,
+        superseded_by: deployment.superseded_by,
+        retry_revision: deployment.retry_revision,
         services,
         pending_removals,
         task_phases,
         image_resolutions,
         gateway,
         errors: deployment.errors.clone(),
+        conditions: deployment.conditions.clone(),
     })
+}
+
+fn deployment_error_requires_user(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "unauthorized",
+        "authentication required",
+        "denied",
+        "forbidden",
+        "no basic auth credentials",
+        "port is already allocated",
+        "no matching node",
+        "insufficient disk",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+fn set_deployment_condition(
+    deployment: &mut StackDeploymentRecord,
+    kind: StackDeploymentConditionKind,
+    now_unix_ms: i64,
+    reason: String,
+    message: String,
+) {
+    if let Some(condition) = deployment
+        .conditions
+        .iter_mut()
+        .find(|condition| condition.kind == kind && condition.resolved_at_unix_ms.is_none())
+    {
+        condition.reason = reason;
+        condition.message = message;
+        return;
+    }
+    deployment.conditions.push(StackDeploymentCondition {
+        kind,
+        observed_at_unix_ms: now_unix_ms,
+        resolved_at_unix_ms: None,
+        reason,
+        message,
+    });
+}
+
+fn resolve_deployment_condition(
+    deployment: &mut StackDeploymentRecord,
+    kind: StackDeploymentConditionKind,
+    now_unix_ms: i64,
+) {
+    for condition in deployment
+        .conditions
+        .iter_mut()
+        .filter(|condition| condition.kind == kind && condition.resolved_at_unix_ms.is_none())
+    {
+        condition.resolved_at_unix_ms = Some(now_unix_ms);
+    }
+}
+
+pub(super) fn mark_deployment_progress(
+    state: &mut ClusterState,
+    stack_name: &str,
+    generation: u64,
+    progress_at_unix_ms: i64,
+) -> bool {
+    let Some(deployment) = state
+        .stacks
+        .get_mut(stack_name)
+        .and_then(|stack| stack.deployment.as_mut())
+        .filter(|deployment| deployment.generation == generation && deployment.status.is_active())
+    else {
+        return false;
+    };
+    let mut changed = false;
+    if progress_at_unix_ms > deployment.last_progress_at_unix_ms {
+        deployment.last_progress_at_unix_ms = progress_at_unix_ms;
+        changed = true;
+    }
+    if deployment.status == StackDeploymentStatus::Stalled {
+        deployment.status = StackDeploymentStatus::Reconciling;
+        deployment.finished_at_unix_ms = None;
+        resolve_deployment_condition(
+            deployment,
+            StackDeploymentConditionKind::ProgressDeadlineExceeded,
+            progress_at_unix_ms,
+        );
+        changed = true;
+    }
+    changed
 }

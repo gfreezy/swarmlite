@@ -12,15 +12,16 @@ use crate::{
     database::{DATABASE_FILE, Database},
     kv::{KvRepository, LegacyKvImport, LegacyKvLock, LegacyKvObject},
     model::{
-        ClusterSettings, ClusterState, DesiredTaskState, NodeMember, ObservedTaskState,
-        PortBinding, RegistryCredential, ServiceRecord, StackRecord, TaskRecord,
+        ClusterSettings, ClusterState, DesiredTaskState, GatewayRecoverySnapshot, NodeMember,
+        ObservedTaskState, PortBinding, RecoveredStackGateway, RegistryCredential, ServiceRecord,
+        StackRecord, TaskRecord,
     },
 };
 use swarmlite_stack::config_digest;
 
+const PERSISTED_SCHEMA_VERSION: u32 = 11;
+#[cfg(test)]
 const LEGACY_PERSISTED_SCHEMA_VERSION: u32 = 7;
-const PREVIOUS_PERSISTED_SCHEMA_VERSION: u32 = 8;
-const PERSISTED_SCHEMA_VERSION: u32 = 9;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -92,6 +93,8 @@ struct PersistedClusterState {
     services: BTreeMap<String, ServiceRecord>,
     tasks: BTreeMap<String, PersistedTaskRecord>,
     members: BTreeMap<String, NodeMember>,
+    gateway_routes: BTreeMap<String, RecoveredStackGateway>,
+    gateway_generation: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     registry_credentials: BTreeMap<String, RegistryCredential>,
 }
@@ -232,6 +235,48 @@ impl StateRepository {
                 generation: 1,
                 cluster: cluster.clone(),
                 state: ClusterState::default(),
+            })
+        })
+    }
+
+    /// Initializes a new Controller database from one Gateway snapshot in a
+    /// single SQLite transaction. No empty desired state is visible between
+    /// database creation and recovery import.
+    pub fn initialize_from_gateway_recovery(
+        &self,
+        snapshot: &GatewayRecoverySnapshot,
+    ) -> StorageResult<VersionedState> {
+        snapshot
+            .validate_for_cluster(&self.cluster.cluster_id)
+            .map_err(StorageError::InvalidData)?;
+        let state = ClusterState {
+            gateway_routes: snapshot.stacks.clone(),
+            gateway_generation: snapshot.generation,
+            ..ClusterState::default()
+        };
+        self.with_connection(|connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(backend)?;
+            if read_versioned(&transaction, &self.cluster)?.is_some() {
+                return Err(StorageError::InvalidData(
+                    "control-plane state is already initialized".to_owned(),
+                ));
+            }
+            let value = PersistedControlPlane::new(self.cluster.clone(), state.clone());
+            let document = serde_json::to_vec(&value).map_err(invalid)?;
+            transaction
+                .execute(
+                    "INSERT INTO control_plane(singleton, generation, schema_version, cluster_id, document)
+                     VALUES (1, 1, ?1, ?2, ?3)",
+                    params![PERSISTED_SCHEMA_VERSION, self.cluster.cluster_id, document],
+                )
+                .map_err(backend)?;
+            transaction.commit().map_err(backend)?;
+            Ok(VersionedState {
+                generation: 1,
+                cluster: self.cluster.clone(),
+                state,
             })
         })
     }
@@ -553,24 +598,14 @@ fn read_versioned(
     };
     let generation = u64::try_from(generation)
         .map_err(|_| StorageError::InvalidData("negative SQLite generation".to_owned()))?;
-    if !matches!(
-        schema_version,
-        LEGACY_PERSISTED_SCHEMA_VERSION
-            | PREVIOUS_PERSISTED_SCHEMA_VERSION
-            | PERSISTED_SCHEMA_VERSION
-    ) || cluster_id != expected_cluster.cluster_id
-    {
+    if schema_version != PERSISTED_SCHEMA_VERSION || cluster_id != expected_cluster.cluster_id {
         return Err(StorageError::InvalidData(
             "persisted SQLite state belongs to a different or unsupported cluster".to_owned(),
         ));
     }
     let value: PersistedControlPlane = serde_json::from_slice(&document).map_err(invalid)?;
-    if !matches!(
-        value.schema_version,
-        LEGACY_PERSISTED_SCHEMA_VERSION
-            | PREVIOUS_PERSISTED_SCHEMA_VERSION
-            | PERSISTED_SCHEMA_VERSION
-    ) || value.cluster_id != expected_cluster.cluster_id
+    if value.schema_version != PERSISTED_SCHEMA_VERSION
+        || value.cluster_id != expected_cluster.cluster_id
         || !same_cluster_identity(&value.cluster, expected_cluster)
     {
         return Err(StorageError::InvalidData(
@@ -656,6 +691,8 @@ impl PersistedClusterState {
                 .map(|(id, task)| (id.clone(), PersistedTaskRecord::from_runtime(task)))
                 .collect(),
             members: state.members.clone(),
+            gateway_routes: state.gateway_routes.clone(),
+            gateway_generation: state.gateway_generation,
             registry_credentials: state.registry_credentials.clone(),
         }
     }
@@ -672,6 +709,8 @@ impl PersistedClusterState {
                 .collect(),
             members: self.members,
             unclaimed_tasks: BTreeMap::new(),
+            gateway_routes: self.gateway_routes,
+            gateway_generation: self.gateway_generation,
             registry_credentials: self.registry_credentials,
         }
     }
@@ -724,7 +763,8 @@ mod tests {
     use crate::local_state::{LocalState, NODE_KEY};
     use crate::model::{
         ClusterGatewayConfig, DeploymentImageResolutionNodeRecord, DeploymentImageResolutionRecord,
-        ImageResolutionStatus, KvLockStatus, NodeRecord, RegistryCredential, ServiceSpec,
+        GatewayRecoverySnapshot, HttpBackendProtocol, ImageResolutionStatus, NodeRecord,
+        RecoveredStackGateway, RegistryCredential, ServicePortKey, ServiceSpec,
         StackDeploymentRecord, StackDeploymentStatus,
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -738,7 +778,61 @@ mod tests {
             controller_id: "controller-node".into(),
             controller_port: 19090,
             gateway: ClusterGatewayConfig::default(),
+            deployment: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn atomically_imports_gateway_recovery_routes_into_a_new_controller() {
+        let directory = tempfile::tempdir().unwrap();
+        let cluster = cluster();
+        let gateway = swarmlite_stack::parse_stack(
+            r#"
+services:
+  web:
+    image: nginx
+    expose: [80]
+x-swarmlite:
+  http_routes:
+    - hostnames: [recovered.example.com]
+      rules:
+        - backend: { service: web, port: 80 }
+"#,
+        )
+        .unwrap()
+        .gateway;
+        let snapshot = GatewayRecoverySnapshot::new(
+            cluster.cluster_id.clone(),
+            87,
+            BTreeMap::from([(
+                "demo".into(),
+                RecoveredStackGateway {
+                    gateway,
+                    upstreams: BTreeMap::from([(
+                        ServicePortKey::new("web", 80, HttpBackendProtocol::Http),
+                        vec!["10.0.0.8:32080".into()],
+                    )]),
+                },
+            )]),
+        );
+        let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
+
+        let imported = repository
+            .initialize_from_gateway_recovery(&snapshot)
+            .unwrap();
+
+        assert_eq!(imported.generation, 1);
+        assert_eq!(imported.state.gateway_generation, 87);
+        assert_eq!(imported.state.gateway_routes, snapshot.stacks);
+        let reopened = StateRepository::open(directory.path(), cluster).unwrap();
+        let loaded = reopened.load().await.unwrap();
+        assert_eq!(loaded.state.gateway_generation, 87);
+        assert_eq!(loaded.state.gateway_routes, snapshot.stacks);
+        assert!(
+            reopened
+                .initialize_from_gateway_recovery(&snapshot)
+                .is_err()
+        );
     }
 
     #[test]
@@ -930,8 +1024,12 @@ mod tests {
                     generation: 2,
                     status: StackDeploymentStatus::Healthy,
                     started_at_unix_ms: 1,
+                    last_progress_at_unix_ms: 2,
+                    progress_deadline_seconds: 300,
                     wait_for_gateway: false,
                     finished_at_unix_ms: Some(2),
+                    superseded_by: None,
+                    retry_revision: 0,
                     errors: Vec::new(),
                     image_resolutions: BTreeMap::from([(
                         "demo.web".into(),
@@ -956,7 +1054,10 @@ mod tests {
                             )]),
                         },
                     )]),
+                    conditions: Vec::new(),
+                    snapshot: Default::default(),
                 }),
+                deployment_history: BTreeMap::new(),
             },
         );
         state.services.insert(
@@ -1057,7 +1158,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrates_embedded_legacy_kv_into_dedicated_tables() {
+    async fn rejects_unsupported_control_plane_schema() {
         let directory = tempfile::tempdir().unwrap();
         let cluster = cluster();
         let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
@@ -1130,40 +1231,9 @@ mod tests {
             })
             .unwrap();
 
-        let loaded = repository.initialize_with_cluster(&cluster).await.unwrap();
-        assert_eq!(loaded.generation, 6);
-        let kv = repository.kv_repository();
-        assert_eq!(
-            STANDARD
-                .decode(kv.get("caddy/live").unwrap().unwrap().value_base64)
-                .unwrap(),
-            b"certificate"
-        );
-        assert!(kv.get("caddy/removed/item").unwrap().is_none());
-        assert_eq!(
-            kv.acquire_lock("caddy/locks/issue", "another-gateway", 0, 30_000,)
-                .unwrap()
-                .status,
-            KvLockStatus::Busy
-        );
-        repository
-            .with_connection(|connection| {
-                let (schema, document): (u32, Vec<u8>) = connection
-                    .query_row(
-                        "SELECT schema_version, document FROM control_plane WHERE singleton = 1",
-                        [],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .map_err(backend)?;
-                assert_eq!(schema, PERSISTED_SCHEMA_VERSION);
-                assert!(
-                    serde_json::from_slice::<serde_json::Value>(&document)
-                        .unwrap()
-                        .get("kv")
-                        .is_none()
-                );
-                Ok(())
-            })
-            .unwrap();
+        assert!(matches!(
+            repository.initialize_with_cluster(&cluster).await,
+            Err(StorageError::InvalidData(message)) if message.contains("unsupported cluster")
+        ));
     }
 }

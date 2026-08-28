@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     time::Duration,
 };
 
@@ -25,31 +25,47 @@ struct LogTarget {
 impl Controller {
     pub(super) async fn list_stacks(&self) -> StackListResponse {
         let inner = self.inner.lock().await;
-        let stacks = inner
+        let mut stacks = inner
             .state
             .stacks
             .values()
             .filter(|stack| stack_is_active(&inner.state, &stack.name))
-            .map(|stack| StackSummary {
-                name: stack.name.clone(),
-                services: stack
-                    .services
-                    .iter()
-                    .filter(|id| {
-                        inner
-                            .state
+            .map(|stack| {
+                (
+                    stack.name.clone(),
+                    StackSummary {
+                        name: stack.name.clone(),
+                        services: stack
                             .services
-                            .get(*id)
-                            .is_some_and(|service| !service.deleted)
-                    })
-                    .count() as u32,
-                status: stack
-                    .deployment
-                    .as_ref()
-                    .map(|deployment| deployment.status),
+                            .iter()
+                            .filter(|id| {
+                                inner
+                                    .state
+                                    .services
+                                    .get(*id)
+                                    .is_some_and(|service| !service.deleted)
+                            })
+                            .count() as u32,
+                        status: stack
+                            .deployment
+                            .as_ref()
+                            .map(|deployment| deployment.status),
+                    },
+                )
             })
-            .collect();
-        StackListResponse { stacks }
+            .collect::<BTreeMap<_, _>>();
+        for stack_key in inner.state.gateway_routes.keys() {
+            stacks
+                .entry(stack_key.clone())
+                .or_insert_with(|| StackSummary {
+                    name: stack_key.clone(),
+                    services: 0,
+                    status: None,
+                });
+        }
+        StackListResponse {
+            stacks: stacks.into_values().collect(),
+        }
     }
 
     pub(super) async fn list_services(

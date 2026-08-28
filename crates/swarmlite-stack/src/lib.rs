@@ -416,7 +416,7 @@ pub fn validate_and_normalize(
 pub fn generate<'a>(
     stacks: impl IntoIterator<Item = (&'a str, &'a StackGatewaySpec)>,
     listen: &[String],
-    mut resolve_service: impl FnMut(&str, &str, u16) -> Vec<String>,
+    mut resolve_service: impl FnMut(&str, &str, u16, HttpBackendProtocol) -> Vec<String>,
 ) -> HttpServer {
     let mut routes = Vec::new();
     let mut skip_certificates = BTreeSet::new();
@@ -778,7 +778,7 @@ struct ProxyRouteConfig<'a> {
 
 fn build_proxy_routes(
     config: ProxyRouteConfig<'_>,
-    resolve_service: &mut impl FnMut(&str, &str, u16) -> Vec<String>,
+    resolve_service: &mut impl FnMut(&str, &str, u16, HttpBackendProtocol) -> Vec<String>,
     routes: &mut Vec<Route>,
 ) {
     let mut expanded = config
@@ -947,11 +947,11 @@ fn backend_handlers(
     stack_name: &str,
     backend: &HttpBackend,
     trusted_proxies: &[String],
-    resolve_service: &mut impl FnMut(&str, &str, u16) -> Vec<String>,
+    resolve_service: &mut impl FnMut(&str, &str, u16, HttpBackendProtocol) -> Vec<String>,
 ) -> Vec<Value> {
     let (upstreams, upstream_name) = match (&backend.service, &backend.host) {
         (Some(service_name), None) => (
-            resolve_service(stack_name, service_name, backend.port)
+            resolve_service(stack_name, service_name, backend.port, backend.protocol)
                 .into_iter()
                 .map(|dial| json!({ "dial": dial }))
                 .collect::<Vec<_>>(),
@@ -1185,7 +1185,7 @@ mod tests {
         let server = generate(
             [("demo", &gateway)],
             &[":80".into(), ":443".into()],
-            |_, service, port| vec![format!("10.0.0.21:{port}-{service}")],
+            |_, service, port, _| vec![format!("10.0.0.21:{port}-{service}")],
         );
         let value = serde_json::to_value(server).unwrap();
         assert_eq!(value["routes"][0]["handle"][0]["status_code"], 308);
@@ -1252,7 +1252,7 @@ x-swarmlite:
         let value = serde_json::to_value(generate(
             [("demo", &parsed.gateway)],
             &[":80".into()],
-            |_, _, _| Vec::new(),
+            |_, _, _, _| Vec::new(),
         ))
         .unwrap();
         let proxy_for = |hostname: &str| {
@@ -1357,7 +1357,7 @@ x-swarmlite:
         let value = serde_json::to_value(generate(
             [("demo", &parsed.gateway)],
             &[":80".into()],
-            |_, _, port| vec![format!("10.0.0.21:{port}")],
+            |_, _, port, _| vec![format!("10.0.0.21:{port}")],
         ))
         .unwrap();
         let handlers = value["routes"][0]["handle"].as_array().unwrap();
@@ -1446,7 +1446,7 @@ x-swarmlite:
         let value = serde_json::to_value(generate(
             [("demo", &gateway)],
             &[":80".into(), ":443".into()],
-            |_, _, _| Vec::new(),
+            |_, _, _, _| Vec::new(),
         ))
         .unwrap();
         let routes = value["routes"].as_array().unwrap();
@@ -1530,7 +1530,7 @@ x-swarmlite:
         let value = serde_json::to_value(generate(
             [("demo", &gateway)],
             &[":80".into()],
-            |_, _, _| Vec::new(),
+            |_, _, _, _| Vec::new(),
         ))
         .unwrap();
         let routes = value["routes"].as_array().unwrap();
@@ -1601,7 +1601,7 @@ x-swarmlite:
         let value = serde_json::to_value(generate(
             [("demo", &gateway)],
             &[":80".into()],
-            |_, _, _| vec!["10.0.0.21:28443".into()],
+            |_, _, _, _| vec!["10.0.0.21:28443".into()],
         ))
         .unwrap();
         let routes = value["routes"].as_array().unwrap();

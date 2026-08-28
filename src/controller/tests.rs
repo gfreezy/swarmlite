@@ -4,14 +4,12 @@ use std::collections::BTreeMap;
 use swarmlite_stack::{ParsedStack, parse_stack};
 
 use crate::{
-    config::{
-        DEFAULT_CONTROLLER_PORT, DEFAULT_DEPLOYMENT_TIMEOUT_SECONDS,
-        DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS,
-    },
+    config::{DEFAULT_CONTROLLER_PORT, DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS},
     model::{
-        CLUSTER_SCHEMA_VERSION, ClusterGatewayConfig, ImageResolutionServiceReport, KvLockStatus,
-        NodeRecord, PortBinding, PullPolicy, ServiceConfigMount, ServicePort, ServiceSpec,
-        StackGatewaySpec, TaskRecord, TaskReport,
+        CLUSTER_SCHEMA_VERSION, ClusterGatewayConfig, HttpBackendProtocol,
+        ImageResolutionServiceReport, KvLockStatus, NodeRecord, PortBinding, PullPolicy,
+        ServiceConfigMount, ServicePort, ServicePortKey, ServiceSpec, StackGatewaySpec, TaskRecord,
+        TaskReport,
     },
 };
 
@@ -24,6 +22,7 @@ fn test_cluster(id: &str) -> ClusterSettings {
         controller_id: "controller-a".into(),
         controller_port: DEFAULT_CONTROLLER_PORT,
         gateway: ClusterGatewayConfig::default(),
+        deployment: Default::default(),
     }
 }
 
@@ -36,7 +35,6 @@ fn test_controller_config(cluster: &ClusterSettings) -> ControllerConfig {
         node_timeout_seconds: 20,
         reconcile_interval_seconds: 1,
         gateway_drain_timeout_seconds: DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS,
-        deployment_timeout_seconds: DEFAULT_DEPLOYMENT_TIMEOUT_SECONDS,
         cluster: cluster.clone(),
     }
 }
@@ -969,10 +967,14 @@ fn one_service_image_result_does_not_wait_for_other_services() {
             gateway: Default::default(),
             deployment: Some(StackDeploymentRecord {
                 generation: 2,
-                status: StackDeploymentStatus::Deploying,
+                status: StackDeploymentStatus::Reconciling,
                 started_at_unix_ms: 1,
+                last_progress_at_unix_ms: 1,
+                progress_deadline_seconds: 300,
                 wait_for_gateway: false,
                 finished_at_unix_ms: None,
+                superseded_by: None,
+                retry_revision: 0,
                 errors: Vec::new(),
                 image_resolutions: BTreeMap::from([
                     ("demo.api".into(), resolution("api", "node-a", "task-api")),
@@ -981,7 +983,10 @@ fn one_service_image_result_does_not_wait_for_other_services() {
                         resolution("worker", "node-b", "task-worker"),
                     ),
                 ]),
+                conditions: Vec::new(),
+                snapshot: Default::default(),
             }),
+            deployment_history: BTreeMap::new(),
         },
     );
 
@@ -1013,7 +1018,57 @@ fn one_service_image_result_does_not_wait_for_other_services() {
         deployment.image_resolutions["demo.worker"].status,
         ImageResolutionStatus::Checking
     );
-    assert_eq!(deployment.status, StackDeploymentStatus::Deploying);
+    assert_eq!(deployment.status, StackDeploymentStatus::Reconciling);
+}
+
+#[test]
+fn progress_deadline_stalls_without_finishing_and_progress_resumes_it() {
+    let mut state = ClusterState::default();
+    state.stacks.insert(
+        "demo".into(),
+        StackRecord {
+            name: "demo".into(),
+            applied_at_unix_ms: 1_000,
+            services: vec!["demo.web".into()],
+            gateway: Default::default(),
+            deployment: Some(StackDeploymentRecord {
+                generation: 2,
+                status: StackDeploymentStatus::Reconciling,
+                started_at_unix_ms: 1_000,
+                last_progress_at_unix_ms: 1_000,
+                progress_deadline_seconds: 5,
+                wait_for_gateway: false,
+                finished_at_unix_ms: None,
+                superseded_by: None,
+                retry_revision: 0,
+                errors: Vec::new(),
+                image_resolutions: BTreeMap::new(),
+                conditions: Vec::new(),
+                snapshot: Default::default(),
+            }),
+            deployment_history: BTreeMap::new(),
+        },
+    );
+
+    assert!(!deployment::refresh_stack_deployments(
+        &mut state, 5_999, false
+    ));
+    assert!(deployment::refresh_stack_deployments(
+        &mut state, 6_000, false
+    ));
+    let stalled = state.stacks["demo"].deployment.as_ref().unwrap();
+    assert_eq!(stalled.status, StackDeploymentStatus::Stalled);
+    assert!(stalled.finished_at_unix_ms.is_none());
+    assert_eq!(
+        stalled.conditions[0].kind,
+        StackDeploymentConditionKind::ProgressDeadlineExceeded
+    );
+
+    assert!(mark_deployment_progress(&mut state, "demo", 2, 7_000));
+    let resumed = state.stacks["demo"].deployment.as_ref().unwrap();
+    assert_eq!(resumed.status, StackDeploymentStatus::Reconciling);
+    assert_eq!(resumed.last_progress_at_unix_ms, 7_000);
+    assert!(resumed.conditions[0].resolved_at_unix_ms.is_some());
 }
 
 #[tokio::test]
@@ -1172,7 +1227,7 @@ async fn deployment_waits_for_agent_application_and_health() {
     let (controller, _, _directory) = test_controller("deployment-success-test").await;
     register_live_node(&controller).await;
     let accepted = controller.apply("demo", parsed_test_stack()).await.unwrap();
-    assert_eq!(accepted.status, StackDeploymentStatus::Deploying);
+    assert_eq!(accepted.status, StackDeploymentStatus::Reconciling);
     assert_eq!(accepted.services[0].healthy, 0);
 
     let task = {
@@ -1191,6 +1246,10 @@ async fn deployment_waits_for_agent_application_and_health() {
                     task_id: task.id.clone(),
                     desired_generation: accepted.generation,
                     phase: crate::model::TaskReconcilePhase::Pull,
+                    attempt: 1,
+                    current_bytes: Some(128),
+                    total_bytes: Some(1_024),
+                    updated_at_unix_ms: unix_ms(),
                 }],
                 image_results: Vec::new(),
                 image_progress: Vec::new(),
@@ -1200,7 +1259,7 @@ async fn deployment_waits_for_agent_application_and_health() {
         .await
         .unwrap();
     let pulling = controller
-        .wait_for_deployment("demo", accepted.generation, None, Duration::ZERO)
+        .wait_for_deployment("demo", Some(accepted.generation), None, Duration::ZERO)
         .await
         .unwrap();
     assert_eq!(pulling.task_phases.len(), 1);
@@ -1257,7 +1316,7 @@ async fn deployment_waits_for_agent_application_and_health() {
         .unwrap();
 
     let completed = controller
-        .wait_for_deployment("demo", accepted.generation, None, Duration::ZERO)
+        .wait_for_deployment("demo", Some(accepted.generation), None, Duration::ZERO)
         .await
         .unwrap();
     assert_eq!(completed.status, StackDeploymentStatus::Healthy);
@@ -1379,11 +1438,27 @@ x-swarmlite:
         .unwrap()
         .gateway_config
         .unwrap();
+    let recovered_route = &desired.recovery_snapshot.stacks["demo"];
+    assert_eq!(desired.recovery_snapshot.generation, desired.generation);
+    assert_eq!(
+        recovered_route.upstreams[&ServicePortKey::new("web", 80, HttpBackendProtocol::Http)],
+        ["127.0.0.1:49153"]
+    );
+    assert_eq!(
+        desired.config["apps"]["http"]["servers"]["swarmlite"]["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|route| route["handle"].as_array().into_iter().flatten())
+            .find(|handler| handler["handler"] == "reverse_proxy")
+            .unwrap()["upstreams"],
+        serde_json::json!([{"dial": "127.0.0.1:49153"}])
+    );
     let waiting = controller
-        .wait_for_deployment("demo", accepted.generation, None, Duration::ZERO)
+        .wait_for_deployment("demo", Some(accepted.generation), None, Duration::ZERO)
         .await
         .unwrap();
-    assert_eq!(waiting.status, StackDeploymentStatus::Deploying);
+    assert_eq!(waiting.status, StackDeploymentStatus::Reconciling);
     assert_eq!(waiting.gateway.as_ref().unwrap().applied_nodes, 0);
     assert_eq!(waiting.gateway.as_ref().unwrap().total_nodes, 1);
 
@@ -1407,7 +1482,7 @@ x-swarmlite:
         .await
         .unwrap();
     let completed = controller
-        .wait_for_deployment("demo", accepted.generation, None, Duration::ZERO)
+        .wait_for_deployment("demo", Some(accepted.generation), None, Duration::ZERO)
         .await
         .unwrap();
     assert_eq!(completed.status, StackDeploymentStatus::Healthy);
@@ -1415,7 +1490,152 @@ x-swarmlite:
 }
 
 #[tokio::test]
-async fn deployment_failure_is_persisted_and_releases_stack_name() {
+async fn ordinary_stack_rm_removes_a_route_only_recovered_stack() {
+    let cluster = test_cluster("route-only-rm-test");
+    let directory = tempfile::tempdir().unwrap();
+    let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
+    let parsed = parse_stack(
+        r#"
+services:
+  web:
+    image: nginx
+    expose: [80]
+x-swarmlite:
+  http_routes:
+    - hostnames: [recovered.example.com]
+      rules:
+        - backend: { service: web, port: 80 }
+"#,
+    )
+    .unwrap();
+    let snapshot = GatewayRecoverySnapshot::new(
+        cluster.cluster_id.clone(),
+        41,
+        BTreeMap::from([(
+            "demo".into(),
+            crate::model::RecoveredStackGateway {
+                gateway: parsed.gateway,
+                upstreams: BTreeMap::from([(
+                    ServicePortKey::new("web", 80, HttpBackendProtocol::Http),
+                    vec!["10.0.0.8:32080".into()],
+                )]),
+            },
+        )]),
+    );
+    repository
+        .initialize_from_gateway_recovery(&snapshot)
+        .unwrap();
+    let controller = Controller::new(
+        test_controller_config(&cluster),
+        "0123456789abcdef".into(),
+        repository.clone(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(controller.list_stacks().await.stacks[0].name, "demo");
+    controller.remove_stack("demo").await.unwrap();
+
+    let inner = controller.inner.lock().await;
+    assert!(!inner.state.gateway_routes.contains_key("demo"));
+    assert!(!inner.gateway_snapshot.stacks.contains_key("demo"));
+    assert!(inner.gateway_generation > snapshot.generation);
+    drop(inner);
+    assert!(
+        !repository
+            .load()
+            .await
+            .unwrap()
+            .state
+            .gateway_routes
+            .contains_key("demo")
+    );
+}
+
+#[tokio::test]
+async fn ordinary_deploy_replaces_only_its_recovered_stack_route_fragment() {
+    let cluster = test_cluster("recovered-fragment-replace-test");
+    let directory = tempfile::tempdir().unwrap();
+    let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
+    let old_demo = parse_stack(
+        r#"
+services:
+  web: { image: nginx, expose: [80] }
+x-swarmlite:
+  http_routes:
+    - hostnames: [old.example.com]
+      rules: [{ backend: { service: web, port: 80 } }]
+"#,
+    )
+    .unwrap();
+    let stable = parse_stack(
+        r#"
+services:
+  api: { image: nginx, expose: [8080] }
+x-swarmlite:
+  http_routes:
+    - hostnames: [stable.example.com]
+      rules: [{ backend: { service: api, port: 8080 } }]
+"#,
+    )
+    .unwrap();
+    let stable_route = crate::model::RecoveredStackGateway {
+        gateway: stable.gateway,
+        upstreams: BTreeMap::from([(
+            ServicePortKey::new("api", 8080, HttpBackendProtocol::Http),
+            vec!["10.0.0.9:32100".into()],
+        )]),
+    };
+    let snapshot = GatewayRecoverySnapshot::new(
+        cluster.cluster_id.clone(),
+        52,
+        BTreeMap::from([
+            (
+                "demo".into(),
+                crate::model::RecoveredStackGateway {
+                    gateway: old_demo.gateway,
+                    upstreams: BTreeMap::from([(
+                        ServicePortKey::new("web", 80, HttpBackendProtocol::Http),
+                        vec!["10.0.0.8:32080".into()],
+                    )]),
+                },
+            ),
+            ("stable".into(), stable_route.clone()),
+        ]),
+    );
+    repository
+        .initialize_from_gateway_recovery(&snapshot)
+        .unwrap();
+    let controller = Controller::new(
+        test_controller_config(&cluster),
+        "0123456789abcdef".into(),
+        repository,
+    )
+    .await
+    .unwrap();
+    let replacement = parse_stack(
+        r#"
+services:
+  web: { image: nginx, expose: [80] }
+x-swarmlite:
+  http_routes:
+    - hostnames: [new.example.com]
+      rules: [{ backend: { service: web, port: 80 } }]
+"#,
+    )
+    .unwrap();
+
+    controller.apply("demo", replacement).await.unwrap();
+
+    let inner = controller.inner.lock().await;
+    assert_eq!(inner.state.gateway_routes["stable"], stable_route);
+    let demo = &inner.state.gateway_routes["demo"];
+    assert_eq!(demo.gateway.http_routes[0].hostnames, ["new.example.com"]);
+    assert!(demo.upstreams[&ServicePortKey::new("web", 80, HttpBackendProtocol::Http)].is_empty());
+}
+
+#[tokio::test]
+async fn deployment_block_is_persisted_and_can_be_retried() {
     let (controller, repository, _directory) = test_controller("deployment-failure-test").await;
     register_live_node(&controller).await;
     let accepted = controller.apply("demo", parsed_test_stack()).await.unwrap();
@@ -1460,13 +1680,13 @@ async fn deployment_failure_is_persisted_and_releases_stack_name() {
     let failed = controller
         .wait_for_deployment(
             "demo",
-            accepted.generation,
+            Some(accepted.generation),
             Some(accepted.revision),
             Duration::ZERO,
         )
         .await
         .unwrap();
-    assert_eq!(failed.status, StackDeploymentStatus::Failed);
+    assert_eq!(failed.status, StackDeploymentStatus::Blocked);
     assert_eq!(failed.errors[0].message, "image pull denied");
     let persisted = repository.load().await.unwrap();
     assert_eq!(
@@ -1475,9 +1695,92 @@ async fn deployment_failure_is_persisted_and_releases_stack_name() {
             .as_ref()
             .unwrap()
             .status,
-        StackDeploymentStatus::Failed
+        StackDeploymentStatus::Blocked
     );
-    assert!(controller.apply("demo", parsed_test_stack()).await.is_ok());
+    let retried = controller.retry_stack_deployment("demo").await.unwrap();
+    assert_eq!(retried.generation, accepted.generation);
+    assert_eq!(retried.retry_revision, 1);
+    assert_eq!(retried.status, StackDeploymentStatus::Reconciling);
+    let assignments = controller
+        .heartbeat(
+            "node-a",
+            NodeHeartbeat {
+                node: test_node(),
+                tasks: Vec::new(),
+                task_inventory_error: None,
+                task_results: Vec::new(),
+                task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
+                gateway: GatewayReport::default(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(assignments.assignments[0].deployment_retry_revision, 1);
+}
+
+#[tokio::test]
+async fn replace_supersedes_and_archives_the_active_generation() {
+    let (controller, _, _directory) = test_controller("deployment-replace-test").await;
+    register_live_node(&controller).await;
+    let first = controller.apply("demo", parsed_test_stack()).await.unwrap();
+    let mut replacement = parsed_test_stack();
+    replacement.services.get_mut("web").unwrap().image = "nginx:replacement".into();
+    let second = controller
+        .apply_with_registry_credentials_mode("demo", replacement, BTreeMap::new(), true)
+        .await
+        .unwrap();
+
+    assert!(second.generation > first.generation);
+    let archived = controller
+        .wait_for_deployment("demo", Some(first.generation), None, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(archived.status, StackDeploymentStatus::Superseded);
+    let inner = controller.inner.lock().await;
+    let archived = &inner.state.stacks["demo"].deployment_history[&first.generation];
+    assert_eq!(archived.superseded_by, Some(second.generation));
+}
+
+#[tokio::test]
+async fn rollback_restores_the_latest_healthy_snapshot_as_a_new_generation() {
+    let (controller, _, _directory) = test_controller("deployment-rollback-test").await;
+    register_live_node(&controller).await;
+    let first = controller.apply("demo", parsed_test_stack()).await.unwrap();
+    {
+        let mut inner = controller.inner.lock().await;
+        let deployment = inner
+            .state
+            .stacks
+            .get_mut("demo")
+            .unwrap()
+            .deployment
+            .as_mut()
+            .unwrap();
+        deployment.status = StackDeploymentStatus::Healthy;
+        deployment.finished_at_unix_ms = Some(unix_ms());
+    }
+    let mut second_stack = parsed_test_stack();
+    second_stack.services.get_mut("web").unwrap().image = "nginx:broken".into();
+    let second = controller.apply("demo", second_stack).await.unwrap();
+
+    let rollback = controller.rollback_stack("demo", None).await.unwrap();
+    assert!(rollback.generation > second.generation);
+    let inner = controller.inner.lock().await;
+    let stack = &inner.state.stacks["demo"];
+    assert_eq!(
+        stack.deployment.as_ref().unwrap().snapshot.services["web"].image,
+        "nginx:1.29-alpine"
+    );
+    assert_eq!(
+        stack.deployment_history[&second.generation].status,
+        StackDeploymentStatus::Superseded
+    );
+    assert_eq!(
+        stack.deployment_history[&first.generation].status,
+        StackDeploymentStatus::Healthy
+    );
 }
 
 #[tokio::test]
@@ -1534,10 +1837,10 @@ async fn failed_container_inventory_does_not_fail_stack_removal() {
     assert_eq!(response.remove_tasks.len(), 1);
     assert_eq!(response.remove_tasks[0].id, task.id);
     let removing = controller
-        .wait_for_deployment("demo", removal.generation, None, Duration::ZERO)
+        .wait_for_deployment("demo", Some(removal.generation), None, Duration::ZERO)
         .await
         .unwrap();
-    assert_eq!(removing.status, StackDeploymentStatus::Deploying);
+    assert_eq!(removing.status, StackDeploymentStatus::Reconciling);
     assert_eq!(removing.pending_removals, 1);
 
     controller
@@ -1564,7 +1867,7 @@ async fn failed_container_inventory_does_not_fail_stack_removal() {
         .unwrap();
 
     let completed = controller
-        .wait_for_deployment("demo", removal.generation, None, Duration::ZERO)
+        .wait_for_deployment("demo", Some(removal.generation), None, Duration::ZERO)
         .await
         .unwrap();
     assert_eq!(completed.status, StackDeploymentStatus::Healthy);
@@ -1621,6 +1924,7 @@ x-swarmlite:
             services: vec!["first.web".into()],
             gateway: gateway.clone(),
             deployment: None,
+            deployment_history: BTreeMap::new(),
         },
     );
     let error = validate_gateway_hostname_ownership(&state, "second", &gateway).unwrap_err();
@@ -1729,6 +2033,41 @@ async fn gateway_is_the_only_mutable_component_setting() {
         .await
         .unwrap();
     assert!(!disabled.enabled);
+}
+
+#[tokio::test]
+async fn deployment_policy_updates_are_validated_and_persisted() {
+    let (controller, repository, _directory) = test_controller("deployment-policy-test").await;
+    let updated = controller
+        .update_cluster_config(ClusterConfigUpdate {
+            deployment_progress_deadline_seconds: Some(600),
+            image_pull_idle_timeout_seconds: Some(90),
+            image_pull_max_attempts: Some(7),
+            image_pull_initial_backoff_seconds: Some(3),
+            image_pull_max_backoff_seconds: Some(30),
+            ..ClusterConfigUpdate::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated.config.deployment.progress_deadline_seconds, 600);
+    assert_eq!(
+        updated.config.deployment.image_pull_idle_timeout_seconds,
+        90
+    );
+    assert_eq!(updated.config.deployment.image_pull_max_attempts, 7);
+    assert_eq!(
+        repository.load().await.unwrap().cluster.deployment,
+        updated.config.deployment
+    );
+    assert!(matches!(
+        controller
+            .update_cluster_config(ClusterConfigUpdate {
+                image_pull_max_attempts: Some(0),
+                ..ClusterConfigUpdate::default()
+            })
+            .await,
+        Err(ControllerError::Invalid(message)) if message.contains("greater than zero")
+    ));
 }
 
 #[tokio::test]

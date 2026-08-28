@@ -16,8 +16,21 @@ impl Controller {
         update: ClusterConfigUpdate,
     ) -> Result<ClusterConfigResponse, ControllerError> {
         let mut inner = self.inner.lock().await;
-        let ClusterConfigUpdate { gateway_image } = update;
-        if gateway_image.is_none() {
+        let ClusterConfigUpdate {
+            gateway_image,
+            deployment_progress_deadline_seconds,
+            image_pull_idle_timeout_seconds,
+            image_pull_max_attempts,
+            image_pull_initial_backoff_seconds,
+            image_pull_max_backoff_seconds,
+        } = update;
+        if gateway_image.is_none()
+            && deployment_progress_deadline_seconds.is_none()
+            && image_pull_idle_timeout_seconds.is_none()
+            && image_pull_max_attempts.is_none()
+            && image_pull_initial_backoff_seconds.is_none()
+            && image_pull_max_backoff_seconds.is_none()
+        {
             return Err(ControllerError::Invalid(
                 "cluster configuration update must contain a key".to_owned(),
             ));
@@ -42,6 +55,45 @@ impl Controller {
             cluster.gateway.image = image;
             changed = true;
         }
+        if let Some(value) = deployment_progress_deadline_seconds {
+            cluster.deployment.progress_deadline_seconds = value;
+        }
+        if let Some(value) = image_pull_idle_timeout_seconds {
+            cluster.deployment.image_pull_idle_timeout_seconds = value;
+        }
+        if let Some(value) = image_pull_max_attempts {
+            cluster.deployment.image_pull_max_attempts = value;
+        }
+        if let Some(value) = image_pull_initial_backoff_seconds {
+            cluster.deployment.image_pull_initial_backoff_seconds = value;
+        }
+        if let Some(value) = image_pull_max_backoff_seconds {
+            cluster.deployment.image_pull_max_backoff_seconds = value;
+        }
+        if cluster.deployment.progress_deadline_seconds == 0 {
+            return Err(ControllerError::Invalid(
+                "deployment-progress-deadline-seconds must be greater than zero".into(),
+            ));
+        }
+        if cluster.deployment.image_pull_idle_timeout_seconds == 0 {
+            return Err(ControllerError::Invalid(
+                "image-pull-idle-timeout-seconds must be greater than zero".into(),
+            ));
+        }
+        if cluster.deployment.image_pull_max_attempts == 0 {
+            return Err(ControllerError::Invalid(
+                "image-pull-max-attempts must be greater than zero".into(),
+            ));
+        }
+        if cluster.deployment.image_pull_initial_backoff_seconds
+            > cluster.deployment.image_pull_max_backoff_seconds
+        {
+            return Err(ControllerError::Invalid(
+                "image-pull-initial-backoff-seconds cannot exceed image-pull-max-backoff-seconds"
+                    .into(),
+            ));
+        }
+        changed |= cluster != previous_cluster;
 
         if changed {
             inner.cluster = cluster.clone();
@@ -49,7 +101,7 @@ impl Controller {
                 inner.cluster = previous_cluster;
                 return Err(error.into());
             }
-            info!(gateway_image = %cluster.gateway.image, "updated cluster configuration");
+            info!("updated cluster configuration");
         }
 
         Ok(ClusterConfigResponse {

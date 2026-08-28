@@ -239,6 +239,7 @@ async fn run_with_runtime<R: ContainerRuntime>(
             });
         node.gateway_enabled = response.gateway_enabled;
         node.labels.clone_from(&response.labels);
+        runtime.update_deployment_policy(response.cluster.deployment.clone());
         if gateway_needs_apply {
             updates.send_replace(next_control);
         } else {
@@ -251,10 +252,40 @@ async fn run_with_runtime<R: ContainerRuntime>(
                 }
             });
         }
-        if assignments_tx.send(Some(response)).is_err() {
+        if assignments_tx.is_closed() {
             bail!("container reconciliation loop stopped unexpectedly");
         }
+        assignments_tx.send_if_modified(|current| {
+            if current
+                .as_ref()
+                .is_some_and(|current| same_reconciliation_input(current, &response))
+            {
+                false
+            } else {
+                *current = Some(response);
+                true
+            }
+        });
     }
+}
+
+fn same_reconciliation_input(left: &HeartbeatResponse, right: &HeartbeatResponse) -> bool {
+    left.assignments.len() == right.assignments.len()
+        && left
+            .assignments
+            .iter()
+            .zip(&right.assignments)
+            .all(|(left, right)| {
+                let mut left = left.clone();
+                let mut right = right.clone();
+                left.generation = 0;
+                right.generation = 0;
+                left == right
+            })
+        && left.image_assignments == right.image_assignments
+        && left.remove_tasks == right.remove_tasks
+        && left.registry_credentials == right.registry_credentials
+        && left.registry_credentials_hash == right.registry_credentials_hash
 }
 
 async fn command_loop<R: ContainerRuntime>(
@@ -523,118 +554,178 @@ async fn reconciliation_loop<R: ContainerRuntime>(
         progress: Arc::clone(&state.image_progress),
         events: state.events.clone(),
     };
-    while assignments.changed().await.is_ok() {
-        let Some(response) = assignments.borrow_and_update().clone() else {
+    let context = ReconcileContext {
+        runtime: runtime.as_ref(),
+        client: &client,
+        config_cache: &config_cache,
+        cluster_id: &cluster_id,
+        state: &state,
+        progress: &progress,
+        image_progress: &image_progress,
+    };
+    'updates: while assignments.changed().await.is_ok() {
+        let Some(mut response) = assignments.borrow_and_update().clone() else {
             continue;
         };
-        let existing = match runtime.list_managed(&cluster_id).await {
-            Ok(containers) => containers,
-            Err(error) => {
-                error!(%error, "failed to inspect containers in reconciliation loop");
-                let message = format!("{error:#}");
-                let reports = response
-                    .assignments
-                    .iter()
-                    .map(|assignment| (&assignment.id, assignment.deployment_generation))
-                    .chain(
-                        response
-                            .remove_tasks
-                            .iter()
-                            .map(|assignment| (&assignment.id, assignment.deployment_generation)),
-                    )
-                    .map(|(task_id, desired_generation)| TaskReconcileReport {
-                        task_id: task_id.clone(),
-                        desired_generation,
-                        applied_generation: None,
-                        phase: TaskReconcilePhase::Inspect,
-                        error: Some(message.clone()),
-                    })
-                    .collect();
-                publish_reconcile_results(&response, reports, &state.task_results, &state.events);
-                let image_reports = response
-                    .image_assignments
-                    .iter()
-                    .map(|assignment| ImageResolutionReport {
-                        deployment_generation: assignment.deployment_generation,
-                        image: assignment.image.clone(),
-                        resolved_image_id: None,
-                        services: Vec::new(),
-                        error: Some(message.clone()),
-                    })
-                    .collect();
-                publish_image_results(
-                    &response,
-                    image_reports,
-                    &state.image_results,
-                    &state.events,
-                );
-                continue;
-            }
-        };
-        progress.retain_for_response(&response);
-        image_progress.retain_for_response(&response);
-        let image_reports = reconcile_images(
-            runtime.as_ref(),
-            &existing,
-            &response,
-            &state.image_results,
-            &image_progress,
-        )
-        .await;
-        publish_image_results(
-            &response,
-            image_reports,
-            &state.image_results,
-            &state.events,
-        );
-        let config_errors = prepare_assignment_configs(
-            &client,
-            &config_cache,
-            &existing,
-            &response,
-            Some(&progress),
-        )
-        .await;
-        let reports = reconcile_containers_with_progress(
-            runtime.as_ref(),
-            &existing,
-            &response,
-            Some(&progress),
-            &config_errors,
-        )
-        .await;
-        publish_reconcile_results(&response, reports, &state.task_results, &state.events);
-        let referenced_paths = referenced_config_cache_paths(&config_cache, &existing, &response);
-        let grace_period_ms =
-            i64::try_from(CONFIG_GC_GRACE_PERIOD_SECONDS.saturating_mul(1_000)).unwrap_or(i64::MAX);
-        match config_cache
-            .gc_at(&referenced_paths, unix_ms(), grace_period_ms)
-            .await
-        {
-            Ok(stats) if stats.failures > 0 => warn!(
-                referenced = stats.referenced,
-                marked = stats.marked,
-                retained_for_grace = stats.retained_for_grace,
-                deleted = stats.deleted,
-                failures = stats.failures,
-                "Agent config cache garbage collection had file deletion failures"
-            ),
-            Ok(stats) if stats.marked > 0 || stats.deleted > 0 => info!(
-                referenced = stats.referenced,
-                marked = stats.marked,
-                retained_for_grace = stats.retained_for_grace,
-                deleted = stats.deleted,
-                failures = stats.failures,
-                "reconciled Agent config cache garbage collection"
-            ),
-            Ok(stats) if stats.retained_for_grace > 0 => debug!(
-                referenced = stats.referenced,
-                retained_for_grace = stats.retained_for_grace,
-                "Agent config cache garbage collection retained grace-period candidates"
-            ),
-            Ok(_) => {}
-            Err(error) => warn!(%error, "Agent config cache garbage collection failed"),
+        loop {
+            let update = {
+                let work = reconcile_response(&context, &response);
+                tokio::pin!(work);
+                tokio::select! {
+                    () = &mut work => None,
+                    changed = assignments.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        Some(assignments.borrow_and_update().clone())
+                    }
+                }
+            };
+            let Some(Some(next)) = update else {
+                continue 'updates;
+            };
+            debug!(
+                previous_generation = response.generation,
+                next_generation = next.generation,
+                "canceling stale reconciliation for a newer assignment"
+            );
+            response = next;
         }
+    }
+}
+
+struct ReconcileContext<'a, R> {
+    runtime: &'a R,
+    client: &'a ControllerClient,
+    config_cache: &'a ConfigCache,
+    cluster_id: &'a str,
+    state: &'a ReconciliationState,
+    progress: &'a ReconcileProgressPublisher,
+    image_progress: &'a ImageProgressPublisher,
+}
+
+async fn reconcile_response<R: ContainerRuntime>(
+    context: &ReconcileContext<'_, R>,
+    response: &HeartbeatResponse,
+) {
+    let existing = match context.runtime.list_managed(context.cluster_id).await {
+        Ok(containers) => containers,
+        Err(error) => {
+            error!(%error, "failed to inspect containers in reconciliation loop");
+            let message = format!("{error:#}");
+            let reports = response
+                .assignments
+                .iter()
+                .map(|assignment| (&assignment.id, assignment.deployment_generation))
+                .chain(
+                    response
+                        .remove_tasks
+                        .iter()
+                        .map(|assignment| (&assignment.id, assignment.deployment_generation)),
+                )
+                .map(|(task_id, desired_generation)| TaskReconcileReport {
+                    task_id: task_id.clone(),
+                    desired_generation,
+                    applied_generation: None,
+                    phase: TaskReconcilePhase::Inspect,
+                    error: Some(message.clone()),
+                })
+                .collect();
+            publish_reconcile_results(
+                response,
+                reports,
+                &context.state.task_results,
+                &context.state.events,
+            );
+            let image_reports = response
+                .image_assignments
+                .iter()
+                .map(|assignment| ImageResolutionReport {
+                    deployment_generation: assignment.deployment_generation,
+                    image: assignment.image.clone(),
+                    resolved_image_id: None,
+                    services: Vec::new(),
+                    error: Some(message.clone()),
+                })
+                .collect();
+            publish_image_results(
+                response,
+                image_reports,
+                &context.state.image_results,
+                &context.state.events,
+            );
+            return;
+        }
+    };
+    context.progress.retain_for_response(response);
+    context.image_progress.retain_for_response(response);
+    let image_reports = reconcile_images(
+        context.runtime,
+        &existing,
+        response,
+        &context.state.image_results,
+        context.image_progress,
+    )
+    .await;
+    publish_image_results(
+        response,
+        image_reports,
+        &context.state.image_results,
+        &context.state.events,
+    );
+    let config_errors = prepare_assignment_configs(
+        context.client,
+        context.config_cache,
+        &existing,
+        response,
+        Some(context.progress),
+    )
+    .await;
+    let reports = reconcile_containers_with_progress(
+        context.runtime,
+        &existing,
+        response,
+        Some(context.progress),
+        &config_errors,
+    )
+    .await;
+    publish_reconcile_results(
+        response,
+        reports,
+        &context.state.task_results,
+        &context.state.events,
+    );
+    let referenced_paths = referenced_config_cache_paths(context.config_cache, &existing, response);
+    let grace_period_ms =
+        i64::try_from(CONFIG_GC_GRACE_PERIOD_SECONDS.saturating_mul(1_000)).unwrap_or(i64::MAX);
+    match context
+        .config_cache
+        .gc_at(&referenced_paths, unix_ms(), grace_period_ms)
+        .await
+    {
+        Ok(stats) if stats.failures > 0 => warn!(
+            referenced = stats.referenced,
+            marked = stats.marked,
+            retained_for_grace = stats.retained_for_grace,
+            deleted = stats.deleted,
+            failures = stats.failures,
+            "Agent config cache garbage collection had file deletion failures"
+        ),
+        Ok(stats) if stats.marked > 0 || stats.deleted > 0 => info!(
+            referenced = stats.referenced,
+            marked = stats.marked,
+            retained_for_grace = stats.retained_for_grace,
+            deleted = stats.deleted,
+            failures = stats.failures,
+            "reconciled Agent config cache garbage collection"
+        ),
+        Ok(stats) if stats.retained_for_grace > 0 => debug!(
+            referenced = stats.referenced,
+            retained_for_grace = stats.retained_for_grace,
+            "Agent config cache garbage collection retained grace-period candidates"
+        ),
+        Ok(_) => {}
+        Err(error) => warn!(%error, "Agent config cache garbage collection failed"),
     }
 }
 
@@ -676,17 +767,27 @@ impl ImageProgressPublisher {
         let image = image.to_owned();
         let progress = Arc::clone(&self.progress);
         let events = self.events.clone();
-        RuntimeImageProgress::new(move |status| {
+        RuntimeImageProgress::new(move |update| {
+            let now = unix_ms();
             let next = ImageResolutionProgress {
                 deployment_generation,
                 image: image.clone(),
-                status,
+                status: update.status,
+                attempt: update.attempt,
+                current_bytes: update.current_bytes,
+                total_bytes: update.total_bytes,
+                updated_at_unix_ms: now,
             };
             let key = (deployment_generation, image.clone());
             let mut current = progress
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if current.get(&key) != Some(&next) {
+            let throttled = current.get(&key).is_some_and(|previous| {
+                previous.status == next.status
+                    && previous.attempt == next.attempt
+                    && now.saturating_sub(previous.updated_at_unix_ms) < 1_000
+            });
+            if !throttled && current.get(&key) != Some(&next) {
                 current.insert(key, next);
                 let _ = events.send(());
             }
@@ -809,17 +910,26 @@ impl ReconcileProgressPublisher {
         let task_id = task_id.to_owned();
         let progress = Arc::clone(&self.progress);
         let events = self.events.clone();
-        RuntimeTaskProgress::new(move |phase| {
+        RuntimeTaskProgress::new(move |update| {
+            let now = unix_ms();
             let next = TaskReconcileProgress {
                 task_id: task_id.clone(),
                 desired_generation,
-                phase,
+                phase: update.phase,
+                attempt: update.attempt,
+                current_bytes: update.current_bytes,
+                total_bytes: update.total_bytes,
+                updated_at_unix_ms: now,
             };
             let mut current = progress
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let key = (task_id.clone(), phase);
-            if current.get(&key) != Some(&next) {
+            let key = (task_id.clone(), update.phase);
+            let throttled = current.get(&key).is_some_and(|previous| {
+                previous.attempt == next.attempt
+                    && now.saturating_sub(previous.updated_at_unix_ms) < 1_000
+            });
+            if !throttled && current.get(&key) != Some(&next) {
                 current.insert(key, next);
                 let _ = events.send(());
             }
@@ -1323,6 +1433,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reconciliation_input_ignores_global_generation_but_not_desired_work() {
+        let current = image_test_response(&["task-a"]);
+        let mut unrelated_update = current.clone();
+        unrelated_update.generation += 1;
+        unrelated_update.cluster.deployment.image_pull_max_attempts += 1;
+        assert!(same_reconciliation_input(&current, &unrelated_update));
+
+        let mut new_deployment = unrelated_update;
+        new_deployment.image_assignments[0].deployment_generation += 1;
+        assert!(!same_reconciliation_input(&current, &new_deployment));
+    }
+
     #[tokio::test]
     async fn resolves_each_deployment_image_once_and_never_removes_containers() {
         let runtime = FakeRuntime {
@@ -1458,6 +1581,7 @@ mod tests {
             controller_id: "controller-a".into(),
             controller_port: crate::config::DEFAULT_CONTROLLER_PORT,
             gateway: ClusterGatewayConfig::default(),
+            deployment: Default::default(),
         }
     }
 
@@ -1543,6 +1667,7 @@ mod tests {
                 ports: Vec::new(),
                 generation: 2,
                 deployment_generation: 2,
+                deployment_retry_revision: 0,
                 spec_hash: "new-hash".into(),
                 image_resolved: false,
             }],
@@ -1628,6 +1753,7 @@ mod tests {
                 }],
                 generation: 1,
                 deployment_generation: 1,
+                deployment_retry_revision: 0,
                 spec_hash: "hash".into(),
                 image_resolved: false,
             }],
@@ -1693,6 +1819,7 @@ mod tests {
                 ports: Vec::new(),
                 generation: 2,
                 deployment_generation: 2,
+                deployment_retry_revision: 0,
                 spec_hash: "new-scale-hash".into(),
                 image_resolved: false,
             }],
@@ -1750,6 +1877,7 @@ mod tests {
                 ports: Vec::new(),
                 generation: 7,
                 deployment_generation: 5,
+                deployment_retry_revision: 0,
                 spec_hash: "hash".into(),
                 image_resolved: false,
             }],

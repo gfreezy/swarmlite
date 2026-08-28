@@ -16,14 +16,14 @@ use crate::{
     agent,
     client::ControllerClient,
     config::{
-        AgentConfig, ControllerConfig, DEFAULT_DEPLOYMENT_TIMEOUT_SECONDS,
-        DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS, PortRangeConfig, RuntimeConfig, RuntimeKind,
+        AgentConfig, ControllerConfig, DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS, PortRangeConfig,
+        RuntimeConfig, RuntimeKind,
     },
     controller,
     local_state::{AgentFence, DATABASE_FILE, FENCE_KEY, LocalState, NODE_KEY},
     model::{
-        BootstrapResponse, CLUSTER_SCHEMA_VERSION, ClusterSettings, GatewayReport, JoinRequest,
-        JoinResponse, NodeControl, valid_gateway_image,
+        BootstrapResponse, CLUSTER_SCHEMA_VERSION, ClusterSettings, GatewayRecoverySnapshot,
+        GatewayReport, JoinRequest, JoinResponse, NodeControl, valid_gateway_image,
     },
     registry::{RegistryCredentialStore, credentials_hash},
     runtime::{
@@ -33,7 +33,7 @@ use crate::{
 };
 
 const NODE_LOCK_FILE: &str = "serve.lock";
-const NODE_SETTINGS_SCHEMA_VERSION: u32 = 8;
+const NODE_SETTINGS_SCHEMA_VERSION: u32 = 9;
 const LEGACY_LOCAL_STATE_FILE: &str = "local.sqlite";
 const LEGACY_CONTROL_PLANE_FILE: &str = "control-plane.sqlite";
 
@@ -135,7 +135,7 @@ pub async fn init(mut options: InitOptions) -> Result<String> {
     let _node_lock = acquire_node_lock(&options.data_dir, "init")?;
     ensure_controller_port_is_available(options.cluster.controller_port)?;
     let inventory = inspect_runtime_before_init(&options).await?;
-    let local_state = if options.recovery {
+    let (local_state, recovery_snapshot) = if options.recovery {
         let local_cluster_id = recovery_local_cluster_id(&options.data_dir, &inventory).await?;
         options.cluster.cluster_id = recovery_cluster_id(&inventory, local_cluster_id.as_deref())?;
         recover_gateway_config(
@@ -145,7 +145,9 @@ pub async fn init(mut options: InitOptions) -> Result<String> {
         );
         validate_managed_inventory(&inventory, &options.cluster.cluster_id, true)?;
         archive_control_plane_state(&options.data_dir).await?;
-        LocalState::open(&options.data_dir)?
+        let snapshot =
+            load_gateway_recovery_snapshot(&options, &options.cluster.cluster_id).await?;
+        (LocalState::open(&options.data_dir)?, Some(snapshot))
     } else {
         ensure_control_plane_data_is_absent(&options.data_dir)?;
         let state = open_local_state(&options.data_dir).await?;
@@ -156,7 +158,7 @@ pub async fn init(mut options: InitOptions) -> Result<String> {
             );
         }
         validate_managed_inventory(&inventory, &options.cluster.cluster_id, false)?;
-        state
+        (state, None)
     };
     let node_id = default_node_id();
     options.cluster.controller_id.clone_from(&node_id);
@@ -180,6 +182,12 @@ pub async fn init(mut options: InitOptions) -> Result<String> {
         runtime: requested_runtime(options.runtime, options.runtime_socket.as_deref()),
         labels: options.labels,
     };
+    if let Some(snapshot) = &recovery_snapshot {
+        StateRepository::open(&options.data_dir, settings.cluster.clone())
+            .map_err(anyhow::Error::msg)?
+            .initialize_from_gateway_recovery(snapshot)
+            .map_err(anyhow::Error::msg)?;
+    }
     local_state.put_pair((NODE_KEY, &settings), (FENCE_KEY, &AgentFence::default()))?;
     Ok(format!(
         "initialized {}single-controller cluster {} as {}; gateway {}; run `swarmlite serve` (join token: {token})",
@@ -192,6 +200,67 @@ pub async fn init(mut options: InitOptions) -> Result<String> {
             "disabled"
         },
     ))
+}
+
+async fn load_gateway_recovery_snapshot(
+    options: &InitOptions,
+    cluster_id: &str,
+) -> Result<GatewayRecoverySnapshot> {
+    let requested = requested_runtime(options.runtime, options.runtime_socket.as_deref());
+    let runtime = resolve_runtime(
+        options.runtime,
+        options.runtime_socket.as_deref(),
+        requested.as_ref(),
+    );
+    let resolved = runtime.resolve()?;
+    if !Path::new(&resolved.socket).exists() {
+        bail!(
+            "recovery cannot load a Gateway route snapshot because the container runtime socket {} does not exist",
+            resolved.socket
+        );
+    }
+    let runtime = DockerCompatibleRuntime::connect(&resolved)?;
+    runtime.ping().await?;
+    let snapshots = runtime.gateway_recovery_snapshots(cluster_id).await?;
+    select_gateway_recovery_snapshot(cluster_id, snapshots)
+}
+
+fn select_gateway_recovery_snapshot(
+    cluster_id: &str,
+    snapshots: Vec<GatewayRecoverySnapshot>,
+) -> Result<GatewayRecoverySnapshot> {
+    let mut valid = Vec::new();
+    let mut invalid = Vec::new();
+    for snapshot in snapshots {
+        match snapshot.validate_for_cluster(cluster_id) {
+            Ok(()) => valid.push(snapshot),
+            Err(error) if snapshot.cluster_id != cluster_id => return Err(anyhow::anyhow!(error)),
+            Err(error) => invalid.push(error),
+        }
+    }
+    let highest = valid.iter().map(|snapshot| snapshot.generation).max();
+    let Some(highest) = highest else {
+        let detail = if invalid.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", invalid.join("; "))
+        };
+        bail!(
+            "recovery found no valid Gateway route snapshot for cluster {cluster_id}{detail}; refusing to initialize a Controller that could publish an empty Gateway configuration"
+        );
+    };
+    let mut latest = valid
+        .into_iter()
+        .filter(|snapshot| snapshot.generation == highest);
+    let selected = latest.next().expect("highest generation exists");
+    for candidate in latest {
+        if candidate != selected {
+            bail!(
+                "Gateway recovery conflict: generation {highest} has different contents on multiple Gateways; refusing automatic recovery"
+            );
+        }
+    }
+    Ok(selected)
 }
 
 pub async fn run(options: ServeOptions) -> Result<()> {
@@ -228,6 +297,7 @@ pub async fn run(options: ServeOptions) -> Result<()> {
         &runtime_config.resolve()?,
         registry_credentials.clone(),
         config_dir.clone(),
+        settings.cluster.deployment.clone(),
     )?;
     let initial_gateway_report = gateway_operation_report(
         "failed to reconcile gateway during node startup",
@@ -490,7 +560,6 @@ async fn start_controller(
         node_timeout_seconds: 20,
         reconcile_interval_seconds: 1,
         gateway_drain_timeout_seconds: DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS,
-        deployment_timeout_seconds: DEFAULT_DEPLOYMENT_TIMEOUT_SECONDS,
         cluster,
     };
     let token = settings.token.clone();
@@ -1320,6 +1389,7 @@ mod tests {
             controller_id: "controller-a".into(),
             controller_port: crate::config::DEFAULT_CONTROLLER_PORT,
             gateway: Default::default(),
+            deployment: Default::default(),
         };
         assert!(validate_cluster(&cluster).is_ok());
     }
@@ -1390,6 +1460,7 @@ mod tests {
             controller_id: "controller-a".into(),
             controller_port: crate::config::DEFAULT_CONTROLLER_PORT,
             gateway: Default::default(),
+            deployment: Default::default(),
         };
         let inventory = ManagedClusterInventory {
             gateway_listen: BTreeMap::from([(
@@ -1410,6 +1481,60 @@ mod tests {
         cluster.gateway.image = "registry.example.com/caddy:new".into();
         recover_gateway_config(&mut cluster, &inventory, true);
         assert_eq!(cluster.gateway.image, "registry.example.com/caddy:new");
+    }
+
+    #[test]
+    fn recovery_selects_the_highest_matching_gateway_snapshot() {
+        let old = GatewayRecoverySnapshot::new("cluster-old", 4, BTreeMap::new());
+        let latest = GatewayRecoverySnapshot::new(
+            "cluster-old",
+            7,
+            BTreeMap::from([(
+                "demo".into(),
+                crate::model::RecoveredStackGateway {
+                    gateway: Default::default(),
+                    upstreams: BTreeMap::new(),
+                },
+            )]),
+        );
+        assert_eq!(
+            select_gateway_recovery_snapshot(
+                "cluster-old",
+                vec![old, latest.clone(), latest.clone()]
+            )
+            .unwrap(),
+            latest
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_conflicting_gateway_snapshots_at_the_same_generation() {
+        let first = GatewayRecoverySnapshot::new("cluster-old", 7, BTreeMap::new());
+        let second = GatewayRecoverySnapshot::new(
+            "cluster-old",
+            7,
+            BTreeMap::from([(
+                "demo".into(),
+                crate::model::RecoveredStackGateway {
+                    gateway: Default::default(),
+                    upstreams: BTreeMap::new(),
+                },
+            )]),
+        );
+        let error =
+            select_gateway_recovery_snapshot("cluster-old", vec![first, second]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("generation 7 has different contents")
+        );
+    }
+
+    #[test]
+    fn recovery_without_a_valid_snapshot_refuses_empty_gateway_publication() {
+        let error = select_gateway_recovery_snapshot("cluster-old", Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("refusing to initialize"));
+        assert!(error.to_string().contains("empty Gateway configuration"));
     }
 
     #[tokio::test]
@@ -1451,6 +1576,7 @@ mod tests {
             controller_id: "controller-a".into(),
             controller_port: 18080,
             gateway: Default::default(),
+            deployment: Default::default(),
         };
         init(InitOptions {
             data_dir: directory.path().to_owned(),
@@ -1496,6 +1622,7 @@ mod tests {
                 controller_id: "controller-b".into(),
                 controller_port: 18080,
                 gateway: Default::default(),
+                deployment: Default::default(),
             },
             token: Some("0123456789abcdef".into()),
             advertise_address: None,
@@ -1527,6 +1654,7 @@ mod tests {
             controller_id: "controller-a".into(),
             controller_port: 18080,
             gateway: Default::default(),
+            deployment: Default::default(),
         };
         let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
         repository.initialize_with_cluster(&cluster).await.unwrap();
@@ -1553,7 +1681,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_init_archives_local_control_plane_and_keeps_cluster_identity() {
+    async fn recovery_init_archives_old_state_before_rejecting_a_missing_snapshot() {
         let directory = tempfile::tempdir().unwrap();
         let cluster = ClusterSettings {
             schema_version: CLUSTER_SCHEMA_VERSION,
@@ -1561,6 +1689,7 @@ mod tests {
             controller_id: "controller-a".into(),
             controller_port: 18081,
             gateway: Default::default(),
+            deployment: Default::default(),
         };
         init(InitOptions {
             data_dir: directory.path().to_owned(),
@@ -1588,7 +1717,7 @@ mod tests {
         .await
         .unwrap();
 
-        let message = init(InitOptions {
+        let error = init(InitOptions {
             data_dir: directory.path().to_owned(),
             cluster: ClusterSettings {
                 cluster_id: new_cluster_id(),
@@ -1604,12 +1733,14 @@ mod tests {
             gateway_enabled: true,
         })
         .await
-        .unwrap();
+        .unwrap_err();
 
-        assert!(message.contains("recovered single-controller cluster recover-test"));
-        let settings = load_node_settings(directory.path()).await.unwrap();
-        assert_eq!(settings.cluster.cluster_id, "recover-test");
-        assert_eq!(settings.token, "new-token-0123456");
+        assert!(
+            error
+                .to_string()
+                .contains("no valid Gateway route snapshot")
+        );
+        assert!(error.to_string().contains("refusing to initialize"));
         assert!(!directory.path().join("raft").exists());
         let backups = std::fs::read_dir(directory.path().join("recovery-backup"))
             .unwrap()
@@ -1629,6 +1760,7 @@ mod tests {
             controller_id: "controller-a".into(),
             controller_port: 18080,
             gateway: Default::default(),
+            deployment: Default::default(),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1689,6 +1821,7 @@ mod tests {
             controller_id: "controller-a".into(),
             controller_port: 18082,
             gateway: Default::default(),
+            deployment: Default::default(),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1770,6 +1903,7 @@ mod tests {
                         controller_id: "controller-a".into(),
                         controller_port: crate::config::DEFAULT_CONTROLLER_PORT,
                         gateway: Default::default(),
+                        deployment: Default::default(),
                     },
                     node_id: "unsupported-node".into(),
                     token: "0123456789abcdef".into(),
