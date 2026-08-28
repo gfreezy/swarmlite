@@ -57,9 +57,9 @@ pub(super) struct ListArgs {
 
 #[derive(Debug, Args)]
 pub(super) struct PsArgs {
-    /// Stack or Service whose tasks should be listed.
+    /// Limit the task list to one Stack or Service.
     #[arg(value_name = "STACK|STACK.SERVICE")]
-    target: String,
+    target: Option<String>,
     #[arg(short = 'q', long)]
     quiet: bool,
     #[arg(long)]
@@ -156,9 +156,11 @@ pub(super) async fn run_list(data_dir: &Path, args: ListArgs) -> Result<()> {
 
 pub(super) async fn run_ps(data_dir: &Path, args: PsArgs) -> Result<()> {
     let client = resolve_client(data_dir, args.connection).await?;
-    let response: TaskListResponse = client
-        .get_json(&format!("/v1/tasks?target={}", encode(&args.target)))
-        .await?;
+    let path = args.target.map_or_else(
+        || "/v1/tasks".to_owned(),
+        |target| format!("/v1/tasks?target={}", encode(&target)),
+    );
+    let response: TaskListResponse = client.get_json(&path).await?;
     print_task_table(&response, args.quiet, args.no_trunc);
     Ok(())
 }

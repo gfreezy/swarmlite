@@ -311,8 +311,9 @@ until at least one is enabled.
 
 Gateway lifecycle and configuration operations are best-effort. A Gateway image, port binding,
 container startup, or Caddy configuration error does not stop the node Agent or Controller. The
-Agent reports the error through `swarmlite status` under `gateway.endpoint_errors` and retries the
-enabled Gateway on subsequent heartbeats.
+Agent reports the error in the `swarmlite status` Issues section (and under
+`gateway.endpoint_errors` with `swarmlite status --json`) and retries the enabled Gateway on
+subsequent heartbeats.
 
 ### Labels and placement
 
@@ -436,6 +437,7 @@ not need connection flags. All commands are cluster-scoped and use flat action n
 ```bash
 sudo swarmlite ls
 sudo swarmlite ls demo
+sudo swarmlite ps
 sudo swarmlite ps demo
 sudo swarmlite ps demo.web
 sudo swarmlite inspect demo.web
@@ -700,7 +702,7 @@ upstream response `Cache-Control` headers. Responses are stored in a node-local 
 the Gateway's persistent `/cache` volume. Each Gateway has its own cache; it is not replicated
 between nodes. A malformed native cache option is rejected when Caddy atomically loads the
 generated configuration, leaving the previous accepted configuration active and reporting the
-failure under `gateway.endpoint_errors`.
+failure in `swarmlite status` (`gateway.endpoint_errors` with `--json`).
 
 `tls` is `serve|disabled`, and `http` is `redirect|serve|disabled`. Each route may override the
 top-level defaults. `http: redirect` requires `tls: serve`.
@@ -877,14 +879,14 @@ node label get|set|remove
 registry login       store private registry credentials
 deploy               deploy or update a Stack
 ls [STACK]           list Services
-ps TARGET            list tasks for a Stack or Service
+ps [TARGET]          list tasks, optionally for one Stack or Service
 inspect SERVICE      inspect a Service
 logs SERVICE|TASK_NAME|TASK_ID
                      stream container logs
 scale SERVICE=N      scale replicated Services
 restart SERVICE      roll a Service
 rm STACK             remove Stacks
-status               inspect cluster state
+status [--json]      inspect cluster state
 ```
 
 There are no separate public `controller`, `agent`, or `gateway` runtime commands.

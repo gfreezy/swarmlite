@@ -176,6 +176,13 @@ impl Controller {
         }
     }
 
+    pub(super) async fn list_tasks(&self) -> TaskListResponse {
+        let inner = self.inner.lock().await;
+        TaskListResponse {
+            tasks: summarize_tasks(&inner.state, |service| !service.deleted),
+        }
+    }
+
     pub(super) async fn create_data_session(
         &self,
         operation: DataSessionOperation,

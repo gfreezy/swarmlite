@@ -239,6 +239,7 @@ async fn swarm_style_mutations_reuse_the_stack_deployment_state_machine() {
         controller.target_tasks("demo").await.unwrap().tasks.len(),
         1
     );
+    assert_eq!(controller.list_tasks().await.tasks.len(), 1);
     assert_eq!(
         controller
             .target_tasks("demo.web")

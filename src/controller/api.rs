@@ -482,7 +482,8 @@ async fn service_tasks(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TaskTargetQuery {
-    target: String,
+    #[serde(default)]
+    target: Option<String>,
 }
 
 async fn target_tasks(
@@ -491,7 +492,10 @@ async fn target_tasks(
     headers: HeaderMap,
 ) -> Result<Json<TaskListResponse>, ControllerError> {
     require_auth(&controller, &headers)?;
-    controller.target_tasks(&query.target).await.map(Json)
+    match query.target {
+        Some(target) => controller.target_tasks(&target).await.map(Json),
+        None => Ok(Json(controller.list_tasks().await)),
+    }
 }
 
 async fn scale_service(

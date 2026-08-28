@@ -17,7 +17,7 @@ use swarmlite::{
         MAX_CONFIG_FILE_BYTES, MAX_STACK_CONFIG_BYTES, NodeGatewayResponse, NodeGatewayUpdate,
         NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, RegistryLoginRequest,
         RegistryLoginResponse, StackApplyRequest, StackConfigPayload, StackDeploymentResponse,
-        StackDeploymentStatus, StackValidationResponse, config_digest,
+        StackDeploymentStatus, StackValidationResponse, StatusResponse, config_digest,
     },
     node, registry,
 };
@@ -116,7 +116,7 @@ enum Command {
         #[command(flatten)]
         options: cluster_cli::ListArgs,
     },
-    /// List tasks belonging to a Stack or Service.
+    /// List tasks, optionally limited to a Stack or Service.
     Ps {
         #[command(flatten)]
         options: cluster_cli::PsArgs,
@@ -148,6 +148,9 @@ enum Command {
     },
     /// Display the current cluster state.
     Status {
+        /// Emit the complete machine-readable status response.
+        #[arg(long)]
+        json: bool,
         /// HTTP(S) Controller URL or ssh://[user@]host[:port].
         #[arg(short = 'u', long)]
         controller: Option<String>,
@@ -523,9 +526,13 @@ async fn run() -> Result<()> {
         Command::Scale { options } => cluster_cli::run_scale(&data_dir, options).await,
         Command::Restart { options } => cluster_cli::run_restart(&data_dir, options).await,
         Command::Rm { options } => cluster_cli::run_remove(&data_dir, options).await,
-        Command::Status { controller, token } => {
+        Command::Status {
+            json,
+            controller,
+            token,
+        } => {
             let client = connection::resolve(&data_dir, controller, token).await?;
-            status(&client).await
+            status(&client, json).await
         }
     }
 }
@@ -1517,10 +1524,406 @@ async fn wait_for_deployment(
     Ok(deployment)
 }
 
-async fn status(client: &ControllerClient) -> Result<()> {
+async fn status(client: &ControllerClient, json: bool) -> Result<()> {
     let value: serde_json::Value = client.get_json("/v1/status").await?;
-    println!("{}", serde_json::to_string_pretty(&value)?);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        let response: StatusResponse = serde_json::from_value(value)
+            .context("controller returned an invalid status response")?;
+        let color = std::io::stdout().is_terminal()
+            && std::env::var("TERM").ok().as_deref() != Some("dumb")
+            && std::env::var_os("NO_COLOR").is_none();
+        print!("{}", format_status(&response, color));
+    }
     Ok(())
+}
+
+fn format_status(response: &StatusResponse, color: bool) -> String {
+    use std::fmt::Write as _;
+
+    let state = &response.state;
+    let active_services = state
+        .services
+        .values()
+        .filter(|service| !service.deleted)
+        .count();
+
+    let mut output = String::new();
+    writeln!(output, "{}", ansi(color, "1;36", "Cluster")).unwrap();
+    writeln!(
+        output,
+        "  ID:         {}",
+        ansi(color, "1", &response.cluster_id)
+    )
+    .unwrap();
+    writeln!(output, "  Generation: {}", response.generation).unwrap();
+    writeln!(
+        output,
+        "  Controller: {}",
+        ansi(color, "1", &response.controller_id)
+    )
+    .unwrap();
+
+    writeln!(output, "\n{}", ansi(color, "1;36", "Resources")).unwrap();
+    writeln!(output, "  Nodes:           {}", state.members.len()).unwrap();
+    writeln!(output, "  Stacks:          {}", state.stacks.len()).unwrap();
+    writeln!(output, "  Services:        {active_services}").unwrap();
+    let task_summary = format_task_summary(response);
+    writeln!(
+        output,
+        "  Tasks:           {}",
+        ansi(color, task_summary_color(response), task_summary)
+    )
+    .unwrap();
+    let deployment_summary = format_deployment_summary(response);
+    writeln!(
+        output,
+        "  Deployments:     {}",
+        ansi(
+            color,
+            deployment_summary_color(response),
+            deployment_summary
+        )
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Unclaimed tasks: {}",
+        ansi(
+            color,
+            attention_count_color(state.unclaimed_tasks.len()),
+            state.unclaimed_tasks.len()
+        )
+    )
+    .unwrap();
+
+    let gateway_status = if !response.gateway.enabled {
+        "disabled"
+    } else if !response.gateway.endpoint_errors.is_empty() {
+        "degraded"
+    } else if response.gateway.applied_generation == Some(response.gateway.desired_generation) {
+        "ready"
+    } else {
+        "pending"
+    };
+    let gateway_generation = if !response.gateway.enabled {
+        "-".to_owned()
+    } else if let Some(applied) = response.gateway.applied_generation {
+        format!("{applied}/{} applied", response.gateway.desired_generation)
+    } else {
+        format!("pending (desired {})", response.gateway.desired_generation)
+    };
+    let gateway_color = match gateway_status {
+        "ready" => "32",
+        "degraded" => "31",
+        "pending" => "33",
+        _ => "2",
+    };
+    writeln!(output, "\n{}", ansi(color, "1;36", "Gateway")).unwrap();
+    writeln!(
+        output,
+        "  Status:     {}",
+        ansi(color, gateway_color, gateway_status)
+    )
+    .unwrap();
+    writeln!(output, "  Generation: {gateway_generation}").unwrap();
+    writeln!(
+        output,
+        "  Errors:     {}",
+        ansi(
+            color,
+            attention_count_color(response.gateway.endpoint_errors.len()),
+            response.gateway.endpoint_errors.len()
+        )
+    )
+    .unwrap();
+
+    let recovery_status =
+        if response.recovery.awaiting_adoption == 0 && response.recovery.conflicting_slots == 0 {
+            "clean"
+        } else {
+            "needs attention"
+        };
+    let recovery_color = if recovery_status == "clean" {
+        "32"
+    } else {
+        "31"
+    };
+    writeln!(output, "\n{}", ansi(color, "1;36", "Recovery")).unwrap();
+    writeln!(
+        output,
+        "  Status:            {}",
+        ansi(color, recovery_color, recovery_status)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Awaiting adoption: {}",
+        ansi(
+            color,
+            attention_count_color(response.recovery.awaiting_adoption),
+            response.recovery.awaiting_adoption
+        )
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Conflicting slots: {}",
+        ansi(
+            color,
+            attention_count_color(response.recovery.conflicting_slots),
+            response.recovery.conflicting_slots
+        )
+    )
+    .unwrap();
+
+    writeln!(output, "\n{}", ansi(color, "1;36", "Nodes")).unwrap();
+    if state.members.is_empty() {
+        writeln!(output, "  {}", ansi(color, "2", "none")).unwrap();
+    } else {
+        let rows = state
+            .members
+            .values()
+            .map(|member| {
+                let tasks = state
+                    .tasks
+                    .values()
+                    .filter(|task| task.node_id.as_str() == member.id.as_str())
+                    .count();
+                vec![
+                    member.id.clone(),
+                    member.address.clone(),
+                    if member.gateway_enabled {
+                        ansi(color, "32", "enabled")
+                    } else {
+                        ansi(color, "2", "disabled")
+                    },
+                    tasks.to_string(),
+                    format_labels(&member.labels),
+                ]
+            })
+            .collect::<Vec<_>>();
+        append_table(
+            &mut output,
+            &["ID", "ADDRESS", "GATEWAY", "TASKS", "LABELS"],
+            &rows,
+            color,
+        );
+    }
+
+    let mut issues = response
+        .gateway
+        .endpoint_errors
+        .iter()
+        .map(|(node_id, error)| {
+            vec![
+                ansi(color, "31", "gateway"),
+                ansi(color, "1", node_id),
+                ansi(color, "31", single_line(error)),
+            ]
+        })
+        .collect::<Vec<_>>();
+    issues.extend(state.tasks.values().filter_map(|task| {
+        task.reconcile_error.as_ref().map(|error| {
+            vec![
+                ansi(color, "31", "task"),
+                ansi(color, "1", task.id.chars().take(12).collect::<String>()),
+                ansi(
+                    color,
+                    "31",
+                    format!(
+                        "{} on {}: {}",
+                        format!("{:?}", error.phase).to_ascii_lowercase(),
+                        task.node_id,
+                        single_line(&error.message)
+                    ),
+                ),
+            ]
+        })
+    }));
+    if !issues.is_empty() {
+        writeln!(output, "\n{}", ansi(color, "1;31", "Issues")).unwrap();
+        append_table(&mut output, &["TYPE", "RESOURCE", "DETAIL"], &issues, color);
+    }
+
+    output
+}
+
+fn format_task_summary(response: &StatusResponse) -> String {
+    use swarmlite::model::ObservedTaskState;
+
+    let states = [
+        (ObservedTaskState::Healthy, "healthy"),
+        (ObservedTaskState::Running, "running"),
+        (ObservedTaskState::Starting, "starting"),
+        (ObservedTaskState::Pending, "pending"),
+        (ObservedTaskState::Failed, "failed"),
+        (ObservedTaskState::Lost, "lost"),
+    ];
+    let details = states
+        .iter()
+        .filter_map(|(state, label)| {
+            let count = response
+                .state
+                .tasks
+                .values()
+                .filter(|task| &task.observed == state)
+                .count();
+            (count > 0).then(|| format!("{count} {label}"))
+        })
+        .collect::<Vec<_>>();
+    let total = response.state.tasks.len();
+    if details.is_empty() {
+        total.to_string()
+    } else {
+        format!("{total} ({})", details.join(", "))
+    }
+}
+
+fn task_summary_color(response: &StatusResponse) -> &'static str {
+    use swarmlite::model::ObservedTaskState;
+
+    if response.state.tasks.values().any(|task| {
+        matches!(
+            &task.observed,
+            ObservedTaskState::Failed | ObservedTaskState::Lost
+        )
+    }) {
+        "31"
+    } else if response.state.tasks.values().any(|task| {
+        matches!(
+            &task.observed,
+            ObservedTaskState::Pending | ObservedTaskState::Starting
+        )
+    }) {
+        "33"
+    } else if response.state.tasks.is_empty() {
+        "2"
+    } else {
+        "32"
+    }
+}
+
+fn format_deployment_summary(response: &StatusResponse) -> String {
+    let states = [
+        (StackDeploymentStatus::Healthy, "healthy"),
+        (StackDeploymentStatus::Deploying, "deploying"),
+        (StackDeploymentStatus::Failed, "failed"),
+        (StackDeploymentStatus::TimedOut, "timed out"),
+    ];
+    let details = states
+        .iter()
+        .filter_map(|(status, label)| {
+            let count = response
+                .state
+                .stacks
+                .values()
+                .filter_map(|stack| stack.deployment.as_ref())
+                .filter(|deployment| deployment.status == *status)
+                .count();
+            (count > 0).then(|| format!("{count} {label}"))
+        })
+        .collect::<Vec<_>>();
+    if details.is_empty() {
+        "none".to_owned()
+    } else {
+        details.join(", ")
+    }
+}
+
+fn deployment_summary_color(response: &StatusResponse) -> &'static str {
+    let deployments = response
+        .state
+        .stacks
+        .values()
+        .filter_map(|stack| stack.deployment.as_ref())
+        .collect::<Vec<_>>();
+    if deployments.iter().any(|deployment| {
+        matches!(
+            deployment.status,
+            StackDeploymentStatus::Failed | StackDeploymentStatus::TimedOut
+        )
+    }) {
+        "31"
+    } else if deployments
+        .iter()
+        .any(|deployment| deployment.status == StackDeploymentStatus::Deploying)
+    {
+        "33"
+    } else if deployments.is_empty() {
+        "2"
+    } else {
+        "32"
+    }
+}
+
+fn attention_count_color(count: usize) -> &'static str {
+    if count == 0 { "32" } else { "31" }
+}
+
+fn format_labels(labels: &BTreeMap<String, String>) -> String {
+    if labels.is_empty() {
+        "-".to_owned()
+    } else {
+        labels
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+fn single_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn append_table(output: &mut String, headers: &[&str], rows: &[Vec<String>], color: bool) {
+    use std::fmt::Write as _;
+
+    let mut widths = headers
+        .iter()
+        .map(|header| header.chars().count())
+        .collect::<Vec<_>>();
+    for row in rows {
+        for (index, value) in row.iter().enumerate() {
+            widths[index] = widths[index].max(display_width(value));
+        }
+    }
+    let headers = headers
+        .iter()
+        .map(|header| ansi(color, "1", header))
+        .collect::<Vec<_>>();
+    for row in std::iter::once(&headers).chain(rows) {
+        for (index, value) in row.iter().enumerate() {
+            write!(output, "{value}").unwrap();
+            if index + 1 < row.len() {
+                let padding = widths[index].saturating_sub(display_width(value)) + 2;
+                output.push_str(&" ".repeat(padding));
+            }
+        }
+        output.push('\n');
+    }
+}
+
+fn display_width(value: &str) -> usize {
+    let mut escape = false;
+    value
+        .chars()
+        .filter(|character| {
+            if escape {
+                if *character == 'm' {
+                    escape = false;
+                }
+                false
+            } else if *character == '\x1b' {
+                escape = true;
+                false
+            } else {
+                true
+            }
+        })
+        .count()
 }
 
 #[cfg(test)]
@@ -1535,16 +1938,19 @@ mod tests {
     use swarmlite::{
         config::DEFAULT_CONTROLLER_PORT,
         model::{
-            ImageResolutionStatus, StackDeploymentGatewayProgress, StackDeploymentImageProgress,
-            StackDeploymentResponse, StackDeploymentServiceProgress, StackDeploymentStatus,
-            StackDeploymentTaskPhaseProgress, TaskReconcilePhase,
+            ClusterState, DesiredTaskState, GatewayStatus, ImageResolutionStatus, NodeMember,
+            ObservedTaskState, RecoveryStatus, StackDeploymentGatewayProgress,
+            StackDeploymentImageProgress, StackDeploymentResponse, StackDeploymentServiceProgress,
+            StackDeploymentStatus, StackDeploymentTaskPhaseProgress, StatusResponse,
+            TaskReconcileError, TaskReconcilePhase, TaskRecord,
         },
     };
 
     use super::{
         Cli, Command, DeploymentOperation, DeploymentProgressRenderer, deployment_progress_summary,
-        deployment_terminal_progress_summary, local_stack_apply_request, resolve_stack_name,
-        retain_missing_config_contents, write_terminal_progress,
+        deployment_terminal_progress_summary, display_width, format_status,
+        local_stack_apply_request, resolve_stack_name, retain_missing_config_contents,
+        write_terminal_progress,
     };
 
     #[test]
@@ -1848,6 +2254,7 @@ mod tests {
     fn exposes_flat_cluster_commands() {
         assert!(Cli::try_parse_from(["swarmlite", "ls"]).is_ok());
         assert!(Cli::try_parse_from(["swarmlite", "ls", "demo"]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "ps"]).is_ok());
         assert!(Cli::try_parse_from(["swarmlite", "ps", "demo"]).is_ok());
         assert!(Cli::try_parse_from(["swarmlite", "ps", "demo.web"]).is_ok());
         assert!(Cli::try_parse_from(["swarmlite", "inspect", "demo.web"]).is_ok());
@@ -1894,6 +2301,109 @@ mod tests {
     fn connection_info_supports_machine_readable_output() {
         assert!(Cli::try_parse_from(["swarmlite", "connection-info"]).is_ok());
         assert!(Cli::try_parse_from(["swarmlite", "connection-info", "--json"]).is_ok());
+    }
+
+    #[test]
+    fn status_defaults_to_human_output_and_supports_json() {
+        let Command::Status { json, .. } = Cli::try_parse_from(["swarmlite", "status"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected status command");
+        };
+        assert!(!json);
+
+        let Command::Status { json, .. } = Cli::try_parse_from(["swarmlite", "status", "--json"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected status command");
+        };
+        assert!(json);
+    }
+
+    #[test]
+    fn human_status_highlights_cluster_health_and_issues() {
+        let mut state = ClusterState::default();
+        state.members.insert(
+            "node-a".into(),
+            NodeMember {
+                id: "node-a".into(),
+                address: "10.0.0.1".into(),
+                gateway_enabled: true,
+                labels: BTreeMap::from([("region".into(), "east".into())]),
+                joined_at_unix_ms: 1,
+            },
+        );
+        state.members.insert(
+            "node-b".into(),
+            NodeMember {
+                id: "node-b".into(),
+                address: "10.0.0.2".into(),
+                gateway_enabled: false,
+                labels: BTreeMap::new(),
+                joined_at_unix_ms: 2,
+            },
+        );
+        state.tasks.insert(
+            "1234567890abcdef".into(),
+            TaskRecord {
+                id: "1234567890abcdef".into(),
+                service_id: "demo.web".into(),
+                revision: 1,
+                slot: 0,
+                node_id: "node-a".into(),
+                desired: DesiredTaskState::Running,
+                observed: ObservedTaskState::Failed,
+                ports: Vec::new(),
+                config_digests: Vec::new(),
+                container_id: None,
+                drain_until_unix_ms: None,
+                applied_generation: None,
+                reconcile_error: Some(TaskReconcileError {
+                    phase: TaskReconcilePhase::Start,
+                    message: "container exited".into(),
+                }),
+            },
+        );
+        let response = StatusResponse {
+            cluster_id: "cluster-1".into(),
+            generation: 7,
+            controller_id: "node-a".into(),
+            gateway: GatewayStatus {
+                enabled: true,
+                desired_generation: 3,
+                applied_generation: None,
+                endpoint_errors: BTreeMap::from([(
+                    "node-a".into(),
+                    "failed to load configuration".into(),
+                )]),
+            },
+            recovery: RecoveryStatus {
+                awaiting_adoption: 1,
+                conflicting_slots: 0,
+            },
+            state,
+        };
+
+        let output = format_status(&response, false);
+        assert!(!output.contains("\x1b["));
+        assert!(output.contains("Nodes:           2"));
+        assert!(output.contains("Tasks:           1 (1 failed)"));
+        assert!(output.contains("Status:     degraded"));
+        assert!(output.contains("Status:            needs attention"));
+        assert!(output.contains("node-a  10.0.0.1  enabled"));
+        assert!(output.contains("node-b  10.0.0.2  disabled"));
+        assert!(output.contains("region=east"));
+        assert!(output.contains("gateway  node-a"));
+        assert!(output.contains("task     1234567890ab"));
+        assert!(output.contains("start on node-a: container exited"));
+
+        let colored = format_status(&response, true);
+        assert!(colored.contains("\x1b[1;36mCluster\x1b[0m"));
+        assert!(colored.contains("\x1b[31mdegraded\x1b[0m"));
+        assert!(colored.contains("\x1b[31mneeds attention\x1b[0m"));
+        assert_eq!(display_width("\x1b[32menabled\x1b[0m"), 7);
     }
 
     #[test]
