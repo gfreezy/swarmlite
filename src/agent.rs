@@ -34,6 +34,50 @@ use crate::{
 
 const AGENT_DATA_QUEUE_FRAMES: usize = 64;
 const RUNTIME_LOG_QUEUE_FRAMES: usize = 16;
+const CONTAINER_INVENTORY_TIMEOUT: Duration = Duration::from_secs(5);
+const GATEWAY_RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(2);
+const GATEWAY_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(60);
+const GATEWAY_PORT_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Default)]
+struct GatewayRetryState {
+    retryable: Option<bool>,
+    next_attempt: Option<std::time::Instant>,
+    next_backoff: Duration,
+}
+
+impl GatewayRetryState {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn retry_due(&mut self, report: &GatewayReport, now: std::time::Instant) -> bool {
+        if self.retryable != Some(report.retryable) {
+            self.retryable = Some(report.retryable);
+            let delay = if report.retryable {
+                GATEWAY_RETRY_INITIAL_BACKOFF
+            } else {
+                GATEWAY_PORT_RECHECK_INTERVAL
+            };
+            self.next_backoff = delay;
+            self.next_attempt = Some(now + delay);
+            return false;
+        }
+        if self.next_attempt.is_some_and(|attempt| now < attempt) {
+            return false;
+        }
+        let delay = if report.retryable {
+            self.next_backoff
+                .saturating_mul(2)
+                .min(GATEWAY_RETRY_MAX_BACKOFF)
+        } else {
+            GATEWAY_PORT_RECHECK_INTERVAL
+        };
+        self.next_backoff = delay;
+        self.next_attempt = Some(now + delay);
+        true
+    }
+}
 
 #[derive(Clone)]
 struct ReconciliationState {
@@ -131,6 +175,7 @@ async fn run_with_runtime<R: ContainerRuntime>(
     });
     let mut ticker = tokio::time::interval(Duration::from_secs(config.heartbeat_interval_seconds));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut gateway_retry = GatewayRetryState::default();
     info!(
         node_id = %config.node_id,
         runtime = %runtime.kind(),
@@ -147,14 +192,12 @@ async fn run_with_runtime<R: ContainerRuntime>(
                 }
             }
         }
-        let (containers, task_inventory_error) =
-            match runtime.list_managed(&config.cluster_id).await {
-                Ok(containers) => (containers, None),
-                Err(error) => {
-                    error!(%error, "failed to inspect managed containers");
-                    (HashMap::new(), Some(format!("{error:#}")))
-                }
-            };
+        let (containers, task_inventory_error) = managed_container_inventory(
+            runtime.as_ref(),
+            &config.cluster_id,
+            CONTAINER_INVENTORY_TIMEOUT,
+        )
+        .await;
         let heartbeat = NodeHeartbeat {
             node: node.clone(),
             tasks: containers
@@ -232,15 +275,25 @@ async fn run_with_runtime<R: ContainerRuntime>(
             gateway_config: response.gateway_config.clone(),
             registry_credentials_hash: response.registry_credentials_hash.clone(),
         };
-        let gateway_needs_apply = response.gateway_enabled
-            && response.gateway_config.as_ref().is_some_and(|assignment| {
+        let gateway_needs_apply = if response.gateway_enabled {
+            response.gateway_config.as_ref().is_some_and(|assignment| {
                 heartbeat.gateway.error.is_some()
                     || heartbeat.gateway.applied_generation != Some(assignment.generation)
-            });
+            })
+        } else {
+            heartbeat.gateway.error.is_some()
+        };
+        let control_changed = *updates.borrow() != next_control;
         node.gateway_enabled = response.gateway_enabled;
         node.labels.clone_from(&response.labels);
         runtime.update_deployment_policy(response.cluster.deployment.clone());
-        if gateway_needs_apply {
+        let retry_due = if control_changed || !gateway_needs_apply {
+            gateway_retry.reset();
+            false
+        } else {
+            gateway_retry.retry_due(&heartbeat.gateway, std::time::Instant::now())
+        };
+        if control_changed || retry_due {
             updates.send_replace(next_control);
         } else {
             updates.send_if_modified(|current| {
@@ -266,6 +319,28 @@ async fn run_with_runtime<R: ContainerRuntime>(
                 true
             }
         });
+    }
+}
+
+async fn managed_container_inventory<R: ContainerRuntime>(
+    runtime: &R,
+    cluster_id: &str,
+    timeout: Duration,
+) -> (HashMap<String, ManagedContainer>, Option<String>) {
+    match tokio::time::timeout(timeout, runtime.list_managed(cluster_id)).await {
+        Ok(Ok(containers)) => (containers, None),
+        Ok(Err(error)) => {
+            error!(%error, "failed to inspect managed containers");
+            (HashMap::new(), Some(format!("{error:#}")))
+        }
+        Err(_) => {
+            let error = format!(
+                "timed out after {} seconds while inspecting managed containers",
+                timeout.as_secs()
+            );
+            error!(%error, "failed to inspect managed containers");
+            (HashMap::new(), Some(error))
+        }
     }
 }
 
@@ -1266,6 +1341,7 @@ mod tests {
         resolve_count: Arc<AtomicUsize>,
         resolved_image_id: Option<String>,
         fail_resolve: bool,
+        list_delay: Option<Duration>,
     }
 
     impl ContainerRuntime for FakeRuntime {
@@ -1292,6 +1368,9 @@ mod tests {
             &self,
             _cluster_id: &str,
         ) -> Result<HashMap<String, ManagedContainer>> {
+            if let Some(delay) = self.list_delay {
+                tokio::time::sleep(delay).await;
+            }
             Ok(HashMap::new())
         }
 
@@ -1431,6 +1510,51 @@ mod tests {
             registry_credentials: Default::default(),
             registry_credentials_hash: String::new(),
         }
+    }
+
+    #[test]
+    fn gateway_retries_transient_errors_with_backoff_and_port_conflicts_once_per_minute() {
+        let now = std::time::Instant::now();
+        let transient = GatewayReport {
+            applied_generation: None,
+            error: Some("Docker temporarily unavailable".into()),
+            retryable: true,
+        };
+        let mut retries = GatewayRetryState::default();
+        assert!(!retries.retry_due(&transient, now));
+        assert!(!retries.retry_due(&transient, now + Duration::from_secs(1)));
+        assert!(retries.retry_due(&transient, now + Duration::from_secs(2)));
+        assert!(!retries.retry_due(&transient, now + Duration::from_secs(5)));
+        assert!(retries.retry_due(&transient, now + Duration::from_secs(6)));
+
+        let port_conflict = GatewayReport {
+            applied_generation: None,
+            error: Some("Gateway port 80 is occupied".into()),
+            retryable: false,
+        };
+        retries.reset();
+        assert!(!retries.retry_due(&port_conflict, now));
+        assert!(!retries.retry_due(&port_conflict, now + Duration::from_secs(59)));
+        assert!(retries.retry_due(&port_conflict, now + Duration::from_secs(60)));
+        assert!(!retries.retry_due(&port_conflict, now + Duration::from_secs(119)));
+        assert!(retries.retry_due(&port_conflict, now + Duration::from_secs(120)));
+    }
+
+    #[tokio::test]
+    async fn managed_container_inventory_timeout_is_reported_without_waiting_forever() {
+        let runtime = FakeRuntime {
+            list_delay: Some(Duration::from_secs(1)),
+            ..Default::default()
+        };
+
+        let (containers, error) =
+            managed_container_inventory(&runtime, "cluster-test", Duration::ZERO).await;
+
+        assert!(containers.is_empty());
+        assert_eq!(
+            error.as_deref(),
+            Some("timed out after 0 seconds while inspecting managed containers")
+        );
     }
 
     #[test]

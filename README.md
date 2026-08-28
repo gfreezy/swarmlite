@@ -314,8 +314,9 @@ until at least one is enabled.
 Gateway lifecycle and configuration operations are best-effort. A Gateway image, port binding,
 container startup, or Caddy configuration error does not stop the node Agent or Controller. The
 Agent reports the error in the `swarmlite status` Issues section (and under
-`gateway.endpoint_errors` with `swarmlite status --json`) and retries the enabled Gateway on
-subsequent heartbeats.
+`gateway.endpoint_errors` with `swarmlite status --json`). Transient failures use exponential
+backoff. Listener port conflicts are checked before container creation and rechecked once per
+minute, so the Gateway starts automatically after the port is released without hammering Docker.
 
 ### Labels and placement
 

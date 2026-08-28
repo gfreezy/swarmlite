@@ -28,6 +28,7 @@ use crate::{
     registry::{RegistryCredentialStore, credentials_hash},
     runtime::{
         ContainerRuntime, DockerCompatibleRuntime, GatewayContainerSpec, ManagedClusterInventory,
+        gateway_error_is_retryable,
     },
     storage::{StateRepository, control_plane_state_exists},
 };
@@ -299,19 +300,7 @@ pub async fn run(options: ServeOptions) -> Result<()> {
         config_dir.clone(),
         settings.cluster.deployment.clone(),
     )?;
-    let initial_gateway_report = gateway_operation_report(
-        "failed to reconcile gateway during node startup",
-        None,
-        runtime
-            .reconcile_gateway(
-                &gateway_container_spec(&settings, &advertise_address, &public_controller),
-                settings.gateway_enabled,
-            )
-            .await,
-    );
-    if settings.gateway_enabled && initial_gateway_report.error.is_none() {
-        info!("gateway enabled; independent Caddy container is running");
-    }
+    let initial_gateway_report = GatewayReport::default();
     let agent_controller = if is_controller(&settings) {
         local_controller
     } else {
@@ -339,7 +328,8 @@ pub async fn run(options: ServeOptions) -> Result<()> {
         gateway_config: None,
         registry_credentials_hash: credentials_hash(&registry_credentials.snapshot()?),
     };
-    let (control_tx, control_rx) = watch::channel(initial_control);
+    let (control_tx, control_rx) = watch::channel(initial_control.clone());
+    control_tx.send_replace(initial_control);
     let (gateway_report_tx, gateway_report_rx) = watch::channel(initial_gateway_report);
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let token = settings.token.clone();
@@ -406,6 +396,7 @@ impl NodeSupervisor {
                     .await?,
             );
         }
+        let mut gateway_reconciled = false;
         loop {
             tokio::select! {
                 signal = tokio::signal::ctrl_c() => {
@@ -458,7 +449,8 @@ impl NodeSupervisor {
                         if !had_gateway && reconciled {
                             info!("gateway enabled; started independent Caddy container");
                         }
-                    } else if had_gateway && !has_gateway {
+                        gateway_reconciled = true;
+                    } else if had_gateway || !gateway_reconciled {
                         let report = gateway_operation_report(
                             "failed to remove disabled gateway",
                             None,
@@ -476,6 +468,7 @@ impl NodeSupervisor {
                             info!("gateway disabled; removed independent Caddy container");
                         }
                         gateway_report_tx.send_replace(report);
+                        gateway_reconciled = true;
                     }
                 }
                 event = events_rx.recv() => {
@@ -528,13 +521,16 @@ fn gateway_operation_report(
         Ok(()) => GatewayReport {
             applied_generation,
             error: None,
+            retryable: true,
         },
         Err(error) => {
+            let retryable = gateway_error_is_retryable(&error);
             let error = format!("{operation}: {error:#}");
-            warn!(%error, "gateway operation failed; continuing node service");
+            warn!(%error, retryable, "gateway operation failed; continuing node service");
             GatewayReport {
                 applied_generation: None,
                 error: Some(error),
+                retryable,
             }
         }
     }
@@ -1400,6 +1396,7 @@ mod tests {
             gateway_operation_report("failed to apply gateway configuration", Some(7), Ok(()));
         assert_eq!(success.applied_generation, Some(7));
         assert_eq!(success.error, None);
+        assert!(success.retryable);
 
         let failure = gateway_operation_report(
             "failed to reconcile gateway during node startup",
@@ -1407,6 +1404,7 @@ mod tests {
             Err(anyhow::anyhow!("port 80 is already allocated")),
         );
         assert_eq!(failure.applied_generation, None);
+        assert!(failure.retryable);
         assert_eq!(
             failure.error.as_deref(),
             Some("failed to reconcile gateway during node startup: port 80 is already allocated")

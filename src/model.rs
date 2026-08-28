@@ -775,11 +775,27 @@ pub struct NodeControl {
     pub registry_credentials_hash: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GatewayReport {
     pub applied_generation: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default = "default_gateway_retryable")]
+    pub retryable: bool,
+}
+
+const fn default_gateway_retryable() -> bool {
+    true
+}
+
+impl Default for GatewayReport {
+    fn default() -> Self {
+        Self {
+            applied_generation: None,
+            error: None,
+            retryable: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

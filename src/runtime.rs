@@ -1,7 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
-    io::{Cursor, Read},
+    io::{Cursor, ErrorKind, Read},
+    net::{Ipv4Addr, SocketAddrV4, TcpListener, UdpSocket},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -139,6 +140,12 @@ struct ExistingGatewayContainer {
     token_hash: Option<String>,
     schema: Option<String>,
     running: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct NonRetryableGatewayError {
+    message: String,
 }
 
 #[derive(Clone)]
@@ -403,9 +410,13 @@ impl DockerCompatibleRuntime {
         spec: &GatewayContainerSpec,
         enabled: bool,
     ) -> Result<()> {
-        if enabled {
-            gateway_ports(&spec.listen)?;
-        }
+        let ports = enabled
+            .then(|| {
+                gateway_ports(&spec.listen).map_err(|error| NonRetryableGatewayError {
+                    message: format!("invalid Gateway listener configuration: {error:#}"),
+                })
+            })
+            .transpose()?;
         let gateways = self.gateway_containers().await?;
         if gateways.len() > 1 {
             bail!(
@@ -434,6 +445,7 @@ impl DockerCompatibleRuntime {
         if let Some(existing) = existing {
             if gateway_matches_spec(&existing, spec) {
                 if !existing.running {
+                    ensure_gateway_ports_available(ports.as_ref().expect("enabled Gateway ports"))?;
                     self.client
                         .start_container(&existing.id, None)
                         .await
@@ -449,9 +461,11 @@ impl DockerCompatibleRuntime {
                 "recreating gateway container for the current gateway settings"
             );
             self.remove_gateway(&existing).await?;
+            ensure_gateway_ports_available(ports.as_ref().expect("enabled Gateway ports"))?;
             return self.create_gateway(spec).await;
         }
 
+        ensure_gateway_ports_available(ports.as_ref().expect("enabled Gateway ports"))?;
         self.create_gateway(spec).await
     }
 
@@ -1048,6 +1062,60 @@ fn gateway_ports(listen: &[String]) -> Result<BTreeSet<u16>> {
             Ok(port)
         })
         .collect()
+}
+
+fn ensure_gateway_ports_available(ports: &BTreeSet<u16>) -> Result<()> {
+    for &port in ports {
+        let address = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+        check_gateway_port(
+            TcpListener::bind(address),
+            format!("{address}/tcp"),
+            "disable Gateway on this node, free the port, or change gateway-listen",
+        )?;
+        if port == 443 {
+            check_gateway_port(
+                UdpSocket::bind(address),
+                format!("{address}/udp"),
+                "disable Gateway on this node, free the port, or change gateway-listen",
+            )?;
+        }
+    }
+    let admin = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 2019);
+    check_gateway_port(
+        TcpListener::bind(admin),
+        format!("{admin}/tcp"),
+        "free the local Caddy admin port or disable Gateway on this node",
+    )?;
+    Ok(())
+}
+
+fn check_gateway_port<T>(
+    result: std::io::Result<T>,
+    endpoint: String,
+    recovery: &str,
+) -> Result<()> {
+    match result {
+        Ok(bound) => {
+            drop(bound);
+            Ok(())
+        }
+        Err(error) if error.kind() == ErrorKind::AddrInUse => Err(NonRetryableGatewayError {
+            message: format!("Gateway port conflict: cannot bind {endpoint} ({error}); {recovery}"),
+        }
+        .into()),
+        Err(error) => {
+            warn!(
+                %endpoint,
+                %error,
+                "could not preflight a Gateway port; deferring the authoritative check to the container runtime"
+            );
+            Ok(())
+        }
+    }
+}
+
+pub(crate) fn gateway_error_is_retryable(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<NonRetryableGatewayError>().is_none() && !is_host_port_conflict(error)
 }
 
 fn gateway_bootstrap(spec: &GatewayContainerSpec) -> Result<String> {
@@ -1910,6 +1978,7 @@ mod tests {
         server.abort();
 
         assert!(format!("{error:#}").contains("failed to start the gateway container"));
+        assert!(!gateway_error_is_retryable(&error));
         let calls = calls.lock().unwrap();
         assert_eq!(
             calls
@@ -2029,6 +2098,17 @@ mod tests {
         );
         assert!(gateway_ports(&[":2019".into()]).is_err());
         assert!(gateway_ports(&["unix/socket".into()]).is_err());
+    }
+
+    #[test]
+    fn occupied_gateway_port_is_detected_before_docker_container_creation() {
+        let occupied = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let port = occupied.local_addr().unwrap().port();
+
+        let error = ensure_gateway_ports_available(&BTreeSet::from([port])).unwrap_err();
+
+        assert!(format!("{error:#}").contains(&format!("0.0.0.0:{port}/tcp")));
+        assert!(!gateway_error_is_retryable(&error));
     }
 
     #[test]

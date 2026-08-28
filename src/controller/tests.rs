@@ -1504,6 +1504,7 @@ x-swarmlite:
                 gateway: GatewayReport {
                     applied_generation: Some(desired.generation),
                     error: None,
+                    retryable: true,
                 },
             },
         )
@@ -1584,6 +1585,7 @@ x-swarmlite:
                 gateway: GatewayReport {
                     applied_generation: Some(snapshot.generation),
                     error: None,
+                    retryable: true,
                 },
             },
         )
@@ -1608,6 +1610,7 @@ x-swarmlite:
                 gateway: GatewayReport {
                     applied_generation: Some(snapshot.generation),
                     error: None,
+                    retryable: true,
                 },
             },
         )
@@ -1630,6 +1633,7 @@ x-swarmlite:
                 gateway: GatewayReport {
                     applied_generation: Some(gateway_generation),
                     error: None,
+                    retryable: true,
                 },
             },
         )
@@ -1658,6 +1662,7 @@ x-swarmlite:
                 gateway: GatewayReport {
                     applied_generation: Some(gateway_generation),
                     error: None,
+                    retryable: true,
                 },
             },
         )
@@ -2011,6 +2016,46 @@ async fn failed_container_inventory_does_not_fail_stack_removal() {
     assert!(controller.inner.lock().await.state.tasks.is_empty());
 }
 
+#[tokio::test]
+async fn failed_container_inventory_keeps_running_tasks_and_node_lease_alive() {
+    let (controller, _, _directory) = test_controller("inventory-timeout-test").await;
+    register_live_node(&controller).await;
+    controller.apply("demo", parsed_test_stack()).await.unwrap();
+    let original = {
+        let mut inner = controller.inner.lock().await;
+        let task = inner.state.tasks.values_mut().next().unwrap();
+        task.observed = ObservedTaskState::Healthy;
+        task.container_id = Some("container-web".into());
+        task.clone()
+    };
+
+    controller
+        .heartbeat(
+            "node-a",
+            NodeHeartbeat {
+                node: test_node(),
+                tasks: Vec::new(),
+                task_inventory_error: Some("Docker container inventory timed out".into()),
+                task_results: Vec::new(),
+                task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
+                gateway: GatewayReport::default(),
+            },
+        )
+        .await
+        .unwrap();
+    controller.tick().await.unwrap();
+
+    let inner = controller.inner.lock().await;
+    assert!(inner.live_nodes.contains_key("node-a"));
+    assert_eq!(inner.state.tasks.len(), 1);
+    let preserved = &inner.state.tasks[&original.id];
+    assert_eq!(preserved.node_id, original.node_id);
+    assert_eq!(preserved.observed, ObservedTaskState::Healthy);
+    assert_eq!(preserved.container_id.as_deref(), Some("container-web"));
+}
+
 fn test_join_request(node_id: &str, address: &str) -> JoinRequest {
     JoinRequest {
         node_id: node_id.to_owned(),
@@ -2343,6 +2388,7 @@ async fn caddy_acknowledgement_starts_drain_deadline() {
                 gateway: GatewayReport {
                     applied_generation: Some(desired.generation),
                     error: None,
+                    retryable: true,
                 },
             },
         )
@@ -2378,6 +2424,7 @@ async fn gateway_failures_are_exposed_in_status() {
                 gateway: GatewayReport {
                     applied_generation: None,
                     error: Some("failed to bind gateway port 80".into()),
+                    retryable: false,
                 },
             },
         )
