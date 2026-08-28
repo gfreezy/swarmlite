@@ -768,7 +768,7 @@ pub(super) fn apply_task_result(
     report: &TaskReconcileReport,
 ) -> (bool, bool) {
     let Some(task) = state.tasks.get(&report.task_id) else {
-        return (false, false);
+        return apply_unclaimed_task_result(state, node_id, report);
     };
     if task.node_id != node_id {
         return (false, false);
@@ -860,6 +860,78 @@ pub(super) fn apply_task_result(
         deployment_changed = true;
     }
     (true, deployment_changed)
+}
+
+fn apply_unclaimed_task_result(
+    state: &mut ClusterState,
+    node_id: &str,
+    report: &TaskReconcileReport,
+) -> (bool, bool) {
+    let Some(task) = state
+        .unclaimed_tasks
+        .get(&report.task_id)
+        .filter(|task| task.node_id == node_id)
+    else {
+        return (false, false);
+    };
+    let stack_name = task.stack.clone();
+    let service_name = task.service.clone();
+    let Some(deployment) = state
+        .stacks
+        .get(&stack_name)
+        .and_then(|stack| stack.deployment.as_ref())
+    else {
+        return (false, false);
+    };
+    if report.desired_generation != deployment.generation
+        || report
+            .applied_generation
+            .is_some_and(|generation| generation != report.desired_generation)
+        || (report.error.is_none()) != report.applied_generation.is_some()
+    {
+        return (false, false);
+    }
+    let Some(message) = report.error.as_ref() else {
+        return (false, false);
+    };
+    let deployment = state
+        .stacks
+        .get_mut(&stack_name)
+        .and_then(|stack| stack.deployment.as_mut())
+        .expect("deployment was present above");
+    if deployment.status.is_terminal() {
+        return (false, false);
+    }
+    let error = StackDeploymentError {
+        task_id: report.task_id.clone(),
+        service: service_name,
+        node_id: node_id.to_owned(),
+        phase: report.phase,
+        message: message.clone(),
+    };
+    let mut deployment_changed = false;
+    if !deployment.errors.contains(&error) {
+        deployment.errors.push(error);
+        deployment_changed = true;
+    }
+    if deployment.status.is_active() {
+        let blocked = deployment_error_requires_user(message);
+        deployment.status = if blocked {
+            set_deployment_condition(
+                deployment,
+                StackDeploymentConditionKind::UserActionRequired,
+                unix_ms(),
+                "runtime_dependency".into(),
+                message.clone(),
+            );
+            StackDeploymentStatus::Blocked
+        } else {
+            StackDeploymentStatus::Failed
+        };
+        deployment.finished_at_unix_ms = (!blocked).then(unix_ms);
+        deployment_changed = true;
+    }
+    (false, deployment_changed)
 }
 
 pub(super) fn apply_image_progress(
@@ -1120,6 +1192,31 @@ fn deployment_is_healthy(
     generation: u64,
     gateway_ready: bool,
 ) -> bool {
+    deployment_replacement_ready(state, stack_name, generation, gateway_ready)
+        && state.tasks.values().all(|task| {
+            let Some(service) = state.services.get(&task.service_id) else {
+                return true;
+            };
+            if service.stack != stack_name {
+                return true;
+            }
+            let is_current = !service.deleted
+                && task.revision == service.revision
+                && task.desired == DesiredTaskState::Running;
+            is_current || task.observed == ObservedTaskState::Lost
+        })
+        && !state
+            .unclaimed_tasks
+            .values()
+            .any(|task| task.stack == stack_name)
+}
+
+pub(super) fn deployment_replacement_ready(
+    state: &ClusterState,
+    stack_name: &str,
+    generation: u64,
+    gateway_ready: bool,
+) -> bool {
     let Some(stack) = state.stacks.get(stack_name) else {
         return false;
     };
@@ -1159,20 +1256,7 @@ fn deployment_is_healthy(
             .count()
             >= service.spec.replicas as usize
     });
-    (!deployment.wait_for_gateway || gateway_ready)
-        && replicas_healthy
-        && state.tasks.values().all(|task| {
-            let Some(service) = state.services.get(&task.service_id) else {
-                return true;
-            };
-            if service.stack != stack_name {
-                return true;
-            }
-            let is_current = !service.deleted
-                && task.revision == service.revision
-                && task.desired == DesiredTaskState::Running;
-            is_current || task.observed == ObservedTaskState::Lost
-        })
+    (!deployment.wait_for_gateway || gateway_ready) && replicas_healthy
 }
 
 fn deployment_response(
@@ -1259,13 +1343,20 @@ fn deployment_response(
         .values()
         .filter(|progress| current && progress.desired_generation == generation)
     {
-        let Some(task) = inner.state.tasks.get(&progress.task_id) else {
-            continue;
-        };
-        let Some(service) = inner.state.services.get(&task.service_id) else {
-            continue;
-        };
-        if service.stack == stack_name {
+        let progress_stack = inner
+            .state
+            .tasks
+            .get(&progress.task_id)
+            .and_then(|task| inner.state.services.get(&task.service_id))
+            .map(|service| service.stack.as_str())
+            .or_else(|| {
+                inner
+                    .state
+                    .unclaimed_tasks
+                    .get(&progress.task_id)
+                    .map(|task| task.stack.as_str())
+            });
+        if progress_stack == Some(stack_name) {
             *task_phase_counts.entry(progress.phase).or_insert(0_u32) += 1;
         }
     }
@@ -1292,26 +1383,24 @@ fn deployment_response(
         })
         .collect();
     let pending_removals = if current {
-        u32::try_from(
-            inner
-                .state
-                .tasks
-                .values()
-                .filter(|task| {
-                    let Some(service) = inner.state.services.get(&task.service_id) else {
-                        return false;
-                    };
-                    if service.stack != stack_name {
-                        return false;
-                    }
-                    let is_current = !service.deleted
-                        && task.revision == service.revision
-                        && task.desired == DesiredTaskState::Running;
-                    !is_current && task.observed != ObservedTaskState::Lost
-                })
-                .count(),
-        )
-        .unwrap_or(u32::MAX)
+        let assigned = inner.state.tasks.values().filter(|task| {
+            let Some(service) = inner.state.services.get(&task.service_id) else {
+                return false;
+            };
+            if service.stack != stack_name {
+                return false;
+            }
+            let is_current = !service.deleted
+                && task.revision == service.revision
+                && task.desired == DesiredTaskState::Running;
+            !is_current && task.observed != ObservedTaskState::Lost
+        });
+        let unclaimed = inner
+            .state
+            .unclaimed_tasks
+            .values()
+            .filter(|task| task.stack == stack_name);
+        u32::try_from(assigned.count().saturating_add(unclaimed.count())).unwrap_or(u32::MAX)
     } else {
         0
     };

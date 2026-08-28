@@ -70,14 +70,26 @@ impl Controller {
             .collect();
         let reported_ids = reports.keys().cloned().collect::<BTreeSet<_>>();
         if task_inventory_error.is_none() {
-            inner
+            let disappeared = inner
                 .state
                 .unclaimed_tasks
-                .retain(|task_id, task| task.node_id != node_id || reported_ids.contains(task_id));
+                .values()
+                .filter(|task| task.node_id == node_id && !reported_ids.contains(&task.id))
+                .map(|task| (task.id.clone(), task.stack.clone()))
+                .collect::<Vec<_>>();
+            for (task_id, stack_name) in disappeared {
+                inner.state.unclaimed_tasks.remove(&task_id);
+                inner
+                    .task_progress
+                    .retain(|(progress_task_id, _), _| progress_task_id != &task_id);
+                changed = true;
+                changed |=
+                    mark_current_deployment_progress(&mut inner.state, &stack_name, unix_ms());
+            }
         }
         for report in reports.values() {
             if inner.state.tasks.contains_key(&report.id) {
-                inner.state.unclaimed_tasks.remove(&report.id);
+                changed |= inner.state.unclaimed_tasks.remove(&report.id).is_some();
                 continue;
             }
             let unclaimed = report
@@ -106,6 +118,7 @@ impl Controller {
                     .state
                     .unclaimed_tasks
                     .insert(report.id.clone(), unclaimed);
+                changed = true;
             }
         }
         let assigned_ids: Vec<String> = inner
@@ -312,7 +325,7 @@ impl Controller {
             })
             .collect();
         let image_assignments = image_assignments_for_node(&inner.state, node_id);
-        let remove_tasks = inner
+        let mut remove_tasks = inner
             .state
             .tasks
             .values()
@@ -330,7 +343,24 @@ impl Controller {
                     deployment_generation,
                 })
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let gateway_ready = gateway_ready_for_current_snapshot(&inner);
+        remove_tasks.extend(inner.state.unclaimed_tasks.values().filter_map(|task| {
+            if task.node_id != node_id {
+                return None;
+            }
+            let deployment = inner.state.stacks.get(&task.stack)?.deployment.as_ref()?;
+            deployment_replacement_ready(
+                &inner.state,
+                &task.stack,
+                deployment.generation,
+                gateway_ready,
+            )
+            .then(|| TaskRemovalAssignment {
+                id: task.id.clone(),
+                deployment_generation: deployment.generation,
+            })
+        }));
         let gateway_config = self.gateway_assignment(&inner, gateway_enabled);
         let registry_credentials = inner.state.registry_credentials.clone();
         let registry_credentials_hash = crate::registry::credentials_hash(&registry_credentials);
@@ -466,39 +496,26 @@ fn apply_task_progress(
     node_id: &str,
     progress: &TaskReconcileProgress,
 ) -> (bool, bool) {
-    let Some(task) = inner
-        .state
-        .tasks
-        .get(&progress.task_id)
-        .filter(|task| task.node_id == node_id)
+    let Some((stack_name, deployment_generation)) =
+        task_deployment_target(&inner.state, &progress.task_id, node_id)
     else {
-        return (false, false);
-    };
-    let task_id = task.id.clone();
-    let stack_name = inner
-        .state
-        .services
-        .get(&task.service_id)
-        .map(|service| service.stack.clone());
-    let Some(deployment_generation) = task_deployment_generation(&inner.state, &task_id) else {
         return (false, false);
     };
     if progress.desired_generation != deployment_generation {
         return (false, false);
     }
+    let task_id = progress.task_id.clone();
     let key = (task_id, progress.phase);
     if inner.task_progress.get(&key) == Some(progress) {
         return (false, false);
     }
     inner.task_progress.insert(key, progress.clone());
-    let deployment_changed = stack_name.is_some_and(|stack_name| {
-        mark_deployment_progress(
-            &mut inner.state,
-            &stack_name,
-            deployment_generation,
-            progress.updated_at_unix_ms,
-        )
-    });
+    let deployment_changed = mark_deployment_progress(
+        &mut inner.state,
+        &stack_name,
+        deployment_generation,
+        progress.updated_at_unix_ms,
+    );
     (true, deployment_changed)
 }
 
@@ -541,12 +558,79 @@ fn mark_deployment_progress_record(
 }
 
 fn task_deployment_generation(state: &ClusterState, task_id: &str) -> Option<u64> {
-    let task = state.tasks.get(task_id)?;
-    let service = state.services.get(&task.service_id)?;
+    if let Some(task) = state.tasks.get(task_id) {
+        let service = state.services.get(&task.service_id)?;
+        return state
+            .stacks
+            .get(&service.stack)?
+            .deployment
+            .as_ref()
+            .map(|deployment| deployment.generation);
+    }
+    let task = state.unclaimed_tasks.get(task_id)?;
     state
         .stacks
-        .get(&service.stack)?
+        .get(&task.stack)?
         .deployment
         .as_ref()
         .map(|deployment| deployment.generation)
+}
+
+fn task_deployment_target(
+    state: &ClusterState,
+    task_id: &str,
+    node_id: &str,
+) -> Option<(String, u64)> {
+    let stack_name = if let Some(task) = state.tasks.get(task_id) {
+        if task.node_id != node_id {
+            return None;
+        }
+        state.services.get(&task.service_id)?.stack.clone()
+    } else {
+        let task = state
+            .unclaimed_tasks
+            .get(task_id)
+            .filter(|task| task.node_id == node_id)?;
+        task.stack.clone()
+    };
+    let generation = state
+        .stacks
+        .get(&stack_name)?
+        .deployment
+        .as_ref()?
+        .generation;
+    Some((stack_name, generation))
+}
+
+fn mark_current_deployment_progress(
+    state: &mut ClusterState,
+    stack_name: &str,
+    progress_at_unix_ms: i64,
+) -> bool {
+    let Some(generation) = state
+        .stacks
+        .get(stack_name)
+        .and_then(|stack| stack.deployment.as_ref())
+        .map(|deployment| deployment.generation)
+    else {
+        return false;
+    };
+    mark_deployment_progress(state, stack_name, generation, progress_at_unix_ms)
+}
+
+fn gateway_ready_for_current_snapshot(inner: &Inner) -> bool {
+    let enabled = inner
+        .state
+        .members
+        .values()
+        .filter(|member| member.gateway_enabled)
+        .map(|member| member.id.as_str())
+        .collect::<Vec<_>>();
+    !enabled.is_empty()
+        && enabled.iter().all(|node_id| {
+            inner.gateway_reports.get(*node_id).is_some_and(|report| {
+                report.error.is_none()
+                    && report.applied_generation == Some(inner.gateway_generation)
+            })
+        })
 }

@@ -577,6 +577,34 @@ fn parsed_test_stack() -> ParsedStack {
     }
 }
 
+fn recovered_task_report(
+    cluster_id: &str,
+    stack: &str,
+    id: &str,
+    revision: u64,
+    spec: &ServiceSpec,
+    published_port: u16,
+) -> TaskReport {
+    TaskReport {
+        id: id.into(),
+        observed: ObservedTaskState::Healthy,
+        container_id: Some(format!("container-{id}")),
+        image_id: None,
+        cluster_id: Some(cluster_id.into()),
+        stack: Some(stack.into()),
+        service: Some("web".into()),
+        slot: Some(0),
+        revision: Some(revision),
+        spec_hash: Some(service_spec_hash(spec)),
+        ports: vec![PortBinding {
+            target: 80,
+            published: Some(published_port),
+            protocol: "tcp".into(),
+        }],
+        config_digests: Vec::new(),
+    }
+}
+
 fn image_test_heartbeat(
     task: &TaskRecord,
     desired_generation: Option<u64>,
@@ -1508,6 +1536,7 @@ x-swarmlite:
 "#,
     )
     .unwrap();
+    let recovered_spec = parsed.services["web"].clone();
     let snapshot = GatewayRecoverySnapshot::new(
         cluster.cluster_id.clone(),
         41,
@@ -1525,16 +1554,122 @@ x-swarmlite:
     repository
         .initialize_from_gateway_recovery(&snapshot)
         .unwrap();
-    let controller = Controller::new(
-        test_controller_config(&cluster),
-        "0123456789abcdef".into(),
-        repository.clone(),
-    )
-    .await
-    .unwrap();
+    let mut config = test_controller_config(&cluster);
+    config.gateway_enabled = false;
+    let controller = Controller::new(config, "0123456789abcdef".into(), repository.clone())
+        .await
+        .unwrap();
+    let mut request = test_join_request("node-a", "127.0.0.1");
+    request.gateway_enabled = true;
+    controller.join_node("node-a", request).await.unwrap();
+    let recovered_task = recovered_task_report(
+        &cluster.cluster_id,
+        "demo",
+        "recovered-task",
+        4,
+        &recovered_spec,
+        32_080,
+    );
+    controller
+        .heartbeat(
+            "node-a",
+            NodeHeartbeat {
+                node: test_node(),
+                tasks: vec![recovered_task.clone()],
+                task_inventory_error: None,
+                task_results: Vec::new(),
+                task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
+                gateway: GatewayReport {
+                    applied_generation: Some(snapshot.generation),
+                    error: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
 
     assert_eq!(controller.list_stacks().await.stacks[0].name, "demo");
-    controller.remove_stack("demo").await.unwrap();
+    let removal = controller.remove_stack("demo").await.unwrap();
+    assert_eq!(removal.pending_removals, 1);
+
+    let waiting = controller
+        .heartbeat(
+            "node-a",
+            NodeHeartbeat {
+                node: test_node(),
+                tasks: vec![recovered_task.clone()],
+                task_inventory_error: None,
+                task_results: Vec::new(),
+                task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
+                gateway: GatewayReport {
+                    applied_generation: Some(snapshot.generation),
+                    error: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(waiting.remove_tasks.is_empty());
+    let gateway_generation = waiting.gateway_config.unwrap().generation;
+
+    let cleanup = controller
+        .heartbeat(
+            "node-a",
+            NodeHeartbeat {
+                node: test_node(),
+                tasks: vec![recovered_task],
+                task_inventory_error: None,
+                task_results: Vec::new(),
+                task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
+                gateway: GatewayReport {
+                    applied_generation: Some(gateway_generation),
+                    error: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleanup.remove_tasks.len(), 1);
+    assert_eq!(cleanup.remove_tasks[0].id, "recovered-task");
+
+    controller
+        .heartbeat(
+            "node-a",
+            NodeHeartbeat {
+                node: test_node(),
+                tasks: Vec::new(),
+                task_inventory_error: None,
+                task_results: vec![TaskReconcileReport {
+                    task_id: "recovered-task".into(),
+                    desired_generation: removal.generation,
+                    applied_generation: Some(removal.generation),
+                    phase: crate::model::TaskReconcilePhase::Remove,
+                    error: None,
+                }],
+                task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
+                gateway: GatewayReport {
+                    applied_generation: Some(gateway_generation),
+                    error: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    let completed = controller
+        .wait_for_deployment("demo", Some(removal.generation), None, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(completed.status, StackDeploymentStatus::Healthy);
+    assert_eq!(completed.pending_removals, 0);
 
     let inner = controller.inner.lock().await;
     assert!(!inner.state.gateway_routes.contains_key("demo"));
@@ -2376,6 +2511,150 @@ async fn heartbeat_then_deploy_adopts_the_existing_container() {
     assert_eq!(inner.state.services["demo.web"].revision, 7);
     assert_eq!(inner.state.tasks["existing-task"].revision, 7);
     assert!(inner.state.unclaimed_tasks.is_empty());
+}
+
+#[tokio::test]
+async fn changed_deploy_removes_only_its_stale_recovered_tasks_after_replacement_is_ready() {
+    let cluster_id = "stale-recovery-cleanup-test";
+    let (controller, _, _directory) = test_controller(cluster_id).await;
+    controller
+        .join_node("node-a", test_join_request("node-a", "127.0.0.1"))
+        .await
+        .unwrap();
+    let mut recovered_spec = test_service().spec;
+    recovered_spec.service_labels.clear();
+    let alpha_old =
+        recovered_task_report(cluster_id, "alpha", "alpha-old", 7, &recovered_spec, 20_001);
+    let beta_old =
+        recovered_task_report(cluster_id, "beta", "beta-old", 7, &recovered_spec, 20_002);
+    controller
+        .heartbeat(
+            "node-a",
+            NodeHeartbeat {
+                node: test_node(),
+                tasks: vec![alpha_old.clone(), beta_old.clone()],
+                task_inventory_error: None,
+                task_results: Vec::new(),
+                task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
+                gateway: GatewayReport::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut replacement_spec = recovered_spec.clone();
+    replacement_spec.environment.push("RECOVERY_TEST=v2".into());
+    let accepted = controller
+        .apply(
+            "alpha",
+            ParsedStack {
+                services: BTreeMap::from([("web".into(), replacement_spec.clone())]),
+                gateway: StackGatewaySpec::default(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted.pending_removals, 1);
+
+    let waiting = controller
+        .heartbeat(
+            "node-a",
+            NodeHeartbeat {
+                node: test_node(),
+                tasks: vec![alpha_old.clone(), beta_old.clone()],
+                task_inventory_error: None,
+                task_results: Vec::new(),
+                task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
+                gateway: GatewayReport::default(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(waiting.remove_tasks.is_empty());
+
+    let replacement = {
+        let inner = controller.inner.lock().await;
+        inner
+            .state
+            .tasks
+            .values()
+            .find(|task| task.service_id == "alpha.web")
+            .unwrap()
+            .clone()
+    };
+    let replacement_report = recovered_task_report(
+        cluster_id,
+        "alpha",
+        &replacement.id,
+        replacement.revision,
+        &replacement_spec,
+        20_003,
+    );
+    let cleanup = controller
+        .heartbeat(
+            "node-a",
+            NodeHeartbeat {
+                node: test_node(),
+                tasks: vec![
+                    alpha_old.clone(),
+                    beta_old.clone(),
+                    replacement_report.clone(),
+                ],
+                task_inventory_error: None,
+                task_results: vec![TaskReconcileReport {
+                    task_id: replacement.id.clone(),
+                    desired_generation: accepted.generation,
+                    applied_generation: Some(accepted.generation),
+                    phase: crate::model::TaskReconcilePhase::Verify,
+                    error: None,
+                }],
+                task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
+                gateway: GatewayReport::default(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleanup.remove_tasks.len(), 1);
+    assert_eq!(cleanup.remove_tasks[0].id, "alpha-old");
+
+    controller
+        .heartbeat(
+            "node-a",
+            NodeHeartbeat {
+                node: test_node(),
+                tasks: vec![beta_old, replacement_report],
+                task_inventory_error: None,
+                task_results: vec![TaskReconcileReport {
+                    task_id: "alpha-old".into(),
+                    desired_generation: accepted.generation,
+                    applied_generation: Some(accepted.generation),
+                    phase: crate::model::TaskReconcilePhase::Remove,
+                    error: None,
+                }],
+                task_progress: Vec::new(),
+                image_results: Vec::new(),
+                image_progress: Vec::new(),
+                gateway: GatewayReport::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let completed = controller
+        .wait_for_deployment("alpha", Some(accepted.generation), None, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(completed.status, StackDeploymentStatus::Healthy);
+    assert_eq!(completed.pending_removals, 0);
+    let inner = controller.inner.lock().await;
+    assert!(!inner.state.unclaimed_tasks.contains_key("alpha-old"));
+    assert!(inner.state.unclaimed_tasks.contains_key("beta-old"));
 }
 
 #[tokio::test]

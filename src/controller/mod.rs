@@ -66,7 +66,7 @@ mod stacks;
 
 use deployment::{
     apply_image_progress, apply_image_resolution_report, apply_task_result,
-    mark_deployment_progress,
+    deployment_replacement_ready, mark_deployment_progress,
 };
 use membership::*;
 use recovery::*;
