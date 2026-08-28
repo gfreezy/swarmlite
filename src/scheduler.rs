@@ -239,6 +239,7 @@ fn schedule_task(
         .values()
         .filter(|node| live_nodes.contains(&node.id))
         .filter(|node| matches_constraints(node, &service.spec.constraints))
+        .filter(|node| node_has_replica_capacity(state, node, service))
         .filter(|node| explicit_ports_available(state, node, &service.spec))
         .collect::<Vec<_>>();
     candidates.sort_by_key(|node| {
@@ -285,6 +286,53 @@ fn schedule_task(
         drain_until_unix_ms: None,
         applied_generation: None,
         reconcile_error: None,
+    })
+}
+
+fn node_has_replica_capacity(
+    state: &ClusterState,
+    node: &NodeRecord,
+    service: &ServiceRecord,
+) -> bool {
+    service.spec.max_replicas_per_node.is_none_or(|limit| {
+        if limit == 0 {
+            return true;
+        }
+
+        let active = state
+            .tasks
+            .values()
+            .filter(|task| {
+                task.node_id == node.id
+                    && task.service_id == service.id
+                    && !matches!(
+                        task.observed,
+                        ObservedTaskState::Failed | ObservedTaskState::Lost
+                    )
+            })
+            .count();
+        if active < limit as usize {
+            return true;
+        }
+
+        // A start-first replacement may temporarily share a node with the old task it
+        // replaces. Each still-running old task grants at most one such surge slot;
+        // ordinary scaling and stop-first updates continue to enforce the hard limit.
+        let old_running = state
+            .tasks
+            .values()
+            .filter(|task| {
+                task.node_id == node.id
+                    && task.service_id == service.id
+                    && task.revision != service.revision
+                    && task.desired == DesiredTaskState::Running
+                    && !matches!(
+                        task.observed,
+                        ObservedTaskState::Failed | ObservedTaskState::Lost
+                    )
+            })
+            .count();
+        service.spec.max_surge > 0 && active < (limit as usize).saturating_add(old_running)
     })
 }
 
@@ -427,6 +475,7 @@ mod tests {
                 healthcheck: None,
                 replicas,
                 constraints: vec![],
+                max_replicas_per_node: None,
                 max_surge: 1,
                 stop_grace_period_seconds: 10,
             },
@@ -469,6 +518,83 @@ mod tests {
         });
         assert_eq!(by_node["node-a"], 2);
         assert_eq!(by_node["node-b"], 1);
+    }
+
+    #[test]
+    fn max_replicas_per_node_leaves_excess_replicas_unscheduled() {
+        let (mut state, live) = state_with_nodes();
+        let mut limited = service(1, 3);
+        limited.spec.max_replicas_per_node = Some(1);
+        state.services.insert(limited.id.clone(), limited);
+
+        assert!(reconcile(&mut state, &live));
+        assert_eq!(state.tasks.len(), 2);
+        assert_eq!(
+            state
+                .tasks
+                .values()
+                .map(|task| task.node_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["node-a", "node-b"])
+        );
+        assert!(!reconcile(&mut state, &live));
+        assert_eq!(state.tasks.len(), 2);
+    }
+
+    #[test]
+    fn start_first_update_temporarily_exceeds_max_replicas_per_node() {
+        let (mut state, mut live) = state_with_nodes();
+        state.nodes.remove("node-b");
+        live.remove("node-b");
+        let mut original = service(1, 1);
+        original.spec.max_replicas_per_node = Some(1);
+        state.services.insert(original.id.clone(), original.clone());
+        assert!(reconcile(&mut state, &live));
+        state.tasks.values_mut().for_each(|task| {
+            task.observed = ObservedTaskState::Healthy;
+        });
+
+        let mut updated = original;
+        updated.revision = 2;
+        updated.spec.image = "example/web:v2".into();
+        state.services.insert(updated.id.clone(), updated);
+
+        assert!(reconcile(&mut state, &live));
+        assert_eq!(state.tasks.len(), 2);
+        assert!(state.tasks.values().all(|task| task.node_id == "node-a"));
+        assert_eq!(
+            state
+                .tasks
+                .values()
+                .map(|task| task.revision)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([1, 2])
+        );
+
+        let replacement = state
+            .tasks
+            .values_mut()
+            .find(|task| task.revision == 2)
+            .unwrap();
+        replacement.observed = ObservedTaskState::Healthy;
+        replacement.ports[0].published = Some(20_000);
+        assert!(reconcile(&mut state, &live));
+        assert_eq!(
+            state
+                .tasks
+                .values()
+                .find(|task| task.revision == 1)
+                .unwrap()
+                .desired,
+            DesiredTaskState::Stopped
+        );
+
+        state
+            .tasks
+            .retain(|_, task| task.desired != DesiredTaskState::Stopped);
+        assert!(!reconcile(&mut state, &live));
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.tasks.values().next().unwrap().revision, 2);
     }
 
     #[test]

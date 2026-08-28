@@ -141,6 +141,7 @@ struct RawDeploy {
 struct RawPlacement {
     #[serde(default)]
     constraints: Vec<String>,
+    max_replicas_per_node: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -372,6 +373,11 @@ fn normalize_service(name: &str, raw: RawService) -> Result<ServiceSpec> {
     } else {
         0
     };
+    let max_replicas_per_node = raw
+        .deploy
+        .placement
+        .max_replicas_per_node
+        .filter(|limit| *limit > 0);
 
     let expose = raw
         .expose
@@ -428,6 +434,7 @@ fn normalize_service(name: &str, raw: RawService) -> Result<ServiceSpec> {
             .transpose()?,
         replicas: raw.deploy.replicas.unwrap_or(1),
         constraints: raw.deploy.placement.constraints,
+        max_replicas_per_node,
         max_surge,
         stop_grace_period_seconds,
     };
@@ -899,6 +906,7 @@ services:
       placement:
         constraints:
           - node.labels.role==app
+        max_replicas_per_node: 2
       update_config:
         parallelism: 2
         order: start-first
@@ -920,6 +928,7 @@ x-swarmlite:
         let web = &stack.services["web"];
         assert_eq!(web.pull_policy, PullPolicy::Always);
         assert_eq!(web.replicas, 3);
+        assert_eq!(web.max_replicas_per_node, Some(2));
         assert_eq!(web.max_surge, 2);
         assert_eq!(web.stop_grace_period_seconds, 20);
         assert_eq!(
@@ -932,6 +941,23 @@ x-swarmlite:
         assert_eq!(rule.backend.service.as_deref(), Some("web"));
         assert_eq!(rule.backend.port, 80);
         assert_eq!(rule.matches[0].path, "/api");
+    }
+
+    #[test]
+    fn treats_zero_max_replicas_per_node_as_unlimited() {
+        let stack = parse_stack(
+            r#"
+services:
+  web:
+    image: nginx
+    deploy:
+      placement:
+        max_replicas_per_node: 0
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(stack.services["web"].max_replicas_per_node, None);
     }
 
     #[test]

@@ -46,6 +46,8 @@ pub struct ServiceSpec {
     pub healthcheck: Option<HealthcheckSpec>,
     pub replicas: u32,
     pub constraints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_replicas_per_node: Option<u32>,
     pub max_surge: u32,
     pub stop_grace_period_seconds: u64,
 }
@@ -1074,6 +1076,7 @@ mod tests {
             healthcheck: None,
             replicas: 1,
             constraints: Vec::new(),
+            max_replicas_per_node: None,
             max_surge: 1,
             stop_grace_period_seconds: 10,
         }

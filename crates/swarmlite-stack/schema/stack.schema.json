@@ -316,6 +316,13 @@
           "items": { "type": "string", "minLength": 1 },
           "default": [],
           "description": "Hard constraints such as node.labels.region == cn-east or node.id != node-a."
+        },
+        "max_replicas_per_node": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 0,
+          "description": "Steady-state limit on replicas of this service assigned to one node. Zero means unlimited. Start-first replacements may temporarily exceed the limit while their old tasks are still running."
         }
       },
       "additionalProperties": false

@@ -65,6 +65,7 @@ rejected instead of being silently ignored. The complete supported surface is:
 | `deploy.replicas` | Non-negative integer; defaults to `1` |
 | `deploy.labels` | Scalar map or string array; stored as service metadata |
 | `deploy.placement.constraints` | Hard `node.id`, `node.hostname`, or `node.labels.*` comparisons using `==` or `!=` |
+| `deploy.placement.max_replicas_per_node` | Non-negative steady-state per-node limit; unset or `0` means unlimited; `start-first` replacements may temporarily exceed it |
 | `deploy.update_config` | `parallelism` and `order: start-first|stop-first` |
 
 An internal route may omit `backend.port` when its Service declares exactly one distinct TCP

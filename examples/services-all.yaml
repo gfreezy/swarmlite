@@ -50,6 +50,7 @@ services:
         constraints:
           - node.labels.region == cn-east
           - node.labels.disk != hdd
+        max_replicas_per_node: 2
       update_config:
         parallelism: 2
         order: start-first

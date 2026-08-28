@@ -350,11 +350,19 @@ services:
         constraints:
           - node.labels.region == cn-north
           - node.labels.disk == nvme
+        max_replicas_per_node: 1
 ```
 
 When a label change makes a running task violate a constraint, Swarmlite drains that task and
 schedules a replacement on an eligible live node. If no node matches, the service remains
 under-replicated; constraints are never silently ignored.
+
+`max_replicas_per_node` is a steady-state hard placement rule; omit it or set it to `0` for no
+limit. If eligible nodes do not provide enough slots, Swarmlite keeps the service under-replicated
+until capacity becomes available. During a `start-first` update only, each running old task grants
+one temporary slot for its replacement on the same node. The old task is removed after the
+replacement becomes healthy, returning the node to its configured limit. Scaling and failure
+recovery never receive temporary slots.
 
 `serve` does not accept label arguments. Agent heartbeats receive the authoritative label set from
 the Controller and cache it in local SQLite state.

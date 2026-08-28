@@ -1082,6 +1082,7 @@ x-swarmlite:
                     healthcheck: None,
                     replicas: 1,
                     constraints: Vec::new(),
+                    max_replicas_per_node: None,
                     max_surge: 0,
                     stop_grace_period_seconds: 10,
                 },
