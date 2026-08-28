@@ -5,6 +5,8 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/caddy ./cmd/caddy
 RUN /out/caddy list-modules | grep -qx 'caddy.storage.swarmlite'
+RUN /out/caddy list-modules | grep -qx 'http.handlers.cache'
+RUN /out/caddy list-modules | grep -qx 'storages.cache.badger'
 
 FROM caddy:2.11.2-alpine
 COPY --from=build /out/caddy /usr/bin/caddy

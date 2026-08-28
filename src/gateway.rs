@@ -43,19 +43,46 @@ pub fn generate(state: &ClusterState, listen: &[String]) -> HttpServer {
 pub fn config(state: &ClusterState, listen: &[String], controller: String) -> Value {
     let server = generate(state, listen);
     let storage = storage(controller);
+    let mut apps = json!({
+        "http": {
+            "servers": {
+                "swarmlite": server
+            }
+        }
+    });
+    if state.stacks.values().any(|stack| {
+        stack
+            .gateway
+            .http_routes
+            .iter()
+            .flat_map(|route| &route.rules)
+            .any(|rule| rule.cache.is_some())
+    }) {
+        apps.as_object_mut()
+            .expect("apps is an object")
+            .insert("cache".to_owned(), cache_app());
+    }
+
     json!({
         "admin": {
             "listen": "0.0.0.0:2019",
             "config": { "persist": true }
         },
         "storage": storage,
-        "apps": {
-            "http": {
-                "servers": {
-                    "swarmlite": server
-                }
+        "apps": apps
+    })
+}
+
+fn cache_app() -> Value {
+    json!({
+        "badger": {
+            "found": true,
+            "configuration": {
+                "Dir": "/cache/badger",
+                "ValueDir": "/cache/badger"
             }
-        }
+        },
+        "mode": "bypass"
     })
 }
 
@@ -165,6 +192,55 @@ x-swarmlite:
         assert_eq!(
             proxy["upstreams"],
             serde_json::json!([{"dial": "10.0.0.21:20001"}])
+        );
+    }
+
+    #[test]
+    fn only_configures_the_cache_app_for_cached_routes() {
+        let uncached = config(
+            &ClusterState::default(),
+            &[":80".into()],
+            "controller".into(),
+        );
+        assert!(uncached["apps"].get("cache").is_none());
+
+        let parsed = parse_stack(
+            r#"
+services:
+  web:
+    image: nginx
+    expose: [80]
+x-swarmlite:
+  http_routes:
+    - hostnames: [example.com]
+      rules:
+        - cache:
+            ttl: 5m
+          backend: { service: web }
+"#,
+        )
+        .unwrap();
+        let mut state = ClusterState::default();
+        state.stacks.insert(
+            "demo".into(),
+            StackRecord {
+                name: "demo".into(),
+                applied_at_unix_ms: 1,
+                services: vec!["demo.web".into()],
+                gateway: parsed.gateway,
+                deployment: None,
+            },
+        );
+
+        let cached = config(&state, &[":80".into()], "controller".into());
+        assert_eq!(cached["apps"]["cache"]["mode"], "bypass");
+        assert_eq!(
+            cached["apps"]["cache"]["badger"]["configuration"]["Dir"],
+            "/cache/badger"
+        );
+        assert_eq!(
+            cached["apps"]["cache"]["badger"]["configuration"]["ValueDir"],
+            "/cache/badger"
         );
     }
 

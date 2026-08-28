@@ -304,7 +304,8 @@ impl Controller {
     pub(super) async fn status(&self) -> StatusResponse {
         let inner = self.inner.lock().await;
         let generation = inner.generation;
-        let state = inner.state.clone();
+        let mut state = inner.state.clone();
+        state.registry_credentials.clear();
         let recovery = recovery_status(&state);
         let enabled = state
             .members

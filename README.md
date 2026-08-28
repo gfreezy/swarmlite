@@ -306,7 +306,8 @@ until at least one is enabled.
 
 > [!WARNING]
 > Disabling a Gateway deletes its Caddy container and persistent volumes, including its local
-> certificate data. Image, listener, and advertise-address replacements retain those volumes.
+> certificate data and disk response cache. Image, listener, and advertise-address replacements
+> retain those volumes.
 
 Gateway lifecycle and configuration operations are best-effort. A Gateway image, port binding,
 container startup, or Caddy configuration error does not stop the node Agent or Controller. The
@@ -372,6 +373,31 @@ printf '%s' "$GHCR_TOKEN" | swarmlite registry login ghcr.io \
   --username github-user --password-stdin \
   --controller http://controller.example:17080 --token "$SWARMLITE_TOKEN"
 ```
+
+Credentials may also be declared in the Compose-compatible `x-swarmlite` extension. Deploying the
+Stack validates and merges these entries into the same cluster-wide credential store before Agents
+process the deployment:
+
+```yaml
+services:
+  api:
+    image: ghcr.io/example/private-api:latest
+
+x-swarmlite:
+  registries:
+    ghcr.io:
+      username: github-user
+      password: your-access-token
+```
+
+Registry hostnames are case-normalized, and Docker Hub aliases normalize to `docker.io`. Entries
+not present in a later Stack deployment are retained so one Stack cannot remove credentials used
+by another Stack. An inline credential change does not by itself alter a Service revision, but an
+`always` or effective `latest` pull in that deployment immediately uses the new credential.
+
+The password is omitted from progress, debug, API status, and Service specifications. It is still
+plain text in the Stack file and is persisted in the protected Controller and Agent state, so keep
+the file private (for example, mode `0600`) and do not commit real credentials to source control.
 
 ## Deploying and operating Stacks
 
@@ -611,6 +637,11 @@ x-swarmlite:
             - path: /api
           rewrite:
             strip_prefix: true
+          cache:
+            ttl: 5m
+            stale: 30s
+            key:
+              hash: true
           backend:
             service: api
 ```
@@ -630,6 +661,23 @@ Path matches support `exact`, `prefix` (the default), and RE2-compatible `regex`
 exactly one of `strip_prefix`, `replace_prefix`, or `replace_path`. Multiple matches in one rule
 are OR conditions. A rule without matches is the hostname fallback. Precedence is exact, longest
 prefix, regex, then fallback.
+
+`cache` is optional on each rule. When it is absent, Swarmlite does not add a cache handler for
+that rule. When present, its fields are passed as the route's
+[`cache-handler`](https://github.com/caddyserver/cache-handler) `DefaultCache` configuration; the
+most common fields are `ttl`, `stale`, `key`, `headers`, `allowed_http_verbs`, and
+`max_cacheable_body_bytes`. The dedicated
+[`cache-handler.schema.json`](https://raw.githubusercontent.com/gfreezy/swarmlite/main/crates/swarmlite-stack/schema/cache-handler.schema.json)
+provides editor completion without turning those fields into Rust Stack types. Unknown fields are
+preserved for Caddy, so newer cache-handler options can be used without changing Swarmlite.
+
+Swarmlite reserves `handler`, `Configuration`, and `mode`. Cached rules always use cache-handler's
+`bypass` mode: the route declaration and its TTL decide caching, independently of request or
+upstream response `Cache-Control` headers. Responses are stored in a node-local Badger database in
+the Gateway's persistent `/cache` volume. Each Gateway has its own cache; it is not replicated
+between nodes. A malformed native cache option is rejected when Caddy atomically loads the
+generated configuration, leaving the previous accepted configuration active and reporting the
+failure under `gateway.endpoint_errors`.
 
 `tls` is `serve|disabled`, and `http` is `redirect|serve|disabled`. Each route may override the
 top-level defaults. `http: redirect` requires `tls: serve`.
@@ -660,19 +708,22 @@ sudo swarmlite config set gateway-image registry.example.com/swarmlite-caddy:1.1
 sudo swarmlite config get
 ```
 
-Every Gateway pulls the updated image before replacing its Caddy container. Its `/data` and
-`/config` volumes are retained. Advanced installations can override the default listeners with
+Every Gateway pulls the updated image before replacing its Caddy container. Its `/data`,
+`/config`, and `/cache` volumes are retained. Advanced installations can override the default listeners with
 repeated `--gateway-listen` options during `init`. Custom images must contain
-`caddy.storage.swarmlite`; see [`caddy-storage/README.md`](caddy-storage/README.md).
+`caddy.storage.swarmlite`, `http.handlers.cache`, and `storages.cache.badger`; see
+[`caddy-storage/README.md`](caddy-storage/README.md).
 
 <details>
 <summary>Gateway persistence and certificate coordination</summary>
 
 Caddy stores certificates in a cluster-specific volume mounted at `/data` and its last accepted
 configuration in a volume mounted at `/config`. It starts with `--resume`, so existing routes can
-survive temporary Controller unavailability.
+survive temporary Controller unavailability. Cached HTTP responses use a third cluster-specific
+volume mounted at `/cache`, so cache entries survive Gateway container restarts and image changes.
 
-The gateway image enables `caddy.storage.swarmlite`. Local Caddy storage remains authoritative,
+The gateway image enables `caddy.storage.swarmlite`, `http.handlers.cache`, and
+`storages.cache.badger`. Local Caddy storage remains authoritative,
 while certificate objects are copied to the Controller KV API and certificate issuance uses
 distributed locks. Additional Gateways can normally reuse an existing certificate. If the KV API
 is unavailable, Caddy falls back immediately to local certificate data and local locks; existing

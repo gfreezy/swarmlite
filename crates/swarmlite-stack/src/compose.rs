@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt,
     time::Duration,
 };
 
@@ -23,11 +24,28 @@ pub struct ParsedStackDocument {
     pub name: Option<String>,
     pub stack: ParsedStack,
     pub configs: BTreeMap<String, StackConfigSource>,
+    pub registries: BTreeMap<String, StackRegistryCredential>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StackConfigSource {
     pub file: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct StackRegistryCredential {
+    pub username: String,
+    pub password: String,
+}
+
+impl fmt::Debug for StackRegistryCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StackRegistryCredential")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,11 +68,20 @@ struct RawConfigSource {
 struct RawSwarmlite {
     name: Option<String>,
     #[serde(default)]
+    registries: BTreeMap<String, RawRegistryCredential>,
+    #[serde(default)]
     tls: GatewayTlsMode,
     #[serde(default)]
     http: GatewayHttpMode,
     #[serde(default)]
     http_routes: Vec<HttpRouteSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRegistryCredential {
+    username: String,
+    password: String,
 }
 
 impl RawSwarmlite {
@@ -274,6 +301,13 @@ pub fn parse_stack_document(yaml: &str) -> Result<ParsedStackDocument> {
         .collect::<Result<_>>()?;
     validate_service_configs(&services, &configs)?;
     let name = raw.swarmlite.name.take();
+    let registries = std::mem::take(&mut raw.swarmlite.registries)
+        .into_iter()
+        .map(|(registry, credential)| {
+            normalize_registry_credential(&registry, credential)
+                .map(|credential| (registry, credential))
+        })
+        .collect::<Result<_>>()?;
     let mut gateway = raw.swarmlite.gateway();
     crate::validate_and_normalize(&mut gateway, &services)
         .context("invalid x-swarmlite configuration")?;
@@ -281,6 +315,26 @@ pub fn parse_stack_document(yaml: &str) -> Result<ParsedStackDocument> {
         name,
         stack: ParsedStack { services, gateway },
         configs,
+        registries,
+    })
+}
+
+fn normalize_registry_credential(
+    registry: &str,
+    raw: RawRegistryCredential,
+) -> Result<StackRegistryCredential> {
+    if registry.is_empty() || registry.trim() != registry {
+        bail!("x-swarmlite.registries contains an empty or whitespace-padded registry name");
+    }
+    if raw.username.is_empty() {
+        bail!("x-swarmlite.registries[{registry:?}].username must not be empty");
+    }
+    if raw.password.is_empty() {
+        bail!("x-swarmlite.registries[{registry:?}].password must not be empty");
+    }
+    Ok(StackRegistryCredential {
+        username: raw.username,
+        password: raw.password,
     })
 }
 
@@ -772,6 +826,47 @@ x-swarmlite:
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("invalid x-swarmlite.name"));
+    }
+
+    #[test]
+    fn parses_registry_credentials_without_exposing_passwords_in_debug_output() {
+        let document = parse_stack_document(
+            r#"
+services:
+  web:
+    image: ghcr.io/example/private:latest
+x-swarmlite:
+  registries:
+    ghcr.io:
+      username: octocat
+      password: private-token
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(document.registries["ghcr.io"].username, "octocat");
+        assert_eq!(document.registries["ghcr.io"].password, "private-token");
+        let debug = format!("{document:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("private-token"));
+    }
+
+    #[test]
+    fn rejects_empty_or_malformed_registry_credentials() {
+        for (field, value) in [
+            ("username", "username: ''\n      password: token"),
+            ("password", "username: user\n      password: ''"),
+            (
+                "email",
+                "username: user\n      password: token\n      email: user@example.com",
+            ),
+        ] {
+            let yaml = format!(
+                "services:\n  web:\n    image: nginx\nx-swarmlite:\n  registries:\n    ghcr.io:\n      {value}\n"
+            );
+            let error = parse_stack_document(&yaml).unwrap_err();
+            assert!(format!("{error:#}").contains(field), "{error:#}");
+        }
     }
 
     #[test]

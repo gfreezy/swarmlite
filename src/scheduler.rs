@@ -810,6 +810,7 @@ mod tests {
                         rules: vec![HttpRouteRule {
                             matches: Vec::new(),
                             rewrite: None,
+                            cache: None,
                             backend: HttpBackend {
                                 service: Some(service.into()),
                                 host: None,

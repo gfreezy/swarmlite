@@ -12,8 +12,8 @@ use sha2::{Digest, Sha256};
 mod compose;
 
 pub use compose::{
-    ParsedStack, ParsedStackDocument, StackConfigSource, parse_stack, parse_stack_document,
-    resolve_config_digests,
+    ParsedStack, ParsedStackDocument, StackConfigSource, StackRegistryCredential, parse_stack,
+    parse_stack_document, resolve_config_digests,
 };
 
 pub fn validate_stack_name(name: &str) -> Result<()> {
@@ -212,6 +212,8 @@ pub struct HttpRouteRule {
     pub matches: Vec<HttpPathMatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rewrite: Option<HttpPathRewrite>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<serde_json::Map<String, Value>>,
     pub backend: HttpBackend,
 }
 
@@ -389,6 +391,9 @@ pub fn validate_and_normalize(
             }
             validate_rewrite(rule.rewrite.as_ref(), &rule.matches).with_context(|| {
                 format!("invalid http_routes[{route_index}].rules[{rule_index}].rewrite")
+            })?;
+            validate_cache(rule.cache.as_ref()).with_context(|| {
+                format!("invalid http_routes[{route_index}].rules[{rule_index}].cache")
             })?;
             normalize_backend(&mut rule.backend, services).with_context(|| {
                 format!("invalid http_routes[{route_index}].rules[{rule_index}].backend")
@@ -630,6 +635,20 @@ fn validate_rewrite_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_cache(cache: Option<&serde_json::Map<String, Value>>) -> Result<()> {
+    let Some(cache) = cache else {
+        return Ok(());
+    };
+
+    for field in ["handler", "Configuration", "mode"] {
+        if cache.contains_key(field) {
+            bail!("{field} is managed by Swarmlite and must not be set");
+        }
+    }
+
+    Ok(())
+}
+
 fn normalize_backend(
     backend: &mut HttpBackend,
     services: &BTreeMap<String, ServiceSpec>,
@@ -728,7 +747,13 @@ fn build_proxy_routes(
     for (rule_index, path_match, rule) in expanded {
         let match_index = path_match.map_or(0, |(index, _)| index);
         let path_match = path_match.map(|(_, path_match)| path_match);
-        let mut handle = rewrite_handlers(rule.rewrite.as_ref(), path_match);
+        let mut handle = rule
+            .cache
+            .as_ref()
+            .map(cache_handler)
+            .into_iter()
+            .collect::<Vec<_>>();
+        handle.extend(rewrite_handlers(rule.rewrite.as_ref(), path_match));
         handle.extend(backend_handlers(stack_name, &rule.backend, resolve_service));
         routes.push(Route {
             id: format!(
@@ -750,6 +775,29 @@ fn build_proxy_routes(
             terminal: true,
         });
     }
+}
+
+fn cache_handler(cache: &serde_json::Map<String, Value>) -> Value {
+    // cache-handler's native JSON keeps the effective route settings under
+    // Configuration.DefaultCache. Keep the stack syntax flat while passing
+    // every unmodeled field through to that object.
+    let mut default_cache = cache.clone();
+    let cache_keys = default_cache.remove("cache_keys");
+    let log_level = default_cache.remove("log_level");
+
+    let mut configuration = serde_json::Map::new();
+    configuration.insert("DefaultCache".to_owned(), Value::Object(default_cache));
+    if let Some(cache_keys) = cache_keys {
+        configuration.insert("cache_keys".to_owned(), cache_keys);
+    }
+    if let Some(log_level) = log_level {
+        configuration.insert("LogLevel".to_owned(), log_level);
+    }
+
+    json!({
+        "handler": "cache",
+        "Configuration": configuration,
+    })
 }
 
 fn redirect_route(
@@ -973,6 +1021,7 @@ mod tests {
                         strip_prefix: true,
                         ..Default::default()
                     }),
+                    cache: None,
                     backend: HttpBackend {
                         service: Some("api".into()),
                         host: None,
@@ -1012,6 +1061,7 @@ mod tests {
                         strip_prefix: true,
                         ..Default::default()
                     }),
+                    cache: None,
                     backend: HttpBackend {
                         service: Some("missing".into()),
                         host: None,
@@ -1078,6 +1128,109 @@ mod tests {
             handler["headers"]["request"]["set"]["Host"][0],
             "api.openai.com"
         );
+    }
+
+    #[test]
+    fn passes_cache_configuration_through_before_rewrite_and_proxy() {
+        let parsed = parse_stack(
+            r#"
+services:
+  api:
+    image: example/api
+    expose: [8080]
+x-swarmlite:
+  tls: disabled
+  http: serve
+  http_routes:
+    - hostnames: [cache.example.com]
+      rules:
+        - matches:
+            - path: /public
+          rewrite:
+            strip_prefix: true
+          cache:
+            log_level: debug
+            ttl: 5m
+            stale: 30s
+            key:
+              hash: true
+              headers: [Accept-Language]
+            cache_keys:
+              ^https://cache.example.com/public/.*:
+                hide: true
+          backend:
+            service: api
+"#,
+        )
+        .unwrap();
+
+        let value = serde_json::to_value(generate(
+            [("demo", &parsed.gateway)],
+            &[":80".into()],
+            |_, _, port| vec![format!("10.0.0.21:{port}")],
+        ))
+        .unwrap();
+        let handlers = value["routes"][0]["handle"].as_array().unwrap();
+
+        assert_eq!(handlers[0]["handler"], "cache");
+        let cache = &handlers[0]["Configuration"]["DefaultCache"];
+        assert_eq!(cache["ttl"], "5m");
+        assert_eq!(cache["stale"], "30s");
+        assert_eq!(cache["key"]["hash"], true);
+        assert_eq!(cache["key"]["headers"], json!(["Accept-Language"]));
+        assert_eq!(handlers[0]["Configuration"]["LogLevel"], "debug");
+        assert_eq!(
+            handlers[0]["Configuration"]["cache_keys"]["^https://cache.example.com/public/.*"]["hide"],
+            true
+        );
+        assert_eq!(handlers[1]["handler"], "rewrite");
+        assert_eq!(handlers[2]["handler"], "reverse_proxy");
+    }
+
+    #[test]
+    fn rejects_overriding_the_managed_cache_handler_name() {
+        let error = parse_stack(
+            r#"
+services:
+  web:
+    image: nginx
+    expose: [80]
+x-swarmlite:
+  http_routes:
+    - hostnames: [example.com]
+      rules:
+        - cache:
+            handler: reverse_proxy
+          backend:
+            service: web
+"#,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("handler is managed by Swarmlite"));
+    }
+
+    #[test]
+    fn rejects_overriding_the_gateway_managed_cache_mode() {
+        let error = parse_stack(
+            r#"
+services:
+  web:
+    image: nginx
+    expose: [80]
+x-swarmlite:
+  http_routes:
+    - hostnames: [example.com]
+      rules:
+        - cache:
+            mode: strict
+          backend:
+            service: web
+"#,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("mode is managed by Swarmlite"));
     }
 
     #[test]

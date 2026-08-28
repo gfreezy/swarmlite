@@ -78,15 +78,31 @@ impl Controller {
         validate_apply_locked(&inner, stack_name, &parsed.gateway)
     }
 
+    #[cfg(test)]
     pub(super) async fn apply(
         &self,
         stack_name: &str,
         parsed: ParsedStack,
     ) -> Result<StackDeploymentResponse, ControllerError> {
+        self.apply_with_registry_credentials(stack_name, parsed, BTreeMap::new())
+            .await
+    }
+
+    pub(super) async fn apply_with_registry_credentials(
+        &self,
+        stack_name: &str,
+        parsed: ParsedStack,
+        registry_credentials: BTreeMap<String, RegistryCredential>,
+    ) -> Result<StackDeploymentResponse, ControllerError> {
         validate_stack_name(stack_name)?;
         let _deployment = self.begin_stack_deployment(stack_name)?;
-        self.apply_guarded(stack_name, parsed, RevisionPolicy::DetectChanges)
-            .await
+        self.apply_guarded(
+            stack_name,
+            parsed,
+            RevisionPolicy::DetectChanges,
+            registry_credentials,
+        )
+        .await
     }
 
     pub(super) async fn scale_service(
@@ -109,8 +125,13 @@ impl Controller {
             .get_mut(&service.name)
             .expect("resolved service must be present")
             .replicas = replicas;
-        self.apply_guarded(&stack_name, parsed, RevisionPolicy::Preserve(&service.name))
-            .await
+        self.apply_guarded(
+            &stack_name,
+            parsed,
+            RevisionPolicy::Preserve(&service.name),
+            BTreeMap::new(),
+        )
+        .await
     }
 
     pub(super) async fn force_update_service(
@@ -126,8 +147,13 @@ impl Controller {
             let inner = self.inner.lock().await;
             current_stack(&inner.state, &service.stack)?
         };
-        self.apply_guarded(&service.stack, parsed, RevisionPolicy::Force(&service.name))
-            .await
+        self.apply_guarded(
+            &service.stack,
+            parsed,
+            RevisionPolicy::Force(&service.name),
+            BTreeMap::new(),
+        )
+        .await
     }
 
     pub(super) async fn remove_stack(
@@ -147,6 +173,7 @@ impl Controller {
                 gateway: Default::default(),
             },
             RevisionPolicy::DetectChanges,
+            BTreeMap::new(),
         )
         .await
     }
@@ -156,6 +183,7 @@ impl Controller {
         stack_name: &str,
         parsed: ParsedStack,
         revision_policy: RevisionPolicy<'_>,
+        registry_credentials: BTreeMap<String, RegistryCredential>,
     ) -> Result<StackDeploymentResponse, ControllerError> {
         let ParsedStack {
             services,
@@ -164,6 +192,10 @@ impl Controller {
         let mut inner = self.inner.lock().await;
         validate_apply_locked(&inner, stack_name, &stack_gateway)?;
         let previous = inner.state.clone();
+        inner
+            .state
+            .registry_credentials
+            .extend(registry_credentials);
         let deployment_generation = inner.generation + 1;
         let started_at_unix_ms = unix_ms();
         let previous_gateway = inner
@@ -319,7 +351,10 @@ impl Controller {
         restore_unclaimed_service_revisions(&mut inner.state, &new_service_ids);
         adopt_unclaimed_tasks(&mut inner.state, stack_name);
         scheduler::reconcile(&mut inner.state, &live);
-        self.refresh_stack_deployments_locked(&mut inner, unix_ms())?;
+        if let Err(error) = self.refresh_stack_deployments_locked(&mut inner, unix_ms()) {
+            inner.state = previous;
+            return Err(error.into());
+        }
         if let Err(error) = self.commit_locked(&mut inner).await {
             inner.state = previous;
             return Err(error.into());

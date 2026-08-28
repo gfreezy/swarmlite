@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/gfreezy/swarmlite/main/crates/swarmlite-stack/schema/cache-handler.schema.json",
+  "title": "Caddy cache-handler route configuration",
+  "description": "Cache settings passed through to Caddy's http.handlers.cache DefaultCache configuration. Swarmlite supplies the native handler envelope, bypass mode, and the gateway's Badger storage.",
+  "type": "object",
+  "properties": {
+    "log_level": { "type": "string" },
+    "allowed_http_verbs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "allowed_additional_status_codes": {
+      "type": "array",
+      "items": { "type": "integer", "minimum": 100, "maximum": 599 }
+    },
+    "headers": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "badger": { "$ref": "#/$defs/provider" },
+    "nats": { "$ref": "#/$defs/provider" },
+    "nuts": { "$ref": "#/$defs/provider" },
+    "otter": { "$ref": "#/$defs/provider" },
+    "etcd": { "$ref": "#/$defs/provider" },
+    "redis": { "$ref": "#/$defs/provider" },
+    "olric": { "$ref": "#/$defs/provider" },
+    "simplefs": { "$ref": "#/$defs/provider" },
+    "key": { "$ref": "#/$defs/key" },
+    "cache_keys": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/key" }
+    },
+    "timeout": {
+      "type": "object",
+      "properties": {
+        "backend": { "$ref": "#/$defs/duration" },
+        "cache": { "$ref": "#/$defs/duration" }
+      },
+      "additionalProperties": true
+    },
+    "ttl": { "$ref": "#/$defs/duration" },
+    "stale": { "$ref": "#/$defs/duration" },
+    "storers": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "default_cache_control": { "type": "string" },
+    "cache_name": { "type": "string" },
+    "max_cacheable_body_bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "disable_coalescing": { "type": "boolean" },
+    "distributed": { "type": "boolean" },
+    "regex": {
+      "type": "object",
+      "properties": {
+        "exclude": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "cdn": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "propertyNames": {
+    "not": {
+      "enum": ["handler", "Configuration", "mode"]
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "duration": {
+      "type": "string",
+      "minLength": 1,
+      "description": "A Go duration such as 500ms, 60s, or 5m."
+    },
+    "provider": {
+      "type": "object",
+      "properties": {
+        "found": { "type": "boolean" },
+        "url": { "type": "string" },
+        "path": { "type": "string" },
+        "configuration": { "type": "object" }
+      },
+      "additionalProperties": true
+    },
+    "key": {
+      "type": "object",
+      "properties": {
+        "disable_body": { "type": "boolean" },
+        "disable_host": { "type": "boolean" },
+        "disable_method": { "type": "boolean" },
+        "disable_query": { "type": "boolean" },
+        "disable_scheme": { "type": "boolean" },
+        "disable_vary": { "type": "boolean" },
+        "hash": { "type": "boolean" },
+        "hide": { "type": "boolean" },
+        "template": { "type": "string" },
+        "headers": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

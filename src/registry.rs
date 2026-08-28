@@ -9,6 +9,7 @@ use crate::{
     local_state::LocalState,
     model::{RegistryCredential, RegistryLoginRequest},
 };
+use swarmlite_stack::StackRegistryCredential;
 
 const REGISTRY_CREDENTIALS_KEY: &str = "registry_credentials";
 const DOCKER_HUB_REGISTRY: &str = "docker.io";
@@ -67,6 +68,25 @@ pub(crate) fn validate_login(
             password: request.password,
         },
     ))
+}
+
+pub(crate) fn validate_stack_credentials(
+    credentials: BTreeMap<String, StackRegistryCredential>,
+) -> Result<BTreeMap<String, RegistryCredential>> {
+    let mut validated = BTreeMap::new();
+    for (registry, credential) in credentials {
+        let (registry, credential) = validate_login(RegistryLoginRequest {
+            registry,
+            username: credential.username,
+            password: credential.password,
+        })?;
+        if validated.insert(registry.clone(), credential).is_some() {
+            bail!(
+                "x-swarmlite.registries contains more than one entry for normalized registry {registry:?}"
+            );
+        }
+    }
+    Ok(validated)
 }
 
 pub(crate) fn credentials_hash(credentials: &BTreeMap<String, RegistryCredential>) -> String {
@@ -239,6 +259,38 @@ mod tests {
         assert!(validate_login(request("", "token")).is_err());
         assert!(validate_login(request("octocat", "")).is_err());
         assert!(validate_login(request("octocat", "bad\0token")).is_err());
+    }
+
+    #[test]
+    fn validates_and_normalizes_stack_credentials() {
+        let credentials = validate_stack_credentials(BTreeMap::from([(
+            "GHCR.IO".into(),
+            StackRegistryCredential {
+                username: "octocat".into(),
+                password: "private-token".into(),
+            },
+        )]))
+        .unwrap();
+        assert_eq!(credentials["ghcr.io"].username, "octocat");
+        assert_eq!(credentials["ghcr.io"].password, "private-token");
+
+        let duplicate = validate_stack_credentials(BTreeMap::from([
+            (
+                "index.docker.io".into(),
+                StackRegistryCredential {
+                    username: "first".into(),
+                    password: "token-one".into(),
+                },
+            ),
+            (
+                "registry-1.docker.io".into(),
+                StackRegistryCredential {
+                    username: "second".into(),
+                    password: "token-two".into(),
+                },
+            ),
+        ]));
+        assert!(format!("{:#}", duplicate.unwrap_err()).contains("more than one entry"));
     }
 
     #[test]

@@ -1,9 +1,9 @@
 # Independent Caddy gateway storage
 
 When a node has its Gateway enabled, `swarmlite serve` creates an independent Caddy container with
-its own restart policy and persistent `/data` and `/config` volumes. The default gateway image
-includes and enables this directory's `caddy.storage.swarmlite` module. No separately maintained
-Compose stack is required.
+its own restart policy and persistent `/data`, `/config`, and `/cache` volumes. The default gateway
+image includes this directory's `caddy.storage.swarmlite` module, Caddy's `http.handlers.cache`,
+and the `storages.cache.badger` provider. No separately maintained Compose stack is required.
 
 The module consumes Swarmlite's generic KV and lock APIs; those APIs contain no Caddy-specific
 behavior. The authoritative certificate storage remains local CertMagic `FileStorage`, while
@@ -37,8 +37,9 @@ swarmlite config set gateway-image registry.example.com/swarmlite-caddy:1.1.0
 ```
 
 The image reference is stored in the controller's SQLite database. The selected image must provide
-both `caddy` and the `caddy.storage.swarmlite` module. Gateway nodes pull it before replacing an
-existing container, and keep the existing `/data` and `/config` volumes.
+`caddy`, `caddy.storage.swarmlite`, `http.handlers.cache`, and `storages.cache.badger`. Gateway
+nodes pull it before replacing an existing container, and keep the existing `/data`, `/config`,
+and `/cache` volumes.
 
 ## Automatic configuration
 
@@ -46,6 +47,11 @@ Swarmlite generates the storage block automatically, injects the cluster token t
 `SWARMLITE_TOKEN`, and sends the cluster's fixed controller URL to the node through heartbeat
 configuration. The node atomically loads the complete configuration through Caddy's loopback-only
 admin API. The token is not written into Caddy's JSON configuration or container labels.
+
+The generated global cache application uses `mode: bypass` and a Badger database whose `Dir` and
+`ValueDir` are `/cache/badger`. A route only receives `http.handlers.cache` when its Stack rule has
+a `cache` object. Consequently uncached routes are untouched, while cached routes use their
+declared TTL without consulting upstream `Cache-Control` headers.
 
 For a manually configured Caddy instance, export a valid cluster token and run the example:
 

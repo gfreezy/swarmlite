@@ -50,7 +50,7 @@ const GATEWAY_SCHEMA_LABEL: &str = "io.swarmlite.gateway_schema";
 const GATEWAY_IMAGE_LABEL: &str = "io.swarmlite.gateway_image";
 const GATEWAY_LISTEN_LABEL: &str = "io.swarmlite.gateway_listen";
 const GATEWAY_TOKEN_HASH_LABEL: &str = "io.swarmlite.gateway_token_sha256";
-const GATEWAY_SCHEMA: &str = "4";
+const GATEWAY_SCHEMA: &str = "5";
 const GATEWAY_CONTAINER_NAME: &str = "swarmlite-gateway";
 const GATEWAY_ADMIN_URL: &str = "http://127.0.0.1:2019";
 const TASK_LABEL: &str = "io.swarmlite.task_id";
@@ -488,11 +488,12 @@ impl DockerCompatibleRuntime {
             }]),
         );
 
-        let [data_volume, config_volume] = gateway_volume_names(&spec.cluster_id);
+        let [data_volume, config_volume, cache_volume] = gateway_volume_names(&spec.cluster_id);
         let host_config = HostConfig {
             binds: Some(vec![
                 format!("{data_volume}:/data"),
                 format!("{config_volume}:/config"),
+                format!("{cache_volume}:/cache"),
             ]),
             port_bindings: Some(port_bindings),
             restart_policy: Some(RestartPolicy {
@@ -661,9 +662,13 @@ fn gateway_token_hash(token: &str) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 
-fn gateway_volume_names(cluster_id: &str) -> [String; 2] {
+fn gateway_volume_names(cluster_id: &str) -> [String; 3] {
     let prefix = format!("swarmlite-gateway-{cluster_id}");
-    [format!("{prefix}-data"), format!("{prefix}-config")]
+    [
+        format!("{prefix}-data"),
+        format!("{prefix}-config"),
+        format!("{prefix}-cache"),
+    ]
 }
 
 fn gateway_matches_spec(container: &ExistingGatewayContainer, spec: &GatewayContainerSpec) -> bool {
@@ -1339,6 +1344,7 @@ mod tests {
             [
                 "swarmlite-gateway-cluster-old-data".to_owned(),
                 "swarmlite-gateway-cluster-old-config".to_owned(),
+                "swarmlite-gateway-cluster-old-cache".to_owned(),
             ]
         );
     }
@@ -1361,6 +1367,7 @@ mod tests {
         assert_eq!(value["storage"]["controller"], "http://10.0.0.21:17080");
         assert!(value["storage"].get("controllers").is_none());
         assert_eq!(value["storage"]["token_env"], "SWARMLITE_TOKEN");
+        assert!(value["apps"].get("cache").is_none());
         assert!(!encoded.contains("do-not-persist-this-token"));
         assert_eq!(
             value["apps"]["http"]["servers"]["swarmlite"]["listen"][0],

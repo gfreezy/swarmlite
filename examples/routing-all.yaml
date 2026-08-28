@@ -61,6 +61,14 @@ x-swarmlite:
         # prefix is the default type
         - matches:
             - path: /api
+          # Cache is opt-in per rule. It uses the Gateway's persistent Badger volume
+          # and ignores upstream Cache-Control headers.
+          cache:
+            ttl: 5m
+            stale: 30s
+            key:
+              hash: true
+              headers: [Accept-Language]
           rewrite:
             strip_prefix: true
           backend:

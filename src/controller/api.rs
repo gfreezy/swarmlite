@@ -23,10 +23,10 @@ use crate::model::{
     KvDeleteRequest, KvListResponse, KvLockAcquireRequest, KvLockAcquireResponse,
     KvLockMutationRequest, KvObjectResponse, KvPutRequest, KvStatResponse, MAX_CONFIG_FILE_BYTES,
     MAX_STACK_CONFIG_BYTES, NodeGatewayResponse, NodeGatewayUpdate, NodeHeartbeat,
-    NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, RegistryLoginRequest,
-    RegistryLoginResponse, ServiceInspectResponse, ServiceListResponse, ServiceScaleRequest,
-    StackApplyRequest, StackDeploymentResponse, StackListResponse, StackValidationResponse,
-    StatusResponse, TaskListResponse,
+    NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, RegistryCredential,
+    RegistryLoginRequest, RegistryLoginResponse, ServiceInspectResponse, ServiceListResponse,
+    ServiceScaleRequest, StackApplyRequest, StackDeploymentResponse, StackListResponse,
+    StackValidationResponse, StatusResponse, TaskListResponse,
 };
 use swarmlite_stack::{config_digest, parse_stack_document, resolve_config_digests};
 
@@ -213,7 +213,11 @@ async fn apply_stack(
 ) -> Result<Json<StackDeploymentResponse>, ControllerError> {
     require_auth(&controller, &headers)?;
     let request = parse_stack_apply_body(&headers, &body)?;
-    let (parsed, blobs) = prepare_stack_apply(request, &controller.repository)?;
+    let PreparedStackApply {
+        stack: parsed,
+        blobs,
+        registry_credentials,
+    } = prepare_stack_apply(request, &controller.repository)?;
     let config_digests = parsed
         .services
         .values()
@@ -221,7 +225,10 @@ async fn apply_stack(
         .collect::<BTreeSet<_>>();
     controller.repository.put_config_blobs(&blobs)?;
     controller.repository.pin_config_blobs(&config_digests)?;
-    controller.apply(&name, parsed).await.map(Json)
+    controller
+        .apply_with_registry_credentials(&name, parsed, registry_credentials)
+        .await
+        .map(Json)
 }
 
 async fn validate_stack(
@@ -232,7 +239,8 @@ async fn validate_stack(
 ) -> Result<Json<StackValidationResponse>, ControllerError> {
     require_auth(&controller, &headers)?;
     let request = parse_stack_apply_body(&headers, &body)?;
-    let (parsed, _blobs) = prepare_stack_apply(request, &controller.repository)?;
+    let PreparedStackApply { stack: parsed, .. } =
+        prepare_stack_apply(request, &controller.repository)?;
     controller.validate_apply(&name, &parsed).await?;
     Ok(Json(StackValidationResponse {
         stack: name,
@@ -308,11 +316,20 @@ fn parse_stack_apply_body(
     }
 }
 
+#[derive(Debug)]
+struct PreparedStackApply {
+    stack: swarmlite_stack::ParsedStack,
+    blobs: BTreeMap<String, Vec<u8>>,
+    registry_credentials: BTreeMap<String, RegistryCredential>,
+}
+
 fn prepare_stack_apply(
     request: StackApplyRequest,
     repository: &crate::storage::StateRepository,
-) -> Result<(swarmlite_stack::ParsedStack, BTreeMap<String, Vec<u8>>), ControllerError> {
+) -> Result<PreparedStackApply, ControllerError> {
     let document = parse_stack_document(&request.yaml)
+        .map_err(|error| ControllerError::Invalid(format!("{error:#}")))?;
+    let registry_credentials = crate::registry::validate_stack_credentials(document.registries)
         .map_err(|error| ControllerError::Invalid(format!("{error:#}")))?;
     for name in request.configs.keys() {
         if !document.configs.contains_key(name) {
@@ -392,7 +409,11 @@ fn prepare_stack_apply(
     let mut stack = document.stack;
     resolve_config_digests(&mut stack, &digests)
         .map_err(|error| ControllerError::Invalid(format!("{error:#}")))?;
-    Ok((stack, blobs))
+    Ok(PreparedStackApply {
+        stack,
+        blobs,
+        registry_credentials,
+    })
 }
 
 async fn list_stacks(
@@ -817,7 +838,7 @@ configs:
         let contents = b"server { listen 80; }\n";
         let digest = config_digest(contents);
         let (_directory, repository) = repository();
-        let (stack, blobs) = prepare_stack_apply(
+        let prepared = prepare_stack_apply(
             StackApplyRequest {
                 yaml: YAML.into(),
                 configs: BTreeMap::from([(
@@ -831,8 +852,9 @@ configs:
             &repository,
         )
         .unwrap();
-        assert_eq!(stack.services["web"].configs[0].digest, digest);
-        assert_eq!(blobs[&digest], contents);
+        assert_eq!(prepared.stack.services["web"].configs[0].digest, digest);
+        assert_eq!(prepared.blobs[&digest], contents);
+        assert!(prepared.registry_credentials.is_empty());
     }
 
     #[test]
@@ -844,7 +866,7 @@ configs:
             .put_config_blobs(&BTreeMap::from([(digest.clone(), contents)]))
             .unwrap();
 
-        let (stack, blobs) = prepare_stack_apply(
+        let prepared = prepare_stack_apply(
             StackApplyRequest {
                 yaml: YAML.into(),
                 configs: BTreeMap::from([(
@@ -859,8 +881,70 @@ configs:
         )
         .unwrap();
 
-        assert_eq!(stack.services["web"].configs[0].digest, digest);
-        assert!(blobs.is_empty());
+        assert_eq!(prepared.stack.services["web"].configs[0].digest, digest);
+        assert!(prepared.blobs.is_empty());
+        assert!(prepared.registry_credentials.is_empty());
+    }
+
+    #[test]
+    fn validates_and_normalizes_inline_registry_credentials() {
+        let (_directory, repository) = repository();
+        let prepared = prepare_stack_apply(
+            StackApplyRequest {
+                yaml: r#"
+services:
+  web:
+    image: ghcr.io/example/private:latest
+x-swarmlite:
+  registries:
+    GHCR.IO:
+      username: octocat
+      password: private-token
+"#
+                .into(),
+                configs: BTreeMap::new(),
+            },
+            &repository,
+        )
+        .unwrap();
+
+        assert_eq!(
+            prepared.stack.services["web"].image,
+            "ghcr.io/example/private:latest"
+        );
+        assert!(prepared.blobs.is_empty());
+        assert_eq!(prepared.registry_credentials["ghcr.io"].username, "octocat");
+        assert_eq!(
+            prepared.registry_credentials["ghcr.io"].password,
+            "private-token"
+        );
+    }
+
+    #[test]
+    fn registry_validation_errors_do_not_echo_the_inline_password() {
+        let (_directory, repository) = repository();
+        let error = prepare_stack_apply(
+            StackApplyRequest {
+                yaml: r#"
+services:
+  web:
+    image: nginx
+x-swarmlite:
+  registries:
+    https://ghcr.io:
+      username: octocat
+      password: do-not-echo-this-token
+"#
+                .into(),
+                configs: BTreeMap::new(),
+            },
+            &repository,
+        )
+        .unwrap_err();
+
+        let message = format!("{error:?}");
+        assert!(message.contains("registry must be a hostname"));
+        assert!(!message.contains("do-not-echo-this-token"));
     }
 
     #[test]

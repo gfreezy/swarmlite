@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://swarmlite.dev/schema/stack.schema.json",
+  "$id": "https://raw.githubusercontent.com/gfreezy/swarmlite/main/crates/swarmlite-stack/schema/stack.schema.json",
   "title": "Swarmlite Stack",
   "type": "object",
   "required": ["services"],
@@ -346,6 +346,15 @@
           "pattern": "^[A-Za-z0-9._-]+$",
           "description": "Default Stack name used when the deploy command omits its STACK argument."
         },
+        "registries": {
+          "type": "object",
+          "propertyNames": {
+            "minLength": 1
+          },
+          "additionalProperties": { "$ref": "#/$defs/registryCredential" },
+          "default": {},
+          "description": "Private registry credentials merged into the cluster credential store when this Stack is deployed."
+        },
         "tls": {
           "$ref": "#/$defs/tlsMode",
           "default": "serve"
@@ -358,6 +367,24 @@
           "type": "array",
           "items": { "$ref": "#/$defs/httpRoute" },
           "default": []
+        }
+      },
+      "additionalProperties": false
+    },
+    "registryCredential": {
+      "type": "object",
+      "required": ["username", "password"],
+      "properties": {
+        "username": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "password": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 65536,
+          "description": "Registry password or access token. Protect the Stack file as a secret."
         }
       },
       "additionalProperties": false
@@ -405,6 +432,7 @@
           "default": []
         },
         "rewrite": { "$ref": "#/$defs/rewrite" },
+        "cache": { "$ref": "cache-handler.schema.json" },
         "backend": { "$ref": "#/$defs/backend" }
       },
       "additionalProperties": false

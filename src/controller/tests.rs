@@ -106,6 +106,57 @@ async fn registry_login_is_persisted_and_synchronized_to_nodes() {
         "private-token"
     );
     assert_eq!(heartbeat.registry_credentials_hash.len(), 64);
+
+    let status = controller.status().await;
+    assert!(status.state.registry_credentials.is_empty());
+    assert!(
+        !serde_json::to_string(&status)
+            .unwrap()
+            .contains("private-token")
+    );
+}
+
+#[tokio::test]
+async fn stack_registry_credentials_are_atomically_persisted_and_not_removed_when_omitted() {
+    let (controller, repository, _directory) = test_controller("stack-registry-test").await;
+    controller
+        .apply_with_registry_credentials(
+            "demo",
+            parsed_test_stack(),
+            BTreeMap::from([(
+                "ghcr.io".into(),
+                RegistryCredential {
+                    username: "octocat".into(),
+                    password: "private-token".into(),
+                },
+            )]),
+        )
+        .await
+        .unwrap();
+
+    let persisted = repository.load().await.unwrap();
+    assert_eq!(
+        persisted.state.registry_credentials["ghcr.io"].password,
+        "private-token"
+    );
+    let joined = controller
+        .join_node("node-a", test_join_request("node-a", "127.0.0.1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        joined.registry_credentials["ghcr.io"].password,
+        "private-token"
+    );
+
+    controller
+        .apply("other", parsed_test_stack())
+        .await
+        .unwrap();
+    let persisted = repository.load().await.unwrap();
+    assert_eq!(
+        persisted.state.registry_credentials["ghcr.io"].password,
+        "private-token"
+    );
 }
 
 #[tokio::test]

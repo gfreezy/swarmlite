@@ -7,6 +7,7 @@
 - the internal `ServiceSpec`, port, and healthcheck models;
 - the `x-swarmlite` routing data model;
 - the optional `x-swarmlite.name` default used by the deploy CLI;
+- private registry credentials under `x-swarmlite.registries`;
 - normalization and validation;
 - internal service port discovery from route references;
 - deterministic rule ordering;
@@ -18,7 +19,12 @@ map, and exposes a renderer callback which resolves an internal `(stack, service
 healthy dial addresses. The main `swarmlite` crate implements that runtime adapter from replicated
 cluster state.
 
-The editor schema is at [schema/stack.schema.json](schema/stack.schema.json). During deployment, the
+The editor schema is at [schema/stack.schema.json](schema/stack.schema.json). Route-level `cache`
+completion is kept separately in
+[schema/cache-handler.schema.json](schema/cache-handler.schema.json) and referenced by the main
+schema. The parser stores `cache` as a raw JSON object rather than defining every cache-handler
+field in Rust; generation places those fields in the native `Configuration.DefaultCache` envelope
+before rewrite and reverse-proxy handlers. During deployment, the
 main process passes the normalized services from the same Stack file to `validate_and_normalize`;
 no external validation service or network request is involved. This in-process check is
 authoritative because the standard JSON Schema implementation used by VS Code cannot compare a
@@ -26,6 +32,11 @@ route backend with arbitrary keys and ports in the sibling `services` map.
 
 Set `x-swarmlite.name` to let `swarmlite deploy` use a Stack name from the document. An explicit
 command-line Stack name takes precedence.
+
+`x-swarmlite.registries.<host>` accepts a required `username` and `password`. The parser keeps
+credentials separate from normalized Service specifications and redacts passwords from debug
+output. The main crate performs authoritative registry-host and credential validation before
+merging them into cluster state.
 
 ## Supported service fields
 
