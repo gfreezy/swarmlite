@@ -83,7 +83,7 @@ enum Command {
     },
     /// Upgrade Swarmlite using an official GitHub Release.
     Upgrade {
-        /// Release to install, such as v0.2.0.
+        /// Release tag to install; defaults to the latest release.
         #[arg(long, default_value = "latest", value_parser = upgrade::validate_version)]
         version: String,
     },

@@ -21,12 +21,13 @@ GHCR with `sha-<commit>`, and the default branch also updates `latest`.
 Release tags compare the current and previous release's complete `caddy-storage/` Git trees. A
 changed tree is rebuilt and published under the release version. An unchanged tree is not rebuilt;
 the new version and commit tags are attached to the previous release's exact manifest digest. The
-release fails if an existing immutable version tag points somewhere else. Build and publish an
-image manually with:
+release fails if an existing immutable version tag points somewhere else. From the repository
+root, build and publish the current package version manually with:
 
 ```bash
-docker build -t ghcr.io/gfreezy/swarmlite-caddy:v0.1.15 ./caddy-storage
-docker push ghcr.io/gfreezy/swarmlite-caddy:v0.1.15
+VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+docker build -t "ghcr.io/gfreezy/swarmlite-caddy:v${VERSION}" ./caddy-storage
+docker push "ghcr.io/gfreezy/swarmlite-caddy:v${VERSION}"
 ```
 
 Caddy stays pinned to a tested version in both `go.mod` and the runtime base image. Dependabot
@@ -60,14 +61,14 @@ The generated global cache application uses `mode: bypass` and a Badger database
 a `cache` object. Consequently uncached routes are untouched, while cached routes use their
 declared TTL without consulting upstream `Cache-Control` headers.
 
-For a manually configured Caddy instance, export a valid cluster token and stable Gateway ID, add
-the owner-probe handler route shown in [`bootstrap.json`](bootstrap.json), and run the example:
+For a manually configured Caddy instance, export a valid cluster token and stable Gateway ID. The
+example includes the owner-probe handler route also used by [`bootstrap.json`](bootstrap.json):
 
 ```bash
 export SWARMLITE_TOKEN='<cluster-token>'
 export SWARMLITE_GATEWAY_ID='<gateway-node-id>'
-go build -o target/caddy ./caddy-storage/cmd/caddy
-target/caddy run --resume --config examples/caddy-with-swarmlite-kv.json
+go -C caddy-storage build -o /tmp/swarmlite-caddy ./cmd/caddy
+/tmp/swarmlite-caddy run --resume --config examples/caddy-with-swarmlite-kv.json
 ```
 
 The storage JSON is:
@@ -76,7 +77,7 @@ The storage JSON is:
 {
   "storage": {
     "module": "swarmlite",
-    "controller": "http://10.0.0.21:8080",
+    "controller": "http://10.0.0.21:17080",
     "token_env": "SWARMLITE_TOKEN",
     "gateway_id_env": "SWARMLITE_GATEWAY_ID",
     "timeout": "500ms",
@@ -93,7 +94,7 @@ Keep that directory on persistent local storage. The equivalent Caddyfile global
 ```caddyfile
 {
     storage swarmlite {
-        controller http://10.0.0.21:8080
+        controller http://10.0.0.21:17080
         token_env SWARMLITE_TOKEN
         gateway_id_env SWARMLITE_GATEWAY_ID
         timeout 500ms
@@ -121,7 +122,7 @@ Keep that directory on persistent local storage. The equivalent Caddyfile global
 - KV values are plaintext base64. There is no application-level encryption.
 
 Consequently, Swarmlite failure never makes existing local Caddy storage unavailable. If the
-entire Swarmlite cluster is rebuilt, each Caddy instance keeps using its local certificates. A
-standard Caddy binary can use the same local data directory without migrating certificate data.
-During a Controller outage, a hostname routed to exactly one Gateway can still be issued there;
-an actively load-balanced hostname needs the Controller for cross-node exclusion.
+entire Swarmlite cluster is rebuilt, each Caddy instance keeps using its local certificates in
+Caddy's standard data layout. During a Controller outage, a hostname routed to exactly one Gateway
+can still be issued there; an actively load-balanced hostname needs the Controller for cross-node
+exclusion.

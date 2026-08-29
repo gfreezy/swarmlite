@@ -17,7 +17,7 @@
     },
     "x-swarmlite": { "$ref": "#/$defs/swarmlite" }
   },
-  "additionalProperties": true,
+  "additionalProperties": false,
   "$defs": {
     "service": {
       "type": "object",
@@ -30,9 +30,9 @@
         },
         "pull_policy": {
           "type": "string",
-          "enum": ["always", "missing", "if_not_present", "never"],
+          "enum": ["always", "missing", "never"],
           "default": "missing",
-          "description": "Controls registry pulls. missing refreshes an omitted or latest tag; if_not_present is an alias for missing."
+          "description": "Controls registry pulls. missing refreshes an omitted or latest tag."
         },
         "command": {
           "$ref": "#/$defs/stringOrList",
@@ -44,7 +44,7 @@
         },
         "environment": {
           "$ref": "#/$defs/stringMapOrList",
-          "description": "Environment as a scalar map or KEY=value list. A null map value emits only KEY."
+          "description": "Environment as a scalar map or a list containing KEY and KEY=value entries. A null map value emits only KEY."
         },
         "labels": {
           "$ref": "#/$defs/stringMapOrList",
@@ -60,7 +60,7 @@
           "type": "array",
           "items": { "$ref": "#/$defs/servicePort" },
           "default": [],
-          "description": "Container target ports published through a Docker-assigned ephemeral host port. Fixed published ports, ranges, host-IP prefixes, and mode are not supported."
+          "description": "Container target ports published through a runtime-assigned ephemeral host port. Fixed published ports, ranges, and host-IP prefixes are not supported."
         },
         "volumes": {
           "type": "array",
@@ -124,7 +124,7 @@
         {
           "type": "string",
           "pattern": "^(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])(?:/(?:tcp|udp))?$",
-          "description": "Short syntax: target[/protocol]. Docker allocates the host port."
+          "description": "Short syntax: target[/protocol]. The container runtime allocates the host port."
         },
         {
           "$ref": "#/$defs/servicePortLong"
@@ -167,7 +167,7 @@
         {
           "type": "string",
           "minLength": 1,
-          "description": "Docker bind syntax such as data:/data, /host:/container:ro, or /container."
+          "description": "Short volume syntax such as data:/data, /host:/container:ro, or /container."
         },
         {
           "$ref": "#/$defs/serviceVolumeLong"

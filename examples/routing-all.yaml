@@ -12,8 +12,8 @@ services:
     deploy:
       replicas: 3
 
-  legacy_api:
-    image: example/legacy-api:latest
+  versioned_api:
+    image: example/versioned-api:latest
     expose: [8080]
 
   health:
@@ -78,13 +78,13 @@ x-swarmlite:
 
         # prefix + ignore_case + replace_prefix
         - matches:
-            - path: /legacy
+            - path: /public-api
               type: prefix
               ignore_case: true
           rewrite:
             replace_prefix: /v1
           backend:
-            service: legacy_api
+            service: versioned_api
             preserve_host: false
 
         # regex
@@ -135,10 +135,10 @@ x-swarmlite:
 
     # External HTTPS proxy which preserves the incoming HTTP Host header.
     - hostnames:
-        - legacy-proxy.example.com
+        - upstream-proxy.example.com
       rules:
         - backend:
-            host: legacy-upstream.example.net
+            host: upstream.example.net
             port: 443
             protocol: https
             preserve_host: true

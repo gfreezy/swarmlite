@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/gfreezy/swarmlite/main/crates/swarmlite-stack/schema/stack.schema.json
 services:
   web:
-    image: nginx:1.29-alpine
+    image: nginx:alpine
     ports:
       - "80"
     healthcheck:

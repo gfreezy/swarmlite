@@ -51,20 +51,20 @@ rejected instead of being silently ignored. The complete supported surface is:
 | Field | Supported forms |
 | --- | --- |
 | `image` | Non-empty image reference; required |
-| `pull_policy` | `always`, `missing` (default), `if_not_present` (alias for `missing`), or `never` |
+| `pull_policy` | `always`, `missing` (default), or `never` |
 | `command`, `entrypoint` | String with shell-style word splitting, or string array |
 | `environment` | Scalar map or string array |
 | `labels` | Scalar map or string array; attached to task containers |
 | `expose` | Internal target number or `target[/tcp|udp]`; port ranges are not supported |
-| `ports` | Target number, `target[/tcp|udp]`, or long syntax with `target` and optional `protocol`; Docker assigns the host port |
-| `volumes` | Docker short bind syntax, or long syntax with `target`, optional `source` and `read_only` |
+| `ports` | Target number, `target[/tcp|udp]`, or long syntax with `target` and optional `protocol`; the container runtime assigns the host port |
+| `volumes` | Node-local named volumes, bind mounts, or anonymous volumes; short syntax or long syntax with `target`, optional `source` and `read_only` |
 | `configs` | Top-level config name, or long syntax with `source`, optional absolute `target`, numeric `uid`/`gid`, and octal `mode` |
 | `healthcheck` | `test`, `disable`, `interval`, `timeout`, `retries`, `start_period`, and `start_interval` |
 | `stop_grace_period` | Human-readable duration; defaults to `10s` |
 | `deploy.mode` | Only `replicated` |
 | `deploy.replicas` | Non-negative integer; defaults to `1` |
 | `deploy.labels` | Scalar map or string array; stored as service metadata |
-| `deploy.placement.constraints` | Hard `node.id`, `node.hostname`, or `node.labels.*` comparisons using `==` or `!=` |
+| `deploy.placement.constraints` | Hard `node.id` or `node.labels.*` comparisons using `==` or `!=` |
 | `deploy.placement.max_replicas_per_node` | Non-negative steady-state per-node limit; unset or `0` means unlimited; `start-first` replacements may temporarily exceed it |
 | `deploy.update_config` | `parallelism` and `order: start-first|stop-first` |
 
@@ -72,8 +72,9 @@ An internal route may omit `backend.port` when its Service declares exactly one 
 target across `expose` and `ports`. A Service with zero or multiple TCP targets requires an
 explicit declared target. External `backend.host` routes always require `port`.
 
-Fixed `published` values are rejected. Docker assigns an ephemeral host port so replicated and
-`start-first` Services can run old and replacement tasks on the same node without a port collision.
+Fixed `published` values are rejected. The container runtime assigns an ephemeral host port so
+replicated and `start-first` Services can run old and replacement tasks on the same node without a
+port collision.
 
 Top-level `configs.<name>.file` paths are resolved by the CLI relative to the Stack file. Config
 contents are uploaded separately from the Compose YAML and resolved to immutable SHA-256 digests
@@ -81,5 +82,4 @@ before the normalized Service specifications are persisted. External configs are
 
 See [../../examples/services-all.yaml](../../examples/services-all.yaml) for every accepted shape in
 one Stack file. Fields such as `build`, `depends_on`, `networks`, `restart`, `resources`, and
-`secrets` are not currently implemented. Compatibility-only `ports.mode` and `volumes.type` are
-also rejected because Swarmlite does not preserve or interpret them.
+`secrets` are not currently implemented.

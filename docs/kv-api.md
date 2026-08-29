@@ -43,7 +43,7 @@ size:
 List keys with `GET /v1/kv/keys?prefix=my-app%2Fitems&recursive=true`. Direct listing returns
 only the next path component; recursive listing returns all descendant components. Read metadata
 with `GET /v1/kv/stat?key=my-app%2Fitems%2Fexample`; `is_value` distinguishes an exact value from
-a prefix.
+a prefix. Missing list and stat paths return `404`.
 
 Keys use non-empty slash-separated components without a leading or trailing slash. A key is
 limited to 1024 bytes and a decoded value to 4 MiB.
@@ -61,8 +61,10 @@ Acquire an expiring lock with `POST /v1/kv/locks/acquire`:
 ```
 
 The response status is `acquired` or `busy`. An acquired response includes a monotonically
-increasing `fencing_token`. Renew with `POST /v1/kv/locks/renew` and release with
-`POST /v1/kv/locks/release`:
+increasing `fencing_token` and `lease_until_unix_ms`; a busy response includes
+`lease_until_unix_ms` and a bounded `retry_after_millis` hint. Acquiring a live lock again with the
+same `owner_id` renews its lease and returns the same fencing token. Renew with
+`POST /v1/kv/locks/renew` and release with `POST /v1/kv/locks/release`:
 
 ```json
 {
@@ -76,3 +78,6 @@ increasing `fencing_token`. Renew with `POST /v1/kv/locks/renew` and release wit
 Release accepts the same body with `lease_millis` omitted. A stale owner or fencing token returns
 `409`. Leases may be from 1 second through 5 minutes. Clients should renew periodically, for
 example after each third of the lease, and must stop assuming ownership if renewal fails.
+
+Lock names must contain 1 to 1024 bytes, and owner IDs 1 to 512 bytes. Both are trimmed only for
+the empty-value check; clients should use stable, whitespace-free identifiers.
