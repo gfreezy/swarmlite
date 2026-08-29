@@ -982,6 +982,11 @@ pub struct StackDeploymentListResponse {
     pub history: Vec<StackDeploymentSummary>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentListResponse {
+    pub stacks: Vec<StackDeploymentListResponse>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StackDeploymentSummary {
     pub generation: u64,

@@ -466,35 +466,19 @@ impl Controller {
         stack_name: &str,
     ) -> Result<StackDeploymentListResponse, ControllerError> {
         let inner = self.inner.lock().await;
-        let stack =
-            inner.state.stacks.get(stack_name).ok_or_else(|| {
-                ControllerError::NotFound(format!("stack {stack_name:?} not found"))
-            })?;
-        let current = stack
-            .deployment
-            .as_ref()
-            .map(|deployment| deployment_response(&inner, stack_name, Some(deployment.generation)))
-            .transpose()?;
-        let history = stack
-            .deployment_history
-            .values()
-            .rev()
-            .map(|deployment| StackDeploymentSummary {
-                generation: deployment.generation,
-                status: deployment.status,
-                started_at_unix_ms: deployment.started_at_unix_ms,
-                last_progress_at_unix_ms: deployment.last_progress_at_unix_ms,
-                progress_deadline_seconds: deployment.progress_deadline_seconds,
-                finished_at_unix_ms: deployment.finished_at_unix_ms,
-                superseded_by: deployment.superseded_by,
-                retry_revision: deployment.retry_revision,
-            })
-            .collect();
-        Ok(StackDeploymentListResponse {
-            stack: stack_name.to_owned(),
-            current,
-            history,
-        })
+        stack_deployment_list(&inner, stack_name)
+    }
+
+    pub(super) async fn list_deployments(&self) -> Result<DeploymentListResponse, ControllerError> {
+        let inner = self.inner.lock().await;
+        let mut stacks = Vec::new();
+        for stack_name in inner.state.stacks.keys() {
+            let deployments = stack_deployment_list(&inner, stack_name)?;
+            if deployments.current.is_some() || !deployments.history.is_empty() {
+                stacks.push(deployments);
+            }
+        }
+        Ok(DeploymentListResponse { stacks })
     }
 
     pub(super) async fn retry_stack_deployment(
@@ -1456,6 +1440,42 @@ fn deployment_response(
         gateway,
         errors: deployment.errors.clone(),
         conditions: deployment.conditions.clone(),
+    })
+}
+
+fn stack_deployment_list(
+    inner: &Inner,
+    stack_name: &str,
+) -> Result<StackDeploymentListResponse, ControllerError> {
+    let stack = inner
+        .state
+        .stacks
+        .get(stack_name)
+        .ok_or_else(|| ControllerError::NotFound(format!("stack {stack_name:?} not found")))?;
+    let current = stack
+        .deployment
+        .as_ref()
+        .map(|deployment| deployment_response(inner, stack_name, Some(deployment.generation)))
+        .transpose()?;
+    let history = stack
+        .deployment_history
+        .values()
+        .rev()
+        .map(|deployment| StackDeploymentSummary {
+            generation: deployment.generation,
+            status: deployment.status,
+            started_at_unix_ms: deployment.started_at_unix_ms,
+            last_progress_at_unix_ms: deployment.last_progress_at_unix_ms,
+            progress_deadline_seconds: deployment.progress_deadline_seconds,
+            finished_at_unix_ms: deployment.finished_at_unix_ms,
+            superseded_by: deployment.superseded_by,
+            retry_revision: deployment.retry_revision,
+        })
+        .collect();
+    Ok(StackDeploymentListResponse {
+        stack: stack_name.to_owned(),
+        current,
+        history,
     })
 }
 

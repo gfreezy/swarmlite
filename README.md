@@ -76,7 +76,7 @@ sudo swarmlite logs --tail 200 demo.web
 sudo swarmlite logs --tail 200 demo.web.1
 sudo swarmlite scale demo.web=3
 sudo swarmlite restart demo.web
-sudo swarmlite deployment status demo
+sudo swarmlite deployment status
 sudo swarmlite rm demo
 ```
 
@@ -503,9 +503,11 @@ performs the configured rolling replacement.
 Deployment observation and recovery are separate from the process that submitted the change:
 
 ```bash
+swarmlite deployment status                  # all current generations
 swarmlite deployment status demo             # current generation
 swarmlite deployment status demo --generation 42
 swarmlite deployment attach demo             # follow the current generation
+swarmlite deployment history                 # all current and archived generations
 swarmlite deployment history demo
 swarmlite deployment retry demo              # retry the same generation
 swarmlite deployment rollback demo            # latest previous healthy snapshot
@@ -980,7 +982,9 @@ node label get|set|remove
                      read or update one node's placement labels
 registry login       store private registry credentials
 deploy               deploy or update a Stack
-deployment status|attach|history|retry|rollback
+deployment status [STACK]
+deployment history [STACK]
+deployment attach|retry|rollback STACK
                      inspect, follow, or recover Stack deployments
 ls [STACK]           list Services
 ps [TARGET]          list tasks, optionally for one Stack or Service

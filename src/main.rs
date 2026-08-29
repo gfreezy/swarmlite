@@ -14,11 +14,11 @@ use swarmlite::{
     model::{
         CLUSTER_SCHEMA_VERSION, ClusterConfigResponse, ClusterConfigUpdate, ClusterGatewayConfig,
         ClusterSettings, ConfigBlobCheckRequest, ConfigBlobCheckResponse, DEFAULT_GATEWAY_IMAGE,
-        MAX_CONFIG_FILE_BYTES, MAX_STACK_CONFIG_BYTES, NodeGatewayResponse, NodeGatewayUpdate,
-        NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, RegistryLoginRequest,
-        RegistryLoginResponse, StackApplyRequest, StackConfigPayload, StackDeploymentListResponse,
-        StackDeploymentResponse, StackDeploymentStatus, StackRollbackRequest,
-        StackValidationResponse, StatusResponse, config_digest,
+        DeploymentListResponse, MAX_CONFIG_FILE_BYTES, MAX_STACK_CONFIG_BYTES, NodeGatewayResponse,
+        NodeGatewayUpdate, NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse,
+        RegistryLoginRequest, RegistryLoginResponse, StackApplyRequest, StackConfigPayload,
+        StackDeploymentListResponse, StackDeploymentResponse, StackDeploymentStatus,
+        StackRollbackRequest, StackValidationResponse, StatusResponse, config_digest,
     },
     node, registry,
 };
@@ -257,19 +257,21 @@ enum RegistryCommand {
 
 #[derive(Debug, Subcommand)]
 enum DeploymentCommand {
-    /// Show one deployment; defaults to the current generation.
+    /// Show current deployments, optionally limited to one Stack or generation.
     Status {
-        stack: String,
-        #[arg(long)]
+        #[arg(value_name = "STACK")]
+        stack: Option<String>,
+        #[arg(long, requires = "stack")]
         generation: Option<u64>,
         #[arg(long)]
         json: bool,
         #[command(flatten)]
         connection: ConnectionArgs,
     },
-    /// List the current deployment and archived generations.
+    /// List current and archived deployments, optionally limited to one Stack.
     History {
-        stack: String,
+        #[arg(value_name = "STACK")]
+        stack: Option<String>,
         #[arg(long)]
         json: bool,
         #[command(flatten)]
@@ -668,22 +670,12 @@ async fn read_registry_password() -> Result<String> {
 }
 
 async fn run_deployment_command(data_dir: &Path, action: DeploymentCommand) -> Result<()> {
-    let (stack, connection) = match &action {
-        DeploymentCommand::Status {
-            stack, connection, ..
-        }
-        | DeploymentCommand::History {
-            stack, connection, ..
-        }
-        | DeploymentCommand::Attach {
-            stack, connection, ..
-        }
-        | DeploymentCommand::Retry {
-            stack, connection, ..
-        }
-        | DeploymentCommand::Rollback {
-            stack, connection, ..
-        } => (stack.clone(), connection),
+    let connection = match &action {
+        DeploymentCommand::Status { connection, .. }
+        | DeploymentCommand::History { connection, .. }
+        | DeploymentCommand::Attach { connection, .. }
+        | DeploymentCommand::Retry { connection, .. }
+        | DeploymentCommand::Rollback { connection, .. } => connection,
     };
     let client = connection::resolve(
         data_dir,
@@ -691,78 +683,80 @@ async fn run_deployment_command(data_dir: &Path, action: DeploymentCommand) -> R
         connection.token.clone(),
     )
     .await?;
-    let encoded_stack = url::form_urlencoded::byte_serialize(stack.as_bytes()).collect::<String>();
+    let encode_stack =
+        |stack: &str| url::form_urlencoded::byte_serialize(stack.as_bytes()).collect::<String>();
     match action {
         DeploymentCommand::Status {
-            generation, json, ..
+            stack,
+            generation,
+            json,
+            ..
         } => {
-            let deployment = get_deployment(&client, &encoded_stack, generation).await?;
-            print_deployment(&deployment, json)?;
-        }
-        DeploymentCommand::History { json, .. } => {
-            let deployments: StackDeploymentListResponse = client
-                .get_json(&format!("/v1/stacks/{encoded_stack}/deployments"))
-                .await?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&deployments)?);
+            if let Some(stack) = stack {
+                let deployment = get_deployment(&client, &encode_stack(&stack), generation).await?;
+                print_deployment(&deployment, json)?;
             } else {
-                let color = stdout_color();
-                println!(
-                    "{}",
-                    ansi(
-                        color,
-                        "1",
-                        "GENERATION\tSTATUS\tRETRIES\tSTARTED\tLAST PROGRESS\tFINISHED"
-                    )
-                );
-                if let Some(current) = deployments.current {
-                    println!(
-                        "{}\t{}\t{}\t{}\t{}\t{}",
-                        current.generation,
-                        ansi(
-                            color,
-                            deployment_status_color(current.status),
-                            format!("{:?} (current)", current.status)
-                        ),
-                        current.retry_revision,
-                        current.started_at_unix_ms,
-                        current.last_progress_at_unix_ms,
-                        current
-                            .finished_at_unix_ms
-                            .map_or_else(|| "-".into(), |value| value.to_string())
-                    );
-                }
-                for deployment in deployments.history {
-                    let status = deployment.superseded_by.map_or_else(
-                        || format!("{:?}", deployment.status),
-                        |generation| format!("{:?} by {generation}", deployment.status),
-                    );
-                    println!(
-                        "{}\t{}\t{}\t{}\t{}\t{}",
-                        deployment.generation,
-                        ansi(color, deployment_status_color(deployment.status), status),
-                        deployment.retry_revision,
-                        deployment.started_at_unix_ms,
-                        deployment.last_progress_at_unix_ms,
-                        deployment
-                            .finished_at_unix_ms
-                            .map_or_else(|| "-".into(), |value| value.to_string())
+                let deployments: DeploymentListResponse =
+                    client.get_json("/v1/deployments").await?;
+                if json {
+                    let current = deployments
+                        .stacks
+                        .iter()
+                        .filter_map(|deployments| deployments.current.as_ref())
+                        .collect::<Vec<_>>();
+                    println!("{}", serde_json::to_string_pretty(&current)?);
+                } else {
+                    print!(
+                        "{}",
+                        format_deployment_statuses(&deployments.stacks, stdout_color())
                     );
                 }
             }
         }
+        DeploymentCommand::History { stack, json, .. } => {
+            let (deployments, include_stack) = if let Some(stack) = stack {
+                let deployments = client
+                    .get_json(&format!("/v1/stacks/{}/deployments", encode_stack(&stack)))
+                    .await?;
+                (vec![deployments], false)
+            } else {
+                let deployments: DeploymentListResponse =
+                    client.get_json("/v1/deployments").await?;
+                (deployments.stacks, true)
+            };
+            if json {
+                if include_stack {
+                    println!("{}", serde_json::to_string_pretty(&deployments)?);
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&deployments[0])?);
+                }
+            } else {
+                print!(
+                    "{}",
+                    format_deployment_history(&deployments, include_stack, stdout_color())
+                );
+            }
+        }
         DeploymentCommand::Attach {
-            generation, json, ..
+            stack,
+            generation,
+            json,
+            ..
         } => {
-            let deployment = get_deployment(&client, &encoded_stack, generation).await?;
+            let deployment = get_deployment(&client, &encode_stack(&stack), generation).await?;
             let deployment = attach_deployment(&client, deployment).await?;
             print_deployment(&deployment, json)?;
         }
-        DeploymentCommand::Retry { detach, json, .. } => {
+        DeploymentCommand::Retry {
+            stack,
+            detach,
+            json,
+            ..
+        } => {
             let deployment: StackDeploymentResponse = client
                 .send_json::<_, ()>(
                     reqwest::Method::POST,
-                    &format!("/v1/stacks/{encoded_stack}/deployment/retry"),
+                    &format!("/v1/stacks/{}/deployment/retry", encode_stack(&stack)),
                     None,
                 )
                 .await?;
@@ -771,6 +765,7 @@ async fn run_deployment_command(data_dir: &Path, action: DeploymentCommand) -> R
             print_deployment(&deployment, json)?;
         }
         DeploymentCommand::Rollback {
+            stack,
             generation,
             detach,
             json,
@@ -779,7 +774,7 @@ async fn run_deployment_command(data_dir: &Path, action: DeploymentCommand) -> R
             let deployment: StackDeploymentResponse = client
                 .send_json(
                     reqwest::Method::POST,
-                    &format!("/v1/stacks/{encoded_stack}/rollback"),
+                    &format!("/v1/stacks/{}/rollback", encode_stack(&stack)),
                     Some(&StackRollbackRequest { generation }),
                 )
                 .await?;
@@ -790,6 +785,139 @@ async fn run_deployment_command(data_dir: &Path, action: DeploymentCommand) -> R
         }
     }
     Ok(())
+}
+
+fn format_deployment_statuses(deployments: &[StackDeploymentListResponse], color: bool) -> String {
+    let rows = deployments
+        .iter()
+        .filter_map(|deployments| deployments.current.as_ref())
+        .map(|deployment| {
+            vec![
+                ansi(color, "1;36", &deployment.stack),
+                ansi(color, "1", deployment.generation).to_string(),
+                ansi(
+                    color,
+                    deployment_status_color(deployment.status),
+                    format!("{:?}", deployment.status),
+                ),
+                deployment.retry_revision.to_string(),
+                deployment.started_at_unix_ms.to_string(),
+                deployment.last_progress_at_unix_ms.to_string(),
+                deployment
+                    .finished_at_unix_ms
+                    .map_or_else(|| "-".into(), |value| value.to_string()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let mut output = String::new();
+    append_table(
+        &mut output,
+        &[
+            "STACK",
+            "GENERATION",
+            "STATUS",
+            "RETRIES",
+            "STARTED",
+            "LAST PROGRESS",
+            "FINISHED",
+        ],
+        &rows,
+        color,
+    );
+    output
+}
+
+fn format_deployment_history(
+    deployments: &[StackDeploymentListResponse],
+    include_stack: bool,
+    color: bool,
+) -> String {
+    let mut rows = Vec::new();
+    for deployments in deployments {
+        if let Some(current) = &deployments.current {
+            rows.push(deployment_history_row(
+                &deployments.stack,
+                current.generation,
+                current.status,
+                format!("{:?} (current)", current.status),
+                current.retry_revision,
+                current.started_at_unix_ms,
+                current.last_progress_at_unix_ms,
+                current.finished_at_unix_ms,
+                include_stack,
+                color,
+            ));
+        }
+        for deployment in &deployments.history {
+            let status = deployment.superseded_by.map_or_else(
+                || format!("{:?}", deployment.status),
+                |generation| format!("{:?} by {generation}", deployment.status),
+            );
+            rows.push(deployment_history_row(
+                &deployments.stack,
+                deployment.generation,
+                deployment.status,
+                status,
+                deployment.retry_revision,
+                deployment.started_at_unix_ms,
+                deployment.last_progress_at_unix_ms,
+                deployment.finished_at_unix_ms,
+                include_stack,
+                color,
+            ));
+        }
+    }
+    let mut output = String::new();
+    let headers = if include_stack {
+        vec![
+            "STACK",
+            "GENERATION",
+            "STATUS",
+            "RETRIES",
+            "STARTED",
+            "LAST PROGRESS",
+            "FINISHED",
+        ]
+    } else {
+        vec![
+            "GENERATION",
+            "STATUS",
+            "RETRIES",
+            "STARTED",
+            "LAST PROGRESS",
+            "FINISHED",
+        ]
+    };
+    append_table(&mut output, &headers, &rows, color);
+    output
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deployment_history_row(
+    stack: &str,
+    generation: u64,
+    status: StackDeploymentStatus,
+    status_label: String,
+    retry_revision: u64,
+    started_at_unix_ms: i64,
+    last_progress_at_unix_ms: i64,
+    finished_at_unix_ms: Option<i64>,
+    include_stack: bool,
+    color: bool,
+) -> Vec<String> {
+    let mut row = Vec::new();
+    if include_stack {
+        row.push(ansi(color, "1;36", stack));
+    }
+    row.extend([
+        ansi(color, "1", generation),
+        ansi(color, deployment_status_color(status), status_label),
+        retry_revision.to_string(),
+        started_at_unix_ms.to_string(),
+        last_progress_at_unix_ms.to_string(),
+        finished_at_unix_ms.map_or_else(|| "-".into(), |value| value.to_string()),
+    ]);
+    row
 }
 
 async fn get_deployment(
@@ -2402,17 +2530,19 @@ mod tests {
         model::{
             ClusterState, DesiredTaskState, GatewayStatus, ImageResolutionStatus, NodeMember,
             ObservedTaskState, RecoveryStatus, StackDeploymentGatewayProgress,
-            StackDeploymentImageProgress, StackDeploymentResponse, StackDeploymentServiceProgress,
-            StackDeploymentStatus, StackDeploymentTaskPhaseProgress, StatusResponse,
-            TaskReconcileError, TaskReconcilePhase, TaskRecord,
+            StackDeploymentImageProgress, StackDeploymentListResponse, StackDeploymentResponse,
+            StackDeploymentServiceProgress, StackDeploymentStatus, StackDeploymentSummary,
+            StackDeploymentTaskPhaseProgress, StatusResponse, TaskReconcileError,
+            TaskReconcilePhase, TaskRecord,
         },
     };
 
     use super::{
         Cli, Command, DeploymentOperation, DeploymentProgressRenderer, colorize_json,
         deployment_progress_summary, deployment_terminal_progress_summary, display_width,
-        format_node_identity, format_status, local_stack_apply_request, resolve_stack_name,
-        retain_missing_config_contents, write_terminal_progress,
+        format_deployment_history, format_deployment_statuses, format_node_identity, format_status,
+        local_stack_apply_request, resolve_stack_name, retain_missing_config_contents,
+        write_terminal_progress,
     };
 
     #[test]
@@ -2430,6 +2560,54 @@ mod tests {
         assert!(colored.contains("\x1b[33mtrue\x1b[0m"));
         assert!(colored.contains("\x1b[35m2\x1b[0m"));
         assert_eq!(display_width(&colored), encoded.chars().count());
+    }
+
+    #[test]
+    fn deployment_tables_include_stack_and_status_colors() {
+        let current = StackDeploymentResponse {
+            stack: "demo".into(),
+            generation: 2,
+            revision: 3,
+            status: StackDeploymentStatus::Healthy,
+            started_at_unix_ms: 10,
+            last_progress_at_unix_ms: 20,
+            progress_deadline_seconds: 300,
+            finished_at_unix_ms: Some(30),
+            superseded_by: None,
+            retry_revision: 0,
+            services: Vec::new(),
+            pending_removals: 0,
+            task_phases: Vec::new(),
+            image_resolutions: Vec::new(),
+            gateway: None,
+            errors: Vec::new(),
+            conditions: Vec::new(),
+        };
+        let deployments = vec![StackDeploymentListResponse {
+            stack: "demo".into(),
+            current: Some(current),
+            history: vec![StackDeploymentSummary {
+                generation: 1,
+                status: StackDeploymentStatus::Superseded,
+                started_at_unix_ms: 1,
+                last_progress_at_unix_ms: 2,
+                progress_deadline_seconds: 300,
+                finished_at_unix_ms: Some(3),
+                superseded_by: Some(2),
+                retry_revision: 1,
+            }],
+        }];
+
+        let plain = format_deployment_statuses(&deployments, false);
+        assert!(plain.starts_with("STACK"));
+        assert!(plain.contains("demo"));
+        assert!(plain.contains("Healthy"));
+        assert!(!plain.contains("\x1b["));
+
+        let colored = format_deployment_history(&deployments, true, true);
+        assert!(colored.contains("\x1b[1;36mdemo\x1b[0m"));
+        assert!(colored.contains("\x1b[32mHealthy (current)\x1b[0m"));
+        assert!(colored.contains("\x1b[2mSuperseded by 2\x1b[0m"));
     }
 
     #[test]
@@ -2768,6 +2946,11 @@ mod tests {
         assert!(Cli::try_parse_from(["swarmlite", "rm", "demo", "other",]).is_ok());
         assert!(Cli::try_parse_from(["swarmlite", "rm", "--json", "demo",]).is_ok());
         assert!(Cli::try_parse_from(["swarmlite", "deployment", "status", "demo"]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "deployment", "status"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["swarmlite", "deployment", "status", "--generation", "42"])
+                .is_err()
+        );
         assert!(
             Cli::try_parse_from([
                 "swarmlite",
@@ -2780,6 +2963,7 @@ mod tests {
             .is_ok()
         );
         assert!(Cli::try_parse_from(["swarmlite", "deployment", "history", "demo"]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "deployment", "history"]).is_ok());
         assert!(Cli::try_parse_from(["swarmlite", "deployment", "retry", "demo"]).is_ok());
         assert!(
             Cli::try_parse_from([

@@ -1884,6 +1884,34 @@ async fn replace_supersedes_and_archives_the_active_generation() {
 }
 
 #[tokio::test]
+async fn lists_deployments_for_all_stacks_in_name_order() {
+    let (controller, _, _directory) = test_controller("deployment-list-test").await;
+    register_live_node(&controller).await;
+    controller.apply("zeta", parsed_test_stack()).await.unwrap();
+    controller
+        .apply("alpha", parsed_test_stack())
+        .await
+        .unwrap();
+
+    let deployments = controller.list_deployments().await.unwrap();
+
+    assert_eq!(
+        deployments
+            .stacks
+            .iter()
+            .map(|stack| stack.stack.as_str())
+            .collect::<Vec<_>>(),
+        ["alpha", "zeta"]
+    );
+    assert!(
+        deployments
+            .stacks
+            .iter()
+            .all(|stack| stack.current.is_some())
+    );
+}
+
+#[tokio::test]
 async fn rollback_restores_the_latest_healthy_snapshot_as_a_new_generation() {
     let (controller, _, _directory) = test_controller("deployment-rollback-test").await;
     register_live_node(&controller).await;

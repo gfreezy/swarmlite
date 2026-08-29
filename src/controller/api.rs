@@ -19,15 +19,15 @@ use tracing::error;
 use crate::model::{
     AgentCommandAck, AgentCommandPollResponse, AgentCommandResult, BootstrapResponse,
     ClusterConfigResponse, ClusterConfigUpdate, ConfigBlobCheckRequest, ConfigBlobCheckResponse,
-    DataSessionCreateResponse, DataSessionOperation, HeartbeatResponse, JoinRequest, JoinResponse,
-    KvDeleteRequest, KvListResponse, KvLockAcquireRequest, KvLockAcquireResponse,
-    KvLockMutationRequest, KvObjectResponse, KvPutRequest, KvStatResponse, MAX_CONFIG_FILE_BYTES,
-    MAX_STACK_CONFIG_BYTES, NodeGatewayResponse, NodeGatewayUpdate, NodeHeartbeat,
-    NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse, RegistryCredential,
-    RegistryLoginRequest, RegistryLoginResponse, ServiceInspectResponse, ServiceListResponse,
-    ServiceScaleRequest, StackApplyRequest, StackDeploymentListResponse, StackDeploymentResponse,
-    StackListResponse, StackRollbackRequest, StackValidationResponse, StatusResponse,
-    TaskListResponse,
+    DataSessionCreateResponse, DataSessionOperation, DeploymentListResponse, HeartbeatResponse,
+    JoinRequest, JoinResponse, KvDeleteRequest, KvListResponse, KvLockAcquireRequest,
+    KvLockAcquireResponse, KvLockMutationRequest, KvObjectResponse, KvPutRequest, KvStatResponse,
+    MAX_CONFIG_FILE_BYTES, MAX_STACK_CONFIG_BYTES, NodeGatewayResponse, NodeGatewayUpdate,
+    NodeHeartbeat, NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse,
+    RegistryCredential, RegistryLoginRequest, RegistryLoginResponse, ServiceInspectResponse,
+    ServiceListResponse, ServiceScaleRequest, StackApplyRequest, StackDeploymentListResponse,
+    StackDeploymentResponse, StackListResponse, StackRollbackRequest, StackValidationResponse,
+    StatusResponse, TaskListResponse,
 };
 use swarmlite_stack::{config_digest, parse_stack_document, resolve_config_digests};
 
@@ -49,6 +49,7 @@ pub(super) fn router(controller: Arc<Controller>) -> Router {
         .route("/v1/stacks/{name}/tasks", get(stack_tasks))
         .route("/v1/stacks/{name}/deployment", get(stack_deployment))
         .route("/v1/stacks/{name}/deployments", get(stack_deployments))
+        .route("/v1/deployments", get(deployments))
         .route(
             "/v1/stacks/{name}/deployment/retry",
             post(retry_stack_deployment),
@@ -651,6 +652,14 @@ async fn stack_deployments(
 ) -> Result<Json<StackDeploymentListResponse>, ControllerError> {
     require_auth(&controller, &headers)?;
     controller.list_stack_deployments(&name).await.map(Json)
+}
+
+async fn deployments(
+    State(controller): State<Arc<Controller>>,
+    headers: HeaderMap,
+) -> Result<Json<DeploymentListResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.list_deployments().await.map(Json)
 }
 
 async fn retry_stack_deployment(
