@@ -526,13 +526,16 @@ per-Service applied and healthy replica progress. Image checks finish as `unchan
 or `changed/updating`.
 `rm` reports `stop` and `remove` milestones and the number of Tasks still pending removal. Routed
 deployments also report how many gateway nodes have applied the latest configuration and do not
-complete until all enabled gateways have converged. In an interactive terminal, progress is
-colored and refreshed in place on one line; set `NO_COLOR=1` to disable colors. When stderr is
-redirected or the terminal is non-interactive, progress remains plain text and a status line is
-printed every ten seconds when no state changes. Progress always goes to stderr. `deploy` and `rm`
-are quiet on stdout after completion; pass `--json` when the final machine-readable response is
-needed (`rm --json` returns an array because it accepts multiple Stacks). `--dry-run` continues to
-print its validation response as JSON.
+complete until all enabled gateways have converged. In an interactive terminal, human-readable
+output across commands uses color and progress is refreshed in place on one line; set
+`NO_COLOR=1` to disable colors. Tables color headings and health states. `ps`, `status`, and
+multi-Task `logs` mark the current machine as `● NODE (local)`. When output is redirected or the
+terminal is non-interactive, it remains plain text. Explicit `--json`, `ps --quiet`, raw logs, and
+application log bytes are never decorated, so scripts keep receiving stable output. Non-interactive
+deployment progress prints a status line every ten seconds when no state changes and always goes
+to stderr. `deploy` and `rm` are quiet on stdout after completion; pass `--json` when the final
+machine-readable response is needed (`rm --json` returns an array because it accepts multiple
+Stacks). `--dry-run` continues to print its validation response as JSON.
 
 ### Deployment behavior
 

@@ -1,12 +1,21 @@
 use anyhow::{Context, Result, bail};
 use tokio::io::AsyncWriteExt;
 
+use super::{ansi, stderr_color};
+
 const RELEASES_URL: &str = "https://github.com/gfreezy/swarmlite/releases";
 const MAX_INSTALLER_BYTES: u64 = 1024 * 1024;
 
 pub(super) async fn run(version: &str) -> Result<()> {
     let installer_url = installer_url(version)?;
-    eprintln!("downloading the Swarmlite {version} installer");
+    eprintln!(
+        "{}",
+        ansi(
+            stderr_color(),
+            "36",
+            format!("downloading the Swarmlite {version} installer")
+        )
+    );
 
     let response = reqwest::Client::new()
         .get(&installer_url)

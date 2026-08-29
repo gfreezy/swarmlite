@@ -731,6 +731,14 @@ pub async fn connection_info(data_dir: &Path) -> Result<ConnectionInfo> {
     Ok(ConnectionInfo { controller, token })
 }
 
+pub fn local_node_id(data_dir: &Path) -> Result<Option<String>> {
+    let settings = LocalState::get_read_only::<NodeSettings>(data_dir, NODE_KEY)?;
+    if let Some(settings) = settings.as_ref() {
+        validate_node_settings(settings)?;
+    }
+    Ok(settings.map(|settings| settings.node_id))
+}
+
 pub async fn resolve_connection(
     data_dir: &Path,
     controller: Option<String>,
@@ -1614,6 +1622,10 @@ mod tests {
         let info = connection_info(directory.path()).await.unwrap();
         assert_eq!(info.controller, "http://127.0.0.1:18080");
         assert_eq!(info.token, "0123456789abcdef");
+        assert_eq!(
+            local_node_id(directory.path()).unwrap().as_deref(),
+            Some(node.node_id.as_str())
+        );
 
         let duplicate = init(InitOptions {
             data_dir: directory.path().to_owned(),

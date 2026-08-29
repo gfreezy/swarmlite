@@ -9,14 +9,19 @@ use futures_util::{SinkExt, StreamExt};
 use swarmlite::{
     data_plane::{DATA_STREAM_WRITE_TIMEOUT, DataChannel, DataFrame, DataFrameKind},
     model::{
-        DataSessionCreateResponse, DataSessionOperation, DataSessionStream, ServiceInspectResponse,
-        ServiceListResponse, ServiceScaleRequest, StackDeploymentResponse, TaskListResponse,
+        DataSessionCreateResponse, DataSessionOperation, DataSessionStream, DesiredTaskState,
+        ObservedTaskState, ServiceInspectResponse, ServiceListResponse, ServiceScaleRequest,
+        StackDeploymentResponse, TaskListResponse,
     },
+    node,
 };
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio_tungstenite::tungstenite::Message;
 
-use super::{ConnectionArgs, DeploymentOperation, connection, deploy, finish_deployment};
+use super::{
+    ConnectionArgs, DeploymentOperation, ansi, connection, deploy, display_width,
+    finish_deployment, format_node_identity, print_pretty_json, stdout_color,
+};
 
 const LOG_OUTPUT_BUFFER_BYTES: usize = 256 * 1024;
 const LOG_OUTPUT_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -165,7 +170,13 @@ pub(super) async fn run_ps(data_dir: &Path, args: PsArgs) -> Result<()> {
         |target| format!("/v1/tasks?target={}", encode(&target)),
     );
     let response: TaskListResponse = client.get_json(&path).await?;
-    print_task_table(&response, args.quiet, args.no_trunc);
+    let local_node_id = node::local_node_id(data_dir).unwrap_or_default();
+    print_task_table(
+        &response,
+        args.quiet,
+        args.no_trunc,
+        local_node_id.as_deref(),
+    );
     Ok(())
 }
 
@@ -174,11 +185,12 @@ pub(super) async fn run_inspect(data_dir: &Path, args: InspectArgs) -> Result<()
     let response: ServiceInspectResponse = client
         .get_json(&format!("/v1/services/{}", encode(&args.service)))
         .await?;
-    println!("{}", serde_json::to_string_pretty(&response)?);
+    print_pretty_json(&response, stdout_color())?;
     Ok(())
 }
 
 pub(super) async fn run_logs(data_dir: &Path, args: LogsArgs) -> Result<()> {
+    let local_node_id = node::local_node_id(data_dir).unwrap_or_default();
     let client = resolve_client(data_dir, args.connection).await?;
     let response: DataSessionCreateResponse = client
         .send_json(
@@ -202,7 +214,7 @@ pub(super) async fn run_logs(data_dir: &Path, args: LogsArgs) -> Result<()> {
             response.streams.len()
         );
     }
-    receive_logs(socket, response.streams, args.raw).await
+    receive_logs(socket, response.streams, args.raw, local_node_id.as_deref()).await
 }
 
 pub(super) async fn run_scale(data_dir: &Path, args: ScaleArgs) -> Result<()> {
@@ -225,7 +237,12 @@ pub(super) async fn run_scale(data_dir: &Path, args: ScaleArgs) -> Result<()> {
             DeploymentOperation::Scale,
         )
         .await?;
-        println!("{service} scaled to {replicas}");
+        let color = stdout_color();
+        println!(
+            "{} scaled to {}",
+            ansi(color, "1;36", service),
+            ansi(color, "32", replicas)
+        );
     }
     Ok(())
 }
@@ -246,7 +263,7 @@ pub(super) async fn run_restart(data_dir: &Path, args: RestartArgs) -> Result<()
         DeploymentOperation::Restart,
     )
     .await?;
-    println!("{}", args.service);
+    println!("{}", ansi(stdout_color(), "1;36", args.service));
     Ok(())
 }
 
@@ -303,15 +320,24 @@ fn parse_scale(value: &str) -> Result<(&str, u32)> {
 }
 
 fn print_service_table(response: &ServiceListResponse) {
+    let color = stdout_color();
     let rows = response
         .services
         .iter()
         .map(|service| {
             vec![
-                service.id.clone(),
-                format!("{}.{}", service.stack, service.name),
+                ansi(color, "2", &service.id),
+                ansi(color, "1;36", format!("{}.{}", service.stack, service.name)),
                 "replicated".into(),
-                format!("{}/{}", service.running_replicas, service.replicas),
+                ansi(
+                    color,
+                    if service.running_replicas == service.replicas {
+                        "32"
+                    } else {
+                        "33"
+                    },
+                    format!("{}/{}", service.running_replicas, service.replicas),
+                ),
                 service.image.clone(),
             ]
         })
@@ -319,13 +345,19 @@ fn print_service_table(response: &ServiceListResponse) {
     print_table(&["ID", "NAME", "MODE", "REPLICAS", "IMAGE"], rows);
 }
 
-fn print_task_table(response: &TaskListResponse, quiet: bool, no_trunc: bool) {
+fn print_task_table(
+    response: &TaskListResponse,
+    quiet: bool,
+    no_trunc: bool,
+    local_node_id: Option<&str>,
+) {
     if quiet {
         for task in &response.tasks {
             println!("{}", display_id(&task.id, no_trunc));
         }
         return;
     }
+    let color = stdout_color();
     let rows = response
         .tasks
         .iter()
@@ -342,18 +374,33 @@ fn print_task_table(response: &TaskListResponse, quiet: bool, no_trunc: bool) {
                 .collect::<Vec<_>>()
                 .join(",");
             vec![
-                display_id(&task.id, no_trunc),
-                format!(
-                    "{}.{}.{}",
-                    task.stack,
-                    task.service,
-                    task.slot.saturating_add(1)
+                ansi(color, "2", display_id(&task.id, no_trunc)),
+                ansi(
+                    color,
+                    "1;36",
+                    format!(
+                        "{}.{}.{}",
+                        task.stack,
+                        task.service,
+                        task.slot.saturating_add(1)
+                    ),
                 ),
                 task.image.clone(),
-                task.node_id.clone(),
-                format!("{:?}", task.desired),
-                format!("{:?}", task.observed),
-                task.error.clone().unwrap_or_default(),
+                format_node_identity(&task.node_id, local_node_id, color),
+                ansi(
+                    color,
+                    desired_state_color(&task.desired),
+                    format!("{:?}", task.desired),
+                ),
+                ansi(
+                    color,
+                    observed_state_color(&task.observed),
+                    format!("{:?}", task.observed),
+                ),
+                task.error
+                    .as_ref()
+                    .map(|error| ansi(color, "31", error))
+                    .unwrap_or_default(),
                 ports,
             ]
         })
@@ -379,19 +426,27 @@ async fn receive_logs(
     >,
     streams: Vec<DataSessionStream>,
     raw: bool,
+    local_node_id: Option<&str>,
 ) -> Result<()> {
     let prefixed = streams.len() > 1 && !raw;
+    let color = stdout_color();
     let prefixes = streams
         .iter()
         .map(|stream| {
+            let local = local_node_id == Some(stream.node_id.as_str());
+            let node = format_node_identity(&stream.node_id, local_node_id, false);
             (
                 stream.stream_id,
-                format!(
-                    "{}.{}.{}@{} | ",
-                    stream.stack,
-                    stream.service,
-                    stream.slot.saturating_add(1),
-                    stream.node_id
+                ansi(
+                    color,
+                    if local { "1;36" } else { "36" },
+                    format!(
+                        "{}.{}.{}@{} | ",
+                        stream.stack,
+                        stream.service,
+                        stream.slot.saturating_add(1),
+                        node
+                    ),
                 )
                 .into_bytes(),
             )
@@ -596,19 +651,20 @@ fn display_id(id: &str, no_trunc: bool) -> String {
 }
 
 fn print_table(headers: &[&str], rows: Vec<Vec<String>>) {
+    let color = stdout_color();
     let mut widths = headers
         .iter()
-        .map(|header| header.len())
+        .map(|header| header.chars().count())
         .collect::<Vec<_>>();
     for row in &rows {
         for (index, value) in row.iter().enumerate() {
-            widths[index] = widths[index].max(value.chars().count());
+            widths[index] = widths[index].max(display_width(value));
         }
     }
     print_table_row(
         &headers
             .iter()
-            .map(|value| (*value).to_owned())
+            .map(|value| ansi(color, "1", value))
             .collect::<Vec<_>>(),
         &widths,
     );
@@ -622,11 +678,27 @@ fn print_table_row(values: &[String], widths: &[usize]) {
         if index + 1 == values.len() {
             print!("{value}");
         } else {
-            let padding = widths[index].saturating_sub(value.chars().count()) + 2;
+            let padding = widths[index].saturating_sub(display_width(value)) + 2;
             print!("{value}{}", " ".repeat(padding));
         }
     }
     println!();
+}
+
+fn desired_state_color(state: &DesiredTaskState) -> &'static str {
+    match state {
+        DesiredTaskState::Running => "32",
+        DesiredTaskState::Draining => "33",
+        DesiredTaskState::Stopped => "2",
+    }
+}
+
+fn observed_state_color(state: &ObservedTaskState) -> &'static str {
+    match state {
+        ObservedTaskState::Healthy | ObservedTaskState::Running => "32",
+        ObservedTaskState::Pending | ObservedTaskState::Starting => "33",
+        ObservedTaskState::Failed | ObservedTaskState::Lost => "31",
+    }
 }
 
 #[cfg(test)]

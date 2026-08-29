@@ -371,7 +371,7 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("Error: {error:#}");
+            eprintln!("{} {error:#}", ansi(stderr_color(), "1;31", "Error:"));
             ExitCode::FAILURE
         }
     }
@@ -379,6 +379,7 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_ansi(stderr_color())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "swarmlite=info,tower_http=info".into()),
@@ -423,7 +424,7 @@ async fn run() -> Result<()> {
                 gateway_enabled: !options.no_gateway,
             })
             .await?;
-            println!("{message}");
+            println!("{}", ansi(stdout_color(), "32", message));
             Ok(())
         }
         Command::Serve {
@@ -461,11 +462,14 @@ async fn run() -> Result<()> {
                 gateway_enabled: gateway,
             })
             .await?;
-            println!("{message}");
+            println!("{}", ansi(stdout_color(), "32", message));
             Ok(())
         }
         Command::JoinToken => {
-            println!("{}", node::join_command(&data_dir).await?);
+            println!(
+                "{}",
+                ansi(stdout_color(), "36", node::join_command(&data_dir).await?)
+            );
             Ok(())
         }
         Command::ConnectionInfo { json } => {
@@ -473,8 +477,9 @@ async fn run() -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string(&info)?);
             } else {
-                println!("controller: {}", info.controller);
-                println!("token: {}", info.token);
+                let color = stdout_color();
+                println!("{} {}", ansi(color, "1;36", "controller:"), info.controller);
+                println!("{} {}", ansi(color, "1;36", "token:"), info.token);
             }
             Ok(())
         }
@@ -533,7 +538,7 @@ async fn run() -> Result<()> {
             let client =
                 connection::resolve(&data_dir, connection.controller, connection.token).await?;
             let response = cluster_config(&client, update.as_ref()).await?;
-            println!("{}", serde_json::to_string_pretty(&response)?);
+            print_pretty_json(&response, stdout_color())?;
             Ok(())
         }
         Command::Gateway { action } => {
@@ -554,7 +559,7 @@ async fn run() -> Result<()> {
             let client =
                 connection::resolve(&data_dir, connection.controller, connection.token).await?;
             let response = node_gateway(&client, &node_id, enabled).await?;
-            println!("{}", serde_json::to_string_pretty(&response)?);
+            print_pretty_json(&response, stdout_color())?;
             Ok(())
         }
         Command::Node { action } => match action {
@@ -589,7 +594,7 @@ async fn run() -> Result<()> {
                 let client =
                     connection::resolve(&data_dir, connection.controller, connection.token).await?;
                 let response = node_labels(&client, &node_id, method, body.as_ref()).await?;
-                println!("{}", serde_json::to_string_pretty(&response)?);
+                print_pretty_json(&response, stdout_color())?;
                 Ok(())
             }
         },
@@ -614,9 +619,12 @@ async fn run() -> Result<()> {
                         }),
                     )
                     .await?;
+                let color = stdout_color();
                 println!(
-                    "stored credentials for {} as {} across the cluster",
-                    response.registry, response.username
+                    "{} credentials for {} as {} across the cluster",
+                    ansi(color, "32", "stored"),
+                    ansi(color, "1;36", response.registry),
+                    ansi(color, "1", response.username)
                 );
                 Ok(())
             }
@@ -636,7 +644,8 @@ async fn run() -> Result<()> {
             token,
         } => {
             let client = connection::resolve(&data_dir, controller, token).await?;
-            status(&client, json).await
+            let local_node_id = node::local_node_id(&data_dir).unwrap_or_default();
+            status(&client, json, local_node_id.as_deref()).await
         }
     }
 }
@@ -697,12 +706,24 @@ async fn run_deployment_command(data_dir: &Path, action: DeploymentCommand) -> R
             if json {
                 println!("{}", serde_json::to_string_pretty(&deployments)?);
             } else {
-                println!("GENERATION\tSTATUS\tRETRIES\tSTARTED\tLAST PROGRESS\tFINISHED");
+                let color = stdout_color();
+                println!(
+                    "{}",
+                    ansi(
+                        color,
+                        "1",
+                        "GENERATION\tSTATUS\tRETRIES\tSTARTED\tLAST PROGRESS\tFINISHED"
+                    )
+                );
                 if let Some(current) = deployments.current {
                     println!(
-                        "{}\t{:?} (current)\t{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t{}\t{}",
                         current.generation,
-                        current.status,
+                        ansi(
+                            color,
+                            deployment_status_color(current.status),
+                            format!("{:?} (current)", current.status)
+                        ),
                         current.retry_revision,
                         current.started_at_unix_ms,
                         current.last_progress_at_unix_ms,
@@ -719,7 +740,7 @@ async fn run_deployment_command(data_dir: &Path, action: DeploymentCommand) -> R
                     println!(
                         "{}\t{}\t{}\t{}\t{}\t{}",
                         deployment.generation,
-                        status,
+                        ansi(color, deployment_status_color(deployment.status), status),
                         deployment.retry_revision,
                         deployment.started_at_unix_ms,
                         deployment.last_progress_at_unix_ms,
@@ -814,29 +835,49 @@ fn print_deployment(deployment: &StackDeploymentResponse, json: bool) -> Result<
     if json {
         println!("{}", serde_json::to_string_pretty(deployment)?);
     } else {
+        let color = stdout_color();
         println!(
             "{}",
-            deployment_progress_summary(
-                DeploymentOperation::Deploy,
-                deployment,
-                std::time::Duration::ZERO,
+            ansi(
+                color,
+                deployment_status_color(deployment.status),
+                deployment_progress_summary(
+                    DeploymentOperation::Deploy,
+                    deployment,
+                    std::time::Duration::ZERO,
+                )
             )
         );
         println!(
-            "last progress: {}; progress deadline: {}s; retry revision: {}",
+            "{} {}; {} {}s; {} {}",
+            ansi(color, "1;36", "last progress:"),
             deployment.last_progress_at_unix_ms,
+            ansi(color, "1;36", "progress deadline:"),
             deployment.progress_deadline_seconds,
+            ansi(color, "1;36", "retry revision:"),
             deployment.retry_revision
         );
         if let Some(generation) = deployment.superseded_by {
-            println!("superseded by generation {generation}");
+            println!(
+                "{}",
+                ansi(
+                    color,
+                    "33",
+                    format!("superseded by generation {generation}")
+                )
+            );
         }
         for condition in deployment
             .conditions
             .iter()
             .filter(|condition| condition.resolved_at_unix_ms.is_none())
         {
-            println!("condition {:?}: {}", condition.kind, condition.message);
+            println!(
+                "{} {:?}: {}",
+                ansi(color, "1;33", "condition"),
+                condition.kind,
+                condition.message
+            );
         }
     }
     Ok(())
@@ -1366,12 +1407,120 @@ fn compact_name(value: &str) -> String {
     compact
 }
 
+fn terminal_color(is_terminal: bool) -> bool {
+    is_terminal
+        && std::env::var("TERM").ok().as_deref() != Some("dumb")
+        && std::env::var_os("NO_COLOR").is_none()
+}
+
+fn stdout_color() -> bool {
+    terminal_color(std::io::stdout().is_terminal())
+}
+
+fn stderr_color() -> bool {
+    terminal_color(std::io::stderr().is_terminal())
+}
+
 fn ansi(color: bool, code: &str, value: impl std::fmt::Display) -> String {
     if color {
         format!("\x1b[{code}m{value}\x1b[0m")
     } else {
         value.to_string()
     }
+}
+
+fn format_node_identity(node_id: &str, local_node_id: Option<&str>, color: bool) -> String {
+    if local_node_id == Some(node_id) {
+        ansi(color, "1;36", format!("● {node_id} (local)"))
+    } else {
+        node_id.to_owned()
+    }
+}
+
+fn print_pretty_json(value: &impl serde::Serialize, color: bool) -> Result<()> {
+    let encoded = serde_json::to_string_pretty(value)?;
+    println!("{}", colorize_json(&encoded, color));
+    Ok(())
+}
+
+fn colorize_json(encoded: &str, color: bool) -> String {
+    if !color {
+        return encoded.to_owned();
+    }
+    let bytes = encoded.as_bytes();
+    let mut output = String::with_capacity(encoded.len() + 64);
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                let start = index;
+                index += 1;
+                let mut escaped = false;
+                while index < bytes.len() {
+                    let byte = bytes[index];
+                    index += 1;
+                    if escaped {
+                        escaped = false;
+                    } else if byte == b'\\' {
+                        escaped = true;
+                    } else if byte == b'"' {
+                        break;
+                    }
+                }
+                let mut next = index;
+                while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                    next += 1;
+                }
+                let code = if bytes.get(next) == Some(&b':') {
+                    "36"
+                } else {
+                    "32"
+                };
+                output.push_str(&ansi(true, code, &encoded[start..index]));
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = index;
+                index += 1;
+                while index < bytes.len()
+                    && matches!(bytes[index], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+                {
+                    index += 1;
+                }
+                output.push_str(&ansi(true, "35", &encoded[start..index]));
+            }
+            b't' if encoded[index..].starts_with("true") => {
+                output.push_str(&ansi(true, "33", "true"));
+                index += 4;
+            }
+            b'f' if encoded[index..].starts_with("false") => {
+                output.push_str(&ansi(true, "33", "false"));
+                index += 5;
+            }
+            b'n' if encoded[index..].starts_with("null") => {
+                output.push_str(&ansi(true, "2", "null"));
+                index += 4;
+            }
+            b'{' | b'}' | b'[' | b']' | b':' | b',' => {
+                output.push_str(&ansi(true, "2", bytes[index] as char));
+                index += 1;
+            }
+            _ => {
+                let start = index;
+                index += 1;
+                while index < bytes.len()
+                    && !matches!(
+                        bytes[index],
+                        b'"' | b'-' | b'0'
+                            ..=b'9' | b't' | b'f' | b'n' | b'{' | b'}' | b'[' | b']' | b':' | b','
+                    )
+                {
+                    index += 1;
+                }
+                output.push_str(&encoded[start..index]);
+            }
+        }
+    }
+    output
 }
 
 fn deployment_progress_summary(
@@ -1826,22 +1975,20 @@ async fn wait_for_deployment(
     Ok(deployment)
 }
 
-async fn status(client: &ControllerClient, json: bool) -> Result<()> {
+async fn status(client: &ControllerClient, json: bool, local_node_id: Option<&str>) -> Result<()> {
     let value: serde_json::Value = client.get_json("/v1/status").await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         let response: StatusResponse = serde_json::from_value(value)
             .context("controller returned an invalid status response")?;
-        let color = std::io::stdout().is_terminal()
-            && std::env::var("TERM").ok().as_deref() != Some("dumb")
-            && std::env::var_os("NO_COLOR").is_none();
-        print!("{}", format_status(&response, color));
+        let color = stdout_color();
+        print!("{}", format_status(&response, color, local_node_id));
     }
     Ok(())
 }
 
-fn format_status(response: &StatusResponse, color: bool) -> String {
+fn format_status(response: &StatusResponse, color: bool, local_node_id: Option<&str>) -> String {
     use std::fmt::Write as _;
 
     let state = &response.state;
@@ -1863,7 +2010,7 @@ fn format_status(response: &StatusResponse, color: bool) -> String {
     writeln!(
         output,
         "  Controller: {}",
-        ansi(color, "1", &response.controller_id)
+        format_node_identity(&response.controller_id, local_node_id, color)
     )
     .unwrap();
 
@@ -1994,7 +2141,7 @@ fn format_status(response: &StatusResponse, color: bool) -> String {
                     .filter(|task| task.node_id.as_str() == member.id.as_str())
                     .count();
                 vec![
-                    member.id.clone(),
+                    format_node_identity(&member.id, local_node_id, color),
                     member.address.clone(),
                     if member.gateway_enabled {
                         ansi(color, "32", "enabled")
@@ -2021,7 +2168,7 @@ fn format_status(response: &StatusResponse, color: bool) -> String {
         .map(|(node_id, error)| {
             vec![
                 ansi(color, "31", "gateway"),
-                ansi(color, "1", node_id),
+                format_node_identity(node_id, local_node_id, color),
                 ansi(color, "31", single_line(error)),
             ]
         })
@@ -2037,7 +2184,7 @@ fn format_status(response: &StatusResponse, color: bool) -> String {
                     format!(
                         "{} on {}: {}",
                         format!("{:?}", error.phase).to_ascii_lowercase(),
-                        task.node_id,
+                        format_node_identity(&task.node_id, local_node_id, color),
                         single_line(&error.message)
                     ),
                 ),
@@ -2164,6 +2311,15 @@ fn deployment_summary_color(response: &StatusResponse) -> &'static str {
     }
 }
 
+fn deployment_status_color(status: StackDeploymentStatus) -> &'static str {
+    match status {
+        StackDeploymentStatus::Healthy => "32",
+        StackDeploymentStatus::Reconciling | StackDeploymentStatus::Stalled => "33",
+        StackDeploymentStatus::Failed | StackDeploymentStatus::Blocked => "31",
+        StackDeploymentStatus::Superseded => "2",
+    }
+}
+
 fn attention_count_color(count: usize) -> &'static str {
     if count == 0 { "32" } else { "31" }
 }
@@ -2253,15 +2409,39 @@ mod tests {
     };
 
     use super::{
-        Cli, Command, DeploymentOperation, DeploymentProgressRenderer, deployment_progress_summary,
-        deployment_terminal_progress_summary, display_width, format_status,
-        local_stack_apply_request, resolve_stack_name, retain_missing_config_contents,
-        write_terminal_progress,
+        Cli, Command, DeploymentOperation, DeploymentProgressRenderer, colorize_json,
+        deployment_progress_summary, deployment_terminal_progress_summary, display_width,
+        format_node_identity, format_status, local_stack_apply_request, resolve_stack_name,
+        retain_missing_config_contents, write_terminal_progress,
     };
 
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn colors_human_json_without_changing_plain_output_width() {
+        let encoded = "{\n  \"node\": \"节点-a\",\n  \"healthy\": true,\n  \"replicas\": 2\n}";
+        assert_eq!(colorize_json(encoded, false), encoded);
+        let colored = colorize_json(encoded, true);
+        assert!(colored.contains("\x1b[36m\"node\"\x1b[0m"));
+        assert!(colored.contains("\x1b[32m\"节点-a\"\x1b[0m"));
+        assert!(colored.contains("\x1b[33mtrue\x1b[0m"));
+        assert!(colored.contains("\x1b[35m2\x1b[0m"));
+        assert_eq!(display_width(&colored), encoded.chars().count());
+    }
+
+    #[test]
+    fn marks_only_the_local_node_identity() {
+        assert_eq!(
+            format_node_identity("node-a", Some("node-a"), false),
+            "● node-a (local)"
+        );
+        assert_eq!(
+            format_node_identity("node-b", Some("node-a"), false),
+            "node-b"
+        );
     }
 
     #[test]
@@ -2741,23 +2921,27 @@ mod tests {
             state,
         };
 
-        let output = format_status(&response, false);
+        let output = format_status(&response, false, Some("node-a"));
         assert!(!output.contains("\x1b["));
         assert!(output.contains("Nodes:           2"));
         assert!(output.contains("Tasks:           1 (1 failed)"));
         assert!(output.contains("Status:     degraded"));
         assert!(output.contains("Status:            needs attention"));
-        assert!(output.contains("node-a  10.0.0.1  enabled"));
-        assert!(output.contains("node-b  10.0.0.2  disabled"));
+        assert!(output.contains("Controller: ● node-a (local)"));
+        assert!(output.contains("● node-a (local)  10.0.0.1  enabled"));
+        assert!(output.lines().any(|line| {
+            line.contains("node-b") && line.contains("10.0.0.2") && line.contains("disabled")
+        }));
         assert!(output.contains("region=east"));
-        assert!(output.contains("gateway  node-a"));
+        assert!(output.contains("gateway  ● node-a (local)"));
         assert!(output.contains("task     1234567890ab"));
-        assert!(output.contains("start on node-a: container exited"));
+        assert!(output.contains("start on ● node-a (local): container exited"));
 
-        let colored = format_status(&response, true);
+        let colored = format_status(&response, true, Some("node-a"));
         assert!(colored.contains("\x1b[1;36mCluster\x1b[0m"));
         assert!(colored.contains("\x1b[31mdegraded\x1b[0m"));
         assert!(colored.contains("\x1b[31mneeds attention\x1b[0m"));
+        assert!(colored.contains("\x1b[1;36m● node-a (local)\x1b[0m"));
         assert_eq!(display_width("\x1b[32menabled\x1b[0m"), 7);
     }
 
