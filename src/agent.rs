@@ -345,22 +345,63 @@ async fn managed_container_inventory<R: ContainerRuntime>(
 }
 
 fn same_reconciliation_input(left: &HeartbeatResponse, right: &HeartbeatResponse) -> bool {
-    left.assignments.len() == right.assignments.len()
-        && left
-            .assignments
-            .iter()
-            .zip(&right.assignments)
-            .all(|(left, right)| {
-                let mut left = left.clone();
-                let mut right = right.clone();
-                left.generation = 0;
-                right.generation = 0;
-                left == right
-            })
-        && left.image_assignments == right.image_assignments
-        && left.remove_tasks == right.remove_tasks
+    normalized_task_assignments(left) == normalized_task_assignments(right)
+        && normalized_image_assignments(left) == normalized_image_assignments(right)
+        && normalized_task_removals(left) == normalized_task_removals(right)
         && left.registry_credentials == right.registry_credentials
         && left.registry_credentials_hash == right.registry_credentials_hash
+}
+
+fn normalized_task_assignments(
+    response: &HeartbeatResponse,
+) -> BTreeMap<String, crate::model::TaskAssignment> {
+    response
+        .assignments
+        .iter()
+        .cloned()
+        .map(|mut assignment| {
+            // Controller-wide generations and image preparation status do not change the
+            // desired container. Deployment generations and retry revisions remain part of
+            // the input because they require a fresh reconciliation report or retry.
+            assignment.generation = 0;
+            assignment.image_resolved = false;
+            (assignment.id.clone(), assignment)
+        })
+        .collect()
+}
+
+fn normalized_image_assignments(
+    response: &HeartbeatResponse,
+) -> Vec<crate::model::ImageResolutionAssignment> {
+    let mut assignments = response.image_assignments.clone();
+    for assignment in &mut assignments {
+        for service in &mut assignment.services {
+            service.task_ids.sort();
+        }
+        assignment.services.sort_by(|left, right| {
+            left.service_id
+                .cmp(&right.service_id)
+                .then_with(|| left.task_ids.cmp(&right.task_ids))
+        });
+    }
+    assignments.sort_by(|left, right| {
+        left.deployment_generation
+            .cmp(&right.deployment_generation)
+            .then_with(|| left.image.cmp(&right.image))
+    });
+    assignments
+}
+
+fn normalized_task_removals(
+    response: &HeartbeatResponse,
+) -> Vec<crate::model::TaskRemovalAssignment> {
+    let mut removals = response.remove_tasks.clone();
+    removals.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.deployment_generation.cmp(&right.deployment_generation))
+    });
+    removals
 }
 
 async fn command_loop<R: ContainerRuntime>(
@@ -644,10 +685,18 @@ async fn reconciliation_loop<R: ContainerRuntime>(
         };
         loop {
             let update = {
-                let work = reconcile_response(&context, &response);
-                tokio::pin!(work);
+                let preparation = prepare_reconcile_response(&context, &response);
+                tokio::pin!(preparation);
                 tokio::select! {
-                    () = &mut work => None,
+                    prepared = &mut preparation => {
+                        if let Some(prepared) = prepared {
+                            // Runtime mutations are not cancellation-safe once a request has
+                            // reached Docker. Finish the commit before consuming a newer watch
+                            // value; the following pass will converge from a fresh inventory.
+                            commit_reconcile_response(&context, &response, prepared).await;
+                        }
+                        None
+                    }
                     changed = assignments.changed() => {
                         if changed.is_err() {
                             return;
@@ -662,7 +711,7 @@ async fn reconciliation_loop<R: ContainerRuntime>(
             debug!(
                 previous_generation = response.generation,
                 next_generation = next.generation,
-                "canceling stale reconciliation for a newer assignment"
+                "canceling stale reconciliation preparation for a newer assignment"
             );
             response = next;
         }
@@ -679,10 +728,15 @@ struct ReconcileContext<'a, R> {
     image_progress: &'a ImageProgressPublisher,
 }
 
-async fn reconcile_response<R: ContainerRuntime>(
+struct PreparedReconcile {
+    existing: HashMap<String, ManagedContainer>,
+    config_errors: HashMap<String, String>,
+}
+
+async fn prepare_reconcile_response<R: ContainerRuntime>(
     context: &ReconcileContext<'_, R>,
     response: &HeartbeatResponse,
-) {
+) -> Option<PreparedReconcile> {
     let existing = match context.runtime.list_managed(context.cluster_id).await {
         Ok(containers) => containers,
         Err(error) => {
@@ -729,7 +783,7 @@ async fn reconcile_response<R: ContainerRuntime>(
                 &context.state.image_results,
                 &context.state.events,
             );
-            return;
+            return None;
         }
     };
     context.progress.retain_for_response(response);
@@ -756,12 +810,23 @@ async fn reconcile_response<R: ContainerRuntime>(
         Some(context.progress),
     )
     .await;
+    Some(PreparedReconcile {
+        existing,
+        config_errors,
+    })
+}
+
+async fn commit_reconcile_response<R: ContainerRuntime>(
+    context: &ReconcileContext<'_, R>,
+    response: &HeartbeatResponse,
+    prepared: PreparedReconcile,
+) {
     let reports = reconcile_containers_with_progress(
         context.runtime,
-        &existing,
+        &prepared.existing,
         response,
         Some(context.progress),
-        &config_errors,
+        &prepared.config_errors,
     )
     .await;
     publish_reconcile_results(
@@ -770,7 +835,8 @@ async fn reconcile_response<R: ContainerRuntime>(
         &context.state.task_results,
         &context.state.events,
     );
-    let referenced_paths = referenced_config_cache_paths(context.config_cache, &existing, response);
+    let referenced_paths =
+        referenced_config_cache_paths(context.config_cache, &prepared.existing, response);
     let grace_period_ms =
         i64::try_from(CONFIG_GC_GRACE_PERIOD_SECONDS.saturating_mul(1_000)).unwrap_or(i64::MAX);
     match context
@@ -1335,6 +1401,8 @@ mod tests {
         created: Arc<Mutex<Vec<String>>>,
         removed: Arc<Mutex<Vec<String>>>,
         started: Arc<Mutex<Vec<String>>>,
+        create_started: Option<mpsc::UnboundedSender<String>>,
+        create_permits: Option<Arc<tokio::sync::Semaphore>>,
         log_output: Arc<Mutex<Vec<u8>>>,
         fail_create: bool,
         start_port_conflicts: Arc<AtomicUsize>,
@@ -1402,6 +1470,12 @@ mod tests {
                 bail!("image pull denied");
             }
             progress.report(TaskReconcilePhase::Create);
+            if let Some(started) = &self.create_started {
+                let _ = started.send(assignment.id.clone());
+            }
+            if let Some(permits) = &self.create_permits {
+                permits.acquire().await.unwrap().forget();
+            }
             progress.report(TaskReconcilePhase::Start);
             self.created.lock().unwrap().push(assignment.id.clone());
             Ok(())
@@ -1512,6 +1586,55 @@ mod tests {
         }
     }
 
+    fn task_test_response(task_id: &str) -> HeartbeatResponse {
+        HeartbeatResponse {
+            generation: 1,
+            cluster: test_cluster(),
+            assignments: vec![crate::model::TaskAssignment {
+                id: task_id.into(),
+                cluster_id: "cluster-test".into(),
+                stack: "demo".into(),
+                service: "web".into(),
+                service_id: "demo.web".into(),
+                revision: 1,
+                slot: 0,
+                desired: crate::model::DesiredTaskState::Running,
+                spec: crate::model::ServiceSpec {
+                    image: "nginx:alpine".into(),
+                    pull_policy: Default::default(),
+                    command: Vec::new(),
+                    entrypoint: Vec::new(),
+                    environment: Vec::new(),
+                    expose: Vec::new(),
+                    ports: Vec::new(),
+                    volumes: Vec::new(),
+                    configs: Vec::new(),
+                    container_labels: Default::default(),
+                    service_labels: Default::default(),
+                    healthcheck: None,
+                    replicas: 1,
+                    constraints: Vec::new(),
+                    max_replicas_per_node: None,
+                    max_surge: 1,
+                    stop_grace_period_seconds: 10,
+                },
+                ports: Vec::new(),
+                generation: 1,
+                deployment_generation: 1,
+                deployment_retry_revision: 0,
+                spec_hash: "hash".into(),
+                image_resolved: false,
+            }],
+            image_assignments: Vec::new(),
+            gateway_enabled: false,
+            labels: Default::default(),
+            remove_tasks: Vec::new(),
+            gateway_config: None,
+            registry_credentials: Default::default(),
+            registry_credentials_hash: String::new(),
+        }
+    }
+
     #[test]
     fn gateway_retries_transient_errors_with_backoff_and_port_conflicts_once_per_minute() {
         let now = std::time::Instant::now();
@@ -1568,6 +1691,96 @@ mod tests {
         let mut new_deployment = unrelated_update;
         new_deployment.image_assignments[0].deployment_generation += 1;
         assert!(!same_reconciliation_input(&current, &new_deployment));
+    }
+
+    #[test]
+    fn reconciliation_input_is_order_independent_and_ignores_preparation_metadata() {
+        let mut current = task_test_response("task-a");
+        current
+            .assignments
+            .push(task_test_response("task-b").assignments.remove(0));
+        let mut reordered = current.clone();
+        reordered.assignments.reverse();
+        reordered.generation += 1;
+        for assignment in &mut reordered.assignments {
+            assignment.generation += 1;
+            assignment.image_resolved = true;
+        }
+        assert!(same_reconciliation_input(&current, &reordered));
+
+        reordered.assignments[0].spec_hash = "changed".into();
+        assert!(!same_reconciliation_input(&current, &reordered));
+    }
+
+    #[tokio::test]
+    async fn reconciliation_finishes_an_inflight_mutation_before_using_a_new_assignment() {
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        let runtime = FakeRuntime {
+            create_started: Some(started_tx),
+            create_permits: Some(Arc::clone(&permits)),
+            ..FakeRuntime::default()
+        };
+        let observed = runtime.clone();
+        let (assignments_tx, assignments_rx) = tokio::sync::watch::channel(None);
+        let (events, _events_rx) = mpsc::unbounded_channel();
+        let state = ReconciliationState {
+            task_results: Arc::new(Mutex::new(BTreeMap::new())),
+            task_progress: Arc::new(Mutex::new(BTreeMap::new())),
+            image_results: Arc::new(Mutex::new(BTreeMap::new())),
+            image_progress: Arc::new(Mutex::new(BTreeMap::new())),
+            events,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let handle = tokio::spawn(reconciliation_loop(
+            Arc::new(runtime),
+            ControllerClient::new("http://127.0.0.1:1", "test-token"),
+            ConfigCache::new(directory.path().join("configs")),
+            assignments_rx,
+            "cluster-test".into(),
+            state,
+        ));
+
+        assignments_tx.send_replace(Some(task_test_response("task-a")));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("task-a")
+        );
+        assignments_tx.send_replace(Some(task_test_response("task-b")));
+        tokio::task::yield_now().await;
+        assert!(observed.created.lock().unwrap().is_empty());
+
+        permits.add_permits(1);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("task-b")
+        );
+        assert_eq!(&*observed.created.lock().unwrap(), &["task-a"]);
+
+        permits.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if observed.created.lock().unwrap().len() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(&*observed.created.lock().unwrap(), &["task-a", "task-b"]);
+
+        drop(assignments_tx);
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

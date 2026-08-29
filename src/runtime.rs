@@ -27,7 +27,7 @@ use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     config::{ResolvedRuntimeConfig, RuntimeKind},
@@ -298,6 +298,12 @@ pub struct DockerCompatibleRuntime {
     registry_credentials: Option<RegistryCredentialStore>,
     config_root: Option<PathBuf>,
     deployment_policy: Arc<std::sync::RwLock<DeploymentPolicy>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskNameConflictResolution {
+    Recovered,
+    RetryCreate,
 }
 
 impl DockerCompatibleRuntime {
@@ -790,19 +796,170 @@ impl DockerCompatibleRuntime {
         kind: &str,
     ) -> Result<()> {
         let remove = RemoveContainerOptionsBuilder::default().force(true).build();
-        self.client
+        match self
+            .client
             .remove_container(container_id, Some(remove))
             .await
-            .with_context(|| {
-                format!(
-                    "failed to remove newly created {kind} container {container_id} after it failed to start"
-                )
-            })?;
+        {
+            Ok(())
+            | Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to remove newly created {kind} container {container_id} after it failed to start"
+                    )
+                });
+            }
+        }
         info!(
             container_id,
             kind, "removed newly created container after start failure"
         );
         Ok(())
+    }
+
+    async fn recover_task_name_conflict(
+        &self,
+        name: &str,
+        assignment: &TaskAssignment,
+        progress: &RuntimeTaskProgress,
+    ) -> Result<TaskNameConflictResolution> {
+        let inspect = {
+            let mut inspect = None;
+            for attempt in 0..3 {
+                match self.client.inspect_container(name, None).await {
+                    Ok(found) => {
+                        inspect = Some(found);
+                        break;
+                    }
+                    Err(error) if docker_not_found(&error) && attempt < 2 => {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            10 * (attempt + 1) as u64,
+                        ))
+                        .await;
+                    }
+                    Err(error) if docker_not_found(&error) => {
+                        return Ok(TaskNameConflictResolution::RetryCreate);
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "failed to inspect conflicting task container {name} for {}",
+                                assignment.id
+                            )
+                        });
+                    }
+                }
+            }
+            inspect.expect("task conflict inspection either succeeds or returns")
+        };
+        let labels = inspect
+            .config
+            .as_ref()
+            .and_then(|config| config.labels.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        let managed = labels.get(MANAGED_LABEL).map(String::as_str) == Some("true");
+        let cluster_id = labels.get(CLUSTER_LABEL).map(String::as_str);
+        let task_id = labels.get(TASK_LABEL).map(String::as_str);
+        if !managed
+            || cluster_id != Some(assignment.cluster_id.as_str())
+            || task_id != Some(assignment.id.as_str())
+        {
+            bail!(
+                "task container name {name:?} is already owned by managed={managed}, cluster_id={cluster_id:?}, task_id={task_id:?}; refusing to replace it for task {}",
+                assignment.id
+            );
+        }
+
+        let container_id = inspect.id.as_deref().unwrap_or(name);
+        let same_spec = labels.get(SPEC_HASH_LABEL).map(String::as_str)
+            == Some(assignment.spec_hash.as_str())
+            && labels
+                .get(REVISION_LABEL)
+                .and_then(|revision| revision.parse::<u64>().ok())
+                == Some(assignment.revision);
+        if !same_spec {
+            let remove = RemoveContainerOptionsBuilder::default().force(true).build();
+            match self
+                .client
+                .remove_container(container_id, Some(remove))
+                .await
+            {
+                Ok(()) => {}
+                Err(error) if docker_not_found(&error) => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to remove stale task container {container_id} for {}",
+                            assignment.id
+                        )
+                    });
+                }
+            }
+            warn!(
+                task_id = %assignment.id,
+                container_id,
+                "removed a stale same-task container after a name conflict"
+            );
+            return Ok(TaskNameConflictResolution::RetryCreate);
+        }
+
+        if inspect
+            .state
+            .as_ref()
+            .is_some_and(|state| state.running == Some(true))
+        {
+            info!(
+                task_id = %assignment.id,
+                container_id,
+                "adopted an already running task container after a name conflict"
+            );
+            return Ok(TaskNameConflictResolution::Recovered);
+        }
+
+        progress.report(TaskReconcilePhase::Start);
+        match self.client.start_container(container_id, None).await {
+            Ok(()) => {
+                info!(
+                    task_id = %assignment.id,
+                    container_id,
+                    "started an existing task container after a name conflict"
+                );
+                Ok(TaskNameConflictResolution::Recovered)
+            }
+            Err(error) if docker_already_running(&error) => {
+                info!(
+                    task_id = %assignment.id,
+                    container_id,
+                    "adopted an already running task container after a name conflict"
+                );
+                Ok(TaskNameConflictResolution::Recovered)
+            }
+            Err(error) if docker_not_found(&error) => Ok(TaskNameConflictResolution::RetryCreate),
+            Err(error) => {
+                let port_conflict = docker_port_conflict(&error);
+                let start_error = anyhow::Error::new(error).context(format!(
+                    "failed to start conflicting task container for {}",
+                    assignment.id
+                ));
+                if let Err(cleanup_error) = self
+                    .remove_new_container_after_failed_start(container_id, "task")
+                    .await
+                {
+                    return Err(start_error.context(format!(
+                        "also failed to remove the conflicting task container: {cleanup_error:#}"
+                    )));
+                }
+                if port_conflict {
+                    Ok(TaskNameConflictResolution::RetryCreate)
+                } else {
+                    Err(start_error)
+                }
+            }
+        }
     }
 
     async fn remove_gateway(&self, container: &ExistingGatewayContainer) -> Result<()> {
@@ -1186,7 +1343,18 @@ impl ContainerRuntime for DockerCompatibleRuntime {
             let Some(task_id) = labels.get(TASK_LABEL).cloned() else {
                 continue;
             };
-            let inspect = self.client.inspect_container(&id, None).await?;
+            let inspect = match self.client.inspect_container(&id, None).await {
+                Ok(inspect) => inspect,
+                Err(error) if docker_not_found(&error) => {
+                    debug!(
+                        container_id = %id,
+                        task_id,
+                        "managed container disappeared while building inventory"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             let running = inspect
                 .state
                 .as_ref()
@@ -1369,6 +1537,23 @@ impl ContainerRuntime for DockerCompatibleRuntime {
                     warn!(task_id = %assignment.id, %error, "Docker port allocation raced; retrying task creation");
                     continue;
                 }
+                Err(error) if docker_name_conflict(&error) => {
+                    match self
+                        .recover_task_name_conflict(&name, assignment, progress)
+                        .await?
+                    {
+                        TaskNameConflictResolution::Recovered => return Ok(()),
+                        TaskNameConflictResolution::RetryCreate if attempt < 2 => continue,
+                        TaskNameConflictResolution::RetryCreate => {
+                            return Err(error).with_context(|| {
+                                format!(
+                                    "failed to recover conflicting task container for {}",
+                                    assignment.id
+                                )
+                            });
+                        }
+                    }
+                }
                 Err(error) => {
                     return Err(error)
                         .with_context(|| format!("failed to create task {}", assignment.id));
@@ -1419,10 +1604,18 @@ impl ContainerRuntime for DockerCompatibleRuntime {
         }
         progress.report(TaskReconcilePhase::Remove);
         let remove = RemoveContainerOptionsBuilder::default().force(true).build();
-        self.client
+        match self
+            .client
             .remove_container(&container.id, Some(remove))
             .await
-            .with_context(|| format!("failed to remove task {}", container.task_id))?;
+        {
+            Ok(()) => {}
+            Err(error) if docker_not_found(&error) => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to remove task {}", container.task_id));
+            }
+        }
         Ok(())
     }
 
@@ -1437,10 +1630,12 @@ impl ContainerRuntime for DockerCompatibleRuntime {
             "starting recovered task container"
         );
         progress.report(TaskReconcilePhase::Start);
-        self.client
-            .start_container(&container.id, None)
-            .await
-            .with_context(|| format!("failed to start recovered task {}", container.task_id))
+        match self.client.start_container(&container.id, None).await {
+            Ok(()) => Ok(()),
+            Err(error) if docker_already_running(&error) => Ok(()),
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to start recovered task {}", container.task_id)),
+        }
     }
 
     async fn stream_task_logs(
@@ -1554,6 +1749,36 @@ fn docker_port_conflict(error: &bollard::errors::Error) -> bool {
             message,
         } if message.contains("port is already allocated")
             || message.contains("address already in use")
+    )
+}
+
+fn docker_name_conflict(error: &bollard::errors::Error) -> bool {
+    matches!(
+        error,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 409,
+            message,
+        } if message.contains("container name") && message.contains("already in use")
+    )
+}
+
+fn docker_not_found(error: &bollard::errors::Error) -> bool {
+    matches!(
+        error,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            ..
+        }
+    )
+}
+
+fn docker_already_running(error: &bollard::errors::Error) -> bool {
+    matches!(
+        error,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 304,
+            ..
+        }
     )
 }
 
@@ -1677,6 +1902,141 @@ mod tests {
     use crate::model::{ServiceConfigMount, ServicePort, ServiceSpec};
 
     use super::*;
+
+    #[derive(Clone)]
+    struct TaskNameConflictApiState {
+        calls: Arc<Mutex<Vec<String>>>,
+        owner_task_id: String,
+    }
+
+    async fn task_name_conflict_docker_api(
+        State(state): State<TaskNameConflictApiState>,
+        method: Method,
+        uri: Uri,
+    ) -> axum::response::Response {
+        state
+            .calls
+            .lock()
+            .unwrap()
+            .push(format!("{method} {}", uri.path()));
+        let path = uri.path();
+        let (status, body) = if method == Method::GET && path.contains("/images/") {
+            (StatusCode::OK, r#"{"Id":"sha256:test-image"}"#.into())
+        } else if method == Method::POST && path.ends_with("/containers/create") {
+            (
+                StatusCode::CONFLICT,
+                r#"{"message":"Conflict. The container name is already in use"}"#.into(),
+            )
+        } else if method == Method::GET
+            && path.contains("/containers/swarmlite-demo.web-0-task-sta/json")
+        {
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "Id": "existing-container",
+                    "Name": "/swarmlite-demo.web-0-task-sta",
+                    "Config": {
+                        "Labels": {
+                            MANAGED_LABEL: "true",
+                            CLUSTER_LABEL: "cluster-old",
+                            TASK_LABEL: state.owner_task_id,
+                            SPEC_HASH_LABEL: "hash",
+                            REVISION_LABEL: "1"
+                        }
+                    },
+                    "State": {"Running": false, "Status": "created"}
+                })
+                .to_string(),
+            )
+        } else if method == Method::POST && path.ends_with("/containers/existing-container/start") {
+            (StatusCode::NO_CONTENT, String::new())
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                r#"{"message":"unexpected request"}"#.into(),
+            )
+        };
+        axum::response::Response::builder()
+            .status(status)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn disappearing_inventory_docker_api(
+        method: Method,
+        uri: Uri,
+    ) -> axum::response::Response {
+        let path = uri.path();
+        let (status, body) = if method == Method::GET && path.ends_with("/containers/json") {
+            (
+                StatusCode::OK,
+                serde_json::json!([
+                    {
+                        "Id": "gone-container",
+                        "Names": ["/gone"],
+                        "Image": "nginx:alpine",
+                        "ImageID": "sha256:test-image",
+                        "Command": "nginx",
+                        "Created": 1,
+                        "Ports": [],
+                        "Labels": {
+                            MANAGED_LABEL: "true",
+                            CLUSTER_LABEL: "cluster-old",
+                            TASK_LABEL: "task-gone"
+                        },
+                        "State": "exited",
+                        "Status": "Exited"
+                    },
+                    {
+                        "Id": "live-container",
+                        "Names": ["/live"],
+                        "Image": "nginx:alpine",
+                        "ImageID": "sha256:test-image",
+                        "Command": "nginx",
+                        "Created": 1,
+                        "Ports": [],
+                        "Labels": {
+                            MANAGED_LABEL: "true",
+                            CLUSTER_LABEL: "cluster-old",
+                            TASK_LABEL: "task-live",
+                            REVISION_LABEL: "1",
+                            SPEC_HASH_LABEL: "hash"
+                        },
+                        "State": "running",
+                        "Status": "Up"
+                    }
+                ])
+                .to_string(),
+            )
+        } else if method == Method::GET && path.ends_with("/containers/gone-container/json") {
+            (
+                StatusCode::NOT_FOUND,
+                r#"{"message":"No such container"}"#.into(),
+            )
+        } else if method == Method::GET && path.ends_with("/containers/live-container/json") {
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "Id": "live-container",
+                    "Image": "sha256:test-image",
+                    "State": {"Running": true, "Status": "running"},
+                    "Mounts": []
+                })
+                .to_string(),
+            )
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                r#"{"message":"unexpected request"}"#.into(),
+            )
+        };
+        axum::response::Response::builder()
+            .status(status)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
 
     async fn start_failure_docker_api(
         State(calls): State<Arc<Mutex<Vec<String>>>>,
@@ -1862,6 +2222,77 @@ mod tests {
     #[test]
     fn sanitizes_runtime_container_names() {
         assert_eq!(sanitize_name("demo/web:v1"), "demo-web-v1");
+    }
+
+    #[tokio::test]
+    async fn adopts_the_same_task_container_after_a_create_name_conflict() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .fallback(any(task_name_conflict_docker_api))
+            .with_state(TaskNameConflictApiState {
+                calls: Arc::clone(&calls),
+                owner_task_id: "task-start-failure".into(),
+            });
+        let (runtime, server) = runtime_for_pull_api(app, DeploymentPolicy::default()).await;
+
+        runtime
+            .create_task(&start_failure_assignment(), &RuntimeTaskProgress::default())
+            .await
+            .unwrap();
+        server.abort();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.ends_with("/containers/create"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.ends_with("/containers/existing-container/start"))
+                .count(),
+            1
+        );
+        assert!(!calls.iter().any(|call| call.starts_with("DELETE ")));
+    }
+
+    #[tokio::test]
+    async fn refuses_to_adopt_a_name_conflict_owned_by_another_task() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .fallback(any(task_name_conflict_docker_api))
+            .with_state(TaskNameConflictApiState {
+                calls: Arc::clone(&calls),
+                owner_task_id: "another-task".into(),
+            });
+        let (runtime, server) = runtime_for_pull_api(app, DeploymentPolicy::default()).await;
+
+        let error = runtime
+            .create_task(&start_failure_assignment(), &RuntimeTaskProgress::default())
+            .await
+            .unwrap_err();
+        server.abort();
+
+        assert!(format!("{error:#}").contains("refusing to replace it"));
+        let calls = calls.lock().unwrap();
+        assert!(!calls.iter().any(|call| call.starts_with("DELETE ")));
+        assert!(!calls.iter().any(|call| call.ends_with("/start")));
+    }
+
+    #[tokio::test]
+    async fn skips_a_container_that_disappears_during_managed_inventory() {
+        let app = Router::new().fallback(any(disappearing_inventory_docker_api));
+        let (runtime, server) = runtime_for_pull_api(app, DeploymentPolicy::default()).await;
+
+        let inventory = runtime.list_managed("cluster-old").await.unwrap();
+        server.abort();
+
+        assert_eq!(inventory.len(), 1);
+        assert!(inventory.contains_key("task-live"));
+        assert!(!inventory.contains_key("task-gone"));
     }
 
     #[tokio::test]
