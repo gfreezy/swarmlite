@@ -14,7 +14,11 @@ pub use swarmlite_stack::{
 
 pub const CLUSTER_SCHEMA_VERSION: u32 = 9;
 pub const GATEWAY_RECOVERY_FORMAT_VERSION: u32 = 1;
-pub const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/gfreezy/swarmlite-caddy:latest";
+pub const LEGACY_DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/gfreezy/swarmlite-caddy:latest";
+pub const DEFAULT_GATEWAY_IMAGE: &str = concat!(
+    "ghcr.io/gfreezy/swarmlite-caddy:v",
+    env!("CARGO_PKG_VERSION")
+);
 pub const DEFAULT_DEPLOYMENT_PROGRESS_DEADLINE_SECONDS: u64 = 300;
 pub const DEFAULT_IMAGE_PULL_IDLE_TIMEOUT_SECONDS: u64 = 60;
 pub const DEFAULT_IMAGE_PULL_MAX_ATTEMPTS: u32 = 5;
@@ -65,6 +69,8 @@ pub struct ConfigBlobCheckResponse {
 pub struct ClusterGatewayConfig {
     pub listen: Vec<String>,
     pub image: String,
+    #[serde(default)]
+    pub managed_image: bool,
 }
 
 impl Default for ClusterGatewayConfig {
@@ -72,8 +78,22 @@ impl Default for ClusterGatewayConfig {
         Self {
             listen: vec![":80".to_owned(), ":443".to_owned()],
             image: DEFAULT_GATEWAY_IMAGE.to_owned(),
+            managed_image: true,
         }
     }
+}
+
+pub fn refresh_managed_gateway_image(config: &mut ClusterGatewayConfig) -> bool {
+    if config.image == LEGACY_DEFAULT_GATEWAY_IMAGE {
+        config.image = DEFAULT_GATEWAY_IMAGE.to_owned();
+        config.managed_image = true;
+        return true;
+    }
+    if config.managed_image && config.image != DEFAULT_GATEWAY_IMAGE {
+        config.image = DEFAULT_GATEWAY_IMAGE.to_owned();
+        return true;
+    }
+    false
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1192,8 +1212,57 @@ pub struct GatewayStatus {
 }
 
 #[cfg(test)]
-mod gateway_recovery_tests {
+mod tests {
     use super::*;
+
+    #[test]
+    fn default_gateway_image_is_pinned_to_the_package_version() {
+        assert_eq!(
+            DEFAULT_GATEWAY_IMAGE,
+            format!(
+                "ghcr.io/gfreezy/swarmlite-caddy:v{}",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+    }
+
+    #[test]
+    fn refreshes_only_managed_and_legacy_gateway_images() {
+        let mut legacy = ClusterGatewayConfig {
+            image: LEGACY_DEFAULT_GATEWAY_IMAGE.into(),
+            managed_image: false,
+            ..Default::default()
+        };
+        assert!(refresh_managed_gateway_image(&mut legacy));
+        assert_eq!(legacy.image, DEFAULT_GATEWAY_IMAGE);
+        assert!(legacy.managed_image);
+
+        let mut managed = ClusterGatewayConfig {
+            image: "ghcr.io/gfreezy/swarmlite-caddy:v0.0.1".into(),
+            managed_image: true,
+            ..Default::default()
+        };
+        assert!(refresh_managed_gateway_image(&mut managed));
+        assert_eq!(managed.image, DEFAULT_GATEWAY_IMAGE);
+
+        let mut custom = ClusterGatewayConfig {
+            image: "registry.example.com/caddy:latest".into(),
+            managed_image: false,
+            ..Default::default()
+        };
+        assert!(!refresh_managed_gateway_image(&mut custom));
+        assert_eq!(custom.image, "registry.example.com/caddy:latest");
+    }
+
+    #[test]
+    fn old_gateway_config_without_management_flag_remains_custom() {
+        let mut decoded: ClusterGatewayConfig = serde_json::from_str(
+            r#"{"listen":[":80",":443"],"image":"registry.example.com/caddy:v1"}"#,
+        )
+        .unwrap();
+        assert!(!decoded.managed_image);
+        assert!(!refresh_managed_gateway_image(&mut decoded));
+    }
 
     #[test]
     fn snapshot_round_trip_uses_stable_service_port_map_keys() {

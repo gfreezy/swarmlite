@@ -41,7 +41,7 @@ use crate::{
         StackDeploymentSummary, StackDeploymentTaskPhaseProgress, StackListResponse, StackRecord,
         StackSummary, StatusResponse, TaskAssignment, TaskListResponse, TaskReconcileError,
         TaskReconcileProgress, TaskReconcileReport, TaskRecord, TaskRemovalAssignment, TaskSummary,
-        UnclaimedTask, service_spec_hash, valid_gateway_image,
+        UnclaimedTask, refresh_managed_gateway_image, service_spec_hash, valid_gateway_image,
     },
     scheduler,
     storage::{StateRepository, StorageError},

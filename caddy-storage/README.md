@@ -2,8 +2,9 @@
 
 When a node has its Gateway enabled, `swarmlite serve` creates an independent Caddy container with
 its own restart policy and persistent `/data`, `/config`, and `/cache` volumes. The default gateway
-image includes this directory's `caddy.storage.swarmlite` module, Caddy's `http.handlers.cache`,
-and the `storages.cache.badger` provider. No separately maintained Compose stack is required.
+image includes this directory's `caddy.storage.swarmlite` and
+`http.handlers.swarmlite_gateway_probe` modules, Caddy's `http.handlers.cache`, and the
+`storages.cache.badger` provider. No separately maintained Compose stack is required.
 
 The module consumes Swarmlite's generic KV and lock APIs; those APIs contain no Caddy-specific
 behavior. The authoritative certificate storage remains local CertMagic `FileStorage`, while
@@ -11,16 +12,21 @@ remote keys use the fixed `caddy/` namespace as a best-effort cache and distribu
 
 ## Publish the gateway image
 
-Gateway nodes do not build Caddy locally. By default they pull
-`ghcr.io/gfreezy/swarmlite-caddy:latest`. A path-filtered CI workflow builds the image for Linux
-AMD64 and ARM64 only when `caddy-storage/**` or its image workflow changes. Pull requests build
-without publishing; pushes publish a combined multi-platform image to GHCR. Every published image
-gets a `sha-<commit>` tag, and the default branch also updates `latest`. Build and publish it
-manually with:
+Gateway nodes do not build Caddy locally. Each Swarmlite release references the immutable
+`ghcr.io/gfreezy/swarmlite-caddy:v<VERSION>` tag with the same version. A path-filtered CI workflow
+builds the image for Linux AMD64 and ARM64 when `caddy-storage/**` or its image workflow changes.
+Pull requests build without publishing; branch pushes publish a combined multi-platform image to
+GHCR with `sha-<commit>`, and the default branch also updates `latest`.
+
+Release tags compare the current and previous release's complete `caddy-storage/` Git trees. A
+changed tree is rebuilt and published under the release version. An unchanged tree is not rebuilt;
+the new version and commit tags are attached to the previous release's exact manifest digest. The
+release fails if an existing immutable version tag points somewhere else. Build and publish an
+image manually with:
 
 ```bash
-docker build -t ghcr.io/gfreezy/swarmlite-caddy:latest ./caddy-storage
-docker push ghcr.io/gfreezy/swarmlite-caddy:latest
+docker build -t ghcr.io/gfreezy/swarmlite-caddy:v0.1.15 ./caddy-storage
+docker push ghcr.io/gfreezy/swarmlite-caddy:v0.1.15
 ```
 
 Caddy stays pinned to a tested version in both `go.mod` and the runtime base image. Dependabot
@@ -37,14 +43,15 @@ swarmlite config set gateway-image registry.example.com/swarmlite-caddy:1.1.0
 ```
 
 The image reference is stored in the controller's SQLite database. The selected image must provide
-`caddy`, `caddy.storage.swarmlite`, `http.handlers.cache`, and `storages.cache.badger`. Gateway
-nodes pull it before replacing an existing container, and keep the existing `/data`, `/config`,
-and `/cache` volumes.
+`caddy`, `caddy.storage.swarmlite`, `http.handlers.swarmlite_gateway_probe`,
+`http.handlers.cache`, and `storages.cache.badger`. Gateway nodes pull it before replacing an
+existing container, and keep the existing `/data`, `/config`, and `/cache` volumes.
 
 ## Automatic configuration
 
-Swarmlite generates the storage block automatically, injects the cluster token through
-`SWARMLITE_TOKEN`, and sends the cluster's fixed controller URL to the node through heartbeat
+Swarmlite generates the storage block and a highest-priority HTTP owner-probe route automatically,
+injects the cluster token through `SWARMLITE_TOKEN` and the node ID through
+`SWARMLITE_GATEWAY_ID`, and sends the cluster's fixed controller URL to the node through heartbeat
 configuration. The node atomically loads the complete configuration through Caddy's loopback-only
 admin API. The token is not written into Caddy's JSON configuration or container labels.
 
@@ -53,10 +60,12 @@ The generated global cache application uses `mode: bypass` and a Badger database
 a `cache` object. Consequently uncached routes are untouched, while cached routes use their
 declared TTL without consulting upstream `Cache-Control` headers.
 
-For a manually configured Caddy instance, export a valid cluster token and run the example:
+For a manually configured Caddy instance, export a valid cluster token and stable Gateway ID, add
+the owner-probe handler route shown in [`bootstrap.json`](bootstrap.json), and run the example:
 
 ```bash
 export SWARMLITE_TOKEN='<cluster-token>'
+export SWARMLITE_GATEWAY_ID='<gateway-node-id>'
 go build -o target/caddy ./caddy-storage/cmd/caddy
 target/caddy run --resume --config examples/caddy-with-swarmlite-kv.json
 ```
@@ -69,7 +78,10 @@ The storage JSON is:
     "module": "swarmlite",
     "controller": "http://10.0.0.21:8080",
     "token_env": "SWARMLITE_TOKEN",
+    "gateway_id_env": "SWARMLITE_GATEWAY_ID",
     "timeout": "500ms",
+    "probe_timeout": "2s",
+    "owner_cache_ttl": "1m",
     "lock_lease": "30s"
   }
 }
@@ -83,7 +95,10 @@ Keep that directory on persistent local storage. The equivalent Caddyfile global
     storage swarmlite {
         controller http://10.0.0.21:8080
         token_env SWARMLITE_TOKEN
+        gateway_id_env SWARMLITE_GATEWAY_ID
         timeout 500ms
+        probe_timeout 2s
+        owner_cache_ttl 1m
         lock_lease 30s
     }
 }
@@ -93,12 +108,20 @@ Keep that directory on persistent local storage. The equivalent Caddyfile global
 
 - `Store` and `Delete` complete locally first; publishing to KV is best effort.
 - `Load` reads locally first. A KV hit on a local miss is copied into local storage.
-- A live distributed lock prevents duplicate work across machines.
-- An unavailable controller falls back to Caddy's normal local lock.
+- Certificate issuance first probes the target hostname over HTTP and verifies the reached
+  Gateway's signed node ID. Only that Gateway may request the shared hostname lock.
+- A valid owner result is cached for `owner_cache_ttl`; a probe failure without a cached result
+  defers new issuance. It does not affect already loaded certificates or HTTPS traffic.
+- A live distributed lock prevents duplicate work across machines and keeps the lock name
+  `caddy/locks/issue_cert_<hostname>`.
+- An unavailable Controller falls back to Caddy's normal local lock only after this Gateway has
+  been established as the hostname owner, directly or from its recent cache.
 - A reported busy distributed lock does not fall back, because another machine still owns it.
+- Wildcard certificates skip the HTTP owner check and retain the distributed-lock behavior.
 - KV values are plaintext base64. There is no application-level encryption.
 
-Consequently, Swarmlite failure never makes existing local Caddy storage unavailable. It can only
-reduce cross-machine reuse and allow duplicate certificate requests. If the entire Swarmlite
-cluster is rebuilt, each Caddy instance keeps using its local certificates. A standard Caddy
-binary can use the same local data directory without migrating certificate data.
+Consequently, Swarmlite failure never makes existing local Caddy storage unavailable. If the
+entire Swarmlite cluster is rebuilt, each Caddy instance keeps using its local certificates. A
+standard Caddy binary can use the same local data directory without migrating certificate data.
+During a Controller outage, a hostname routed to exactly one Gateway can still be issued there;
+an actively load-balanced hostname needs the Controller for cross-node exclusion.

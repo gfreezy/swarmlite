@@ -2216,6 +2216,48 @@ async fn gateway_is_the_only_mutable_component_setting() {
 }
 
 #[tokio::test]
+async fn migrates_the_legacy_gateway_image_and_preserves_explicit_pins() {
+    let mut cluster = test_cluster("gateway-image-migration-test");
+    cluster.gateway.image = crate::model::LEGACY_DEFAULT_GATEWAY_IMAGE.into();
+    cluster.gateway.managed_image = false;
+    let directory = tempfile::tempdir().unwrap();
+    let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
+    let controller = Controller::new(
+        test_controller_config(&cluster),
+        "0123456789abcdef".into(),
+        repository.clone(),
+    )
+    .await
+    .unwrap();
+
+    let migrated = repository.load().await.unwrap().cluster.gateway;
+    assert_eq!(migrated.image, crate::model::DEFAULT_GATEWAY_IMAGE);
+    assert!(migrated.managed_image);
+
+    let pinned = controller
+        .update_cluster_config(ClusterConfigUpdate {
+            gateway_image: Some(crate::model::DEFAULT_GATEWAY_IMAGE.into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        pinned.config.gateway.image,
+        crate::model::DEFAULT_GATEWAY_IMAGE
+    );
+    assert!(!pinned.config.gateway.managed_image);
+    assert!(
+        !repository
+            .load()
+            .await
+            .unwrap()
+            .cluster
+            .gateway
+            .managed_image
+    );
+}
+
+#[tokio::test]
 async fn deployment_policy_updates_are_validated_and_persisted() {
     let (controller, repository, _directory) = test_controller("deployment-policy-test").await;
     let updated = controller

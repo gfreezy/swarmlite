@@ -358,7 +358,7 @@ struct InitArgs {
     #[arg(long = "gateway-listen", default_values = [":80", ":443"])]
     gateway_listen: Vec<String>,
     /// OCI image containing Caddy and caddy.storage.swarmlite.
-    /// Defaults to ghcr.io/gfreezy/swarmlite-caddy:latest.
+    /// Defaults to the official Gateway image matching this Swarmlite version.
     #[arg(long = "gateway-image")]
     gateway_image: Option<String>,
     /// Initialize without running a gateway on the controller node.
@@ -406,6 +406,7 @@ async fn run() -> Result<()> {
                     image: options
                         .gateway_image
                         .unwrap_or_else(|| DEFAULT_GATEWAY_IMAGE.to_owned()),
+                    managed_image: !gateway_image_explicit,
                 },
                 deployment: Default::default(),
             };

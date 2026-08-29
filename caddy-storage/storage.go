@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io/fs"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,9 +22,19 @@ type storage struct {
 	timeout     time.Duration
 	lockLease   time.Duration
 	ownerID     string
+	gatewayID   string
+	ownerProbe  gatewayOwnerProbe
+	ownerTTL    time.Duration
 
-	locksMu sync.Mutex
-	locks   map[string]*heldLock
+	locksMu  sync.Mutex
+	locks    map[string]*heldLock
+	ownersMu sync.Mutex
+	owners   map[string]ownerObservation
+}
+
+type ownerObservation struct {
+	gatewayID string
+	expiresAt time.Time
 }
 
 type heldLock struct {
@@ -33,7 +44,16 @@ type heldLock struct {
 	stopOnce     sync.Once
 }
 
-func newStorage(root string, controller string, token string, timeout, lockLease time.Duration) *storage {
+func newStorage(
+	root string,
+	controller string,
+	token string,
+	gatewayID string,
+	timeout time.Duration,
+	probeTimeout time.Duration,
+	ownerTTL time.Duration,
+	lockLease time.Duration,
+) *storage {
 	ownerID := randomID()
 	return &storage{
 		local:       &certmagic.FileStorage{Path: root},
@@ -41,7 +61,11 @@ func newStorage(root string, controller string, token string, timeout, lockLease
 		timeout:     timeout,
 		lockLease:   lockLease,
 		ownerID:     ownerID,
+		gatewayID:   strings.TrimSpace(gatewayID),
+		ownerProbe:  newGatewayOwnerProbe(token, probeTimeout),
+		ownerTTL:    ownerTTL,
 		locks:       make(map[string]*heldLock),
+		owners:      make(map[string]ownerObservation),
 	}
 }
 
@@ -143,6 +167,13 @@ func (s *storage) Lock(ctx context.Context, name string) error {
 	if err := s.ensureLockIsFree(name); err != nil {
 		return err
 	}
+	eligible, err := s.certificateLockEligible(ctx, name)
+	if err != nil {
+		return err
+	}
+	if !eligible {
+		return fmt.Errorf("%w for lock %q", errNotGatewayOwner, name)
+	}
 	for s.coordinator.configured() {
 		remoteCtx, cancel := s.remoteContextFrom(ctx)
 		response, err := s.coordinator.acquire(remoteCtx, s.acquireRequest(name))
@@ -166,6 +197,13 @@ func (s *storage) Lock(ctx context.Context, name string) error {
 			return ctx.Err()
 		case <-time.After(wait):
 		}
+		eligible, err = s.certificateLockEligible(ctx, name)
+		if err != nil {
+			return err
+		}
+		if !eligible {
+			return fmt.Errorf("%w for lock %q", errNotGatewayOwner, name)
+		}
 	}
 	if err := s.local.Lock(ctx, name); err != nil {
 		return err
@@ -178,6 +216,10 @@ func (s *storage) Lock(ctx context.Context, name string) error {
 
 func (s *storage) TryLock(ctx context.Context, name string) (bool, error) {
 	if err := s.ensureLockIsFree(name); err != nil {
+		return false, err
+	}
+	eligible, err := s.certificateLockEligible(ctx, name)
+	if err != nil || !eligible {
 		return false, err
 	}
 	if s.coordinator.configured() {
@@ -261,6 +303,10 @@ func (s *storage) renewLock(name string, held *heldLock) {
 		case <-held.stopRenewal:
 			return
 		case <-ticker.C:
+			eligible, err := s.certificateLockEligible(context.Background(), name)
+			if err != nil || !eligible {
+				return
+			}
 			ctx, cancel := s.remoteContext()
 			_ = s.coordinator.renew(ctx, lockMutationRequest{
 				Name:         name,
@@ -271,6 +317,36 @@ func (s *storage) renewLock(name string, held *heldLock) {
 			cancel()
 		}
 	}
+}
+
+func (s *storage) certificateLockEligible(ctx context.Context, name string) (bool, error) {
+	hostname, ok := strings.CutPrefix(name, "issue_cert_")
+	if !ok || hostname == "" || strings.HasPrefix(hostname, "*.") || s.gatewayID == "" {
+		return true, nil
+	}
+	owner, err := s.ownerProbe(ctx, hostname)
+	if err == nil {
+		s.ownersMu.Lock()
+		s.owners[hostname] = ownerObservation{
+			gatewayID: owner,
+			expiresAt: time.Now().Add(s.ownerTTL),
+		}
+		s.ownersMu.Unlock()
+		return owner == s.gatewayID, nil
+	}
+
+	now := time.Now()
+	s.ownersMu.Lock()
+	observation, cached := s.owners[hostname]
+	if cached && !observation.expiresAt.After(now) {
+		delete(s.owners, hostname)
+		cached = false
+	}
+	s.ownersMu.Unlock()
+	if cached {
+		return observation.gatewayID == s.gatewayID, nil
+	}
+	return false, fmt.Errorf("determine Gateway owner for %q: %w", hostname, err)
 }
 
 func (s *storage) acquireRequest(name string) lockAcquireRequest {

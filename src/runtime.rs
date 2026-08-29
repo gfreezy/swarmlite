@@ -51,11 +51,12 @@ pub(crate) const SYSTEM_LABEL: &str = "io.swarmlite.system";
 pub(crate) const COMPONENT_LABEL: &str = "io.swarmlite.component";
 pub(crate) const GATEWAY_COMPONENT: &str = "gateway";
 pub(crate) const GATEWAY_ADDRESS_LABEL: &str = "io.swarmlite.advertise_address";
+const GATEWAY_NODE_LABEL: &str = "io.swarmlite.node_id";
 const GATEWAY_SCHEMA_LABEL: &str = "io.swarmlite.gateway_schema";
 const GATEWAY_IMAGE_LABEL: &str = "io.swarmlite.gateway_image";
 const GATEWAY_LISTEN_LABEL: &str = "io.swarmlite.gateway_listen";
 const GATEWAY_TOKEN_HASH_LABEL: &str = "io.swarmlite.gateway_token_sha256";
-const GATEWAY_SCHEMA: &str = "6";
+const GATEWAY_SCHEMA: &str = "7";
 const GATEWAY_CONTAINER_NAME: &str = "swarmlite-gateway";
 const GATEWAY_ADMIN_URL: &str = "http://127.0.0.1:2019";
 const GATEWAY_RECOVERY_PATH: &str = "/config/swarmlite-recovery.json";
@@ -123,6 +124,7 @@ pub(crate) struct ManagedClusterInventory {
 #[derive(Debug, Clone)]
 pub(crate) struct GatewayContainerSpec {
     pub cluster_id: String,
+    pub node_id: String,
     pub advertise_address: String,
     pub listen: Vec<String>,
     pub controller: String,
@@ -134,6 +136,7 @@ pub(crate) struct GatewayContainerSpec {
 struct ExistingGatewayContainer {
     id: String,
     cluster_id: Option<String>,
+    node_id: Option<String>,
     advertise_address: Option<String>,
     image: Option<String>,
     listen: Option<String>,
@@ -662,6 +665,7 @@ impl DockerCompatibleRuntime {
                 Some(ExistingGatewayContainer {
                     id: summary.id?,
                     cluster_id: labels.get(CLUSTER_LABEL).cloned(),
+                    node_id: labels.get(GATEWAY_NODE_LABEL).cloned(),
                     advertise_address: labels.get(GATEWAY_ADDRESS_LABEL).cloned(),
                     image: labels.get(GATEWAY_IMAGE_LABEL).cloned(),
                     listen: labels.get(GATEWAY_LISTEN_LABEL).cloned(),
@@ -737,6 +741,7 @@ impl DockerCompatibleRuntime {
                 "XDG_CONFIG_HOME=/config".to_owned(),
                 "XDG_DATA_HOME=/data".to_owned(),
                 format!("SWARMLITE_TOKEN={}", spec.token),
+                format!("SWARMLITE_GATEWAY_ID={}", spec.node_id),
                 format!("SWARMLITE_CADDY_BOOTSTRAP={bootstrap}"),
             ]),
             exposed_ports: Some(exposed_ports),
@@ -1000,6 +1005,7 @@ fn gateway_labels(spec: &GatewayContainerSpec) -> HashMap<String, String> {
             GATEWAY_ADDRESS_LABEL.to_owned(),
             spec.advertise_address.clone(),
         ),
+        (GATEWAY_NODE_LABEL.to_owned(), spec.node_id.clone()),
         (GATEWAY_SCHEMA_LABEL.to_owned(), GATEWAY_SCHEMA.to_owned()),
         (GATEWAY_IMAGE_LABEL.to_owned(), spec.image.clone()),
         (GATEWAY_LISTEN_LABEL.to_owned(), spec.listen.join(",")),
@@ -1037,7 +1043,8 @@ fn gateway_recovery_snapshot_archive(payload: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn gateway_matches_spec(container: &ExistingGatewayContainer, spec: &GatewayContainerSpec) -> bool {
-    container.advertise_address.as_deref() == Some(&spec.advertise_address)
+    container.node_id.as_deref() == Some(&spec.node_id)
+        && container.advertise_address.as_deref() == Some(&spec.advertise_address)
         && container.image.as_deref() == Some(&spec.image)
         && container.listen.as_deref() == Some(&spec.listen.join(","))
         && container.token_hash.as_deref() == Some(&gateway_token_hash(&spec.token))
@@ -1968,6 +1975,7 @@ mod tests {
         let error = runtime
             .create_gateway(&GatewayContainerSpec {
                 cluster_id: "cluster-old".into(),
+                node_id: "node-a".into(),
                 advertise_address: "10.0.0.21".into(),
                 listen: vec![":80".into()],
                 controller: "http://10.0.0.21:17080".into(),
@@ -2043,6 +2051,7 @@ mod tests {
     fn builds_gateway_recovery_labels() {
         let spec = GatewayContainerSpec {
             cluster_id: "cluster-old".into(),
+            node_id: "node-a".into(),
             advertise_address: "10.0.0.21".into(),
             listen: vec![":80".into()],
             controller: "http://10.0.0.21:17080".into(),
@@ -2055,6 +2064,7 @@ mod tests {
         assert_eq!(labels[SYSTEM_LABEL], "true");
         assert_eq!(labels[COMPONENT_LABEL], GATEWAY_COMPONENT);
         assert_eq!(labels[GATEWAY_ADDRESS_LABEL], "10.0.0.21");
+        assert_eq!(labels[GATEWAY_NODE_LABEL], "node-a");
         assert_eq!(labels[GATEWAY_SCHEMA_LABEL], GATEWAY_SCHEMA);
         assert_eq!(labels[GATEWAY_IMAGE_LABEL], DEFAULT_GATEWAY_IMAGE);
         assert_eq!(labels[GATEWAY_LISTEN_LABEL], ":80");
@@ -2068,9 +2078,10 @@ mod tests {
 
     #[test]
     fn replaces_a_gateway_when_the_cluster_image_changes() {
-        let container = ExistingGatewayContainer {
+        let mut container = ExistingGatewayContainer {
             id: "gateway".into(),
             cluster_id: Some("cluster-old".into()),
+            node_id: Some("node-a".into()),
             advertise_address: Some("10.0.0.21".into()),
             image: Some("custom-caddy:v1".into()),
             listen: Some(":80".into()),
@@ -2080,6 +2091,7 @@ mod tests {
         };
         let mut spec = GatewayContainerSpec {
             cluster_id: "cluster-old".into(),
+            node_id: "node-a".into(),
             advertise_address: "10.0.0.21".into(),
             listen: vec![":80".into()],
             controller: "http://10.0.0.21:17080".into(),
@@ -2089,6 +2101,8 @@ mod tests {
         assert!(!gateway_matches_spec(&container, &spec));
         spec.image = "custom-caddy:v1".into();
         assert!(gateway_matches_spec(&container, &spec));
+        container.node_id = None;
+        assert!(!gateway_matches_spec(&container, &spec));
     }
 
     #[test]
@@ -2147,6 +2161,7 @@ mod tests {
     fn gateway_bootstrap_persists_admin_updates() {
         let spec = GatewayContainerSpec {
             cluster_id: "cluster-old".into(),
+            node_id: "node-a".into(),
             advertise_address: "10.0.0.21".into(),
             listen: vec![":80".into()],
             controller: "http://10.0.0.21:17080".into(),
@@ -2161,12 +2176,18 @@ mod tests {
         assert_eq!(value["storage"]["controller"], "http://10.0.0.21:17080");
         assert!(value["storage"].get("controllers").is_none());
         assert_eq!(value["storage"]["token_env"], "SWARMLITE_TOKEN");
+        assert_eq!(value["storage"]["gateway_id_env"], "SWARMLITE_GATEWAY_ID");
+        assert_eq!(value["storage"]["probe_timeout"], "2s");
+        assert_eq!(value["storage"]["owner_cache_ttl"], "1m");
         assert!(value["apps"].get("cache").is_none());
         assert!(!encoded.contains("do-not-persist-this-token"));
         assert_eq!(
             value["apps"]["http"]["servers"]["swarmlite"]["listen"][0],
             ":80"
         );
+        let probe = &value["apps"]["http"]["servers"]["swarmlite"]["routes"][0];
+        assert_eq!(probe["@id"], "swarmlite-gateway-owner-probe");
+        assert_eq!(probe["handle"][0]["handler"], "swarmlite_gateway_probe");
     }
 
     #[test]

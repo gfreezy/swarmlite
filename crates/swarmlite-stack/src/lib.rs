@@ -312,7 +312,10 @@ pub struct StorageConfig {
     pub module: &'static str,
     pub controller: String,
     pub token_env: &'static str,
+    pub gateway_id_env: &'static str,
     pub timeout: &'static str,
+    pub probe_timeout: &'static str,
+    pub owner_cache_ttl: &'static str,
     pub lock_lease: &'static str,
 }
 
@@ -328,6 +331,7 @@ pub struct Route {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RequestMatcher {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub host: Vec<String>,
     pub protocol: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -544,7 +548,10 @@ pub fn storage(controller: String) -> StorageConfig {
         module: "swarmlite",
         controller,
         token_env: "SWARMLITE_TOKEN",
+        gateway_id_env: "SWARMLITE_GATEWAY_ID",
         timeout: "500ms",
+        probe_timeout: "2s",
+        owner_cache_ttl: "1m",
         lock_lease: "30s",
     }
 }

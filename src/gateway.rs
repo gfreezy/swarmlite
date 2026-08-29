@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
+use swarmlite_stack::{PathRegexpMatcher, RequestMatcher, Route};
 
 use crate::model::{
     ClusterState, DesiredTaskState, ObservedTaskState, RecoveredStackGateway, ServicePortKey,
@@ -32,7 +33,8 @@ pub fn generate(state: &ClusterState, listen: &[String]) -> HttpServer {
 }
 
 pub fn config(state: &ClusterState, listen: &[String], controller: String) -> Value {
-    let server = generate(state, listen);
+    let mut server = generate(state, listen);
+    server.routes.insert(0, gateway_probe_route());
     let storage = storage(controller);
     let mut apps = json!({
         "http": {
@@ -62,6 +64,21 @@ pub fn config(state: &ClusterState, listen: &[String], controller: String) -> Va
         "storage": storage,
         "apps": apps
     })
+}
+
+fn gateway_probe_route() -> Route {
+    Route {
+        id: "swarmlite-gateway-owner-probe".to_owned(),
+        matchers: vec![RequestMatcher {
+            host: Vec::new(),
+            protocol: "http",
+            path_regexp: Some(PathRegexpMatcher {
+                pattern: r"^/\.well-known/swarmlite/gateway-owner$".to_owned(),
+            }),
+        }],
+        handle: vec![json!({ "handler": "swarmlite_gateway_probe" })],
+        terminal: true,
+    }
 }
 
 pub fn replace_stack_route(state: &mut ClusterState, stack_name: &str) -> bool {
@@ -332,6 +349,28 @@ x-swarmlite:
             cached["apps"]["cache"]["badger"]["configuration"]["ValueDir"],
             "/cache/badger"
         );
+    }
+
+    #[test]
+    fn gateway_owner_probe_precedes_user_routes_and_uses_http_only() {
+        let value = config(
+            &ClusterState::default(),
+            &[":80".into(), ":443".into()],
+            "http://controller:17080".into(),
+        );
+        let route = &value["apps"]["http"]["servers"]["swarmlite"]["routes"][0];
+        assert_eq!(route["@id"], "swarmlite-gateway-owner-probe");
+        assert_eq!(route["match"][0]["protocol"], "http");
+        assert_eq!(
+            route["match"][0]["path_regexp"]["pattern"],
+            r"^/\.well-known/swarmlite/gateway-owner$"
+        );
+        assert!(route["match"][0].get("host").is_none());
+        assert_eq!(route["handle"][0]["handler"], "swarmlite_gateway_probe");
+        assert_eq!(route["terminal"], true);
+        assert_eq!(value["storage"]["gateway_id_env"], "SWARMLITE_GATEWAY_ID");
+        assert_eq!(value["storage"]["probe_timeout"], "2s");
+        assert_eq!(value["storage"]["owner_cache_ttl"], "1m");
     }
 
     fn service() -> ServiceRecord {

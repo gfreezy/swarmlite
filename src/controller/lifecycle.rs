@@ -16,7 +16,7 @@ impl Controller {
             .map(|task| (task.node_id.clone(), Instant::now()))
             .collect();
 
-        let mut changed = false;
+        let mut changed = refresh_managed_gateway_image(&mut versioned.cluster.gateway);
         let gateway_generation = if versioned.state.gateway_generation == 0 {
             changed = true;
             versioned.generation.max(1)

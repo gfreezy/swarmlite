@@ -50,9 +50,10 @@ impl Controller {
         let mut changed = false;
 
         if let Some(image) = gateway_image
-            && cluster.gateway.image != image
+            && (cluster.gateway.image != image || cluster.gateway.managed_image)
         {
             cluster.gateway.image = image;
+            cluster.gateway.managed_image = false;
             changed = true;
         }
         if let Some(value) = deployment_progress_deadline_seconds {

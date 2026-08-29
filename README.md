@@ -779,8 +779,9 @@ Hostnames are literal DNS names, so dots are not regex-escaped.
 
 ### Gateway image and listeners
 
-The default image is `ghcr.io/gfreezy/swarmlite-caddy:latest`. Choose another image during
-initialization or roll all Gateways later:
+The default image is the immutable `ghcr.io/gfreezy/swarmlite-caddy:v<VERSION>` tag matching the
+installed Swarmlite release. Managed clusters automatically advance this official image when
+Swarmlite is upgraded. Choose another image during initialization or pin a custom image later:
 
 ```bash
 sudo swarmlite init --gateway-image registry.example.com/swarmlite-caddy:1.0.0
@@ -788,10 +789,12 @@ sudo swarmlite config set gateway-image registry.example.com/swarmlite-caddy:1.1
 sudo swarmlite config get
 ```
 
-Every Gateway pulls the updated image before replacing its Caddy container. Its `/data`,
-`/config`, and `/cache` volumes are retained. Advanced installations can override the default listeners with
-repeated `--gateway-listen` options during `init`. Custom images must contain
-`caddy.storage.swarmlite`, `http.handlers.cache`, and `storages.cache.badger`; see
+Setting `gateway-image` makes the image user-managed, so later Swarmlite upgrades leave it
+unchanged. Every Gateway pulls an updated image reference before replacing its Caddy container.
+Its `/data`, `/config`, and `/cache` volumes are retained. Advanced installations can override the
+default listeners with repeated `--gateway-listen` options during `init`. Custom images must contain
+`caddy.storage.swarmlite`, `http.handlers.swarmlite_gateway_probe`, `http.handlers.cache`, and
+`storages.cache.badger`; see
 [`caddy-storage/README.md`](caddy-storage/README.md).
 
 <details>
@@ -810,13 +813,26 @@ file, synchronized, and atomically renamed, so a failed publication cannot overw
 last-known-good snapshot. Caddy's own persisted full JSON remains separate and is used only for
 local restart and disconnection continuity.
 
-The gateway image enables `caddy.storage.swarmlite`, `http.handlers.cache`, and
-`storages.cache.badger`. Local Caddy storage remains authoritative,
-while certificate objects are copied to the Controller KV API and certificate issuance uses
-distributed locks. Additional Gateways can normally reuse an existing certificate. If the KV API
-is unavailable, Caddy falls back immediately to local certificate data and local locks; existing
-HTTPS traffic continues, though Gateways may request duplicate certificates until coordination
-returns.
+The gateway image enables `caddy.storage.swarmlite`,
+`http.handlers.swarmlite_gateway_probe`, `http.handlers.cache`, and `storages.cache.badger`. Local
+Caddy storage remains authoritative, while certificate objects are copied to the Controller KV
+API and certificate issuance uses one cluster-wide lock per hostname.
+
+Before requesting that lock, a Gateway probes
+`http://<hostname>/.well-known/swarmlite/gateway-owner` through the hostname's real DNS route. The
+reached Gateway returns its node ID, hostname, and request nonce with a cluster-token HMAC; the
+token itself is never sent. Only the Gateway whose ID was returned may acquire that hostname's
+lock. This lets every node receive the complete route configuration while, for example, a domain
+routed only to node 1 is issued only by node 1. Wildcard names retain the distributed-lock-only
+behavior because an HTTP request cannot route through a wildcard hostname.
+
+Existing local certificates and HTTPS traffic never depend on the probe or Controller. A
+successful owner observation is cached for one minute to bridge a short probe interruption. With
+no current or cached observation, Caddy defers new issuance instead of letting the wrong Gateway
+take the lock. If the Controller KV API is unavailable after this Gateway is confirmed as the
+owner, Caddy uses its normal local lock so that the routed Gateway can continue obtaining or
+renewing certificates. A hostname actively load-balanced across multiple Gateways still requires
+the Controller for cross-node exclusion during that outage.
 
 The Caddy admin API is reachable on host address `127.0.0.1:2019`; traffic ports are published on
 all host interfaces. Each node atomically loads the complete configuration and reports its applied
@@ -1006,11 +1022,13 @@ cargo clippy --all-targets --all-features -- -D warnings
 (cd caddy-storage && go test ./...)
 ```
 
-The project [`Dockerfile`](Dockerfile) builds Swarmlite. Gateway nodes pull the prebuilt
-`ghcr.io/gfreezy/swarmlite-caddy:latest` image, so Go is required only when developing or
+The project [`Dockerfile`](Dockerfile) builds Swarmlite. Gateway nodes pull the prebuilt official
+image pinned to the installed Swarmlite version, so Go is required only when developing or
 publishing the Gateway image.
 
 GitHub Actions builds release archives and SHA-256 checksums for Linux AMD64, Linux ARM64, and
 macOS ARM64. The Linux archives use musl and are verified to be fully static ELF binaries with no
-dynamic interpreter or shared-library dependencies. Tag pushes publish those artifacts together
-with the installer and systemd unit in a GitHub Release.
+dynamic interpreter or shared-library dependencies. A release tag first publishes the matching
+multi-platform Gateway image, then publishes those artifacts together with the installer and
+systemd unit in a GitHub Release. If `caddy-storage/` is unchanged from the previous release, the
+new Gateway version tag reuses the previous manifest digest without rebuilding it.

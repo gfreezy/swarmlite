@@ -504,6 +504,7 @@ fn gateway_container_spec(
     };
     GatewayContainerSpec {
         cluster_id: settings.cluster.cluster_id.clone(),
+        node_id: settings.node_id.clone(),
         advertise_address: advertise_address.to_owned(),
         listen: settings.cluster.gateway.listen.clone(),
         controller,
@@ -974,6 +975,7 @@ fn recover_gateway_config(
     }
     if !image_explicit && let Some(image) = inventory.gateway_images.get(&cluster.cluster_id) {
         cluster.gateway.image.clone_from(image);
+        cluster.gateway.managed_image = false;
     }
 }
 
@@ -1475,6 +1477,7 @@ mod tests {
         recover_gateway_config(&mut cluster, &inventory, false);
         assert_eq!(cluster.gateway.listen, [":80", ":443"]);
         assert_eq!(cluster.gateway.image, "registry.example.com/caddy:old");
+        assert!(!cluster.gateway.managed_image);
 
         cluster.gateway.image = "registry.example.com/caddy:new".into();
         recover_gateway_config(&mut cluster, &inventory, true);

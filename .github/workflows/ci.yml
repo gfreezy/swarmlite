@@ -109,10 +109,24 @@ jobs:
           path: dist/${{ matrix.artifact }}.tar.gz*
           if-no-files-found: error
 
+  gateway-release:
+    name: Publish Gateway image
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - rust
+      - go
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/caddy-image.yml
+    secrets: inherit
+
   cli-release:
     name: Publish CLI release
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    needs: cli-build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - cli-build
+      - gateway-release
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
