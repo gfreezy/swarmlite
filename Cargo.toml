@@ -1,6 +1,6 @@
 [package]
 name = "swarmlite"
-version = "0.1.17"
+version = "0.1.18"
 edition = "2024"
 license = "Apache-2.0"
 description = "A small single-controller container orchestrator for one LAN or region"
