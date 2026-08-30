@@ -506,10 +506,9 @@ fn gateway_container_spec(
         cluster_id: settings.cluster.cluster_id.clone(),
         node_id: settings.node_id.clone(),
         advertise_address: advertise_address.to_owned(),
-        listen: settings.cluster.gateway.listen.clone(),
         controller,
         token: settings.token.clone(),
-        image: settings.cluster.gateway.image.clone(),
+        gateway: settings.cluster.gateway.clone(),
     }
 }
 

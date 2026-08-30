@@ -1,6 +1,53 @@
 use super::*;
 
 impl Controller {
+    pub(super) async fn gateway_status(&self) -> GatewayClusterStatusResponse {
+        let inner = self.inner.lock().await;
+        let live_nodes = current_live_nodes(&inner, self.config.node_timeout_seconds);
+        let nodes = inner
+            .state
+            .members
+            .values()
+            .map(|member| {
+                let report = member
+                    .gateway_enabled
+                    .then(|| inner.gateway_reports.get(&member.id))
+                    .flatten();
+                let status = if !member.gateway_enabled {
+                    GatewayNodeStatusKind::Disabled
+                } else if !live_nodes.contains(&member.id) {
+                    GatewayNodeStatusKind::Offline
+                } else if report.and_then(|report| report.error.as_ref()).is_some() {
+                    GatewayNodeStatusKind::Error
+                } else if report.is_some_and(|report| {
+                    report.applied_generation == Some(inner.gateway_generation)
+                }) {
+                    GatewayNodeStatusKind::Ready
+                } else if report.is_some() {
+                    GatewayNodeStatusKind::Updating
+                } else {
+                    GatewayNodeStatusKind::Pending
+                };
+                GatewayNodeStatus {
+                    node_id: member.id.clone(),
+                    address: member.address.clone(),
+                    enabled: member.gateway_enabled,
+                    status,
+                    desired_generation: member.gateway_enabled.then_some(inner.gateway_generation),
+                    applied_generation: report.and_then(|report| report.applied_generation),
+                    retryable: report.map(|report| report.retryable),
+                    error: report.and_then(|report| report.error.clone()),
+                }
+            })
+            .collect();
+        GatewayClusterStatusResponse {
+            cluster_id: inner.cluster.cluster_id.clone(),
+            desired_generation: inner.gateway_generation,
+            config: GatewayPublicConfig::from(&inner.cluster.gateway),
+            nodes,
+        }
+    }
+
     pub(super) fn gateway_assignment(
         &self,
         inner: &Inner,
@@ -16,7 +63,7 @@ impl Controller {
     pub(super) fn rendered_gateway_config(&self, inner: &Inner) -> serde_json::Value {
         gateway::config(
             &inner.state,
-            &inner.cluster.gateway.listen,
+            &inner.cluster.gateway,
             self.config.advertise_url.clone(),
         )
     }

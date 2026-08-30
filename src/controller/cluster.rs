@@ -16,85 +16,317 @@ impl Controller {
         update: ClusterConfigUpdate,
     ) -> Result<ClusterConfigResponse, ControllerError> {
         let mut inner = self.inner.lock().await;
-        let ClusterConfigUpdate {
-            gateway_image,
-            deployment_progress_deadline_seconds,
-            image_pull_idle_timeout_seconds,
-            image_pull_max_attempts,
-            image_pull_initial_backoff_seconds,
-            image_pull_max_backoff_seconds,
-        } = update;
-        if gateway_image.is_none()
-            && deployment_progress_deadline_seconds.is_none()
-            && image_pull_idle_timeout_seconds.is_none()
-            && image_pull_max_attempts.is_none()
-            && image_pull_initial_backoff_seconds.is_none()
-            && image_pull_max_backoff_seconds.is_none()
-        {
+        if update == ClusterConfigUpdate::default() {
             return Err(ControllerError::Invalid(
                 "cluster configuration update must contain a key".to_owned(),
             ));
         }
-        if gateway_image
+        let conflicts_with_unset = [
+            (
+                update.gateway_image.is_some(),
+                ClusterConfigField::GatewayImage,
+            ),
+            (
+                update.gateway_listen.is_some(),
+                ClusterConfigField::GatewayListen,
+            ),
+            (
+                update.gateway_metrics_enabled.is_some(),
+                ClusterConfigField::GatewayMetricsEnabled,
+            ),
+            (
+                update.gateway_metrics_per_host.is_some(),
+                ClusterConfigField::GatewayMetricsPerHost,
+            ),
+            (
+                update.gateway_logging_runtime_level.is_some(),
+                ClusterConfigField::GatewayLoggingRuntimeLevel,
+            ),
+            (
+                update.gateway_logging_access_enabled.is_some(),
+                ClusterConfigField::GatewayLoggingAccessEnabled,
+            ),
+            (
+                update.gateway_logging_access_format.is_some(),
+                ClusterConfigField::GatewayLoggingAccessFormat,
+            ),
+            (
+                update.gateway_logging_access_sampling_enabled.is_some(),
+                ClusterConfigField::GatewayLoggingAccessSamplingEnabled,
+            ),
+            (
+                update.gateway_logging_access_sampling_first.is_some(),
+                ClusterConfigField::GatewayLoggingAccessSamplingFirst,
+            ),
+            (
+                update.gateway_logging_access_sampling_thereafter.is_some(),
+                ClusterConfigField::GatewayLoggingAccessSamplingThereafter,
+            ),
+            (
+                update.gateway_shutdown_grace_period_seconds.is_some(),
+                ClusterConfigField::GatewayShutdownGracePeriodSeconds,
+            ),
+            (
+                update.gateway_http_read_header_timeout_seconds.is_some(),
+                ClusterConfigField::GatewayHttpReadHeaderTimeoutSeconds,
+            ),
+            (
+                update.gateway_http_read_body_timeout_seconds.is_some(),
+                ClusterConfigField::GatewayHttpReadBodyTimeoutSeconds,
+            ),
+            (
+                update.gateway_http_write_timeout_seconds.is_some(),
+                ClusterConfigField::GatewayHttpWriteTimeoutSeconds,
+            ),
+            (
+                update.gateway_http_idle_timeout_seconds.is_some(),
+                ClusterConfigField::GatewayHttpIdleTimeoutSeconds,
+            ),
+            (
+                update.gateway_http_max_header_bytes.is_some(),
+                ClusterConfigField::GatewayHttpMaxHeaderBytes,
+            ),
+            (
+                update.gateway_http_http3_enabled.is_some(),
+                ClusterConfigField::GatewayHttpHttp3Enabled,
+            ),
+            (
+                update.deployment_progress_deadline_seconds.is_some(),
+                ClusterConfigField::DeploymentProgressDeadlineSeconds,
+            ),
+            (
+                update.image_pull_idle_timeout_seconds.is_some(),
+                ClusterConfigField::DeploymentImagePullIdleTimeoutSeconds,
+            ),
+            (
+                update.image_pull_max_attempts.is_some(),
+                ClusterConfigField::DeploymentImagePullMaxAttempts,
+            ),
+            (
+                update.image_pull_initial_backoff_seconds.is_some(),
+                ClusterConfigField::DeploymentImagePullInitialBackoffSeconds,
+            ),
+            (
+                update.image_pull_max_backoff_seconds.is_some(),
+                ClusterConfigField::DeploymentImagePullMaxBackoffSeconds,
+            ),
+        ]
+        .into_iter()
+        .any(|(is_set, field)| is_set && update.unset.contains(&field));
+        if conflicts_with_unset {
+            return Err(ControllerError::Invalid(
+                "cluster configuration update cannot set and unset the same key".to_owned(),
+            ));
+        }
+        if update
+            .gateway_image
             .as_deref()
             .is_some_and(|image| !valid_gateway_image(image))
         {
             return Err(ControllerError::Invalid(
-                "gateway-image must be a non-empty OCI image reference without whitespace"
+                "gateway.image must be a non-empty OCI image reference without whitespace"
                     .to_owned(),
             ));
         }
 
         let mut cluster = inner.cluster.clone();
         let previous_cluster = inner.cluster.clone();
-        let mut changed = false;
+        let gateway_defaults = crate::model::ClusterGatewayConfig::default();
+        let deployment_defaults = crate::model::DeploymentPolicy::default();
 
-        if let Some(image) = gateway_image
-            && (cluster.gateway.image != image || cluster.gateway.managed_image)
-        {
+        for field in &update.unset {
+            match field {
+                ClusterConfigField::GatewayImage => {
+                    cluster.gateway.image.clone_from(&gateway_defaults.image);
+                    cluster.gateway.managed_image = true;
+                }
+                ClusterConfigField::GatewayListen => {
+                    cluster.gateway.listen.clone_from(&gateway_defaults.listen)
+                }
+                ClusterConfigField::GatewayMetricsEnabled => cluster.gateway.metrics.enabled = None,
+                ClusterConfigField::GatewayMetricsPerHost => {
+                    cluster.gateway.metrics.per_host = None
+                }
+                ClusterConfigField::GatewayLoggingRuntimeLevel => {
+                    cluster.gateway.logging.runtime.level = None
+                }
+                ClusterConfigField::GatewayLoggingAccessEnabled => {
+                    cluster.gateway.logging.access.enabled = None
+                }
+                ClusterConfigField::GatewayLoggingAccessFormat => {
+                    cluster.gateway.logging.access.format = None
+                }
+                ClusterConfigField::GatewayLoggingAccessSamplingEnabled => {
+                    cluster.gateway.logging.access.sampling.enabled = None
+                }
+                ClusterConfigField::GatewayLoggingAccessSamplingFirst => {
+                    cluster.gateway.logging.access.sampling.first = None
+                }
+                ClusterConfigField::GatewayLoggingAccessSamplingThereafter => {
+                    cluster.gateway.logging.access.sampling.thereafter = None
+                }
+                ClusterConfigField::GatewayShutdownGracePeriodSeconds => {
+                    cluster.gateway.shutdown.grace_period_seconds = None
+                }
+                ClusterConfigField::GatewayHttpReadHeaderTimeoutSeconds => {
+                    cluster.gateway.http.timeouts.read_header_seconds = None
+                }
+                ClusterConfigField::GatewayHttpReadBodyTimeoutSeconds => {
+                    cluster.gateway.http.timeouts.read_body_seconds = None
+                }
+                ClusterConfigField::GatewayHttpWriteTimeoutSeconds => {
+                    cluster.gateway.http.timeouts.write_seconds = None
+                }
+                ClusterConfigField::GatewayHttpIdleTimeoutSeconds => {
+                    cluster.gateway.http.timeouts.idle_seconds = None
+                }
+                ClusterConfigField::GatewayHttpMaxHeaderBytes => {
+                    cluster.gateway.http.max_header_bytes = None
+                }
+                ClusterConfigField::GatewayHttpHttp3Enabled => {
+                    cluster.gateway.http.http3_enabled = None
+                }
+                ClusterConfigField::DeploymentProgressDeadlineSeconds => {
+                    cluster.deployment.progress_deadline_seconds =
+                        deployment_defaults.progress_deadline_seconds
+                }
+                ClusterConfigField::DeploymentImagePullIdleTimeoutSeconds => {
+                    cluster.deployment.image_pull_idle_timeout_seconds =
+                        deployment_defaults.image_pull_idle_timeout_seconds
+                }
+                ClusterConfigField::DeploymentImagePullMaxAttempts => {
+                    cluster.deployment.image_pull_max_attempts =
+                        deployment_defaults.image_pull_max_attempts
+                }
+                ClusterConfigField::DeploymentImagePullInitialBackoffSeconds => {
+                    cluster.deployment.image_pull_initial_backoff_seconds =
+                        deployment_defaults.image_pull_initial_backoff_seconds
+                }
+                ClusterConfigField::DeploymentImagePullMaxBackoffSeconds => {
+                    cluster.deployment.image_pull_max_backoff_seconds =
+                        deployment_defaults.image_pull_max_backoff_seconds
+                }
+            }
+        }
+
+        if let Some(image) = update.gateway_image {
             cluster.gateway.image = image;
             cluster.gateway.managed_image = false;
-            changed = true;
         }
-        if let Some(value) = deployment_progress_deadline_seconds {
+        if let Some(value) = update.gateway_listen {
+            cluster.gateway.listen = value;
+        }
+        if let Some(value) = update.gateway_metrics_enabled {
+            cluster.gateway.metrics.enabled = Some(value);
+        }
+        if let Some(value) = update.gateway_metrics_per_host {
+            cluster.gateway.metrics.per_host = Some(value);
+        }
+        if let Some(value) = update.gateway_logging_runtime_level {
+            cluster.gateway.logging.runtime.level = Some(value);
+        }
+        if let Some(value) = update.gateway_logging_access_enabled {
+            cluster.gateway.logging.access.enabled = Some(value);
+        }
+        if let Some(value) = update.gateway_logging_access_format {
+            cluster.gateway.logging.access.format = Some(value);
+        }
+        if let Some(value) = update.gateway_logging_access_sampling_enabled {
+            cluster.gateway.logging.access.sampling.enabled = Some(value);
+        }
+        if let Some(value) = update.gateway_logging_access_sampling_first {
+            cluster.gateway.logging.access.sampling.first = Some(value);
+        }
+        if let Some(value) = update.gateway_logging_access_sampling_thereafter {
+            cluster.gateway.logging.access.sampling.thereafter = Some(value);
+        }
+        if let Some(value) = update.gateway_shutdown_grace_period_seconds {
+            cluster.gateway.shutdown.grace_period_seconds = Some(value);
+        }
+        if let Some(value) = update.gateway_http_read_header_timeout_seconds {
+            cluster.gateway.http.timeouts.read_header_seconds = Some(value);
+        }
+        if let Some(value) = update.gateway_http_read_body_timeout_seconds {
+            cluster.gateway.http.timeouts.read_body_seconds = Some(value);
+        }
+        if let Some(value) = update.gateway_http_write_timeout_seconds {
+            cluster.gateway.http.timeouts.write_seconds = Some(value);
+        }
+        if let Some(value) = update.gateway_http_idle_timeout_seconds {
+            cluster.gateway.http.timeouts.idle_seconds = Some(value);
+        }
+        if let Some(value) = update.gateway_http_max_header_bytes {
+            cluster.gateway.http.max_header_bytes = Some(value);
+        }
+        if let Some(value) = update.gateway_http_http3_enabled {
+            cluster.gateway.http.http3_enabled = Some(value);
+        }
+        if let Some(value) = update.deployment_progress_deadline_seconds {
             cluster.deployment.progress_deadline_seconds = value;
         }
-        if let Some(value) = image_pull_idle_timeout_seconds {
+        if let Some(value) = update.image_pull_idle_timeout_seconds {
             cluster.deployment.image_pull_idle_timeout_seconds = value;
         }
-        if let Some(value) = image_pull_max_attempts {
+        if let Some(value) = update.image_pull_max_attempts {
             cluster.deployment.image_pull_max_attempts = value;
         }
-        if let Some(value) = image_pull_initial_backoff_seconds {
+        if let Some(value) = update.image_pull_initial_backoff_seconds {
             cluster.deployment.image_pull_initial_backoff_seconds = value;
         }
-        if let Some(value) = image_pull_max_backoff_seconds {
+        if let Some(value) = update.image_pull_max_backoff_seconds {
             cluster.deployment.image_pull_max_backoff_seconds = value;
+        }
+        if cluster.gateway.listen.is_empty()
+            || cluster
+                .gateway
+                .listen
+                .iter()
+                .any(|listen| listen.is_empty() || listen.trim() != listen)
+        {
+            return Err(ControllerError::Invalid(
+                "gateway.listen must contain at least one non-empty address without surrounding whitespace"
+                    .into(),
+            ));
+        }
+        let caddy_durations = [
+            cluster.gateway.shutdown.grace_period_seconds,
+            cluster.gateway.http.timeouts.read_header_seconds,
+            cluster.gateway.http.timeouts.read_body_seconds,
+            cluster.gateway.http.timeouts.write_seconds,
+            cluster.gateway.http.timeouts.idle_seconds,
+        ];
+        if caddy_durations
+            .into_iter()
+            .flatten()
+            .any(|seconds| seconds > MAX_CADDY_DURATION_SECONDS)
+        {
+            return Err(ControllerError::Invalid(format!(
+                "Gateway Caddy durations cannot exceed {MAX_CADDY_DURATION_SECONDS} seconds"
+            )));
         }
         if cluster.deployment.progress_deadline_seconds == 0 {
             return Err(ControllerError::Invalid(
-                "deployment-progress-deadline-seconds must be greater than zero".into(),
+                "deployment.progress-deadline-seconds must be greater than zero".into(),
             ));
         }
         if cluster.deployment.image_pull_idle_timeout_seconds == 0 {
             return Err(ControllerError::Invalid(
-                "image-pull-idle-timeout-seconds must be greater than zero".into(),
+                "deployment.image-pull.idle-timeout-seconds must be greater than zero".into(),
             ));
         }
         if cluster.deployment.image_pull_max_attempts == 0 {
             return Err(ControllerError::Invalid(
-                "image-pull-max-attempts must be greater than zero".into(),
+                "deployment.image-pull.max-attempts must be greater than zero".into(),
             ));
         }
         if cluster.deployment.image_pull_initial_backoff_seconds
             > cluster.deployment.image_pull_max_backoff_seconds
         {
             return Err(ControllerError::Invalid(
-                "image-pull-initial-backoff-seconds cannot exceed image-pull-max-backoff-seconds"
-                    .into(),
+                "deployment.image-pull.initial-backoff-seconds cannot exceed deployment.image-pull.max-backoff-seconds".into(),
             ));
         }
-        changed |= cluster != previous_cluster;
+        let changed = cluster != previous_cluster;
 
         if changed {
             inner.cluster = cluster.clone();

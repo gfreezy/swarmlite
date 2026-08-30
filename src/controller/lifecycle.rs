@@ -75,7 +75,7 @@ impl Controller {
 
         let gateway_config = gateway::config(
             &versioned.state,
-            &versioned.cluster.gateway.listen,
+            &versioned.cluster.gateway,
             config.advertise_url.clone(),
         );
         let gateway_snapshot = GatewayRecoverySnapshot::new(

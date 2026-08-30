@@ -7,18 +7,21 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum, builder::PossibleValue};
 use swarmlite::{
     client::ControllerClient,
     config::{DEFAULT_CONTROLLER_PORT, InstalledNodeConfig, RuntimeKind, SYSTEM_CONFIG_PATH},
     model::{
-        CLUSTER_SCHEMA_VERSION, ClusterConfigResponse, ClusterConfigUpdate, ClusterGatewayConfig,
-        ClusterSettings, ConfigBlobCheckRequest, ConfigBlobCheckResponse, DEFAULT_GATEWAY_IMAGE,
-        DeploymentListResponse, MAX_CONFIG_FILE_BYTES, MAX_STACK_CONFIG_BYTES, NodeGatewayResponse,
-        NodeGatewayUpdate, NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse,
-        RegistryLoginRequest, RegistryLoginResponse, StackApplyRequest, StackConfigPayload,
-        StackDeploymentListResponse, StackDeploymentResponse, StackDeploymentStatus,
-        StackRollbackRequest, StackValidationResponse, StatusResponse, config_digest,
+        CLUSTER_SCHEMA_VERSION, ClusterConfigField, ClusterConfigResponse, ClusterConfigUpdate,
+        ClusterGatewayConfig, ClusterSettings, ConfigBlobCheckRequest, ConfigBlobCheckResponse,
+        DEFAULT_GATEWAY_IMAGE, DeploymentListResponse, GatewayAccessLogFormat,
+        GatewayClusterStatusResponse, GatewayLogLevel, GatewayNodeStatusKind,
+        MAX_CADDY_DURATION_SECONDS, MAX_CONFIG_FILE_BYTES, MAX_STACK_CONFIG_BYTES,
+        NodeGatewayResponse, NodeGatewayUpdate, NodeLabelRemoveRequest, NodeLabelSetRequest,
+        NodeLabelsResponse, RegistryLoginRequest, RegistryLoginResponse, StackApplyRequest,
+        StackConfigPayload, StackDeploymentListResponse, StackDeploymentResponse,
+        StackDeploymentStatus, StackRollbackRequest, StackValidationResponse, StatusResponse,
+        config_digest, valid_gateway_image,
     },
     node, registry,
 };
@@ -167,8 +170,10 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
-    /// Print the current cluster configuration.
+    /// Print all mutable settings or one setting's current value.
     Get {
+        /// Configuration key to read; omit it to print every mutable setting.
+        key: Option<ConfigKey>,
         #[command(flatten)]
         connection: ConnectionArgs,
     },
@@ -181,13 +186,29 @@ enum ConfigCommand {
         #[command(flatten)]
         connection: ConnectionArgs,
     },
+    /// Clear a mutable setting so its built-in or Caddy default is used.
+    Unset {
+        /// Configuration key to clear.
+        key: ConfigKey,
+        #[command(flatten)]
+        connection: ConnectionArgs,
+    },
+    /// List configuration keys or explain one scope or key.
+    Explain {
+        /// Dotted scope or exact configuration key.
+        target: Option<String>,
+        #[command(flatten)]
+        connection: ConnectionArgs,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum GatewayCommand {
-    /// Print whether the gateway is enabled on a node.
+    /// Print cluster-wide Gateway configuration and all node states.
     Status {
-        node_id: String,
+        /// Emit one machine-readable JSON object.
+        #[arg(long)]
+        json: bool,
         #[command(flatten)]
         connection: ConnectionArgs,
     },
@@ -312,14 +333,691 @@ enum DeploymentCommand {
     },
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum ConfigKey {
-    GatewayImage,
-    DeploymentProgressDeadlineSeconds,
-    ImagePullIdleTimeoutSeconds,
-    ImagePullMaxAttempts,
-    ImagePullInitialBackoffSeconds,
-    ImagePullMaxBackoffSeconds,
+#[derive(Debug, Clone, Copy)]
+struct ConfigMetadata {
+    key: &'static str,
+    field: ClusterConfigField,
+    value_type: &'static str,
+    values: Option<&'static str>,
+    constraints: &'static str,
+    default_semantics: &'static str,
+    description: &'static str,
+    apply_mode: &'static str,
+}
+
+macro_rules! define_config_keys {
+    ($(
+        $variant:ident => {
+            key: $key:literal,
+            field: $field:path,
+            type: $value_type:literal,
+            values: $values:expr,
+            constraints: $constraints:literal,
+            default: $default:literal,
+            description: $description:literal,
+            apply: $apply:literal
+        }
+    ),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum ConfigKey {
+            $($variant),+
+        }
+
+        impl ConfigKey {
+            const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            fn metadata(self) -> ConfigMetadata {
+                match self {
+                    $(Self::$variant => ConfigMetadata {
+                        key: $key,
+                        field: $field,
+                        value_type: $value_type,
+                        values: $values,
+                        constraints: $constraints,
+                        default_semantics: $default,
+                        description: $description,
+                        apply_mode: $apply,
+                    }),+
+                }
+            }
+
+            fn from_path(path: &str) -> Option<Self> {
+                Self::ALL
+                    .iter()
+                    .copied()
+                    .find(|key| key.metadata().key == path)
+            }
+
+            fn field(self) -> ClusterConfigField {
+                self.metadata().field
+            }
+        }
+
+        impl ValueEnum for ConfigKey {
+            fn value_variants<'a>() -> &'a [Self] {
+                Self::ALL
+            }
+
+            fn to_possible_value(&self) -> Option<PossibleValue> {
+                Some(PossibleValue::new(self.metadata().key))
+            }
+        }
+    };
+}
+
+define_config_keys! {
+    GatewayImage => {
+        key: "gateway.image",
+        field: ClusterConfigField::GatewayImage,
+        type: "string",
+        values: None,
+        constraints: "non-empty OCI image reference without whitespace; at most 512 bytes",
+        default: "Swarmlite-managed Gateway image matching this version",
+        description: "OCI image used by every Gateway container.",
+        apply: "recreate gateway"
+    },
+    GatewayListen => {
+        key: "gateway.listen",
+        field: ClusterConfigField::GatewayListen,
+        type: "list",
+        values: None,
+        constraints: "comma-separated addresses ending in numeric TCP ports; port 2019 is reserved",
+        default: ":80, :443",
+        description: "Caddy listeners and host ports published by every Gateway.",
+        apply: "recreate gateway"
+    },
+    GatewayMetricsEnabled => {
+        key: "gateway.metrics.enabled",
+        field: ClusterConfigField::GatewayMetricsEnabled,
+        type: "bool",
+        values: Some("true, false"),
+        constraints: "must be true or false",
+        default: "Caddy default",
+        description: "Enable Caddy HTTP request metrics at the fixed local endpoint 127.0.0.1:2019/metrics.",
+        apply: "hot reload"
+    },
+    GatewayMetricsPerHost => {
+        key: "gateway.metrics.per-host",
+        field: ClusterConfigField::GatewayMetricsPerHost,
+        type: "bool",
+        values: Some("true, false"),
+        constraints: "must be true or false",
+        default: "Caddy default",
+        description: "Add host labels to metrics; high-cardinality hosts can increase memory use.",
+        apply: "hot reload"
+    },
+    GatewayLoggingRuntimeLevel => {
+        key: "gateway.logging.runtime.level",
+        field: ClusterConfigField::GatewayLoggingRuntimeLevel,
+        type: "enum",
+        values: Some("debug, info, warn, error"),
+        constraints: "must be one of debug, info, warn, error",
+        default: "Caddy default",
+        description: "Set the Caddy runtime log level; output is fixed to stderr.",
+        apply: "hot reload"
+    },
+    GatewayLoggingAccessEnabled => {
+        key: "gateway.logging.access.enabled",
+        field: ClusterConfigField::GatewayLoggingAccessEnabled,
+        type: "bool",
+        values: Some("true, false"),
+        constraints: "must be true or false",
+        default: "Caddy default",
+        description: "Enable HTTP access logs; output is fixed to stdout.",
+        apply: "hot reload"
+    },
+    GatewayLoggingAccessFormat => {
+        key: "gateway.logging.access.format",
+        field: ClusterConfigField::GatewayLoggingAccessFormat,
+        type: "enum",
+        values: Some("json, console"),
+        constraints: "must be one of json, console",
+        default: "Caddy default",
+        description: "Set the access log encoder; access output is fixed to stdout.",
+        apply: "hot reload"
+    },
+    GatewayLoggingAccessSamplingEnabled => {
+        key: "gateway.logging.access.sampling.enabled",
+        field: ClusterConfigField::GatewayLoggingAccessSamplingEnabled,
+        type: "bool",
+        values: Some("true, false"),
+        constraints: "must be true or false",
+        default: "Caddy default",
+        description: "Enable access log sampling with a fixed one-second interval.",
+        apply: "hot reload"
+    },
+    GatewayLoggingAccessSamplingFirst => {
+        key: "gateway.logging.access.sampling.first",
+        field: ClusterConfigField::GatewayLoggingAccessSamplingFirst,
+        type: "integer",
+        values: None,
+        constraints: "0..=4294967295",
+        default: "Caddy default",
+        description: "Number of access log entries retained first in each fixed one-second sampling interval.",
+        apply: "hot reload"
+    },
+    GatewayLoggingAccessSamplingThereafter => {
+        key: "gateway.logging.access.sampling.thereafter",
+        field: ClusterConfigField::GatewayLoggingAccessSamplingThereafter,
+        type: "integer",
+        values: None,
+        constraints: "0..=4294967295",
+        default: "Caddy default",
+        description: "After the initial entries, retain one access log entry per this many entries.",
+        apply: "hot reload"
+    },
+    GatewayShutdownGracePeriodSeconds => {
+        key: "gateway.shutdown.grace-period-seconds",
+        field: ClusterConfigField::GatewayShutdownGracePeriodSeconds,
+        type: "integer",
+        values: None,
+        constraints: "0..=9223372036 seconds; 0 means unlimited",
+        default: "Caddy default",
+        description: "Allow connections to drain before the Gateway container stops.",
+        apply: "recreate gateway"
+    },
+    GatewayHttpReadHeaderTimeoutSeconds => {
+        key: "gateway.http.timeouts.read-header-seconds",
+        field: ClusterConfigField::GatewayHttpReadHeaderTimeoutSeconds,
+        type: "integer",
+        values: None,
+        constraints: "0..=9223372036 seconds",
+        default: "Caddy default",
+        description: "Limit the time spent reading request headers.",
+        apply: "hot reload"
+    },
+    GatewayHttpReadBodyTimeoutSeconds => {
+        key: "gateway.http.timeouts.read-body-seconds",
+        field: ClusterConfigField::GatewayHttpReadBodyTimeoutSeconds,
+        type: "integer",
+        values: None,
+        constraints: "0..=9223372036 seconds",
+        default: "Caddy default",
+        description: "Limit the time spent reading request bodies.",
+        apply: "hot reload"
+    },
+    GatewayHttpWriteTimeoutSeconds => {
+        key: "gateway.http.timeouts.write-seconds",
+        field: ClusterConfigField::GatewayHttpWriteTimeoutSeconds,
+        type: "integer",
+        values: None,
+        constraints: "0..=9223372036 seconds",
+        default: "Caddy default",
+        description: "Limit the time spent writing responses.",
+        apply: "hot reload"
+    },
+    GatewayHttpIdleTimeoutSeconds => {
+        key: "gateway.http.timeouts.idle-seconds",
+        field: ClusterConfigField::GatewayHttpIdleTimeoutSeconds,
+        type: "integer",
+        values: None,
+        constraints: "0..=9223372036 seconds",
+        default: "Caddy default",
+        description: "Set the idle timeout for keep-alive connections.",
+        apply: "hot reload"
+    },
+    GatewayHttpMaxHeaderBytes => {
+        key: "gateway.http.max-header-bytes",
+        field: ClusterConfigField::GatewayHttpMaxHeaderBytes,
+        type: "integer",
+        values: None,
+        constraints: "0..=4294967295 bytes",
+        default: "Caddy default",
+        description: "Set the maximum size of request headers.",
+        apply: "hot reload"
+    },
+    GatewayHttpHttp3Enabled => {
+        key: "gateway.http.http3-enabled",
+        field: ClusterConfigField::GatewayHttpHttp3Enabled,
+        type: "bool",
+        values: Some("true, false"),
+        constraints: "must be true or false",
+        default: "Caddy default",
+        description: "Enable HTTP/3 and UDP port 443 publication.",
+        apply: "recreate gateway"
+    },
+    DeploymentProgressDeadlineSeconds => {
+        key: "deployment.progress-deadline-seconds",
+        field: ClusterConfigField::DeploymentProgressDeadlineSeconds,
+        type: "integer",
+        values: None,
+        constraints: "1..=18446744073709551615 seconds",
+        default: "300 seconds",
+        description: "Time allowed for a deployment to make progress.",
+        apply: "controller update"
+    },
+    DeploymentImagePullIdleTimeoutSeconds => {
+        key: "deployment.image-pull.idle-timeout-seconds",
+        field: ClusterConfigField::DeploymentImagePullIdleTimeoutSeconds,
+        type: "integer",
+        values: None,
+        constraints: "1..=18446744073709551615 seconds",
+        default: "60 seconds",
+        description: "Fail an image pull attempt after this long without progress.",
+        apply: "agent update"
+    },
+    DeploymentImagePullMaxAttempts => {
+        key: "deployment.image-pull.max-attempts",
+        field: ClusterConfigField::DeploymentImagePullMaxAttempts,
+        type: "integer",
+        values: None,
+        constraints: "1..=4294967295",
+        default: "5",
+        description: "Maximum number of image pull attempts.",
+        apply: "agent update"
+    },
+    DeploymentImagePullInitialBackoffSeconds => {
+        key: "deployment.image-pull.initial-backoff-seconds",
+        field: ClusterConfigField::DeploymentImagePullInitialBackoffSeconds,
+        type: "integer",
+        values: None,
+        constraints: "0..=18446744073709551615 seconds; cannot exceed max-backoff-seconds",
+        default: "2 seconds",
+        description: "Initial delay before retrying an image pull.",
+        apply: "agent update"
+    },
+    DeploymentImagePullMaxBackoffSeconds => {
+        key: "deployment.image-pull.max-backoff-seconds",
+        field: ClusterConfigField::DeploymentImagePullMaxBackoffSeconds,
+        type: "integer",
+        values: None,
+        constraints: "0..=18446744073709551615 seconds; cannot be below initial-backoff-seconds",
+        default: "60 seconds",
+        description: "Maximum delay between image pull retries.",
+        apply: "agent update"
+    }
+}
+
+fn config_set_update(key: ConfigKey, value: String) -> Result<ClusterConfigUpdate> {
+    let mut update = ClusterConfigUpdate::default();
+    match key {
+        ConfigKey::GatewayImage => {
+            if !valid_gateway_image(&value) {
+                return Err(invalid_config_value(key, &value));
+            }
+            update.gateway_image = Some(value);
+        }
+        ConfigKey::GatewayListen => {
+            let listen = value
+                .split(',')
+                .map(str::trim)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+            if listen.is_empty()
+                || listen.iter().any(String::is_empty)
+                || listen.iter().any(|address| {
+                    address
+                        .rsplit_once(':')
+                        .map(|(_, port)| port)
+                        .unwrap_or_default()
+                        .parse::<u16>()
+                        .map_or(true, |port| port == 2019)
+                })
+            {
+                return Err(invalid_config_value(key, &value));
+            }
+            update.gateway_listen = Some(listen);
+        }
+        ConfigKey::GatewayMetricsEnabled => {
+            update.gateway_metrics_enabled = Some(parse_config_bool(&value, key)?);
+        }
+        ConfigKey::GatewayMetricsPerHost => {
+            update.gateway_metrics_per_host = Some(parse_config_bool(&value, key)?);
+        }
+        ConfigKey::GatewayLoggingRuntimeLevel => {
+            update.gateway_logging_runtime_level = Some(
+                value
+                    .parse::<GatewayLogLevel>()
+                    .map_err(|_| invalid_config_value(key, &value))?,
+            );
+        }
+        ConfigKey::GatewayLoggingAccessEnabled => {
+            update.gateway_logging_access_enabled = Some(parse_config_bool(&value, key)?);
+        }
+        ConfigKey::GatewayLoggingAccessFormat => {
+            update.gateway_logging_access_format = Some(
+                value
+                    .parse::<GatewayAccessLogFormat>()
+                    .map_err(|_| invalid_config_value(key, &value))?,
+            );
+        }
+        ConfigKey::GatewayLoggingAccessSamplingEnabled => {
+            update.gateway_logging_access_sampling_enabled = Some(parse_config_bool(&value, key)?);
+        }
+        ConfigKey::GatewayLoggingAccessSamplingFirst => {
+            update.gateway_logging_access_sampling_first = Some(parse_config_u32(&value, key, 0)?);
+        }
+        ConfigKey::GatewayLoggingAccessSamplingThereafter => {
+            update.gateway_logging_access_sampling_thereafter =
+                Some(parse_config_u32(&value, key, 0)?);
+        }
+        ConfigKey::GatewayShutdownGracePeriodSeconds => {
+            update.gateway_shutdown_grace_period_seconds = Some(parse_config_u64(
+                &value,
+                key,
+                0,
+                MAX_CADDY_DURATION_SECONDS,
+            )?);
+        }
+        ConfigKey::GatewayHttpReadHeaderTimeoutSeconds => {
+            update.gateway_http_read_header_timeout_seconds = Some(parse_config_u64(
+                &value,
+                key,
+                0,
+                MAX_CADDY_DURATION_SECONDS,
+            )?);
+        }
+        ConfigKey::GatewayHttpReadBodyTimeoutSeconds => {
+            update.gateway_http_read_body_timeout_seconds = Some(parse_config_u64(
+                &value,
+                key,
+                0,
+                MAX_CADDY_DURATION_SECONDS,
+            )?);
+        }
+        ConfigKey::GatewayHttpWriteTimeoutSeconds => {
+            update.gateway_http_write_timeout_seconds = Some(parse_config_u64(
+                &value,
+                key,
+                0,
+                MAX_CADDY_DURATION_SECONDS,
+            )?);
+        }
+        ConfigKey::GatewayHttpIdleTimeoutSeconds => {
+            update.gateway_http_idle_timeout_seconds = Some(parse_config_u64(
+                &value,
+                key,
+                0,
+                MAX_CADDY_DURATION_SECONDS,
+            )?);
+        }
+        ConfigKey::GatewayHttpMaxHeaderBytes => {
+            update.gateway_http_max_header_bytes = Some(parse_config_u32(&value, key, 0)?);
+        }
+        ConfigKey::GatewayHttpHttp3Enabled => {
+            update.gateway_http_http3_enabled = Some(parse_config_bool(&value, key)?);
+        }
+        ConfigKey::DeploymentProgressDeadlineSeconds => {
+            update.deployment_progress_deadline_seconds =
+                Some(parse_config_u64(&value, key, 1, u64::MAX)?);
+        }
+        ConfigKey::DeploymentImagePullIdleTimeoutSeconds => {
+            update.image_pull_idle_timeout_seconds =
+                Some(parse_config_u64(&value, key, 1, u64::MAX)?);
+        }
+        ConfigKey::DeploymentImagePullMaxAttempts => {
+            update.image_pull_max_attempts = Some(parse_config_u32(&value, key, 1)?);
+        }
+        ConfigKey::DeploymentImagePullInitialBackoffSeconds => {
+            update.image_pull_initial_backoff_seconds =
+                Some(parse_config_u64(&value, key, 0, u64::MAX)?);
+        }
+        ConfigKey::DeploymentImagePullMaxBackoffSeconds => {
+            update.image_pull_max_backoff_seconds =
+                Some(parse_config_u64(&value, key, 0, u64::MAX)?);
+        }
+    }
+    Ok(update)
+}
+
+fn invalid_config_value(key: ConfigKey, value: &str) -> anyhow::Error {
+    let metadata = key.metadata();
+    anyhow::anyhow!(
+        "invalid value {value:?} for {}: {}",
+        metadata.key,
+        metadata.constraints
+    )
+}
+
+fn parse_config_bool(value: &str, key: ConfigKey) -> Result<bool> {
+    value.parse().map_err(|_| invalid_config_value(key, value))
+}
+
+fn parse_config_u32(value: &str, key: ConfigKey, minimum: u32) -> Result<u32> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|parsed| *parsed >= minimum)
+        .ok_or_else(|| invalid_config_value(key, value))
+}
+
+fn parse_config_u64(value: &str, key: ConfigKey, minimum: u64, maximum: u64) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|parsed| (minimum..=maximum).contains(parsed))
+        .ok_or_else(|| invalid_config_value(key, value))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CurrentConfigValue {
+    Unset,
+    String(String),
+    List(Vec<String>),
+    Bool(bool),
+    Integer(u64),
+}
+
+impl CurrentConfigValue {
+    fn display(&self, metadata: ConfigMetadata) -> String {
+        match self {
+            Self::Unset => format!("unset ({})", metadata.default_semantics),
+            Self::String(value) => value.clone(),
+            Self::List(values) => values.join(", "),
+            Self::Bool(value) => value.to_string(),
+            Self::Integer(value) => value.to_string(),
+        }
+    }
+
+    fn into_json(self) -> serde_json::Value {
+        match self {
+            Self::Unset => serde_json::Value::Null,
+            Self::String(value) => serde_json::Value::String(value),
+            Self::List(values) => serde_json::json!(values),
+            Self::Bool(value) => serde_json::Value::Bool(value),
+            Self::Integer(value) => serde_json::json!(value),
+        }
+    }
+}
+
+impl ConfigKey {
+    fn current(self, config: &ClusterSettings) -> CurrentConfigValue {
+        let optional_bool =
+            |value: Option<bool>| value.map_or(CurrentConfigValue::Unset, CurrentConfigValue::Bool);
+        let optional_u64 = |value: Option<u64>| {
+            value.map_or(CurrentConfigValue::Unset, CurrentConfigValue::Integer)
+        };
+        match self {
+            Self::GatewayImage => CurrentConfigValue::String(config.gateway.image.clone()),
+            Self::GatewayListen => CurrentConfigValue::List(config.gateway.listen.clone()),
+            Self::GatewayMetricsEnabled => optional_bool(config.gateway.metrics.enabled),
+            Self::GatewayMetricsPerHost => optional_bool(config.gateway.metrics.per_host),
+            Self::GatewayLoggingRuntimeLevel => config
+                .gateway
+                .logging
+                .runtime
+                .level
+                .map_or(CurrentConfigValue::Unset, |level| {
+                    CurrentConfigValue::String(level.as_caddy_str().to_ascii_lowercase())
+                }),
+            Self::GatewayLoggingAccessEnabled => {
+                optional_bool(config.gateway.logging.access.enabled)
+            }
+            Self::GatewayLoggingAccessFormat => config
+                .gateway
+                .logging
+                .access
+                .format
+                .map_or(CurrentConfigValue::Unset, |format| {
+                    CurrentConfigValue::String(format.as_caddy_str().to_owned())
+                }),
+            Self::GatewayLoggingAccessSamplingEnabled => {
+                optional_bool(config.gateway.logging.access.sampling.enabled)
+            }
+            Self::GatewayLoggingAccessSamplingFirst => config
+                .gateway
+                .logging
+                .access
+                .sampling
+                .first
+                .map_or(CurrentConfigValue::Unset, |value| {
+                    CurrentConfigValue::Integer(u64::from(value))
+                }),
+            Self::GatewayLoggingAccessSamplingThereafter => config
+                .gateway
+                .logging
+                .access
+                .sampling
+                .thereafter
+                .map_or(CurrentConfigValue::Unset, |value| {
+                    CurrentConfigValue::Integer(u64::from(value))
+                }),
+            Self::GatewayShutdownGracePeriodSeconds => {
+                optional_u64(config.gateway.shutdown.grace_period_seconds)
+            }
+            Self::GatewayHttpReadHeaderTimeoutSeconds => {
+                optional_u64(config.gateway.http.timeouts.read_header_seconds)
+            }
+            Self::GatewayHttpReadBodyTimeoutSeconds => {
+                optional_u64(config.gateway.http.timeouts.read_body_seconds)
+            }
+            Self::GatewayHttpWriteTimeoutSeconds => {
+                optional_u64(config.gateway.http.timeouts.write_seconds)
+            }
+            Self::GatewayHttpIdleTimeoutSeconds => {
+                optional_u64(config.gateway.http.timeouts.idle_seconds)
+            }
+            Self::GatewayHttpMaxHeaderBytes => config
+                .gateway
+                .http
+                .max_header_bytes
+                .map_or(CurrentConfigValue::Unset, |value| {
+                    CurrentConfigValue::Integer(u64::from(value))
+                }),
+            Self::GatewayHttpHttp3Enabled => optional_bool(config.gateway.http.http3_enabled),
+            Self::DeploymentProgressDeadlineSeconds => {
+                CurrentConfigValue::Integer(config.deployment.progress_deadline_seconds)
+            }
+            Self::DeploymentImagePullIdleTimeoutSeconds => {
+                CurrentConfigValue::Integer(config.deployment.image_pull_idle_timeout_seconds)
+            }
+            Self::DeploymentImagePullMaxAttempts => {
+                CurrentConfigValue::Integer(u64::from(config.deployment.image_pull_max_attempts))
+            }
+            Self::DeploymentImagePullInitialBackoffSeconds => {
+                CurrentConfigValue::Integer(config.deployment.image_pull_initial_backoff_seconds)
+            }
+            Self::DeploymentImagePullMaxBackoffSeconds => {
+                CurrentConfigValue::Integer(config.deployment.image_pull_max_backoff_seconds)
+            }
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ConfigValuesResponse {
+    generation: u64,
+    values: BTreeMap<&'static str, serde_json::Value>,
+}
+
+fn config_values_response(response: &ClusterConfigResponse) -> ConfigValuesResponse {
+    ConfigValuesResponse {
+        generation: response.generation,
+        values: ConfigKey::ALL
+            .iter()
+            .copied()
+            .map(|key| {
+                (
+                    key.metadata().key,
+                    key.current(&response.config).into_json(),
+                )
+            })
+            .collect(),
+    }
+}
+
+fn config_keys_in_scope(scope: &str) -> Result<Vec<ConfigKey>> {
+    let prefix = format!("{scope}.");
+    let keys = ConfigKey::ALL
+        .iter()
+        .copied()
+        .filter(|key| key.metadata().key.starts_with(&prefix))
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        bail!("unknown configuration key or scope {scope:?}; run `swarmlite config explain`");
+    }
+    Ok(keys)
+}
+
+fn format_config_metadata(keys: &[ConfigKey], color: bool) -> String {
+    let mut output = String::new();
+    let rows = keys
+        .iter()
+        .map(|key| {
+            let metadata = key.metadata();
+            vec![
+                metadata.key.to_owned(),
+                metadata.value_type.to_owned(),
+                metadata.description.to_owned(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    append_table(&mut output, &["KEY", "TYPE", "DESCRIPTION"], &rows, color);
+    output
+}
+
+fn format_config_explanation(key: ConfigKey, config: &ClusterSettings, color: bool) -> String {
+    use std::fmt::Write as _;
+
+    let metadata = key.metadata();
+    let mut output = String::new();
+    writeln!(output, "{} {}", ansi(color, "1", "Key:"), metadata.key).unwrap();
+    writeln!(
+        output,
+        "{} {}",
+        ansi(color, "1", "Type:"),
+        metadata.value_type
+    )
+    .unwrap();
+    if let Some(values) = metadata.values {
+        writeln!(output, "{} {values}", ansi(color, "1", "Values:")).unwrap();
+    }
+    writeln!(
+        output,
+        "{} {}",
+        ansi(color, "1", "Constraints:"),
+        metadata.constraints
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "{} {}",
+        ansi(color, "1", "Current:"),
+        key.current(config).display(metadata)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "{} {}",
+        ansi(color, "1", "Default:"),
+        metadata.default_semantics
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "{} {}",
+        ansi(color, "1", "Apply mode:"),
+        metadata.apply_mode
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "{} {}",
+        ansi(color, "1", "Description:"),
+        metadata.description
+    )
+    .unwrap();
+    output
 }
 
 #[derive(Debug, Args)]
@@ -410,6 +1108,7 @@ async fn run() -> Result<()> {
                         .gateway_image
                         .unwrap_or_else(|| DEFAULT_GATEWAY_IMAGE.to_owned()),
                     managed_image: !gateway_image_explicit,
+                    ..Default::default()
                 },
                 deployment: Default::default(),
             };
@@ -486,84 +1185,93 @@ async fn run() -> Result<()> {
             Ok(())
         }
         Command::Upgrade { .. } => unreachable!("upgrade returned before loading node state"),
-        Command::Config { action } => {
-            let (connection, update) = match action {
-                ConfigCommand::Get { connection } => (connection, None),
-                ConfigCommand::Set {
-                    key,
-                    value,
-                    connection,
-                } => {
-                    let mut update = ClusterConfigUpdate {
-                        gateway_image: None,
-                        deployment_progress_deadline_seconds: None,
-                        image_pull_idle_timeout_seconds: None,
-                        image_pull_max_attempts: None,
-                        image_pull_initial_backoff_seconds: None,
-                        image_pull_max_backoff_seconds: None,
-                    };
-                    match key {
-                        ConfigKey::GatewayImage => update.gateway_image = Some(value),
-                        ConfigKey::DeploymentProgressDeadlineSeconds => update
-                            .deployment_progress_deadline_seconds =
-                            Some(value.parse().context(
-                                "deployment-progress-deadline-seconds must be a positive integer",
-                            )?),
-                        ConfigKey::ImagePullIdleTimeoutSeconds => {
-                            update.image_pull_idle_timeout_seconds = Some(value.parse().context(
-                                "image-pull-idle-timeout-seconds must be a positive integer",
-                            )?)
-                        }
-                        ConfigKey::ImagePullMaxAttempts => {
-                            update.image_pull_max_attempts =
-                                Some(value.parse().context(
-                                    "image-pull-max-attempts must be a positive integer",
-                                )?)
-                        }
-                        ConfigKey::ImagePullInitialBackoffSeconds => {
-                            update.image_pull_initial_backoff_seconds =
-                                Some(value.parse().context(
-                                    "image-pull-initial-backoff-seconds must be an integer",
-                                )?)
-                        }
-                        ConfigKey::ImagePullMaxBackoffSeconds => {
-                            update.image_pull_max_backoff_seconds = Some(
-                                value
-                                    .parse()
-                                    .context("image-pull-max-backoff-seconds must be an integer")?,
-                            )
-                        }
-                    };
-                    (connection, Some(update))
+        Command::Config { action } => match action {
+            ConfigCommand::Get { key, connection } => {
+                let client =
+                    connection::resolve(&data_dir, connection.controller, connection.token).await?;
+                let response = cluster_config(&client, None).await?;
+                if let Some(key) = key {
+                    println!("{}", key.current(&response.config).display(key.metadata()));
+                } else {
+                    print_pretty_json(&config_values_response(&response), stdout_color())?;
                 }
-            };
-            let client =
-                connection::resolve(&data_dir, connection.controller, connection.token).await?;
-            let response = cluster_config(&client, update.as_ref()).await?;
-            print_pretty_json(&response, stdout_color())?;
-            Ok(())
-        }
-        Command::Gateway { action } => {
-            let (node_id, enabled, connection) = match action {
-                GatewayCommand::Status {
-                    node_id,
-                    connection,
-                } => (node_id, None, connection),
-                GatewayCommand::Enable {
-                    node_id,
-                    connection,
-                } => (node_id, Some(true), connection),
-                GatewayCommand::Disable {
-                    node_id,
-                    connection,
-                } => (node_id, Some(false), connection),
-            };
-            let client =
-                connection::resolve(&data_dir, connection.controller, connection.token).await?;
-            let response = node_gateway(&client, &node_id, enabled).await?;
-            print_pretty_json(&response, stdout_color())?;
-            Ok(())
-        }
+                Ok(())
+            }
+            ConfigCommand::Set {
+                key,
+                value,
+                connection,
+            } => {
+                let update = config_set_update(key, value)?;
+                let client =
+                    connection::resolve(&data_dir, connection.controller, connection.token).await?;
+                let response = cluster_config(&client, Some(&update)).await?;
+                print_pretty_json(&response, stdout_color())?;
+                Ok(())
+            }
+            ConfigCommand::Unset { key, connection } => {
+                let mut update = ClusterConfigUpdate::default();
+                update.unset.insert(key.field());
+                let client =
+                    connection::resolve(&data_dir, connection.controller, connection.token).await?;
+                let response = cluster_config(&client, Some(&update)).await?;
+                print_pretty_json(&response, stdout_color())?;
+                Ok(())
+            }
+            ConfigCommand::Explain { target, connection } => {
+                let Some(target) = target else {
+                    print!("{}", format_config_metadata(ConfigKey::ALL, stdout_color()));
+                    return Ok(());
+                };
+                if let Some(key) = ConfigKey::from_path(&target) {
+                    let client =
+                        connection::resolve(&data_dir, connection.controller, connection.token)
+                            .await?;
+                    let response = cluster_config(&client, None).await?;
+                    print!(
+                        "{}",
+                        format_config_explanation(key, &response.config, stdout_color())
+                    );
+                } else {
+                    let keys = config_keys_in_scope(&target)?;
+                    print!("{}", format_config_metadata(&keys, stdout_color()));
+                }
+                Ok(())
+            }
+        },
+        Command::Gateway { action } => match action {
+            GatewayCommand::Status { json, connection } => {
+                let client =
+                    connection::resolve(&data_dir, connection.controller, connection.token).await?;
+                let response = gateway_status(&client).await?;
+                if json {
+                    print_pretty_json(&response, stdout_color())?;
+                } else {
+                    print!("{}", format_gateway_status(&response, stdout_color()));
+                }
+                Ok(())
+            }
+            GatewayCommand::Enable {
+                node_id,
+                connection,
+            } => {
+                let client =
+                    connection::resolve(&data_dir, connection.controller, connection.token).await?;
+                let response = node_gateway(&client, &node_id, true).await?;
+                print_pretty_json(&response, stdout_color())?;
+                Ok(())
+            }
+            GatewayCommand::Disable {
+                node_id,
+                connection,
+            } => {
+                let client =
+                    connection::resolve(&data_dir, connection.controller, connection.token).await?;
+                let response = node_gateway(&client, &node_id, false).await?;
+                print_pretty_json(&response, stdout_color())?;
+                Ok(())
+            }
+        },
         Command::Node { action } => match action {
             NodeCommand::Label { action } => {
                 let (node_id, method, body, connection) = match action {
@@ -1868,21 +2576,20 @@ async fn node_labels(
 async fn node_gateway(
     client: &ControllerClient,
     node_id: &str,
-    enabled: Option<bool>,
+    enabled: bool,
 ) -> Result<NodeGatewayResponse> {
-    let update = enabled.map(|enabled| NodeGatewayUpdate { enabled });
-    let method = if update.is_some() {
-        reqwest::Method::PUT
-    } else {
-        reqwest::Method::GET
-    };
+    let update = NodeGatewayUpdate { enabled };
     Ok(client
         .send_json(
-            method,
+            reqwest::Method::PUT,
             &format!("/v1/nodes/{node_id}/gateway"),
-            update.as_ref(),
+            Some(&update),
         )
         .await?)
+}
+
+async fn gateway_status(client: &ControllerClient) -> Result<GatewayClusterStatusResponse> {
+    Ok(client.get_json("/v1/gateway").await?)
 }
 
 async fn cluster_config(
@@ -2327,6 +3034,198 @@ fn format_status(response: &StatusResponse, color: bool, local_node_id: Option<&
     output
 }
 
+fn format_gateway_status(response: &GatewayClusterStatusResponse, color: bool) -> String {
+    use std::fmt::Write as _;
+
+    let config = &response.config;
+    let mut output = String::new();
+    writeln!(output, "{}", ansi(color, "1;36", "Gateway configuration")).unwrap();
+    writeln!(
+        output,
+        "  Cluster ID:                     {}",
+        response.cluster_id
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Desired generation:             {}",
+        response.desired_generation
+    )
+    .unwrap();
+    writeln!(output, "  Image:                          {}", config.image).unwrap();
+    writeln!(
+        output,
+        "  Listen:                         {}",
+        config.listen.join(", ")
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Metrics enabled:                {}",
+        format_optional(config.metrics.enabled)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Metrics per-host:               {}",
+        format_optional(config.metrics.per_host)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Runtime log level:              {}",
+        config
+            .logging
+            .runtime
+            .level
+            .map(|level| level.as_caddy_str().to_ascii_lowercase())
+            .unwrap_or_else(unset_caddy_default)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Access log enabled:             {}",
+        format_optional(config.logging.access.enabled)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Access log format:              {}",
+        config
+            .logging
+            .access
+            .format
+            .map(|format| format.as_caddy_str().to_owned())
+            .unwrap_or_else(unset_caddy_default)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Access log sampling enabled:    {}",
+        format_optional(config.logging.access.sampling.enabled)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Access log sampling first:      {}",
+        format_optional(config.logging.access.sampling.first)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Access log sampling thereafter: {}",
+        format_optional(config.logging.access.sampling.thereafter)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Grace period seconds:           {}",
+        format_optional(config.shutdown.grace_period_seconds)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Read-header timeout seconds:    {}",
+        format_optional(config.http.timeouts.read_header_seconds)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Read-body timeout seconds:      {}",
+        format_optional(config.http.timeouts.read_body_seconds)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Write timeout seconds:          {}",
+        format_optional(config.http.timeouts.write_seconds)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Idle timeout seconds:           {}",
+        format_optional(config.http.timeouts.idle_seconds)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Max header bytes:               {}",
+        format_optional(config.http.max_header_bytes)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  HTTP/3 enabled:                 {}",
+        format_optional(config.http.http3_enabled)
+    )
+    .unwrap();
+
+    writeln!(output, "\n{}", ansi(color, "1;36", "Gateway nodes")).unwrap();
+    if response.nodes.is_empty() {
+        writeln!(output, "  {}", ansi(color, "2", "none")).unwrap();
+        return output;
+    }
+    let rows = response
+        .nodes
+        .iter()
+        .map(|node| {
+            let (status, status_color) = match node.status {
+                GatewayNodeStatusKind::Disabled => ("disabled", "2"),
+                GatewayNodeStatusKind::Offline => ("offline", "31"),
+                GatewayNodeStatusKind::Pending => ("pending", "33"),
+                GatewayNodeStatusKind::Updating => ("updating", "33"),
+                GatewayNodeStatusKind::Ready => ("ready", "32"),
+                GatewayNodeStatusKind::Error => ("error", "31"),
+            };
+            vec![
+                node.node_id.clone(),
+                node.address.clone(),
+                node.enabled.to_string(),
+                ansi(color, status_color, status),
+                format_optional_generation(node.desired_generation),
+                format_optional_generation(node.applied_generation),
+                node.retryable
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                node.error
+                    .as_deref()
+                    .map(single_line)
+                    .unwrap_or_else(|| "-".to_owned()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    append_table(
+        &mut output,
+        &[
+            "NODE",
+            "ADDRESS",
+            "ENABLED",
+            "STATUS",
+            "DESIRED",
+            "APPLIED",
+            "RETRYABLE",
+            "ERROR",
+        ],
+        &rows,
+        color,
+    );
+    output
+}
+
+fn unset_caddy_default() -> String {
+    "unset (Caddy default)".to_owned()
+}
+
+fn format_optional(value: Option<impl ToString>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(unset_caddy_default)
+}
+
+fn format_optional_generation(value: Option<u64>) -> String {
+    value.map_or_else(|| "-".to_owned(), |value| value.to_string())
+}
+
 fn format_task_summary(response: &StatusResponse) -> String {
     use swarmlite::model::ObservedTaskState;
 
@@ -2528,8 +3427,10 @@ mod tests {
     use swarmlite::{
         config::DEFAULT_CONTROLLER_PORT,
         model::{
-            ClusterState, DesiredTaskState, GatewayStatus, ImageResolutionStatus, NodeMember,
-            ObservedTaskState, RecoveryStatus, StackDeploymentGatewayProgress,
+            CLUSTER_SCHEMA_VERSION, ClusterConfigResponse, ClusterGatewayConfig, ClusterSettings,
+            ClusterState, DesiredTaskState, GatewayClusterStatusResponse, GatewayNodeStatus,
+            GatewayNodeStatusKind, GatewayPublicConfig, GatewayStatus, ImageResolutionStatus,
+            NodeMember, ObservedTaskState, RecoveryStatus, StackDeploymentGatewayProgress,
             StackDeploymentImageProgress, StackDeploymentListResponse, StackDeploymentResponse,
             StackDeploymentServiceProgress, StackDeploymentStatus, StackDeploymentSummary,
             StackDeploymentTaskPhaseProgress, StatusResponse, TaskReconcileError,
@@ -2538,9 +3439,11 @@ mod tests {
     };
 
     use super::{
-        Cli, Command, DeploymentOperation, DeploymentProgressRenderer, colorize_json,
+        Cli, Command, ConfigKey, DeploymentOperation, DeploymentProgressRenderer, colorize_json,
+        config_keys_in_scope, config_set_update, config_values_response,
         deployment_progress_summary, deployment_terminal_progress_summary, display_width,
-        format_deployment_history, format_deployment_statuses, format_node_identity, format_status,
+        format_config_explanation, format_config_metadata, format_deployment_history,
+        format_deployment_statuses, format_gateway_status, format_node_identity, format_status,
         local_stack_apply_request, resolve_stack_name, retain_missing_config_contents,
         write_terminal_progress,
     };
@@ -3073,6 +3976,7 @@ mod tests {
 
     #[test]
     fn status_defaults_to_human_output_and_supports_json() {
+        assert!(Cli::try_parse_from(["swarmlite", "status", "--gateway"]).is_err());
         let Command::Status { json, .. } = Cli::try_parse_from(["swarmlite", "status"])
             .unwrap()
             .command
@@ -3232,7 +4136,7 @@ mod tests {
     }
 
     #[test]
-    fn config_exposes_only_get_and_set() {
+    fn config_exposes_get_set_unset_and_explain() {
         let command = Cli::command();
         let config = command
             .get_subcommands()
@@ -3242,7 +4146,7 @@ mod tests {
             .get_subcommands()
             .map(|subcommand| subcommand.get_name())
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["get", "set"]);
+        assert_eq!(names, vec!["get", "set", "unset", "explain"]);
         let set = config
             .get_subcommands()
             .find(|subcommand| subcommand.get_name() == "set")
@@ -3257,33 +4161,191 @@ mod tests {
     }
 
     #[test]
+    fn config_get_and_explain_accept_keys_and_scopes() {
+        assert!(Cli::try_parse_from(["swarmlite", "config", "get"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["swarmlite", "config", "get", "gateway.metrics.enabled"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["swarmlite", "config", "get", "gateway-image"]).is_err());
+        for target in [
+            None,
+            Some("gateway"),
+            Some("gateway.logging"),
+            Some("gateway.http.timeouts"),
+            Some("gateway.logging.access.format"),
+        ] {
+            let mut arguments = vec!["swarmlite", "config", "explain"];
+            arguments.extend(target);
+            assert!(Cli::try_parse_from(arguments).is_ok());
+        }
+    }
+
+    #[test]
     fn config_set_accepts_key_value_arguments() {
         assert!(Cli::try_parse_from(["swarmlite", "config", "set", "mode", "ha"]).is_err());
-        assert!(
-            Cli::try_parse_from([
-                "swarmlite",
-                "config",
-                "set",
-                "gateway-image",
-                "ghcr.io/example/caddy:v1",
-            ])
-            .is_ok()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "swarmlite",
-                "config",
-                "set",
-                "deployment-progress-deadline-seconds",
-                "600",
-            ])
-            .is_ok()
-        );
-        assert!(
-            Cli::try_parse_from(["swarmlite", "config", "set", "image-pull-max-attempts", "5",])
-                .is_ok()
-        );
+        for (key, value) in [
+            ("gateway.image", "ghcr.io/example/caddy:v1"),
+            ("gateway.listen", ":80,:443"),
+            ("gateway.metrics.enabled", "true"),
+            ("gateway.metrics.per-host", "false"),
+            ("gateway.logging.runtime.level", "info"),
+            ("gateway.logging.access.enabled", "true"),
+            ("gateway.logging.access.format", "json"),
+            ("gateway.logging.access.sampling.enabled", "true"),
+            ("gateway.logging.access.sampling.first", "100"),
+            ("gateway.logging.access.sampling.thereafter", "100"),
+            ("gateway.shutdown.grace-period-seconds", "10"),
+            ("gateway.http.timeouts.read-header-seconds", "10"),
+            ("gateway.http.timeouts.read-body-seconds", "30"),
+            ("gateway.http.timeouts.write-seconds", "30"),
+            ("gateway.http.timeouts.idle-seconds", "300"),
+            ("gateway.http.max-header-bytes", "65536"),
+            ("gateway.http.http3-enabled", "true"),
+            ("deployment.progress-deadline-seconds", "600"),
+            ("deployment.image-pull.idle-timeout-seconds", "90"),
+            ("deployment.image-pull.max-attempts", "5"),
+            ("deployment.image-pull.initial-backoff-seconds", "2"),
+            ("deployment.image-pull.max-backoff-seconds", "60"),
+        ] {
+            assert!(
+                Cli::try_parse_from(["swarmlite", "config", "set", key, value]).is_ok(),
+                "rejected {key}"
+            );
+            assert!(
+                Cli::try_parse_from(["swarmlite", "config", "unset", key]).is_ok(),
+                "could not unset {key}"
+            );
+        }
+        for old_key in [
+            "gateway-image",
+            "deployment-progress-deadline-seconds",
+            "image-pull-max-attempts",
+        ] {
+            assert!(Cli::try_parse_from(["swarmlite", "config", "set", old_key, "1"]).is_err());
+        }
         assert!(Cli::try_parse_from(["swarmlite", "config", "set", "unknown", "3"]).is_err());
+    }
+
+    #[test]
+    fn config_set_preserves_explicit_zero_and_false_values() {
+        let zero =
+            config_set_update(ConfigKey::GatewayHttpReadHeaderTimeoutSeconds, "0".into()).unwrap();
+        assert_eq!(zero.gateway_http_read_header_timeout_seconds, Some(0));
+
+        let disabled = config_set_update(ConfigKey::GatewayMetricsEnabled, "false".into()).unwrap();
+        assert_eq!(disabled.gateway_metrics_enabled, Some(false));
+        assert!(disabled.unset.is_empty());
+    }
+
+    #[test]
+    fn config_metadata_drives_scopes_help_and_current_values() {
+        let keys = config_keys_in_scope("gateway.http.timeouts").unwrap();
+        assert_eq!(keys.len(), 4);
+        assert!(
+            keys.iter()
+                .all(|key| { key.metadata().key.starts_with("gateway.http.timeouts.") })
+        );
+        assert!(config_keys_in_scope("gateway.unknown").is_err());
+
+        let listing = format_config_metadata(&keys, false);
+        assert!(listing.contains("gateway.http.timeouts.read-header-seconds"));
+        assert!(listing.contains("integer"));
+
+        let paths = ConfigKey::ALL
+            .iter()
+            .map(|key| key.metadata().key)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(paths.len(), ConfigKey::ALL.len());
+        assert!(ConfigKey::from_path("gateway.metrics.enabled").is_some());
+        assert!(ConfigKey::from_path("gateway-metrics-enabled").is_none());
+    }
+
+    #[test]
+    fn config_get_response_preserves_null_zero_and_false() {
+        let mut gateway = ClusterGatewayConfig::default();
+        gateway.metrics.enabled = Some(false);
+        gateway.http.timeouts.read_header_seconds = Some(0);
+        let response = ClusterConfigResponse {
+            generation: 9,
+            config: ClusterSettings {
+                schema_version: CLUSTER_SCHEMA_VERSION,
+                cluster_id: "cluster-a".into(),
+                controller_id: "node-a".into(),
+                controller_port: 17080,
+                gateway,
+                deployment: Default::default(),
+            },
+        };
+
+        let values = config_values_response(&response);
+        assert_eq!(values.generation, 9);
+        assert_eq!(
+            values.values["gateway.metrics.enabled"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            values.values["gateway.http.timeouts.read-header-seconds"],
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            values.values["gateway.metrics.per-host"],
+            serde_json::Value::Null
+        );
+        assert_eq!(values.values.len(), ConfigKey::ALL.len());
+    }
+
+    #[test]
+    fn config_explain_reports_values_current_default_and_apply_mode() {
+        let mut gateway = ClusterGatewayConfig::default();
+        gateway.logging.access.format = Some(swarmlite::model::GatewayAccessLogFormat::Console);
+        let config = ClusterSettings {
+            schema_version: CLUSTER_SCHEMA_VERSION,
+            cluster_id: "cluster-a".into(),
+            controller_id: "node-a".into(),
+            controller_port: 17080,
+            gateway,
+            deployment: Default::default(),
+        };
+
+        let output =
+            format_config_explanation(ConfigKey::GatewayLoggingAccessFormat, &config, false);
+        assert!(output.contains("Key: gateway.logging.access.format"));
+        assert!(output.contains("Type: enum"));
+        assert!(output.contains("Values: json, console"));
+        assert!(output.contains("Current: console"));
+        assert!(output.contains("Default: Caddy default"));
+        assert!(output.contains("Apply mode: hot reload"));
+        assert!(output.contains("output is fixed to stdout"));
+
+        let unset = format_config_explanation(ConfigKey::GatewayMetricsPerHost, &config, false);
+        assert!(unset.contains("Current: unset (Caddy default)"));
+    }
+
+    #[test]
+    fn config_set_errors_include_enum_or_numeric_constraints() {
+        let format_error = config_set_update(ConfigKey::GatewayLoggingAccessFormat, "text".into())
+            .unwrap_err()
+            .to_string();
+        assert!(format_error.contains("must be one of json, console"));
+
+        let duration_error = config_set_update(
+            ConfigKey::GatewayHttpReadHeaderTimeoutSeconds,
+            "9223372037".into(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(duration_error.contains("0..=9223372036 seconds"));
+
+        let positive_error =
+            config_set_update(ConfigKey::DeploymentProgressDeadlineSeconds, "0".into())
+                .unwrap_err()
+                .to_string();
+        assert!(positive_error.contains("1..=18446744073709551615 seconds"));
+
+        let listen_error = config_set_update(ConfigKey::GatewayListen, ":2019".into())
+            .unwrap_err()
+            .to_string();
+        assert!(listen_error.contains("port 2019 is reserved"));
     }
 
     #[test]
@@ -3307,7 +4369,10 @@ mod tests {
 
     #[test]
     fn gateway_supports_status_enable_and_disable() {
-        for action in ["status", "enable", "disable"] {
+        assert!(Cli::try_parse_from(["swarmlite", "gateway", "status"]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "gateway", "status", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "gateway", "status", "node-a"]).is_err());
+        for action in ["enable", "disable"] {
             assert!(Cli::try_parse_from(["swarmlite", "gateway", action, "node-a"]).is_ok());
         }
         assert!(
@@ -3333,6 +4398,37 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn gateway_status_formats_shared_config_once_and_preserves_explicit_values() {
+        let mut gateway = ClusterGatewayConfig::default();
+        gateway.metrics.enabled = Some(false);
+        gateway.http.timeouts.read_header_seconds = Some(0);
+        let response = GatewayClusterStatusResponse {
+            cluster_id: "cluster-a".into(),
+            desired_generation: 7,
+            config: GatewayPublicConfig::from(&gateway),
+            nodes: vec![GatewayNodeStatus {
+                node_id: "node-a".into(),
+                address: "10.0.0.1".into(),
+                enabled: true,
+                status: GatewayNodeStatusKind::Ready,
+                desired_generation: Some(7),
+                applied_generation: Some(7),
+                retryable: Some(true),
+                error: None,
+            }],
+        };
+
+        let output = format_gateway_status(&response, false);
+        assert_eq!(output.matches("Image:").count(), 1);
+        assert!(output.contains("Metrics enabled:                false"));
+        assert!(output.contains("Metrics per-host:               unset (Caddy default)"));
+        assert!(output.contains("Read-header timeout seconds:    0"));
+        assert!(output.contains("NODE"));
+        assert!(output.contains("node-a"));
+        assert!(output.contains("ready"));
     }
 
     #[test]

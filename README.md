@@ -504,10 +504,15 @@ not become another Controller.
 Read or change the Gateway switch from the Controller:
 
 ```bash
-sudo swarmlite gateway status node-a
+sudo swarmlite gateway status
+sudo swarmlite gateway status --json
 sudo swarmlite gateway enable node-a
 sudo swarmlite gateway disable node-a
 ```
+
+`gateway status` prints the shared Gateway configuration once, followed by every node's enabled,
+address, rollout generation, retryability, and error state. Its JSON form preserves unset optional
+configuration fields as `null`.
 
 At least one Gateway must be enabled before deploying a Stack with HTTP routes.
 
@@ -522,16 +527,74 @@ configuration is rejected. Inspect errors with `swarmlite status` or
 
 The default Gateway image is
 `ghcr.io/gfreezy/swarmlite-caddy:v<VERSION>` matching Swarmlite. Managed clusters advance it during
-upgrade. Pinning `gateway-image` makes it user-managed:
+upgrade. Pinning `gateway.image` makes it user-managed:
 
 ```bash
-sudo swarmlite config set gateway-image registry.example.com/swarmlite-caddy:1.1.0
+sudo swarmlite config set gateway.image registry.example.com/swarmlite-caddy:1.1.0
 sudo swarmlite config get
 ```
 
 Image and listener replacements retain the Gateway's `/data`, `/config`, and `/cache` volumes.
 Custom images and listeners are described in
 [`caddy-storage/README.md`](caddy-storage/README.md).
+
+Gateway and Caddy settings use dotted scopes. Optional settings are omitted until explicitly set;
+an explicit `0` or `false` remains distinct from an unset value. Clear a value with
+`swarmlite config unset KEY` to inherit the Caddy default again. Clearing `gateway.image`,
+`gateway.listen`, or a deployment setting restores the Swarmlite default.
+
+Configuration discovery combines Docker-style command help with scoped, `kubectl explain`-style
+details:
+
+```bash
+# Complete mutable configuration. Unset optional values are null in this JSON output.
+swarmlite config get
+
+# One current value. Unset values print, for example, "unset (Caddy default)".
+swarmlite config get gateway.metrics.enabled
+
+# All keys, a dotted scope, or one key with its current/default/apply details.
+swarmlite config explain
+swarmlite config explain gateway.logging
+swarmlite config explain gateway.http.timeouts
+swarmlite config explain gateway.logging.access.format
+
+# The set help continues to enumerate every accepted key.
+swarmlite config set --help
+```
+
+Only the dotted key names below are accepted. Scope segments use `.`, while compound words within
+one segment use `-`. Invalid values report the applicable enum candidates or numeric constraints.
+
+| Key | Value | Effect |
+| --- | --- | --- |
+| `gateway.image` | OCI image reference | Gateway image; recreates the container |
+| `gateway.listen` | comma-separated addresses | Published Gateway listeners; recreates the container |
+| `gateway.metrics.enabled` | `true`/`false` | HTTP request metrics at local `127.0.0.1:2019/metrics` |
+| `gateway.metrics.per-host` | `true`/`false` | Host-labelled metrics; high-cardinality hosts can consume more memory |
+| `gateway.logging.runtime.level` | `debug`, `info`, `warn`, `error` | Caddy runtime log level; output is fixed to stderr |
+| `gateway.logging.access.enabled` | `true`/`false` | HTTP access logs; output is fixed to stdout |
+| `gateway.logging.access.format` | `json`, `console` | Access log encoder |
+| `gateway.logging.access.sampling.enabled` | `true`/`false` | Access log sampling with a fixed one-second window |
+| `gateway.logging.access.sampling.first` | non-negative integer | Entries retained first in each sampling window |
+| `gateway.logging.access.sampling.thereafter` | non-negative integer | Retain one entry per this many after the initial entries |
+| `gateway.shutdown.grace-period-seconds` | non-negative integer | Caddy connection drain period; `0` means unlimited |
+| `gateway.http.timeouts.read-header-seconds` | non-negative integer | Request-header read timeout |
+| `gateway.http.timeouts.read-body-seconds` | non-negative integer | Request-body read timeout |
+| `gateway.http.timeouts.write-seconds` | non-negative integer | Response write timeout |
+| `gateway.http.timeouts.idle-seconds` | non-negative integer | Keep-Alive idle timeout |
+| `gateway.http.max-header-bytes` | non-negative integer | Maximum request-header bytes |
+| `gateway.http.http3-enabled` | `true`/`false` | HTTP/3 and the Gateway UDP 443 publication |
+
+For example:
+
+```bash
+swarmlite config set gateway.metrics.enabled true
+swarmlite config set gateway.logging.access.enabled true
+swarmlite config set gateway.logging.access.format json
+swarmlite config set gateway.http.timeouts.read-header-seconds 10
+swarmlite config unset gateway.http.timeouts.read-header-seconds
+```
 
 ### Configure labels and deployment policy
 
@@ -558,11 +621,11 @@ on eligible live nodes.
 Cluster-wide deployment and pull settings are also changed through the Controller:
 
 ```bash
-swarmlite config set deployment-progress-deadline-seconds 600
-swarmlite config set image-pull-idle-timeout-seconds 90
-swarmlite config set image-pull-max-attempts 5
-swarmlite config set image-pull-initial-backoff-seconds 2
-swarmlite config set image-pull-max-backoff-seconds 60
+swarmlite config set deployment.progress-deadline-seconds 600
+swarmlite config set deployment.image-pull.idle-timeout-seconds 90
+swarmlite config set deployment.image-pull.max-attempts 5
+swarmlite config set deployment.image-pull.initial-backoff-seconds 2
+swarmlite config set deployment.image-pull.max-backoff-seconds 60
 ```
 
 Defaults are a 300-second progress deadline, a 60-second pull idle deadline, five pull attempts,
@@ -753,9 +816,9 @@ join-token           print the generated join command
 connection-info      print the stored Controller address and cluster token
 upgrade              install the latest or a selected GitHub Release
 serve                run this node's fixed components
-config get|set       read or update cluster-wide settings
+config get|set|unset|explain read, update, clear, or describe cluster-wide settings
 gateway status|enable|disable
-                     read or update one node's Gateway switch
+                     inspect all Gateways or update one node's Gateway switch
 node label get|set|remove
                      read or update one node's placement labels
 registry login       store private registry credentials

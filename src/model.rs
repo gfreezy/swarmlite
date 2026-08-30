@@ -24,6 +24,7 @@ pub const DEFAULT_IMAGE_PULL_IDLE_TIMEOUT_SECONDS: u64 = 60;
 pub const DEFAULT_IMAGE_PULL_MAX_ATTEMPTS: u32 = 5;
 pub const DEFAULT_IMAGE_PULL_INITIAL_BACKOFF_SECONDS: u64 = 2;
 pub const DEFAULT_IMAGE_PULL_MAX_BACKOFF_SECONDS: u64 = 60;
+pub const MAX_CADDY_DURATION_SECONDS: u64 = i64::MAX as u64 / 1_000_000_000;
 pub const MAX_CONFIG_FILE_BYTES: usize = 1024 * 1024;
 pub const MAX_STACK_CONFIG_BYTES: usize = 8 * 1024 * 1024;
 pub const CONFIG_GC_GRACE_PERIOD_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -71,6 +72,14 @@ pub struct ClusterGatewayConfig {
     pub image: String,
     #[serde(default)]
     pub managed_image: bool,
+    #[serde(default, skip_serializing_if = "GatewayMetricsConfig::is_empty")]
+    pub metrics: GatewayMetricsConfig,
+    #[serde(default, skip_serializing_if = "GatewayLoggingConfig::is_empty")]
+    pub logging: GatewayLoggingConfig,
+    #[serde(default, skip_serializing_if = "GatewayShutdownConfig::is_empty")]
+    pub shutdown: GatewayShutdownConfig,
+    #[serde(default, skip_serializing_if = "GatewayHttpConfig::is_empty")]
+    pub http: GatewayHttpConfig,
 }
 
 impl Default for ClusterGatewayConfig {
@@ -79,7 +88,205 @@ impl Default for ClusterGatewayConfig {
             listen: vec![":80".to_owned(), ":443".to_owned()],
             image: DEFAULT_GATEWAY_IMAGE.to_owned(),
             managed_image: true,
+            metrics: GatewayMetricsConfig::default(),
+            logging: GatewayLoggingConfig::default(),
+            shutdown: GatewayShutdownConfig::default(),
+            http: GatewayHttpConfig::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayMetricsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_host: Option<bool>,
+}
+
+impl GatewayMetricsConfig {
+    fn is_empty(&self) -> bool {
+        self.enabled.is_none() && self.per_host.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayLoggingConfig {
+    #[serde(default, skip_serializing_if = "GatewayRuntimeLogConfig::is_empty")]
+    pub runtime: GatewayRuntimeLogConfig,
+    #[serde(default, skip_serializing_if = "GatewayAccessLogConfig::is_empty")]
+    pub access: GatewayAccessLogConfig,
+}
+
+impl GatewayLoggingConfig {
+    fn is_empty(&self) -> bool {
+        self.runtime.is_empty() && self.access.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayRuntimeLogConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<GatewayLogLevel>,
+}
+
+impl GatewayRuntimeLogConfig {
+    fn is_empty(&self) -> bool {
+        self.level.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayAccessLogConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<GatewayAccessLogFormat>,
+    #[serde(
+        default,
+        skip_serializing_if = "GatewayAccessLogSamplingConfig::is_empty"
+    )]
+    pub sampling: GatewayAccessLogSamplingConfig,
+}
+
+impl GatewayAccessLogConfig {
+    fn is_empty(&self) -> bool {
+        self.enabled.is_none() && self.format.is_none() && self.sampling.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GatewayAccessLogFormat {
+    Json,
+    Console,
+}
+
+impl GatewayAccessLogFormat {
+    pub fn as_caddy_str(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Console => "console",
+        }
+    }
+}
+
+impl FromStr for GatewayAccessLogFormat {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "json" => Ok(Self::Json),
+            "console" => Ok(Self::Console),
+            _ => Err("must be json or console".to_owned()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayAccessLogSamplingConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thereafter: Option<u32>,
+}
+
+impl GatewayAccessLogSamplingConfig {
+    fn is_empty(&self) -> bool {
+        self.enabled.is_none() && self.first.is_none() && self.thereafter.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GatewayLogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl GatewayLogLevel {
+    pub fn as_caddy_str(self) -> &'static str {
+        match self {
+            Self::Debug => "DEBUG",
+            Self::Info => "INFO",
+            Self::Warn => "WARN",
+            Self::Error => "ERROR",
+        }
+    }
+}
+
+impl FromStr for GatewayLogLevel {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "debug" => Ok(Self::Debug),
+            "info" => Ok(Self::Info),
+            "warn" => Ok(Self::Warn),
+            "error" => Ok(Self::Error),
+            _ => Err("must be one of debug, info, warn, or error".to_owned()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayShutdownConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace_period_seconds: Option<u64>,
+}
+
+impl GatewayShutdownConfig {
+    fn is_empty(&self) -> bool {
+        self.grace_period_seconds.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayHttpConfig {
+    #[serde(default, skip_serializing_if = "GatewayHttpTimeoutsConfig::is_empty")]
+    pub timeouts: GatewayHttpTimeoutsConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_header_bytes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http3_enabled: Option<bool>,
+}
+
+impl GatewayHttpConfig {
+    fn is_empty(&self) -> bool {
+        self.timeouts.is_empty() && self.max_header_bytes.is_none() && self.http3_enabled.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayHttpTimeoutsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_header_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_body_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_seconds: Option<u64>,
+}
+
+impl GatewayHttpTimeoutsConfig {
+    fn is_empty(&self) -> bool {
+        self.read_header_seconds.is_none()
+            && self.read_body_seconds.is_none()
+            && self.write_seconds.is_none()
+            && self.idle_seconds.is_none()
     }
 }
 
@@ -217,6 +424,88 @@ pub struct ClusterConfigUpdate {
     pub image_pull_initial_backoff_seconds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_pull_max_backoff_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_listen: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_metrics_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_metrics_per_host: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_logging_runtime_level: Option<GatewayLogLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_logging_access_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_logging_access_format: Option<GatewayAccessLogFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_logging_access_sampling_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_logging_access_sampling_first: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_logging_access_sampling_thereafter: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_shutdown_grace_period_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_http_read_header_timeout_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_http_read_body_timeout_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_http_write_timeout_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_http_idle_timeout_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_http_max_header_bytes: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_http_http3_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub unset: BTreeSet<ClusterConfigField>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ClusterConfigField {
+    #[serde(rename = "gateway.image")]
+    GatewayImage,
+    #[serde(rename = "gateway.listen")]
+    GatewayListen,
+    #[serde(rename = "gateway.metrics.enabled")]
+    GatewayMetricsEnabled,
+    #[serde(rename = "gateway.metrics.per-host")]
+    GatewayMetricsPerHost,
+    #[serde(rename = "gateway.logging.runtime.level")]
+    GatewayLoggingRuntimeLevel,
+    #[serde(rename = "gateway.logging.access.enabled")]
+    GatewayLoggingAccessEnabled,
+    #[serde(rename = "gateway.logging.access.format")]
+    GatewayLoggingAccessFormat,
+    #[serde(rename = "gateway.logging.access.sampling.enabled")]
+    GatewayLoggingAccessSamplingEnabled,
+    #[serde(rename = "gateway.logging.access.sampling.first")]
+    GatewayLoggingAccessSamplingFirst,
+    #[serde(rename = "gateway.logging.access.sampling.thereafter")]
+    GatewayLoggingAccessSamplingThereafter,
+    #[serde(rename = "gateway.shutdown.grace-period-seconds")]
+    GatewayShutdownGracePeriodSeconds,
+    #[serde(rename = "gateway.http.timeouts.read-header-seconds")]
+    GatewayHttpReadHeaderTimeoutSeconds,
+    #[serde(rename = "gateway.http.timeouts.read-body-seconds")]
+    GatewayHttpReadBodyTimeoutSeconds,
+    #[serde(rename = "gateway.http.timeouts.write-seconds")]
+    GatewayHttpWriteTimeoutSeconds,
+    #[serde(rename = "gateway.http.timeouts.idle-seconds")]
+    GatewayHttpIdleTimeoutSeconds,
+    #[serde(rename = "gateway.http.max-header-bytes")]
+    GatewayHttpMaxHeaderBytes,
+    #[serde(rename = "gateway.http.http3-enabled")]
+    GatewayHttpHttp3Enabled,
+    #[serde(rename = "deployment.progress-deadline-seconds")]
+    DeploymentProgressDeadlineSeconds,
+    #[serde(rename = "deployment.image-pull.idle-timeout-seconds")]
+    DeploymentImagePullIdleTimeoutSeconds,
+    #[serde(rename = "deployment.image-pull.max-attempts")]
+    DeploymentImagePullMaxAttempts,
+    #[serde(rename = "deployment.image-pull.initial-backoff-seconds")]
+    DeploymentImagePullInitialBackoffSeconds,
+    #[serde(rename = "deployment.image-pull.max-backoff-seconds")]
+    DeploymentImagePullMaxBackoffSeconds,
 }
 
 pub fn valid_gateway_image(value: &str) -> bool {
@@ -860,6 +1149,138 @@ pub struct NodeGatewayResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayClusterStatusResponse {
+    pub cluster_id: String,
+    pub desired_generation: u64,
+    pub config: GatewayPublicConfig,
+    pub nodes: Vec<GatewayNodeStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayPublicConfig {
+    pub image: String,
+    pub listen: Vec<String>,
+    pub metrics: GatewayPublicMetricsConfig,
+    pub logging: GatewayPublicLoggingConfig,
+    pub shutdown: GatewayPublicShutdownConfig,
+    pub http: GatewayPublicHttpConfig,
+}
+
+impl From<&ClusterGatewayConfig> for GatewayPublicConfig {
+    fn from(config: &ClusterGatewayConfig) -> Self {
+        Self {
+            image: config.image.clone(),
+            listen: config.listen.clone(),
+            metrics: GatewayPublicMetricsConfig {
+                enabled: config.metrics.enabled,
+                per_host: config.metrics.per_host,
+            },
+            logging: GatewayPublicLoggingConfig {
+                runtime: GatewayPublicRuntimeLogConfig {
+                    level: config.logging.runtime.level,
+                },
+                access: GatewayPublicAccessLogConfig {
+                    enabled: config.logging.access.enabled,
+                    format: config.logging.access.format,
+                    sampling: GatewayPublicAccessLogSamplingConfig {
+                        enabled: config.logging.access.sampling.enabled,
+                        first: config.logging.access.sampling.first,
+                        thereafter: config.logging.access.sampling.thereafter,
+                    },
+                },
+            },
+            shutdown: GatewayPublicShutdownConfig {
+                grace_period_seconds: config.shutdown.grace_period_seconds,
+            },
+            http: GatewayPublicHttpConfig {
+                timeouts: GatewayPublicHttpTimeoutsConfig {
+                    read_header_seconds: config.http.timeouts.read_header_seconds,
+                    read_body_seconds: config.http.timeouts.read_body_seconds,
+                    write_seconds: config.http.timeouts.write_seconds,
+                    idle_seconds: config.http.timeouts.idle_seconds,
+                },
+                max_header_bytes: config.http.max_header_bytes,
+                http3_enabled: config.http.http3_enabled,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayPublicMetricsConfig {
+    pub enabled: Option<bool>,
+    pub per_host: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayPublicLoggingConfig {
+    pub runtime: GatewayPublicRuntimeLogConfig,
+    pub access: GatewayPublicAccessLogConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayPublicRuntimeLogConfig {
+    pub level: Option<GatewayLogLevel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayPublicAccessLogConfig {
+    pub enabled: Option<bool>,
+    pub format: Option<GatewayAccessLogFormat>,
+    pub sampling: GatewayPublicAccessLogSamplingConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayPublicAccessLogSamplingConfig {
+    pub enabled: Option<bool>,
+    pub first: Option<u32>,
+    pub thereafter: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayPublicShutdownConfig {
+    pub grace_period_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayPublicHttpConfig {
+    pub timeouts: GatewayPublicHttpTimeoutsConfig,
+    pub max_header_bytes: Option<u32>,
+    pub http3_enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayPublicHttpTimeoutsConfig {
+    pub read_header_seconds: Option<u64>,
+    pub read_body_seconds: Option<u64>,
+    pub write_seconds: Option<u64>,
+    pub idle_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayNodeStatus {
+    pub node_id: String,
+    pub address: String,
+    pub enabled: bool,
+    pub status: GatewayNodeStatusKind,
+    pub desired_generation: Option<u64>,
+    pub applied_generation: Option<u64>,
+    pub retryable: Option<bool>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayNodeStatusKind {
+    Disabled,
+    Offline,
+    Pending,
+    Updating,
+    Ready,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NodeLabelsResponse {
     pub node_id: String,
     pub labels: BTreeMap<String, String>,
@@ -1266,7 +1687,45 @@ mod tests {
         )
         .unwrap();
         assert!(!decoded.managed_image);
+        assert_eq!(decoded.metrics, GatewayMetricsConfig::default());
+        assert_eq!(decoded.logging, GatewayLoggingConfig::default());
+        assert_eq!(decoded.shutdown, GatewayShutdownConfig::default());
+        assert_eq!(decoded.http, GatewayHttpConfig::default());
         assert!(!refresh_managed_gateway_image(&mut decoded));
+    }
+
+    #[test]
+    fn gateway_config_serialization_distinguishes_unset_zero_and_false() {
+        let unset = serde_json::to_value(ClusterGatewayConfig::default()).unwrap();
+        assert!(unset.get("metrics").is_none());
+        assert!(unset.get("http").is_none());
+
+        let mut configured = ClusterGatewayConfig::default();
+        configured.metrics.enabled = Some(false);
+        configured.http.timeouts.read_header_seconds = Some(0);
+        let configured = serde_json::to_value(configured).unwrap();
+        assert_eq!(configured["metrics"]["enabled"], false);
+        assert_eq!(configured["http"]["timeouts"]["read_header_seconds"], 0);
+    }
+
+    #[test]
+    fn config_update_serializes_unset_as_dotted_paths() {
+        let update = ClusterConfigUpdate {
+            unset: BTreeSet::from([
+                ClusterConfigField::GatewayMetricsEnabled,
+                ClusterConfigField::GatewayHttpReadHeaderTimeoutSeconds,
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(update).unwrap(),
+            serde_json::json!({
+                "unset": [
+                    "gateway.metrics.enabled",
+                    "gateway.http.timeouts.read-header-seconds"
+                ]
+            })
+        );
     }
 
     #[test]

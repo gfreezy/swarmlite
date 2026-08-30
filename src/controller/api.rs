@@ -19,15 +19,15 @@ use tracing::error;
 use crate::model::{
     AgentCommandAck, AgentCommandPollResponse, AgentCommandResult, BootstrapResponse,
     ClusterConfigResponse, ClusterConfigUpdate, ConfigBlobCheckRequest, ConfigBlobCheckResponse,
-    DataSessionCreateResponse, DataSessionOperation, DeploymentListResponse, HeartbeatResponse,
-    JoinRequest, JoinResponse, KvDeleteRequest, KvListResponse, KvLockAcquireRequest,
-    KvLockAcquireResponse, KvLockMutationRequest, KvObjectResponse, KvPutRequest, KvStatResponse,
-    MAX_CONFIG_FILE_BYTES, MAX_STACK_CONFIG_BYTES, NodeGatewayResponse, NodeGatewayUpdate,
-    NodeHeartbeat, NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse,
-    RegistryCredential, RegistryLoginRequest, RegistryLoginResponse, ServiceInspectResponse,
-    ServiceListResponse, ServiceScaleRequest, StackApplyRequest, StackDeploymentListResponse,
-    StackDeploymentResponse, StackListResponse, StackRollbackRequest, StackValidationResponse,
-    StatusResponse, TaskListResponse,
+    DataSessionCreateResponse, DataSessionOperation, DeploymentListResponse,
+    GatewayClusterStatusResponse, HeartbeatResponse, JoinRequest, JoinResponse, KvDeleteRequest,
+    KvListResponse, KvLockAcquireRequest, KvLockAcquireResponse, KvLockMutationRequest,
+    KvObjectResponse, KvPutRequest, KvStatResponse, MAX_CONFIG_FILE_BYTES, MAX_STACK_CONFIG_BYTES,
+    NodeGatewayResponse, NodeGatewayUpdate, NodeHeartbeat, NodeLabelRemoveRequest,
+    NodeLabelSetRequest, NodeLabelsResponse, RegistryCredential, RegistryLoginRequest,
+    RegistryLoginResponse, ServiceInspectResponse, ServiceListResponse, ServiceScaleRequest,
+    StackApplyRequest, StackDeploymentListResponse, StackDeploymentResponse, StackListResponse,
+    StackRollbackRequest, StackValidationResponse, StatusResponse, TaskListResponse,
 };
 use swarmlite_stack::{config_digest, parse_stack_document, resolve_config_digests};
 
@@ -42,6 +42,7 @@ pub(super) fn router(controller: Arc<Controller>) -> Router {
             "/v1/config",
             get(get_cluster_config).patch(update_cluster_config),
         )
+        .route("/v1/gateway", get(gateway_status))
         .route("/v1/registry-credentials", put(set_registry_credential))
         .route("/v1/stacks", get(list_stacks))
         .route("/v1/stacks/{name}", put(apply_stack).delete(remove_stack))
@@ -141,6 +142,14 @@ async fn update_cluster_config(
 ) -> Result<Json<ClusterConfigResponse>, ControllerError> {
     require_auth(&controller, &headers)?;
     controller.update_cluster_config(update).await.map(Json)
+}
+
+async fn gateway_status(
+    State(controller): State<Arc<Controller>>,
+    headers: HeaderMap,
+) -> Result<Json<GatewayClusterStatusResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    Ok(Json(controller.gateway_status().await))
 }
 
 async fn set_registry_credential(

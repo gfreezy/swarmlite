@@ -35,9 +35,9 @@ use crate::{
     data_plane::MAX_DATA_PAYLOAD_BYTES,
     gateway,
     model::{
-        ClusterState, DeploymentPolicy, GatewayAssignment, GatewayRecoverySnapshot,
-        ImageResolutionStatus, ObservedTaskState, PortBinding, PullPolicy, TaskAssignment,
-        TaskReconcilePhase,
+        ClusterGatewayConfig, ClusterState, DeploymentPolicy, GatewayAssignment,
+        GatewayRecoverySnapshot, ImageResolutionStatus, ObservedTaskState, PortBinding, PullPolicy,
+        TaskAssignment, TaskReconcilePhase,
     },
     registry::RegistryCredentialStore,
 };
@@ -55,8 +55,10 @@ const GATEWAY_NODE_LABEL: &str = "io.swarmlite.node_id";
 const GATEWAY_SCHEMA_LABEL: &str = "io.swarmlite.gateway_schema";
 const GATEWAY_IMAGE_LABEL: &str = "io.swarmlite.gateway_image";
 const GATEWAY_LISTEN_LABEL: &str = "io.swarmlite.gateway_listen";
+const GATEWAY_GRACE_PERIOD_LABEL: &str = "io.swarmlite.gateway_grace_period_seconds";
+const GATEWAY_HTTP3_LABEL: &str = "io.swarmlite.gateway_http3_enabled";
 const GATEWAY_TOKEN_HASH_LABEL: &str = "io.swarmlite.gateway_token_sha256";
-const GATEWAY_SCHEMA: &str = "7";
+const GATEWAY_SCHEMA: &str = "8";
 const GATEWAY_CONTAINER_NAME: &str = "swarmlite-gateway";
 const GATEWAY_ADMIN_URL: &str = "http://127.0.0.1:2019";
 const GATEWAY_RECOVERY_PATH: &str = "/config/swarmlite-recovery.json";
@@ -126,10 +128,9 @@ pub(crate) struct GatewayContainerSpec {
     pub cluster_id: String,
     pub node_id: String,
     pub advertise_address: String,
-    pub listen: Vec<String>,
     pub controller: String,
     pub token: String,
-    pub image: String,
+    pub gateway: ClusterGatewayConfig,
 }
 
 #[derive(Debug)]
@@ -140,6 +141,8 @@ struct ExistingGatewayContainer {
     advertise_address: Option<String>,
     image: Option<String>,
     listen: Option<String>,
+    grace_period_seconds: Option<String>,
+    http3_enabled: Option<String>,
     token_hash: Option<String>,
     schema: Option<String>,
     running: bool,
@@ -421,7 +424,7 @@ impl DockerCompatibleRuntime {
     ) -> Result<()> {
         let ports = enabled
             .then(|| {
-                gateway_ports(&spec.listen).map_err(|error| NonRetryableGatewayError {
+                gateway_ports(&spec.gateway.listen).map_err(|error| NonRetryableGatewayError {
                     message: format!("invalid Gateway listener configuration: {error:#}"),
                 })
             })
@@ -454,7 +457,10 @@ impl DockerCompatibleRuntime {
         if let Some(existing) = existing {
             if gateway_matches_spec(&existing, spec) {
                 if !existing.running {
-                    ensure_gateway_ports_available(ports.as_ref().expect("enabled Gateway ports"))?;
+                    ensure_gateway_ports_available(
+                        ports.as_ref().expect("enabled Gateway ports"),
+                        spec.gateway.http.http3_enabled.unwrap_or(true),
+                    )?;
                     self.client
                         .start_container(&existing.id, None)
                         .await
@@ -463,18 +469,24 @@ impl DockerCompatibleRuntime {
                 }
                 return Ok(());
             }
-            self.ensure_image_if_missing(&spec.image).await?;
+            self.ensure_image_if_missing(&spec.gateway.image).await?;
             info!(
                 previous_address = ?existing.advertise_address,
                 address = %spec.advertise_address,
                 "recreating gateway container for the current gateway settings"
             );
             self.remove_gateway(&existing).await?;
-            ensure_gateway_ports_available(ports.as_ref().expect("enabled Gateway ports"))?;
+            ensure_gateway_ports_available(
+                ports.as_ref().expect("enabled Gateway ports"),
+                spec.gateway.http.http3_enabled.unwrap_or(true),
+            )?;
             return self.create_gateway(spec).await;
         }
 
-        ensure_gateway_ports_available(ports.as_ref().expect("enabled Gateway ports"))?;
+        ensure_gateway_ports_available(
+            ports.as_ref().expect("enabled Gateway ports"),
+            spec.gateway.http.http3_enabled.unwrap_or(true),
+        )?;
         self.create_gateway(spec).await
     }
 
@@ -675,6 +687,8 @@ impl DockerCompatibleRuntime {
                     advertise_address: labels.get(GATEWAY_ADDRESS_LABEL).cloned(),
                     image: labels.get(GATEWAY_IMAGE_LABEL).cloned(),
                     listen: labels.get(GATEWAY_LISTEN_LABEL).cloned(),
+                    grace_period_seconds: labels.get(GATEWAY_GRACE_PERIOD_LABEL).cloned(),
+                    http3_enabled: labels.get(GATEWAY_HTTP3_LABEL).cloned(),
                     token_hash: labels.get(GATEWAY_TOKEN_HASH_LABEL).cloned(),
                     schema: labels.get(GATEWAY_SCHEMA_LABEL).cloned(),
                     running: summary.state == Some(ContainerSummaryStateEnum::RUNNING),
@@ -684,9 +698,9 @@ impl DockerCompatibleRuntime {
     }
 
     async fn create_gateway(&self, spec: &GatewayContainerSpec) -> Result<()> {
-        self.ensure_image_if_missing(&spec.image).await?;
+        self.ensure_image_if_missing(&spec.gateway.image).await?;
         let bootstrap = gateway_bootstrap(spec)?;
-        let ports = gateway_ports(&spec.listen)?;
+        let ports = gateway_ports(&spec.gateway.listen)?;
         let mut port_bindings = HashMap::new();
         let mut exposed_ports = Vec::new();
         for port in ports {
@@ -699,7 +713,7 @@ impl DockerCompatibleRuntime {
                     host_port: Some(port.to_string()),
                 }]),
             );
-            if port == 443 {
+            if port == 443 && spec.gateway.http.http3_enabled.unwrap_or(true) {
                 let key = "443/udp".to_owned();
                 exposed_ports.push(key.clone());
                 port_bindings.insert(
@@ -737,7 +751,7 @@ impl DockerCompatibleRuntime {
         };
         let labels = gateway_labels(spec);
         let body = ContainerCreateBody {
-            image: Some(spec.image.clone()),
+            image: Some(spec.gateway.image.clone()),
             entrypoint: Some(vec!["/bin/sh".to_owned(), "-ec".to_owned()]),
             cmd: Some(vec![
                 "printf '%s' \"$SWARMLITE_CADDY_BOOTSTRAP\" > /config/bootstrap.json; exec caddy run --resume --config /config/bootstrap.json"
@@ -752,7 +766,9 @@ impl DockerCompatibleRuntime {
             ]),
             exposed_ports: Some(exposed_ports),
             labels: Some(labels),
-            stop_timeout: Some(10),
+            stop_timeout: Some(i64::from(gateway_stop_timeout(
+                spec.gateway.shutdown.grace_period_seconds,
+            ))),
             host_config: Some(host_config),
             ..Default::default()
         };
@@ -782,7 +798,7 @@ impl DockerCompatibleRuntime {
             return Err(start_error);
         }
         info!(
-            image = %spec.image,
+            image = %spec.gateway.image,
             address = %spec.advertise_address,
             runtime = %self.kind,
             "started independent gateway container"
@@ -964,7 +980,14 @@ impl DockerCompatibleRuntime {
 
     async fn remove_gateway(&self, container: &ExistingGatewayContainer) -> Result<()> {
         if container.running {
-            let stop = StopContainerOptionsBuilder::default().t(10).build();
+            let stop = StopContainerOptionsBuilder::default()
+                .t(gateway_stop_timeout(
+                    container
+                        .grace_period_seconds
+                        .as_deref()
+                        .and_then(|value| value.parse().ok()),
+                ))
+                .build();
             if let Err(error) = self.client.stop_container(&container.id, Some(stop)).await {
                 warn!(%error, "graceful gateway stop failed; forcing removal");
             }
@@ -1164,8 +1187,19 @@ fn gateway_labels(spec: &GatewayContainerSpec) -> HashMap<String, String> {
         ),
         (GATEWAY_NODE_LABEL.to_owned(), spec.node_id.clone()),
         (GATEWAY_SCHEMA_LABEL.to_owned(), GATEWAY_SCHEMA.to_owned()),
-        (GATEWAY_IMAGE_LABEL.to_owned(), spec.image.clone()),
-        (GATEWAY_LISTEN_LABEL.to_owned(), spec.listen.join(",")),
+        (GATEWAY_IMAGE_LABEL.to_owned(), spec.gateway.image.clone()),
+        (
+            GATEWAY_LISTEN_LABEL.to_owned(),
+            spec.gateway.listen.join(","),
+        ),
+        (
+            GATEWAY_GRACE_PERIOD_LABEL.to_owned(),
+            optional_label(spec.gateway.shutdown.grace_period_seconds),
+        ),
+        (
+            GATEWAY_HTTP3_LABEL.to_owned(),
+            optional_label(spec.gateway.http.http3_enabled),
+        ),
         (
             GATEWAY_TOKEN_HASH_LABEL.to_owned(),
             gateway_token_hash(&spec.token),
@@ -1175,6 +1209,18 @@ fn gateway_labels(spec: &GatewayContainerSpec) -> HashMap<String, String> {
 
 fn gateway_token_hash(token: &str) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
+}
+
+fn optional_label<T: std::fmt::Display>(value: Option<T>) -> String {
+    value.map_or_else(|| "unset".to_owned(), |value| value.to_string())
+}
+
+fn gateway_stop_timeout(grace_period_seconds: Option<u64>) -> i32 {
+    match grace_period_seconds {
+        None => 10,
+        Some(0) => -1,
+        Some(seconds) => i32::try_from(seconds.saturating_add(5)).unwrap_or(i32::MAX),
+    }
 }
 
 fn gateway_volume_names(cluster_id: &str) -> [String; 3] {
@@ -1202,8 +1248,12 @@ fn gateway_recovery_snapshot_archive(payload: &[u8]) -> Result<Vec<u8>> {
 fn gateway_matches_spec(container: &ExistingGatewayContainer, spec: &GatewayContainerSpec) -> bool {
     container.node_id.as_deref() == Some(&spec.node_id)
         && container.advertise_address.as_deref() == Some(&spec.advertise_address)
-        && container.image.as_deref() == Some(&spec.image)
-        && container.listen.as_deref() == Some(&spec.listen.join(","))
+        && container.image.as_deref() == Some(&spec.gateway.image)
+        && container.listen.as_deref() == Some(&spec.gateway.listen.join(","))
+        && container.grace_period_seconds.as_deref()
+            == Some(&optional_label(spec.gateway.shutdown.grace_period_seconds))
+        && container.http3_enabled.as_deref()
+            == Some(&optional_label(spec.gateway.http.http3_enabled))
         && container.token_hash.as_deref() == Some(&gateway_token_hash(&spec.token))
         && container.schema.as_deref() == Some(GATEWAY_SCHEMA)
 }
@@ -1228,7 +1278,7 @@ fn gateway_ports(listen: &[String]) -> Result<BTreeSet<u16>> {
         .collect()
 }
 
-fn ensure_gateway_ports_available(ports: &BTreeSet<u16>) -> Result<()> {
+fn ensure_gateway_ports_available(ports: &BTreeSet<u16>, http3_enabled: bool) -> Result<()> {
     for &port in ports {
         let address = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
         check_gateway_port(
@@ -1236,7 +1286,7 @@ fn ensure_gateway_ports_available(ports: &BTreeSet<u16>) -> Result<()> {
             format!("{address}/tcp"),
             "disable Gateway on this node, free the port, or change gateway-listen",
         )?;
-        if port == 443 {
+        if port == 443 && http3_enabled {
             check_gateway_port(
                 UdpSocket::bind(address),
                 format!("{address}/udp"),
@@ -1285,7 +1335,7 @@ pub(crate) fn gateway_error_is_retryable(error: &anyhow::Error) -> bool {
 fn gateway_bootstrap(spec: &GatewayContainerSpec) -> Result<String> {
     Ok(serde_json::to_string(&gateway::config(
         &ClusterState::default(),
-        &spec.listen,
+        &spec.gateway,
         spec.controller.clone(),
     ))?)
 }
@@ -1903,6 +1953,21 @@ mod tests {
 
     use super::*;
 
+    fn test_gateway_spec() -> GatewayContainerSpec {
+        GatewayContainerSpec {
+            cluster_id: "cluster-old".into(),
+            node_id: "node-a".into(),
+            advertise_address: "10.0.0.21".into(),
+            controller: "http://10.0.0.21:17080".into(),
+            token: "0123456789abcdef".into(),
+            gateway: ClusterGatewayConfig {
+                listen: vec![":80".into()],
+                image: DEFAULT_GATEWAY_IMAGE.into(),
+                ..Default::default()
+            },
+        }
+    }
+
     #[derive(Clone)]
     struct TaskNameConflictApiState {
         calls: Arc<Mutex<Vec<String>>>,
@@ -2404,15 +2469,7 @@ mod tests {
     async fn removes_a_new_gateway_container_when_start_fails() {
         let (runtime, calls, server) = runtime_with_start_failure_api().await;
         let error = runtime
-            .create_gateway(&GatewayContainerSpec {
-                cluster_id: "cluster-old".into(),
-                node_id: "node-a".into(),
-                advertise_address: "10.0.0.21".into(),
-                listen: vec![":80".into()],
-                controller: "http://10.0.0.21:17080".into(),
-                token: "0123456789abcdef".into(),
-                image: DEFAULT_GATEWAY_IMAGE.into(),
-            })
+            .create_gateway(&test_gateway_spec())
             .await
             .unwrap_err();
         server.abort();
@@ -2480,15 +2537,7 @@ mod tests {
 
     #[test]
     fn builds_gateway_recovery_labels() {
-        let spec = GatewayContainerSpec {
-            cluster_id: "cluster-old".into(),
-            node_id: "node-a".into(),
-            advertise_address: "10.0.0.21".into(),
-            listen: vec![":80".into()],
-            controller: "http://10.0.0.21:17080".into(),
-            token: "0123456789abcdef".into(),
-            image: DEFAULT_GATEWAY_IMAGE.into(),
-        };
+        let spec = test_gateway_spec();
         let labels = gateway_labels(&spec);
         assert_eq!(labels[MANAGED_LABEL], "true");
         assert_eq!(labels[CLUSTER_LABEL], "cluster-old");
@@ -2499,6 +2548,8 @@ mod tests {
         assert_eq!(labels[GATEWAY_SCHEMA_LABEL], GATEWAY_SCHEMA);
         assert_eq!(labels[GATEWAY_IMAGE_LABEL], DEFAULT_GATEWAY_IMAGE);
         assert_eq!(labels[GATEWAY_LISTEN_LABEL], ":80");
+        assert_eq!(labels[GATEWAY_GRACE_PERIOD_LABEL], "unset");
+        assert_eq!(labels[GATEWAY_HTTP3_LABEL], "unset");
         assert_eq!(
             labels[GATEWAY_TOKEN_HASH_LABEL],
             gateway_token_hash("0123456789abcdef")
@@ -2516,21 +2567,15 @@ mod tests {
             advertise_address: Some("10.0.0.21".into()),
             image: Some("custom-caddy:v1".into()),
             listen: Some(":80".into()),
+            grace_period_seconds: Some("unset".into()),
+            http3_enabled: Some("unset".into()),
             token_hash: Some(gateway_token_hash("0123456789abcdef")),
             schema: Some(GATEWAY_SCHEMA.into()),
             running: true,
         };
-        let mut spec = GatewayContainerSpec {
-            cluster_id: "cluster-old".into(),
-            node_id: "node-a".into(),
-            advertise_address: "10.0.0.21".into(),
-            listen: vec![":80".into()],
-            controller: "http://10.0.0.21:17080".into(),
-            token: "0123456789abcdef".into(),
-            image: DEFAULT_GATEWAY_IMAGE.into(),
-        };
+        let mut spec = test_gateway_spec();
         assert!(!gateway_matches_spec(&container, &spec));
-        spec.image = "custom-caddy:v1".into();
+        spec.gateway.image = "custom-caddy:v1".into();
         assert!(gateway_matches_spec(&container, &spec));
         container.node_id = None;
         assert!(!gateway_matches_spec(&container, &spec));
@@ -2547,11 +2592,18 @@ mod tests {
     }
 
     #[test]
+    fn coordinates_gateway_stop_timeout_with_caddy_grace_period() {
+        assert_eq!(gateway_stop_timeout(None), 10);
+        assert_eq!(gateway_stop_timeout(Some(0)), -1);
+        assert_eq!(gateway_stop_timeout(Some(20)), 25);
+    }
+
+    #[test]
     fn occupied_gateway_port_is_detected_before_docker_container_creation() {
         let occupied = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
         let port = occupied.local_addr().unwrap().port();
 
-        let error = ensure_gateway_ports_available(&BTreeSet::from([port])).unwrap_err();
+        let error = ensure_gateway_ports_available(&BTreeSet::from([port]), true).unwrap_err();
 
         assert!(format!("{error:#}").contains(&format!("0.0.0.0:{port}/tcp")));
         assert!(!gateway_error_is_retryable(&error));
@@ -2590,15 +2642,8 @@ mod tests {
 
     #[test]
     fn gateway_bootstrap_persists_admin_updates() {
-        let spec = GatewayContainerSpec {
-            cluster_id: "cluster-old".into(),
-            node_id: "node-a".into(),
-            advertise_address: "10.0.0.21".into(),
-            listen: vec![":80".into()],
-            controller: "http://10.0.0.21:17080".into(),
-            token: "do-not-persist-this-token".into(),
-            image: DEFAULT_GATEWAY_IMAGE.into(),
-        };
+        let mut spec = test_gateway_spec();
+        spec.token = "do-not-persist-this-token".into();
         let encoded = gateway_bootstrap(&spec).unwrap();
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(value["admin"]["listen"], "0.0.0.0:2019");

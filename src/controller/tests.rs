@@ -1,6 +1,6 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use swarmlite_stack::{ParsedStack, parse_stack};
 
 use crate::{
@@ -2321,6 +2321,69 @@ async fn deployment_policy_updates_are_validated_and_persisted() {
 }
 
 #[tokio::test]
+async fn gateway_config_preserves_explicit_values_and_unsets_them() {
+    let (controller, repository, _directory) = test_controller("gateway-config-test").await;
+    let updated = controller
+        .update_cluster_config(ClusterConfigUpdate {
+            gateway_listen: Some(vec![":8080".into()]),
+            gateway_metrics_enabled: Some(false),
+            gateway_metrics_per_host: Some(true),
+            gateway_logging_runtime_level: Some(crate::model::GatewayLogLevel::Debug),
+            gateway_logging_access_enabled: Some(true),
+            gateway_logging_access_format: Some(crate::model::GatewayAccessLogFormat::Console),
+            gateway_logging_access_sampling_enabled: Some(true),
+            gateway_logging_access_sampling_first: Some(0),
+            gateway_logging_access_sampling_thereafter: Some(10),
+            gateway_shutdown_grace_period_seconds: Some(0),
+            gateway_http_read_header_timeout_seconds: Some(0),
+            gateway_http_read_body_timeout_seconds: Some(30),
+            gateway_http_write_timeout_seconds: Some(45),
+            gateway_http_idle_timeout_seconds: Some(300),
+            gateway_http_max_header_bytes: Some(0),
+            gateway_http_http3_enabled: Some(false),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let gateway = &updated.config.gateway;
+    assert_eq!(gateway.listen, vec![":8080"]);
+    assert_eq!(gateway.metrics.enabled, Some(false));
+    assert_eq!(gateway.metrics.per_host, Some(true));
+    assert_eq!(gateway.logging.access.sampling.first, Some(0));
+    assert_eq!(gateway.shutdown.grace_period_seconds, Some(0));
+    assert_eq!(gateway.http.timeouts.read_header_seconds, Some(0));
+    assert_eq!(gateway.http.max_header_bytes, Some(0));
+    assert_eq!(gateway.http.http3_enabled, Some(false));
+    assert_eq!(repository.load().await.unwrap().cluster.gateway, *gateway);
+
+    let cleared = controller
+        .update_cluster_config(ClusterConfigUpdate {
+            unset: BTreeSet::from([
+                ClusterConfigField::GatewayListen,
+                ClusterConfigField::GatewayMetricsEnabled,
+                ClusterConfigField::GatewayMetricsPerHost,
+                ClusterConfigField::GatewayLoggingRuntimeLevel,
+                ClusterConfigField::GatewayLoggingAccessEnabled,
+                ClusterConfigField::GatewayLoggingAccessFormat,
+                ClusterConfigField::GatewayLoggingAccessSamplingEnabled,
+                ClusterConfigField::GatewayLoggingAccessSamplingFirst,
+                ClusterConfigField::GatewayLoggingAccessSamplingThereafter,
+                ClusterConfigField::GatewayShutdownGracePeriodSeconds,
+                ClusterConfigField::GatewayHttpReadHeaderTimeoutSeconds,
+                ClusterConfigField::GatewayHttpReadBodyTimeoutSeconds,
+                ClusterConfigField::GatewayHttpWriteTimeoutSeconds,
+                ClusterConfigField::GatewayHttpIdleTimeoutSeconds,
+                ClusterConfigField::GatewayHttpMaxHeaderBytes,
+                ClusterConfigField::GatewayHttpHttp3Enabled,
+            ]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(cleared.config.gateway, ClusterGatewayConfig::default());
+}
+
+#[tokio::test]
 async fn node_labels_are_authoritative_and_persisted() {
     let cluster = test_cluster("node-label-test");
     let directory = tempfile::tempdir().unwrap();
@@ -2510,6 +2573,34 @@ async fn gateway_failures_are_exposed_in_status() {
             .get("node-a")
             .map(String::as_str),
         Some("failed to bind gateway port 80")
+    );
+
+    let gateway_status = controller.gateway_status().await;
+    let node = gateway_status
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "node-a")
+        .unwrap();
+    assert!(node.enabled);
+    assert_eq!(node.status, GatewayNodeStatusKind::Error);
+    assert_eq!(
+        node.desired_generation,
+        Some(gateway_status.desired_generation)
+    );
+    assert_eq!(node.applied_generation, None);
+    assert_eq!(node.retryable, Some(false));
+    assert_eq!(
+        node.error.as_deref(),
+        Some("failed to bind gateway port 80")
+    );
+    let json = serde_json::to_value(gateway_status).unwrap();
+    assert_eq!(
+        json["config"]["metrics"]["enabled"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        json["config"]["http"]["timeouts"]["read_header_seconds"],
+        serde_json::Value::Null
     );
 }
 

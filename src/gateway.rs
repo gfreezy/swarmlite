@@ -4,11 +4,14 @@ use serde_json::{Value, json};
 use swarmlite_stack::{PathRegexpMatcher, RequestMatcher, Route};
 
 use crate::model::{
-    ClusterState, DesiredTaskState, ObservedTaskState, RecoveredStackGateway, ServicePortKey,
-    ServiceRecord,
+    ClusterGatewayConfig, ClusterState, DesiredTaskState, ObservedTaskState, RecoveredStackGateway,
+    ServicePortKey, ServiceRecord,
 };
 
 pub use swarmlite_stack::{HttpServer, StorageConfig, routed_service_ports, storage};
+
+const ACCESS_LOG_NAME: &str = "swarmlite_access";
+const ACCESS_LOG_NAMESPACE: &str = "http.log.access.swarmlite_access";
 
 pub fn generate(state: &ClusterState, listen: &[String]) -> HttpServer {
     swarmlite_stack::generate(
@@ -32,17 +35,59 @@ pub fn generate(state: &ClusterState, listen: &[String]) -> HttpServer {
     )
 }
 
-pub fn config(state: &ClusterState, listen: &[String], controller: String) -> Value {
-    let mut server = generate(state, listen);
+pub fn config(state: &ClusterState, gateway: &ClusterGatewayConfig, controller: String) -> Value {
+    let mut server = generate(state, &gateway.listen);
     server.routes.insert(0, gateway_probe_route());
+    let mut server = serde_json::to_value(server).expect("HTTP server serializes to JSON");
+    let server_object = server.as_object_mut().expect("HTTP server is an object");
+    if gateway.logging.access.enabled == Some(true) {
+        server_object.insert(
+            "logs".to_owned(),
+            json!({ "default_logger_name": ACCESS_LOG_NAME }),
+        );
+    }
+    if let Some(seconds) = gateway.http.timeouts.read_header_seconds {
+        server_object.insert("read_header_timeout".to_owned(), duration(seconds));
+    }
+    if let Some(seconds) = gateway.http.timeouts.read_body_seconds {
+        server_object.insert("read_timeout".to_owned(), duration(seconds));
+    }
+    if let Some(seconds) = gateway.http.timeouts.write_seconds {
+        server_object.insert("write_timeout".to_owned(), duration(seconds));
+    }
+    if let Some(seconds) = gateway.http.timeouts.idle_seconds {
+        server_object.insert("idle_timeout".to_owned(), duration(seconds));
+    }
+    if let Some(bytes) = gateway.http.max_header_bytes {
+        server_object.insert("max_header_bytes".to_owned(), json!(bytes));
+    }
+    if let Some(enabled) = gateway.http.http3_enabled {
+        let protocols = if enabled {
+            json!(["h1", "h2", "h3"])
+        } else {
+            json!(["h1", "h2"])
+        };
+        server_object.insert("protocols".to_owned(), protocols);
+    }
+
     let storage = storage(controller);
-    let mut apps = json!({
-        "http": {
-            "servers": {
-                "swarmlite": server
-            }
+    let mut http = json!({
+        "servers": {
+            "swarmlite": server
         }
     });
+    let http_object = http.as_object_mut().expect("HTTP app is an object");
+    if gateway.metrics.enabled == Some(true) {
+        let mut metrics = serde_json::Map::new();
+        if let Some(per_host) = gateway.metrics.per_host {
+            metrics.insert("per_host".to_owned(), json!(per_host));
+        }
+        http_object.insert("metrics".to_owned(), Value::Object(metrics));
+    }
+    if let Some(seconds) = gateway.shutdown.grace_period_seconds {
+        http_object.insert("grace_period".to_owned(), duration(seconds));
+    }
+    let mut apps = json!({ "http": http });
     if state.gateway_routes.values().any(|stack| {
         stack
             .gateway
@@ -56,14 +101,68 @@ pub fn config(state: &ClusterState, listen: &[String], controller: String) -> Va
             .insert("cache".to_owned(), cache_app());
     }
 
-    json!({
+    let mut config = json!({
         "admin": {
             "listen": "0.0.0.0:2019",
             "config": { "persist": true }
         },
         "storage": storage,
         "apps": apps
-    })
+    });
+    if let Some(logging) = logging_config(gateway) {
+        config
+            .as_object_mut()
+            .expect("Caddy config is an object")
+            .insert("logging".to_owned(), logging);
+    }
+    config
+}
+
+fn duration(seconds: u64) -> Value {
+    Value::String(format!("{seconds}s"))
+}
+
+fn logging_config(gateway: &ClusterGatewayConfig) -> Option<Value> {
+    let runtime_level = gateway.logging.runtime.level;
+    let access_enabled = gateway.logging.access.enabled == Some(true);
+    if runtime_level.is_none() && !access_enabled {
+        return None;
+    }
+
+    let mut default_log =
+        serde_json::Map::from_iter([("writer".to_owned(), json!({ "output": "stderr" }))]);
+    if let Some(level) = runtime_level {
+        default_log.insert("level".to_owned(), json!(level.as_caddy_str()));
+    }
+
+    let mut logs = serde_json::Map::new();
+    if access_enabled {
+        default_log.insert("exclude".to_owned(), json!([ACCESS_LOG_NAMESPACE]));
+        let mut access_log = serde_json::Map::from_iter([
+            ("writer".to_owned(), json!({ "output": "stdout" })),
+            ("include".to_owned(), json!([ACCESS_LOG_NAMESPACE])),
+        ]);
+        if let Some(format) = gateway.logging.access.format {
+            access_log.insert(
+                "encoder".to_owned(),
+                json!({ "format": format.as_caddy_str() }),
+            );
+        }
+        if gateway.logging.access.sampling.enabled == Some(true) {
+            let mut sampling =
+                serde_json::Map::from_iter([("interval".to_owned(), json!(1_000_000_000_u64))]);
+            if let Some(first) = gateway.logging.access.sampling.first {
+                sampling.insert("first".to_owned(), json!(first));
+            }
+            if let Some(thereafter) = gateway.logging.access.sampling.thereafter {
+                sampling.insert("thereafter".to_owned(), json!(thereafter));
+            }
+            access_log.insert("sampling".to_owned(), Value::Object(sampling));
+        }
+        logs.insert(ACCESS_LOG_NAME.to_owned(), Value::Object(access_log));
+    }
+    logs.insert("default".to_owned(), Value::Object(default_log));
+    Some(json!({ "logs": logs }))
 }
 
 fn gateway_probe_route() -> Route {
@@ -226,6 +325,13 @@ mod tests {
 
     use super::*;
 
+    fn gateway_with_listen(listen: &[&str]) -> ClusterGatewayConfig {
+        ClusterGatewayConfig {
+            listen: listen.iter().map(|value| (*value).to_owned()).collect(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn resolves_only_healthy_running_internal_tasks() {
         let parsed = parse_stack(
@@ -310,7 +416,7 @@ x-swarmlite:
     fn only_configures_the_cache_app_for_cached_routes() {
         let uncached = config(
             &ClusterState::default(),
-            &[":80".into()],
+            &gateway_with_listen(&[":80"]),
             "controller".into(),
         );
         assert!(uncached["apps"].get("cache").is_none());
@@ -345,7 +451,7 @@ x-swarmlite:
         );
         assert!(replace_stack_route(&mut state, "demo"));
 
-        let cached = config(&state, &[":80".into()], "controller".into());
+        let cached = config(&state, &gateway_with_listen(&[":80"]), "controller".into());
         assert_eq!(cached["apps"]["cache"]["mode"], "bypass");
         assert_eq!(
             cached["apps"]["cache"]["simplefs"]["path"],
@@ -370,7 +476,7 @@ x-swarmlite:
     fn gateway_owner_probe_precedes_user_routes_and_uses_http_only() {
         let value = config(
             &ClusterState::default(),
-            &[":80".into(), ":443".into()],
+            &gateway_with_listen(&[":80", ":443"]),
             "http://controller:17080".into(),
         );
         let route = &value["apps"]["http"]["servers"]["swarmlite"]["routes"][0];
@@ -386,6 +492,71 @@ x-swarmlite:
         assert_eq!(value["storage"]["gateway_id_env"], "SWARMLITE_GATEWAY_ID");
         assert_eq!(value["storage"]["probe_timeout"], "2s");
         assert_eq!(value["storage"]["owner_cache_ttl"], "1m");
+    }
+
+    #[test]
+    fn renders_gateway_metrics_logging_timeouts_and_protocols() {
+        let mut gateway = gateway_with_listen(&[":80", ":443"]);
+        gateway.metrics.enabled = Some(true);
+        gateway.metrics.per_host = Some(false);
+        gateway.logging.runtime.level = Some(crate::model::GatewayLogLevel::Warn);
+        gateway.logging.access.enabled = Some(true);
+        gateway.logging.access.format = Some(crate::model::GatewayAccessLogFormat::Json);
+        gateway.logging.access.sampling.enabled = Some(true);
+        gateway.logging.access.sampling.first = Some(0);
+        gateway.logging.access.sampling.thereafter = Some(25);
+        gateway.shutdown.grace_period_seconds = Some(0);
+        gateway.http.timeouts.read_header_seconds = Some(0);
+        gateway.http.timeouts.read_body_seconds = Some(30);
+        gateway.http.timeouts.write_seconds = Some(45);
+        gateway.http.timeouts.idle_seconds = Some(300);
+        gateway.http.max_header_bytes = Some(0);
+        gateway.http.http3_enabled = Some(false);
+
+        let value = config(&ClusterState::default(), &gateway, "controller".into());
+        let http = &value["apps"]["http"];
+        let server = &http["servers"]["swarmlite"];
+        assert_eq!(http["metrics"]["per_host"], false);
+        assert_eq!(http["grace_period"], "0s");
+        assert_eq!(server["read_header_timeout"], "0s");
+        assert_eq!(server["read_timeout"], "30s");
+        assert_eq!(server["write_timeout"], "45s");
+        assert_eq!(server["idle_timeout"], "300s");
+        assert_eq!(server["max_header_bytes"], 0);
+        assert_eq!(server["protocols"], json!(["h1", "h2"]));
+        assert_eq!(server["logs"]["default_logger_name"], ACCESS_LOG_NAME);
+
+        let logs = &value["logging"]["logs"];
+        assert_eq!(logs["default"]["writer"]["output"], "stderr");
+        assert_eq!(logs["default"]["level"], "WARN");
+        assert_eq!(logs["default"]["exclude"], json!([ACCESS_LOG_NAMESPACE]));
+        assert_eq!(logs[ACCESS_LOG_NAME]["writer"]["output"], "stdout");
+        assert_eq!(
+            logs[ACCESS_LOG_NAME]["include"],
+            json!([ACCESS_LOG_NAMESPACE])
+        );
+        assert_eq!(logs[ACCESS_LOG_NAME]["encoder"]["format"], "json");
+        assert_eq!(
+            logs[ACCESS_LOG_NAME]["sampling"],
+            json!({ "interval": 1_000_000_000_u64, "first": 0, "thereafter": 25 })
+        );
+    }
+
+    #[test]
+    fn omits_unset_optional_gateway_fields() {
+        let value = config(
+            &ClusterState::default(),
+            &gateway_with_listen(&[":80"]),
+            "controller".into(),
+        );
+        let http = &value["apps"]["http"];
+        let server = &http["servers"]["swarmlite"];
+        assert!(http.get("metrics").is_none());
+        assert!(http.get("grace_period").is_none());
+        assert!(server.get("read_header_timeout").is_none());
+        assert!(server.get("logs").is_none());
+        assert!(server.get("protocols").is_none());
+        assert!(value.get("logging").is_none());
     }
 
     fn service() -> ServiceRecord {
