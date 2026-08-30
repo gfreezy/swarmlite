@@ -32,6 +32,7 @@ pub(super) struct DeployArgs {
         short = 'c',
         long = "compose-file",
         visible_alias = "file",
+        env = "SWARMLITE_COMPOSE_FILE",
         default_value = "swarmlite.yaml"
     )]
     pub(super) file: PathBuf,

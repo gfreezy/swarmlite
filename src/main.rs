@@ -158,7 +158,7 @@ enum Command {
         #[arg(long)]
         json: bool,
         /// HTTP(S) Controller URL or ssh://[user@]host[:port].
-        #[arg(short = 'u', long)]
+        #[arg(short = 'u', long, env = "SWARMLITE_CONTROLLER")]
         controller: Option<String>,
         #[arg(long, env = "SWARMLITE_TOKEN")]
         token: Option<String>,
@@ -325,7 +325,7 @@ enum ConfigKey {
 #[derive(Debug, Args)]
 struct ConnectionArgs {
     /// HTTP(S) Controller URL or ssh://[user@]host[:port].
-    #[arg(short = 'u', long)]
+    #[arg(short = 'u', long, env = "SWARMLITE_CONTROLLER")]
     controller: Option<String>,
     #[arg(long, env = "SWARMLITE_TOKEN")]
     token: Option<String>,
@@ -334,7 +334,7 @@ struct ConnectionArgs {
 #[derive(Debug, Args)]
 struct RegistryConnectionArgs {
     /// HTTP(S) Controller URL or ssh://[user@]host[:port].
-    #[arg(long)]
+    #[arg(long, env = "SWARMLITE_CONTROLLER")]
     controller: Option<String>,
     #[arg(long, env = "SWARMLITE_TOKEN")]
     token: Option<String>,
@@ -2660,6 +2660,55 @@ mod tests {
         };
         assert_eq!(options.file, PathBuf::from("production.yaml"));
         assert_eq!(options.stack.as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn management_defaults_are_exposed_as_environment_variables() {
+        let command = Cli::command();
+        let deploy = command
+            .find_subcommand("deploy")
+            .expect("deploy subcommand");
+        let compose_file = deploy
+            .get_arguments()
+            .find(|argument| argument.get_id() == "file")
+            .expect("compose file argument");
+        assert_eq!(
+            compose_file.get_env().and_then(|value| value.to_str()),
+            Some("SWARMLITE_COMPOSE_FILE")
+        );
+        let controller = deploy
+            .get_arguments()
+            .find(|argument| argument.get_id() == "controller")
+            .expect("Controller argument");
+        assert_eq!(
+            controller.get_env().and_then(|value| value.to_str()),
+            Some("SWARMLITE_CONTROLLER")
+        );
+
+        let status = command
+            .find_subcommand("status")
+            .expect("status subcommand");
+        let controller = status
+            .get_arguments()
+            .find(|argument| argument.get_id() == "controller")
+            .expect("Controller argument");
+        assert_eq!(
+            controller.get_env().and_then(|value| value.to_str()),
+            Some("SWARMLITE_CONTROLLER")
+        );
+
+        let registry = command
+            .find_subcommand("registry")
+            .and_then(|registry| registry.find_subcommand("login"))
+            .expect("registry login subcommand");
+        let controller = registry
+            .get_arguments()
+            .find(|argument| argument.get_id() == "controller")
+            .expect("Controller argument");
+        assert_eq!(
+            controller.get_env().and_then(|value| value.to_str()),
+            Some("SWARMLITE_CONTROLLER")
+        );
     }
 
     #[test]

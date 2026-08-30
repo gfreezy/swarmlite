@@ -398,6 +398,16 @@ Management commands accept `ssh://[user@]host[:port]` as a Controller URL. The s
 executable honors aliases and options from `~/.ssh/config`, including `ProxyJump`. The Stack file
 stays on the local workstation.
 
+For repeated commands, the Controller URL and default Stack file can be supplied through the
+environment. Explicit command-line options take precedence:
+
+```bash
+export SWARMLITE_CONTROLLER=ssh://ubuntu@server.example.com
+export SWARMLITE_COMPOSE_FILE=swarmlite-prod.yaml
+swarmlite deploy
+swarmlite ps demo
+```
+
 The remote Swarmlite CLI must match the local version and be able to read
 `/var/lib/swarmlite`. Root SSH works directly. For a dedicated SSH user, allow only the
 machine-readable connection command without a password prompt:
