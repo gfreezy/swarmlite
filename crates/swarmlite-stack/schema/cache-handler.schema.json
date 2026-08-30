@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/gfreezy/swarmlite/main/crates/swarmlite-stack/schema/cache-handler.schema.json",
   "title": "Caddy cache-handler route configuration",
-  "description": "Cache settings passed through to Caddy's http.handlers.cache DefaultCache configuration. Swarmlite supplies the native handler envelope, bypass mode, and the gateway's Badger storage.",
+  "description": "Cache settings passed through to Caddy's http.handlers.cache DefaultCache configuration. Swarmlite supplies the native handler envelope, bypass mode, and the gateway's managed SQLite storage.",
   "type": "object",
   "properties": {
     "log_level": { "type": "string" },

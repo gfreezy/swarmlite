@@ -178,11 +178,18 @@ fn stack_fragment(state: &ClusterState, stack_name: &str) -> Option<RecoveredSta
 
 fn cache_app() -> Value {
     json!({
-        "badger": {
+        // cache-handler v0.16.0 only dispatches a fixed provider list. The
+        // Gateway image registers its SQLite storer through the SimpleFS slot
+        // until cache-handler accepts native third-party provider names.
+        "simplefs": {
             "found": true,
+            "path": "/cache/sqlite/cache.db",
             "configuration": {
-                "Dir": "/cache/badger",
-                "ValueDir": "/cache/badger"
+                "cache_size_kib": 4096,
+                "read_connections": 4,
+                "cleanup_interval": "5m",
+                "mapping_scan_interval": "1m",
+                "journal_size_limit": 67108864
             }
         },
         "mode": "bypass"
@@ -342,12 +349,20 @@ x-swarmlite:
         let cached = config(&state, &[":80".into()], "controller".into());
         assert_eq!(cached["apps"]["cache"]["mode"], "bypass");
         assert_eq!(
-            cached["apps"]["cache"]["badger"]["configuration"]["Dir"],
-            "/cache/badger"
+            cached["apps"]["cache"]["simplefs"]["path"],
+            "/cache/sqlite/cache.db"
         );
         assert_eq!(
-            cached["apps"]["cache"]["badger"]["configuration"]["ValueDir"],
-            "/cache/badger"
+            cached["apps"]["cache"]["simplefs"]["configuration"]["cache_size_kib"],
+            4096
+        );
+        assert_eq!(
+            cached["apps"]["cache"]["simplefs"]["configuration"]["read_connections"],
+            4
+        );
+        assert_eq!(
+            cached["apps"]["cache"]["simplefs"]["configuration"]["mapping_scan_interval"],
+            "1m"
         );
     }
 
