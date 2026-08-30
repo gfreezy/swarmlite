@@ -148,7 +148,7 @@ func TestSQLiteStorerUsesBoundedWALConnectionPools(t *testing.T) {
 	if err := storer.writer.QueryRow("PRAGMA cache_size").Scan(&cacheSize); err != nil {
 		t.Fatal(err)
 	}
-	if cacheSize != -defaultSQLiteCacheSizeKiB {
+	if cacheSize != -2000 {
 		t.Fatalf("unexpected page cache size %d", cacheSize)
 	}
 	var mmapSize int64
@@ -191,9 +191,38 @@ func TestSQLiteStorerUsesBoundedWALConnectionPools(t *testing.T) {
 		if err := connection.QueryRowContext(context.Background(), "PRAGMA cache_size").Scan(&readerCacheSize); err != nil {
 			t.Fatal(err)
 		}
-		if readerCacheSize != -defaultSQLiteCacheSizeKiB {
+		if readerCacheSize != -2000 {
 			t.Fatalf("unexpected reader %d page cache size %d", index, readerCacheSize)
 		}
+	}
+}
+
+func TestSQLiteStorerHonorsExplicitPageCacheSize(t *testing.T) {
+	storer, err := newSQLiteStorer(
+		core.CacheProvider{
+			Path: filepath.Join(t.TempDir(), "cache.db"),
+			Configuration: map[string]interface{}{
+				"cache_size_kib":        1024,
+				"cleanup_interval":      "1h",
+				"mapping_scan_interval": "1m",
+			},
+		},
+		zap.NewNop().Sugar(),
+		30*time.Second,
+		"SQLITE",
+		func(options sqliteOptions) string { return options.path },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storer.Reset() })
+
+	var cacheSize int64
+	if err := storer.writer.QueryRow("PRAGMA cache_size").Scan(&cacheSize); err != nil {
+		t.Fatal(err)
+	}
+	if cacheSize != -1024 {
+		t.Fatalf("unexpected explicit page cache size %d", cacheSize)
 	}
 }
 

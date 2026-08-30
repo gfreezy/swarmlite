@@ -185,7 +185,6 @@ fn cache_app() -> Value {
             "found": true,
             "path": "/cache/sqlite/cache.db",
             "configuration": {
-                "cache_size_kib": 4096,
                 "read_connections": 4,
                 "cleanup_interval": "5m",
                 "mapping_scan_interval": "1m",
@@ -352,10 +351,9 @@ x-swarmlite:
             cached["apps"]["cache"]["simplefs"]["path"],
             "/cache/sqlite/cache.db"
         );
-        assert_eq!(
-            cached["apps"]["cache"]["simplefs"]["configuration"]["cache_size_kib"],
-            4096
-        );
+        assert!(cached["apps"]["cache"]["simplefs"]["configuration"]
+            .get("cache_size_kib")
+            .is_none());
         assert_eq!(
             cached["apps"]["cache"]["simplefs"]["configuration"]["read_connections"],
             4

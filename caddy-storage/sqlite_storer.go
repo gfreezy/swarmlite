@@ -24,7 +24,6 @@ import (
 
 const (
 	defaultSQLitePath                = "souin-cache.db"
-	defaultSQLiteCacheSizeKiB        = int64(4 << 10)
 	defaultSQLiteReadConnections     = 4
 	maxSQLiteReadConnections         = 16
 	defaultSQLiteBusyTimeout         = 5 * time.Second
@@ -164,7 +163,7 @@ func openSQLiteDatabase(options sqliteOptions, instanceKey string, logger core.L
 
 	// WAL permits reads to proceed while the writer commits. Give reads a
 	// small pool, and apply connection-local PRAGMAs through the DSN so every
-	// lazily opened database/sql connection receives the same memory limits.
+	// lazily opened database/sql connection receives the same settings.
 	readers, err := sql.Open("sqlite", sqliteConnectionDSN(options, true))
 	if err != nil {
 		writer.Close()
@@ -199,7 +198,9 @@ func openSQLiteDatabase(options sqliteOptions, instanceKey string, logger core.L
 func sqliteConnectionDSN(options sqliteOptions, readOnly bool) string {
 	query := make(url.Values)
 	query.Set("_busy_timeout", strconv.FormatInt(options.busyTimeout.Milliseconds(), 10))
-	query.Add("_pragma", fmt.Sprintf("cache_size(-%d)", options.cacheSizeKiB))
+	if options.cacheSizeKiB > 0 {
+		query.Add("_pragma", fmt.Sprintf("cache_size(-%d)", options.cacheSizeKiB))
+	}
 	query.Add("_pragma", "mmap_size(0)")
 	query.Add("_pragma", "temp_store(FILE)")
 	if readOnly {
@@ -215,7 +216,6 @@ func sqliteConnectionDSN(options sqliteOptions, readOnly bool) string {
 func parseSQLiteOptions(provider core.CacheProvider) (sqliteOptions, error) {
 	options := sqliteOptions{
 		path:                configuredSQLitePath(provider),
-		cacheSizeKiB:        defaultSQLiteCacheSizeKiB,
 		readConnections:     defaultSQLiteReadConnections,
 		busyTimeout:         defaultSQLiteBusyTimeout,
 		cleanupInterval:     defaultSQLiteCleanupInterval,
