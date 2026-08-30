@@ -25,6 +25,7 @@ use super::{
 
 const LOG_OUTPUT_BUFFER_BYTES: usize = 256 * 1024;
 const LOG_OUTPUT_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const LOG_PREFIX_COLORS: [&str; 6] = ["36", "35", "94", "33", "32", "37"];
 
 #[derive(Debug, Args)]
 pub(super) struct DeployArgs {
@@ -430,26 +431,53 @@ async fn receive_logs(
     local_node_id: Option<&str>,
 ) -> Result<()> {
     let prefixed = streams.len() > 1 && !raw;
-    let color = stdout_color();
-    let prefixes = streams
+    let stdout_prefix_color = stdout_color();
+    let stderr_prefix_color = super::stderr_color();
+    let prefix_labels = streams
         .iter()
-        .map(|stream| {
+        .enumerate()
+        .map(|(index, stream)| {
             let local = local_node_id == Some(stream.node_id.as_str());
             let node = format_node_identity(&stream.node_id, local_node_id, false);
             (
                 stream.stream_id,
-                ansi(
-                    color,
-                    if local { "1;36" } else { "36" },
-                    format!(
-                        "{}.{}.{}@{} | ",
-                        stream.stack,
-                        stream.service,
-                        stream.slot.saturating_add(1),
-                        node
-                    ),
-                )
-                .into_bytes(),
+                local,
+                LOG_PREFIX_COLORS[index % LOG_PREFIX_COLORS.len()],
+                format!(
+                    "{}.{}.{}@{} | ",
+                    stream.stack,
+                    stream.service,
+                    stream.slot.saturating_add(1),
+                    node
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let prefixes = prefix_labels
+        .iter()
+        .map(|(stream_id, local, code, label)| {
+            let code = if *local {
+                format!("1;{code}")
+            } else {
+                (*code).to_owned()
+            };
+            (
+                *stream_id,
+                ansi(stdout_prefix_color, &code, label).into_bytes(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let error_prefixes = prefix_labels
+        .iter()
+        .map(|(stream_id, local, code, label)| {
+            let code = if *local {
+                format!("1;{code}")
+            } else {
+                (*code).to_owned()
+            };
+            (
+                *stream_id,
+                ansi(stderr_prefix_color, &code, label).into_bytes(),
             )
         })
         .collect::<HashMap<_, _>>();
@@ -514,8 +542,8 @@ async fn receive_logs(
             }
             DataFrameKind::Error => {
                 failed.insert(frame.stream_id);
-                let prefix = prefixes.get(&frame.stream_id).expect("known stream");
-                write_log_error(&mut stderr, prefix, &frame.payload).await?;
+                let prefix = error_prefixes.get(&frame.stream_id).expect("known stream");
+                write_log_error(&mut stderr, prefix, &frame.payload, stderr_prefix_color).await?;
                 flush_log_outputs(&mut stdout, &mut stderr).await?;
             }
             DataFrameKind::End => {
@@ -604,13 +632,20 @@ where
     Ok(())
 }
 
-async fn write_log_error<W>(output: &mut W, prefix: &[u8], payload: &[u8]) -> Result<()>
+async fn write_log_error<W>(
+    output: &mut W,
+    prefix: &[u8],
+    payload: &[u8],
+    color: bool,
+) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     tokio::time::timeout(DATA_STREAM_WRITE_TIMEOUT, async {
         output.write_all(prefix).await?;
-        output.write_all(b"ERROR: ").await?;
+        output
+            .write_all(ansi(color, "1;31", "ERROR: ").as_bytes())
+            .await?;
         output.write_all(payload).await?;
         output.write_all(b"\n").await
     })

@@ -11,6 +11,7 @@ use std::{
     io::{IsTerminal, Write},
     path::{Path, PathBuf},
     process::ExitCode,
+    sync::atomic::{AtomicU8, Ordering},
 };
 
 use crate::swarmlite::{
@@ -32,23 +33,75 @@ use crate::swarmlite::{
 };
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use clap::{Args, Parser, Subcommand, ValueEnum, builder::PossibleValue};
+use clap::{
+    Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
+    builder::{PossibleValue, Styles, styling::AnsiColor},
+};
 use tokio::io::AsyncReadExt;
 
 mod cluster_cli;
 mod connection;
 mod upgrade;
 
+const fn cli_styles() -> Styles {
+    Styles::styled()
+        .header(AnsiColor::Cyan.on_default().bold())
+        .usage(AnsiColor::Cyan.on_default().bold())
+        .literal(AnsiColor::Cyan.on_default().bold())
+        .placeholder(AnsiColor::Magenta.on_default())
+        .valid(AnsiColor::Green.on_default())
+        .invalid(AnsiColor::Yellow.on_default())
+}
+
 #[derive(Debug, Parser)]
-#[command(name = "swarmlite", version, about)]
+#[command(name = "swarmlite", version, about, styles = cli_styles())]
 struct Cli {
     /// Directory for generated node identity, state, and CLI connection settings.
     #[arg(long, global = true, env = "SWARMLITE_DATA_DIR")]
     data_dir: Option<PathBuf>,
 
+    /// Control ANSI colors in command output.
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value_t = ColorMode::Auto,
+        env = "SWARMLITE_COLOR"
+    )]
+    color: ColorMode,
+
     #[command(subcommand)]
     command: Command,
 }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+enum ColorMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl ColorMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "always" => Some(Self::Always),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
+
+    fn clap_choice(self) -> clap::ColorChoice {
+        match self {
+            Self::Auto => clap::ColorChoice::Auto,
+            Self::Always => clap::ColorChoice::Always,
+            Self::Never => clap::ColorChoice::Never,
+        }
+    }
+}
+
+static COLOR_MODE: AtomicU8 = AtomicU8::new(ColorMode::Auto as u8);
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum RuntimeKindArg {
@@ -841,6 +894,17 @@ impl CurrentConfigValue {
             Self::Integer(value) => serde_json::json!(value),
         }
     }
+
+    fn styled_display(&self, metadata: ConfigMetadata, color: bool) -> String {
+        let style = match self {
+            Self::Unset => "2",
+            Self::String(_) | Self::List(_) => "36",
+            Self::Bool(true) => "32",
+            Self::Bool(false) => "2",
+            Self::Integer(_) => "35",
+        };
+        ansi(color, style, self.display(metadata))
+    }
 }
 
 impl ConfigKey {
@@ -979,8 +1043,8 @@ fn format_config_metadata(keys: &[ConfigKey], color: bool) -> String {
         .map(|key| {
             let metadata = key.metadata();
             vec![
-                metadata.key.to_owned(),
-                metadata.value_type.to_owned(),
+                ansi(color, "1;36", metadata.key),
+                ansi(color, "35", metadata.value_type),
                 metadata.description.to_owned(),
             ]
         })
@@ -994,12 +1058,18 @@ fn format_config_explanation(key: ConfigKey, config: &ClusterSettings, color: bo
 
     let metadata = key.metadata();
     let mut output = String::new();
-    writeln!(output, "{} {}", ansi(color, "1", "Key:"), metadata.key).unwrap();
+    writeln!(
+        output,
+        "{} {}",
+        ansi(color, "1", "Key:"),
+        ansi(color, "1;36", metadata.key)
+    )
+    .unwrap();
     writeln!(
         output,
         "{} {}",
         ansi(color, "1", "Type:"),
-        metadata.value_type
+        ansi(color, "35", metadata.value_type)
     )
     .unwrap();
     if let Some(values) = metadata.values {
@@ -1016,7 +1086,7 @@ fn format_config_explanation(key: ConfigKey, config: &ClusterSettings, color: bo
         output,
         "{} {}",
         ansi(color, "1", "Current:"),
-        key.current(config).display(metadata)
+        key.current(config).styled_display(metadata, color)
     )
     .unwrap();
     writeln!(
@@ -1101,6 +1171,7 @@ pub async fn execute() -> ExitCode {
 }
 
 async fn run() -> Result<()> {
+    let cli = parse_cli();
     tracing_subscriber::fmt()
         .with_ansi(stderr_color())
         .with_env_filter(
@@ -1109,7 +1180,6 @@ async fn run() -> Result<()> {
         )
         .init();
 
-    let cli = Cli::parse();
     if let Command::Upgrade { version } = &cli.command {
         return upgrade::run(version).await;
     }
@@ -1216,7 +1286,11 @@ async fn run() -> Result<()> {
                     connection::resolve(&data_dir, connection.controller, connection.token).await?;
                 let response = cluster_config(&client, None).await?;
                 if let Some(key) = key {
-                    println!("{}", key.current(&response.config).display(key.metadata()));
+                    println!(
+                        "{}",
+                        key.current(&response.config)
+                            .styled_display(key.metadata(), stdout_color())
+                    );
                 } else {
                     print_pretty_json(&config_values_response(&response), stdout_color())?;
                 }
@@ -1270,7 +1344,7 @@ async fn run() -> Result<()> {
                     connection::resolve(&data_dir, connection.controller, connection.token).await?;
                 let response = gateway_status(&client).await?;
                 if json {
-                    print_pretty_json(&response, stdout_color())?;
+                    println!("{}", serde_json::to_string_pretty(&response)?);
                 } else {
                     print!("{}", format_gateway_status(&response, stdout_color()));
                 }
@@ -1383,6 +1457,38 @@ async fn run() -> Result<()> {
             status(&client, json, local_node_id.as_deref()).await
         }
     }
+}
+
+fn parse_cli() -> Cli {
+    let mode = requested_color_mode();
+    set_color_mode(mode);
+    let matches = Cli::command().color(mode.clap_choice()).get_matches();
+    Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
+}
+
+fn requested_color_mode() -> ColorMode {
+    let mut mode = std::env::var("SWARMLITE_COLOR")
+        .ok()
+        .and_then(|value| ColorMode::parse(&value))
+        .unwrap_or_default();
+    let mut arguments = std::env::args_os().skip(1);
+    while let Some(argument) = arguments.next() {
+        let Some(argument) = argument.to_str() else {
+            continue;
+        };
+        if let Some(value) = argument.strip_prefix("--color=") {
+            if let Some(value) = ColorMode::parse(value) {
+                mode = value;
+            }
+        } else if argument == "--color"
+            && let Some(value) = arguments.next()
+            && let Some(value) = value.to_str()
+            && let Some(value) = ColorMode::parse(value)
+        {
+            mode = value;
+        }
+    }
+    mode
 }
 
 async fn read_registry_password() -> Result<String> {
@@ -1807,9 +1913,15 @@ impl DeploymentProgressRenderer {
     fn new() -> Self {
         let interactive = std::io::stderr().is_terminal()
             && std::env::var("TERM").ok().as_deref() != Some("dumb");
-        Self::for_output(interactive, std::env::var_os("NO_COLOR").is_some())
+        Self {
+            interactive,
+            color: stderr_color(),
+            frame: 0,
+            line_active: false,
+        }
     }
 
+    #[cfg(test)]
     fn for_output(interactive: bool, no_color: bool) -> Self {
         Self {
             interactive,
@@ -1835,11 +1947,19 @@ impl DeploymentProgressRenderer {
     ) {
         if !self.interactive {
             eprintln!(
-                "{}: {} generation {} accepted{}",
-                deployment.stack,
-                operation.label(),
-                deployment.generation,
-                if detach { " (detached)" } else { "" }
+                "{}: {} generation {} {}",
+                ansi(self.color, "1", &deployment.stack),
+                ansi(self.color, "36", operation.label()),
+                ansi(self.color, "35", deployment.generation),
+                ansi(
+                    self.color,
+                    "32",
+                    if detach {
+                        "accepted (detached)"
+                    } else {
+                        "accepted"
+                    }
+                )
             );
             return;
         }
@@ -1868,9 +1988,14 @@ impl DeploymentProgressRenderer {
         elapsed: std::time::Duration,
     ) {
         if !self.interactive {
+            let summary = deployment_progress_summary(operation, deployment, elapsed);
             eprintln!(
                 "{}",
-                deployment_progress_summary(operation, deployment, elapsed)
+                ansi(
+                    self.color,
+                    deployment_status_color(deployment.status),
+                    summary
+                )
             );
             return;
         }
@@ -1887,7 +2012,7 @@ impl DeploymentProgressRenderer {
 
     fn warning(&mut self, message: &str) {
         if !self.interactive {
-            eprintln!("{message}");
+            eprintln!("{} {message}", ansi(self.color, "33", "!"));
             return;
         }
 
@@ -2268,10 +2393,20 @@ fn compact_name(value: &str) -> String {
     compact
 }
 
+fn set_color_mode(mode: ColorMode) {
+    COLOR_MODE.store(mode as u8, Ordering::Relaxed);
+}
+
 fn terminal_color(is_terminal: bool) -> bool {
-    is_terminal
-        && std::env::var("TERM").ok().as_deref() != Some("dumb")
-        && std::env::var_os("NO_COLOR").is_none()
+    match COLOR_MODE.load(Ordering::Relaxed) {
+        value if value == ColorMode::Always as u8 => true,
+        value if value == ColorMode::Never as u8 => false,
+        _ => {
+            is_terminal
+                && std::env::var("TERM").ok().as_deref() != Some("dumb")
+                && std::env::var_os("NO_COLOR").is_none()
+        }
+    }
 }
 
 fn stdout_color() -> bool {
@@ -2654,7 +2789,7 @@ async fn deploy(
                 Some(&request),
             )
             .await?;
-        println!("{}", serde_json::to_string_pretty(&validation)?);
+        print_pretty_json(&validation, stdout_color())?;
         return Ok(());
     }
     let deployment: StackDeploymentResponse = client
@@ -3070,120 +3205,129 @@ fn format_gateway_status(response: &GatewayClusterStatusResponse, color: bool) -
     writeln!(
         output,
         "  Cluster ID:                     {}",
-        response.cluster_id
+        ansi(color, "1", &response.cluster_id)
     )
     .unwrap();
     writeln!(
         output,
         "  Desired generation:             {}",
-        response.desired_generation
+        ansi(color, "35", response.desired_generation)
     )
     .unwrap();
-    writeln!(output, "  Image:                          {}", config.image).unwrap();
+    writeln!(
+        output,
+        "  Image:                          {}",
+        ansi(color, "36", &config.image)
+    )
+    .unwrap();
     writeln!(
         output,
         "  Listen:                         {}",
-        config.listen.join(", ")
+        ansi(color, "36", config.listen.join(", "))
     )
     .unwrap();
     writeln!(
         output,
         "  Metrics enabled:                {}",
-        format_optional(config.metrics.enabled)
+        format_optional_bool(config.metrics.enabled, color)
     )
     .unwrap();
     writeln!(
         output,
         "  Metrics per-host:               {}",
-        format_optional(config.metrics.per_host)
+        format_optional_bool(config.metrics.per_host, color)
     )
     .unwrap();
     writeln!(
         output,
         "  Runtime log level:              {}",
-        config
-            .logging
-            .runtime
-            .level
-            .map(|level| level.as_caddy_str().to_ascii_lowercase())
-            .unwrap_or_else(unset_caddy_default)
+        style_optional_string(
+            config
+                .logging
+                .runtime
+                .level
+                .map(|level| level.as_caddy_str().to_ascii_lowercase()),
+            color
+        )
     )
     .unwrap();
     writeln!(
         output,
         "  Access log enabled:             {}",
-        format_optional(config.logging.access.enabled)
+        format_optional_bool(config.logging.access.enabled, color)
     )
     .unwrap();
     writeln!(
         output,
         "  Access log format:              {}",
-        config
-            .logging
-            .access
-            .format
-            .map(|format| format.as_caddy_str().to_owned())
-            .unwrap_or_else(unset_caddy_default)
+        style_optional_string(
+            config
+                .logging
+                .access
+                .format
+                .map(|format| format.as_caddy_str().to_owned()),
+            color
+        )
     )
     .unwrap();
     writeln!(
         output,
         "  Access log sampling enabled:    {}",
-        format_optional(config.logging.access.sampling.enabled)
+        format_optional_bool(config.logging.access.sampling.enabled, color)
     )
     .unwrap();
     writeln!(
         output,
         "  Access log sampling first:      {}",
-        format_optional(config.logging.access.sampling.first)
+        format_optional_number(config.logging.access.sampling.first, color)
     )
     .unwrap();
     writeln!(
         output,
         "  Access log sampling thereafter: {}",
-        format_optional(config.logging.access.sampling.thereafter)
+        format_optional_number(config.logging.access.sampling.thereafter, color)
     )
     .unwrap();
     writeln!(
         output,
         "  Grace period seconds:           {}",
-        format_optional(config.shutdown.grace_period_seconds)
+        format_optional_number(config.shutdown.grace_period_seconds, color)
     )
     .unwrap();
     writeln!(
         output,
         "  Read-header timeout seconds:    {}",
-        format_optional(config.http.timeouts.read_header_seconds)
+        format_optional_number(config.http.timeouts.read_header_seconds, color)
     )
     .unwrap();
     writeln!(
         output,
         "  Read-body timeout seconds:      {}",
-        format_optional(config.http.timeouts.read_body_seconds)
+        format_optional_number(config.http.timeouts.read_body_seconds, color)
     )
     .unwrap();
     writeln!(
         output,
         "  Write timeout seconds:          {}",
-        format_optional(config.http.timeouts.write_seconds)
+        format_optional_number(config.http.timeouts.write_seconds, color)
     )
     .unwrap();
     writeln!(
         output,
         "  Idle timeout seconds:           {}",
-        format_optional(config.http.timeouts.idle_seconds)
+        format_optional_number(config.http.timeouts.idle_seconds, color)
     )
     .unwrap();
     writeln!(
         output,
         "  Max header bytes:               {}",
-        format_optional(config.http.max_header_bytes)
+        format_optional_number(config.http.max_header_bytes, color)
     )
     .unwrap();
     writeln!(
         output,
         "  HTTP/3 enabled:                 {}",
-        format_optional(config.http.http3_enabled)
+        format_optional_bool(config.http.http3_enabled, color)
     )
     .unwrap();
 
@@ -3204,20 +3348,22 @@ fn format_gateway_status(response: &GatewayClusterStatusResponse, color: bool) -
                 GatewayNodeStatusKind::Ready => ("ready", "32"),
                 GatewayNodeStatusKind::Error => ("error", "31"),
             };
+            let generations_match = node.desired_generation.is_some()
+                && node.desired_generation == node.applied_generation;
             vec![
-                node.node_id.clone(),
+                ansi(color, "1;36", &node.node_id),
                 node.address.clone(),
-                node.enabled.to_string(),
+                style_bool(node.enabled, color),
                 ansi(color, status_color, status),
-                format_optional_generation(node.desired_generation),
-                format_optional_generation(node.applied_generation),
+                style_optional_generation(node.desired_generation, color, generations_match),
+                style_optional_generation(node.applied_generation, color, generations_match),
                 node.retryable
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "-".to_owned()),
+                    .map(|value| style_bool(value, color))
+                    .unwrap_or_else(|| ansi(color, "2", "-")),
                 node.error
                     .as_deref()
-                    .map(single_line)
-                    .unwrap_or_else(|| "-".to_owned()),
+                    .map(|error| ansi(color, "31", single_line(error)))
+                    .unwrap_or_else(|| ansi(color, "2", "-")),
             ]
         })
         .collect::<Vec<_>>();
@@ -3243,14 +3389,36 @@ fn unset_caddy_default() -> String {
     "unset (Caddy default)".to_owned()
 }
 
-fn format_optional(value: Option<impl ToString>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(unset_caddy_default)
+fn style_bool(value: bool, color: bool) -> String {
+    ansi(color, if value { "32" } else { "2" }, value)
 }
 
-fn format_optional_generation(value: Option<u64>) -> String {
-    value.map_or_else(|| "-".to_owned(), |value| value.to_string())
+fn format_optional_bool(value: Option<bool>, color: bool) -> String {
+    value.map_or_else(
+        || ansi(color, "2", unset_caddy_default()),
+        |value| style_bool(value, color),
+    )
+}
+
+fn format_optional_number(value: Option<impl ToString>, color: bool) -> String {
+    value.map_or_else(
+        || ansi(color, "2", unset_caddy_default()),
+        |value| ansi(color, "35", value.to_string()),
+    )
+}
+
+fn style_optional_string(value: Option<String>, color: bool) -> String {
+    value.map_or_else(
+        || ansi(color, "2", unset_caddy_default()),
+        |value| ansi(color, "36", value),
+    )
+}
+
+fn style_optional_generation(value: Option<u64>, color: bool, matches: bool) -> String {
+    value.map_or_else(
+        || ansi(color, "2", "-"),
+        |value| ansi(color, if matches { "32" } else { "33" }, value),
+    )
 }
 
 fn format_task_summary(response: &StatusResponse) -> String {
@@ -3466,8 +3634,8 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     use super::{
-        Cli, Command, ConfigKey, DeploymentOperation, DeploymentProgressRenderer, colorize_json,
-        config_keys_in_scope, config_set_update, config_values_response,
+        Cli, ColorMode, Command, ConfigKey, DeploymentOperation, DeploymentProgressRenderer,
+        colorize_json, config_keys_in_scope, config_set_update, config_values_response,
         deployment_progress_summary, deployment_terminal_progress_summary, display_width,
         format_config_explanation, format_config_metadata, format_deployment_history,
         format_deployment_statuses, format_gateway_status, format_node_identity, format_status,
@@ -3478,6 +3646,69 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn command_inventory_matches_the_reference() {
+        fn leaf_commands(command: &clap::Command) -> usize {
+            if command.has_subcommands() {
+                command.get_subcommands().map(leaf_commands).sum()
+            } else {
+                1
+            }
+        }
+
+        let command = Cli::command();
+        let top_level = command
+            .get_subcommands()
+            .map(|command| command.get_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            top_level,
+            [
+                "init",
+                "serve",
+                "join",
+                "join-token",
+                "connection-info",
+                "upgrade",
+                "config",
+                "gateway",
+                "node",
+                "registry",
+                "deploy",
+                "deployment",
+                "ls",
+                "ps",
+                "inspect",
+                "logs",
+                "scale",
+                "restart",
+                "rm",
+                "status",
+            ]
+        );
+        let grouped_actions = ["config", "gateway", "node", "registry", "deployment"]
+            .into_iter()
+            .map(|name| {
+                leaf_commands(
+                    command
+                        .get_subcommands()
+                        .find(|subcommand| subcommand.get_name() == name)
+                        .unwrap(),
+                )
+            })
+            .sum::<usize>();
+        assert_eq!(grouped_actions, 16);
+    }
+
+    #[test]
+    fn color_mode_is_available_before_and_after_subcommands() {
+        let before = Cli::try_parse_from(["swarmlite", "--color", "always", "status"]).unwrap();
+        assert_eq!(before.color, ColorMode::Always);
+
+        let after = Cli::try_parse_from(["swarmlite", "status", "--color", "never"]).unwrap();
+        assert_eq!(after.color, ColorMode::Never);
     }
 
     #[test]
@@ -4277,6 +4508,9 @@ mod tests {
         let listing = format_config_metadata(&keys, false);
         assert!(listing.contains("gateway.http.timeouts.read-header-seconds"));
         assert!(listing.contains("integer"));
+        let colored = format_config_metadata(&keys, true);
+        assert!(colored.contains("\x1b[1;36mgateway.http.timeouts.read-header-seconds\x1b[0m"));
+        assert!(colored.contains("\x1b[35minteger\x1b[0m"));
 
         let paths = ConfigKey::ALL
             .iter()
@@ -4347,6 +4581,11 @@ mod tests {
 
         let unset = format_config_explanation(ConfigKey::GatewayMetricsPerHost, &config, false);
         assert!(unset.contains("Current: unset (Caddy default)"));
+
+        let colored =
+            format_config_explanation(ConfigKey::GatewayLoggingAccessFormat, &config, true);
+        assert!(colored.contains("\x1b[1;36mgateway.logging.access.format\x1b[0m"));
+        assert!(colored.contains("Current:\x1b[0m \x1b[36mconsole\x1b[0m"));
     }
 
     #[test]
@@ -4457,6 +4696,13 @@ mod tests {
         assert!(output.contains("NODE"));
         assert!(output.contains("node-a"));
         assert!(output.contains("ready"));
+
+        let colored = format_gateway_status(&response, true);
+        assert!(colored.contains("\x1b[2mfalse\x1b[0m"));
+        assert!(colored.contains("\x1b[2munset (Caddy default)\x1b[0m"));
+        assert!(colored.contains("\x1b[1;36mnode-a\x1b[0m"));
+        assert!(colored.contains("\x1b[32mready\x1b[0m"));
+        assert!(colored.contains("\x1b[32m7\x1b[0m"));
     }
 
     #[test]

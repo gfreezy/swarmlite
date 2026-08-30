@@ -807,6 +807,7 @@ service VIPs, cross-node DNS, autoscaling, global services, or the broader Kuber
 
 ### Command reference
 
+The CLI exposes 20 top-level commands and 16 actionable subcommands in the grouped command trees.
 Run `swarmlite COMMAND --help` for complete arguments.
 
 ```text
@@ -839,6 +840,14 @@ status [--json]      inspect cluster state
 ```
 
 There are no separate public `controller`, `agent`, or `gateway` runtime commands.
+
+Human-readable output uses color automatically when its destination is a terminal: cyan identifies
+resources, configured values, and active work; green marks healthy or successful states; yellow
+marks pending or degraded states; red marks failures; magenta marks numeric values; and dim text
+marks inactive or unset values. Use the global `--color auto|always|never` option or
+`SWARMLITE_COLOR` to override
+automatic detection; `NO_COLOR` disables color while the mode is `auto`. Explicit machine-readable
+output (`--json`, `ps --quiet`, and `logs --raw`) never adds styling.
 
 ### Schemas and examples
 
