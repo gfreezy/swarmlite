@@ -1,0 +1,23 @@
+[package]
+name = "swarmlite-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+swarmlite-client.workspace = true
+swarmlite-core.workspace = true
+swarmlite-platform.workspace = true
+swarmlite-protocol.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+bollard.workspace = true
+tempfile.workspace = true

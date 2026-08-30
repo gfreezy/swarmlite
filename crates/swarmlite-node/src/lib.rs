@@ -1,3 +1,10 @@
+pub use swarmlite_agent as agent;
+pub use swarmlite_client as client;
+pub use swarmlite_controller as controller;
+pub use swarmlite_controller::storage;
+pub use swarmlite_core::{config, model};
+pub use swarmlite_platform::{local_state, registry, runtime};
+
 use std::{
     collections::BTreeMap,
     env,
@@ -13,13 +20,11 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    agent,
     client::ControllerClient,
     config::{
         AgentConfig, ControllerConfig, DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS, PortRangeConfig,
         RuntimeConfig, RuntimeKind,
     },
-    controller,
     local_state::{AgentFence, DATABASE_FILE, FENCE_KEY, LocalState, NODE_KEY},
     model::{
         BootstrapResponse, CLUSTER_SCHEMA_VERSION, ClusterSettings, GatewayRecoverySnapshot,

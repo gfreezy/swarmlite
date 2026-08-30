@@ -6,11 +6,11 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
-use swarmlite::{
+use crate::swarmlite::{
     client::ControllerClient,
     node::{self, ConnectionInfo},
 };
+use anyhow::{Context, Result, bail};
 use tokio::{net::TcpStream, process::Child};
 use url::Url;
 

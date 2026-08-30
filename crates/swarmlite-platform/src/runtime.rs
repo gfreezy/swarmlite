@@ -45,12 +45,12 @@ use crate::{
 #[cfg(test)]
 use crate::model::DEFAULT_GATEWAY_IMAGE;
 
-pub(crate) const MANAGED_LABEL: &str = "io.swarmlite.managed";
-pub(crate) const CLUSTER_LABEL: &str = "io.swarmlite.cluster_id";
-pub(crate) const SYSTEM_LABEL: &str = "io.swarmlite.system";
-pub(crate) const COMPONENT_LABEL: &str = "io.swarmlite.component";
-pub(crate) const GATEWAY_COMPONENT: &str = "gateway";
-pub(crate) const GATEWAY_ADDRESS_LABEL: &str = "io.swarmlite.advertise_address";
+pub const MANAGED_LABEL: &str = "io.swarmlite.managed";
+pub const CLUSTER_LABEL: &str = "io.swarmlite.cluster_id";
+pub const SYSTEM_LABEL: &str = "io.swarmlite.system";
+pub const COMPONENT_LABEL: &str = "io.swarmlite.component";
+pub const GATEWAY_COMPONENT: &str = "gateway";
+pub const GATEWAY_ADDRESS_LABEL: &str = "io.swarmlite.advertise_address";
 const GATEWAY_NODE_LABEL: &str = "io.swarmlite.node_id";
 const GATEWAY_SCHEMA_LABEL: &str = "io.swarmlite.gateway_schema";
 const GATEWAY_IMAGE_LABEL: &str = "io.swarmlite.gateway_image";
@@ -115,7 +115,7 @@ pub struct RuntimeLogChunk {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct ManagedClusterInventory {
+pub struct ManagedClusterInventory {
     pub cluster_ids: BTreeSet<String>,
     pub gateway_cluster_ids: BTreeSet<String>,
     pub gateway_listen: BTreeMap<String, Vec<String>>,
@@ -124,7 +124,7 @@ pub(crate) struct ManagedClusterInventory {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct GatewayContainerSpec {
+pub struct GatewayContainerSpec {
     pub cluster_id: String,
     pub node_id: String,
     pub advertise_address: String,
@@ -314,7 +314,7 @@ impl DockerCompatibleRuntime {
         Self::connect_inner(config, None, None, DeploymentPolicy::default())
     }
 
-    pub(crate) fn connect_with_registry_credentials(
+    pub fn connect_with_registry_credentials(
         config: &ResolvedRuntimeConfig,
         registry_credentials: RegistryCredentialStore,
         config_root: PathBuf,
@@ -351,7 +351,7 @@ impl DockerCompatibleRuntime {
         })
     }
 
-    pub(crate) async fn managed_cluster_inventory(&self) -> Result<ManagedClusterInventory> {
+    pub async fn managed_cluster_inventory(&self) -> Result<ManagedClusterInventory> {
         let summaries = self.list_managed_summaries().await?;
         let mut inventory = ManagedClusterInventory::default();
         for summary in summaries {
@@ -417,7 +417,7 @@ impl DockerCompatibleRuntime {
             .map_err(Into::into)
     }
 
-    pub(crate) async fn reconcile_gateway(
+    pub async fn reconcile_gateway(
         &self,
         spec: &GatewayContainerSpec,
         enabled: bool,
@@ -490,7 +490,7 @@ impl DockerCompatibleRuntime {
         self.create_gateway(spec).await
     }
 
-    pub(crate) async fn apply_gateway_config(&self, assignment: &GatewayAssignment) -> Result<()> {
+    pub async fn apply_gateway_config(&self, assignment: &GatewayAssignment) -> Result<()> {
         if assignment.recovery_snapshot.generation != assignment.generation {
             bail!(
                 "Gateway assignment generation {} does not match recovery snapshot generation {}",
@@ -525,7 +525,7 @@ impl DockerCompatibleRuntime {
         Ok(())
     }
 
-    pub(crate) async fn gateway_recovery_snapshots(
+    pub async fn gateway_recovery_snapshots(
         &self,
         cluster_id: &str,
     ) -> Result<Vec<GatewayRecoverySnapshot>> {
@@ -1328,7 +1328,7 @@ fn check_gateway_port<T>(
     }
 }
 
-pub(crate) fn gateway_error_is_retryable(error: &anyhow::Error) -> bool {
+pub fn gateway_error_is_retryable(error: &anyhow::Error) -> bool {
     error.downcast_ref::<NonRetryableGatewayError>().is_none() && !is_host_port_conflict(error)
 }
 
@@ -1832,7 +1832,7 @@ fn docker_already_running(error: &bollard::errors::Error) -> bool {
     )
 }
 
-pub(crate) fn is_host_port_conflict(error: &anyhow::Error) -> bool {
+pub fn is_host_port_conflict(error: &anyhow::Error) -> bool {
     error.chain().any(|source| {
         source
             .downcast_ref::<bollard::errors::Error>()

@@ -13,8 +13,8 @@ Examples:
   scripts/release.sh 0.1.20
   scripts/release.sh v0.1.20
 
-The script requires a clean main branch. It updates the workspace package
-versions, creates a release commit and annotated tag, atomically pushes main
+The script requires a clean main branch. It updates the shared workspace
+version, creates a release commit and annotated tag, atomically pushes main
 and the tag, waits for the tag CI run, and verifies the GitHub release and
 multi-platform Gateway image.
 EOF
@@ -71,16 +71,42 @@ import re
 import sys
 
 target = sys.argv[1]
-manifest_paths = [
-    pathlib.Path("Cargo.toml"),
-    pathlib.Path("crates/swarmlite-stack/Cargo.toml"),
+workspace_packages = [
+    "swarmlite",
+    "swarmlite-agent",
+    "swarmlite-cli",
+    "swarmlite-client",
+    "swarmlite-controller",
+    "swarmlite-core",
+    "swarmlite-node",
+    "swarmlite-platform",
+    "swarmlite-protocol",
+    "swarmlite-stack",
 ]
 
+root_path = pathlib.Path("Cargo.toml")
+root_lines = root_path.read_text().splitlines(keepends=True)
+in_workspace_package = False
+found = []
+for index, line in enumerate(root_lines):
+    stripped = line.strip()
+    if stripped == "[workspace.package]":
+        in_workspace_package = True
+        continue
+    if in_workspace_package and stripped.startswith("["):
+        break
+    match = re.fullmatch(r'version\s*=\s*"([^"]+)"', stripped)
+    if in_workspace_package and match:
+        found.append((index, match.group(1)))
+if len(found) != 1:
+    raise SystemExit("release error: expected one [workspace.package] version in Cargo.toml")
+version_index, current = found[0]
 
-def read_manifest_version(path: pathlib.Path):
-    lines = path.read_text().splitlines(keepends=True)
+manifest_paths = [root_path, *sorted(pathlib.Path("crates").glob("*/Cargo.toml"))]
+for path in manifest_paths:
+    lines = path.read_text().splitlines()
     in_package = False
-    found = []
+    inherits_workspace_version = False
     for index, line in enumerate(lines):
         stripped = line.strip()
         if stripped == "[package]":
@@ -88,28 +114,17 @@ def read_manifest_version(path: pathlib.Path):
             continue
         if in_package and stripped.startswith("["):
             break
-        match = re.fullmatch(r'version\s*=\s*"([^"]+)"', stripped)
-        if in_package and match:
-            found.append((index, match.group(1)))
-    if len(found) != 1:
-        raise SystemExit(f"release error: expected one [package] version in {path}")
-    index, current = found[0]
-    return path, lines, index, current
+        if in_package and stripped == "version.workspace = true":
+            inherits_workspace_version = True
+    if not inherits_workspace_version:
+        raise SystemExit(f"release error: {path} must inherit version.workspace")
 
-
-manifests = [read_manifest_version(path) for path in manifest_paths]
-current_versions = [manifest[3] for manifest in manifests]
-if len(set(current_versions)) != 1:
-    raise SystemExit(
-        "release error: workspace package versions differ: " + ", ".join(current_versions)
-    )
-current = current_versions[0]
 if tuple(map(int, target.split("."))) <= tuple(map(int, current.split("."))):
     raise SystemExit(f"release error: target {target} must be newer than {current}")
 
 lock_path = pathlib.Path("Cargo.lock")
 lock_text = lock_path.read_text()
-for package in ("swarmlite", "swarmlite-stack"):
+for package in workspace_packages:
     pattern = re.compile(
         rf'(^\[\[package\]\]\n(?:(?!^\[\[package\]\]).)*?'
         rf'^name = "{re.escape(package)}"\n(?:(?!^\[\[package\]\]).)*?'
@@ -126,14 +141,13 @@ for package in ("swarmlite", "swarmlite-stack"):
         )
     lock_text = pattern.sub(rf'\g<1>{target}\g<3>', lock_text, count=1)
 
-for path, lines, index, _ in manifests:
-    newline = "\n" if lines[index].endswith("\n") else ""
-    lines[index] = f'version = "{target}"{newline}'
-    path.write_text("".join(lines))
+newline = "\n" if root_lines[version_index].endswith("\n") else ""
+root_lines[version_index] = f'version = "{target}"{newline}'
+root_path.write_text("".join(root_lines))
 lock_path.write_text(lock_text)
 PY
 
-git add Cargo.toml Cargo.lock crates/swarmlite-stack/Cargo.toml
+git add Cargo.toml Cargo.lock
 git diff --cached --quiet && fail 'version update produced no changes'
 git commit -m "chore: release $tag"
 release_commit=$(git rev-parse HEAD)

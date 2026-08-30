@@ -388,12 +388,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
-name = "diff"
-version = "0.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
-
-[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1189,16 +1183,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pretty_assertions"
-version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ae130e2f271fbc2ac3a40fb1d07180839cdbbe443c7a27e1e3c13c5cac0116d"
-dependencies = [
- "diff",
- "yansi",
-]
-
-[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1840,30 +1824,158 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 name = "swarmlite"
 version = "0.1.22"
 dependencies = [
+ "swarmlite-cli",
+ "tempfile",
+]
+
+[[package]]
+name = "swarmlite-agent"
+version = "0.1.22"
+dependencies = [
+ "anyhow",
+ "bollard",
+ "bytes",
+ "futures-util",
+ "reqwest",
+ "swarmlite-client",
+ "swarmlite-core",
+ "swarmlite-platform",
+ "swarmlite-protocol",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "swarmlite-cli"
+version = "0.1.22"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "swarmlite-client",
+ "swarmlite-core",
+ "swarmlite-node",
+ "swarmlite-platform",
+ "swarmlite-protocol",
+ "swarmlite-stack",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
+name = "swarmlite-client"
+version = "0.1.22"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite",
+ "url",
+]
+
+[[package]]
+name = "swarmlite-controller"
+version = "0.1.22"
+dependencies = [
  "anyhow",
  "axum",
  "base64",
- "bollard",
  "bytes",
- "clap",
  "futures-util",
- "pretty_assertions",
  "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
- "sha2",
+ "swarmlite-client",
+ "swarmlite-core",
+ "swarmlite-platform",
+ "swarmlite-protocol",
  "swarmlite-stack",
- "tar",
  "tempfile",
  "thiserror",
  "tokio",
  "tokio-tungstenite",
  "tower-http",
  "tracing",
- "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "swarmlite-core"
+version = "0.1.22"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "swarmlite-stack",
+]
+
+[[package]]
+name = "swarmlite-node"
+version = "0.1.22"
+dependencies = [
+ "anyhow",
+ "axum",
+ "reqwest",
+ "serde",
+ "swarmlite-agent",
+ "swarmlite-client",
+ "swarmlite-controller",
+ "swarmlite-core",
+ "swarmlite-platform",
+ "tempfile",
+ "tokio",
+ "tracing",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "swarmlite-platform"
+version = "0.1.22"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "bollard",
+ "bytes",
+ "futures-util",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "swarmlite-core",
+ "swarmlite-protocol",
+ "swarmlite-stack",
+ "tar",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "swarmlite-protocol"
+version = "0.1.22"
+dependencies = [
+ "bytes",
+ "swarmlite-core",
 ]
 
 [[package]]
@@ -2605,12 +2717,6 @@ dependencies = [
  "libc",
  "rustix",
 ]
-
-[[package]]
-name = "yansi"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 
 [[package]]
 name = "yoke"

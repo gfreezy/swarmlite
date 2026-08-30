@@ -14,7 +14,7 @@ use crate::model::{ServiceConfigMount, config_digest};
 const GC_STATE_FILE: &str = "gc-state.json";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ConfigCacheGcStats {
+pub struct ConfigCacheGcStats {
     pub referenced: usize,
     pub marked: usize,
     pub retained_for_grace: usize,
@@ -29,20 +29,20 @@ struct ConfigCacheGcState {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ConfigCache {
+pub struct ConfigCache {
     root: PathBuf,
 }
 
 impl ConfigCache {
-    pub(crate) fn new(root: PathBuf) -> Self {
+    pub fn new(root: PathBuf) -> Self {
         Self { root }
     }
 
-    pub(crate) fn host_path(&self, mount: &ServiceConfigMount) -> PathBuf {
+    pub fn host_path(&self, mount: &ServiceConfigMount) -> PathBuf {
         config_mount_host_path(&self.root, mount)
     }
 
-    pub(crate) async fn is_ready(&self, mount: &ServiceConfigMount) -> bool {
+    pub async fn is_ready(&self, mount: &ServiceConfigMount) -> bool {
         let path = config_mount_host_path(&self.root, mount);
         let metadata = match tokio::fs::symlink_metadata(&path).await {
             Ok(metadata) if metadata.file_type().is_file() => metadata,
@@ -59,7 +59,7 @@ impl ConfigCache {
             .is_ok_and(|contents| config_digest(&contents) == mount.digest)
     }
 
-    pub(crate) async fn materialize(
+    pub async fn materialize(
         &self,
         mount: &ServiceConfigMount,
         contents: &[u8],
@@ -130,7 +130,7 @@ impl ConfigCache {
         Ok(destination)
     }
 
-    pub(crate) async fn gc_at(
+    pub async fn gc_at(
         &self,
         referenced_paths: &BTreeSet<PathBuf>,
         now_unix_ms: i64,
@@ -263,7 +263,7 @@ impl ConfigCache {
     }
 }
 
-pub(crate) fn config_mount_host_path(root: &Path, mount: &ServiceConfigMount) -> PathBuf {
+pub fn config_mount_host_path(root: &Path, mount: &ServiceConfigMount) -> PathBuf {
     let uid = mount
         .uid
         .map_or_else(|| "default".into(), |uid| uid.to_string());

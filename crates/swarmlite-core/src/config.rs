@@ -7,7 +7,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 use crate::model::ClusterSettings;
@@ -120,12 +119,12 @@ pub struct RuntimeConfig {
 }
 
 impl RuntimeConfig {
-    pub(crate) fn resolve(&self) -> Result<ResolvedRuntimeConfig> {
+    pub fn resolve(&self) -> Result<ResolvedRuntimeConfig> {
         resolve_runtime(self.kind, self.socket.as_deref())
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum RuntimeKind {
     #[default]

@@ -1,8 +1,8 @@
 [package]
 name = "swarmlite-stack"
-version = "0.1.22"
-edition = "2024"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Swarmlite Stack parser, routing validation, and Caddy JSON renderer"
 
 [dependencies]

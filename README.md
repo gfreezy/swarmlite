@@ -896,7 +896,28 @@ formats are in [`docs/kv-api.md`](docs/kv-api.md).
 
 ## Development
 
-The project pins Rust 1.97.0:
+The project pins Rust 1.97.0.
+
+### Workspace architecture
+
+The Rust implementation is a Cargo workspace with one thin `swarmlite` binary and explicit
+dependency boundaries:
+
+- `swarmlite-cli` owns argument parsing, command orchestration, connection handling, and output;
+- `swarmlite-node` is the composition root for initialization, joining, serving, and supervising
+  the Agent, optional Controller, and Gateway on one machine;
+- `swarmlite-agent` owns heartbeats, assignments, reconciliation, commands, and data streams;
+- `swarmlite-controller` owns the API, desired state, scheduling, deployments, and control-plane
+  persistence;
+- `swarmlite-core`, `swarmlite-protocol`, and `swarmlite-client` provide shared domain, wire, and
+  client boundaries;
+- `swarmlite-platform` contains Docker/Podman, SQLite local state, registry credentials, and config
+  cache adapters;
+- `swarmlite-stack` parses and validates Stack documents and renders routing structures.
+
+Only `swarmlite-node` composes Agent and Controller. Those role crates do not depend on each other.
+
+Build the Rust binary with:
 
 ```bash
 cargo build --release --locked

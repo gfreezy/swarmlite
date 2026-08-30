@@ -17,16 +17,16 @@ const MAX_USERNAME_BYTES: usize = 512;
 pub const MAX_PASSWORD_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
-pub(crate) struct RegistryCredentialStore {
+pub struct RegistryCredentialStore {
     local_state: LocalState,
 }
 
 impl RegistryCredentialStore {
-    pub(crate) fn new(local_state: LocalState) -> Self {
+    pub fn new(local_state: LocalState) -> Self {
         Self { local_state }
     }
 
-    pub(crate) fn credentials_for_image(&self, image: &str) -> Result<Option<DockerCredentials>> {
+    pub fn credentials_for_image(&self, image: &str) -> Result<Option<DockerCredentials>> {
         let registry = registry_from_image(image)?;
         let credentials = self.snapshot()?;
         Ok(credentials
@@ -39,7 +39,7 @@ impl RegistryCredentialStore {
             }))
     }
 
-    pub(crate) fn replace(&self, credentials: &BTreeMap<String, RegistryCredential>) -> Result<()> {
+    pub fn replace(&self, credentials: &BTreeMap<String, RegistryCredential>) -> Result<()> {
         if self.snapshot()? != *credentials {
             self.local_state
                 .put(REGISTRY_CREDENTIALS_KEY, credentials)?;
@@ -47,7 +47,7 @@ impl RegistryCredentialStore {
         Ok(())
     }
 
-    pub(crate) fn snapshot(&self) -> Result<BTreeMap<String, RegistryCredential>> {
+    pub fn snapshot(&self) -> Result<BTreeMap<String, RegistryCredential>> {
         Ok(self
             .local_state
             .get(REGISTRY_CREDENTIALS_KEY)?
@@ -55,9 +55,7 @@ impl RegistryCredentialStore {
     }
 }
 
-pub(crate) fn validate_login(
-    request: RegistryLoginRequest,
-) -> Result<(String, RegistryCredential)> {
+pub fn validate_login(request: RegistryLoginRequest) -> Result<(String, RegistryCredential)> {
     let registry = normalize_registry(&request.registry)?;
     validate_username(&request.username)?;
     validate_password(&request.password)?;
@@ -70,7 +68,7 @@ pub(crate) fn validate_login(
     ))
 }
 
-pub(crate) fn validate_stack_credentials(
+pub fn validate_stack_credentials(
     credentials: BTreeMap<String, StackRegistryCredential>,
 ) -> Result<BTreeMap<String, RegistryCredential>> {
     let mut validated = BTreeMap::new();
@@ -89,7 +87,7 @@ pub(crate) fn validate_stack_credentials(
     Ok(validated)
 }
 
-pub(crate) fn credentials_hash(credentials: &BTreeMap<String, RegistryCredential>) -> String {
+pub fn credentials_hash(credentials: &BTreeMap<String, RegistryCredential>) -> String {
     let encoded =
         serde_json::to_vec(credentials).expect("registry credential serialization cannot fail");
     let digest = Sha256::digest(encoded);
@@ -122,7 +120,7 @@ fn validate_password(password: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn normalize_registry(registry: &str) -> Result<String> {
+pub fn normalize_registry(registry: &str) -> Result<String> {
     if registry.is_empty()
         || registry.trim() != registry
         || registry.chars().any(char::is_whitespace)

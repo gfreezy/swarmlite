@@ -114,7 +114,7 @@ struct PersistedTaskRecord {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ConfigBlobGcStats {
+pub struct ConfigBlobGcStats {
     pub referenced: usize,
     pub marked: usize,
     pub retained_for_grace: usize,
@@ -343,7 +343,7 @@ impl StateRepository {
         self.kv_repository.clone()
     }
 
-    pub(crate) fn put_config_blobs(&self, blobs: &BTreeMap<String, Vec<u8>>) -> StorageResult<()> {
+    pub fn put_config_blobs(&self, blobs: &BTreeMap<String, Vec<u8>>) -> StorageResult<()> {
         self.with_connection(|connection| {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -395,7 +395,7 @@ impl StateRepository {
         })
     }
 
-    pub(crate) fn get_config_blob(&self, digest: &str) -> StorageResult<Option<Vec<u8>>> {
+    pub fn get_config_blob(&self, digest: &str) -> StorageResult<Option<Vec<u8>>> {
         self.with_connection(|connection| {
             connection
                 .query_row(
@@ -409,7 +409,7 @@ impl StateRepository {
         })
     }
 
-    pub(crate) fn pin_config_blobs(&self, digests: &BTreeSet<String>) -> StorageResult<()> {
+    pub fn pin_config_blobs(&self, digests: &BTreeSet<String>) -> StorageResult<()> {
         self.with_connection(|connection| {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -434,7 +434,7 @@ impl StateRepository {
         })
     }
 
-    pub(crate) fn config_blob_size(&self, digest: &str) -> StorageResult<Option<usize>> {
+    pub fn config_blob_size(&self, digest: &str) -> StorageResult<Option<usize>> {
         self.with_connection(|connection| {
             let size = connection
                 .query_row(
@@ -456,7 +456,7 @@ impl StateRepository {
         })
     }
 
-    pub(crate) fn gc_config_blobs(
+    pub fn gc_config_blobs(
         &self,
         referenced: &BTreeSet<String>,
         now_unix_ms: i64,
@@ -541,7 +541,7 @@ impl StateRepository {
     }
 }
 
-pub(crate) fn control_plane_state_exists(data_dir: &Path) -> StorageResult<bool> {
+pub fn control_plane_state_exists(data_dir: &Path) -> StorageResult<bool> {
     let path = data_dir.join(DATABASE_FILE);
     if !path.exists() {
         return Ok(false);

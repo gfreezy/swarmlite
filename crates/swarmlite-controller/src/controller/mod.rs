@@ -74,7 +74,7 @@ use membership::*;
 use recovery::*;
 use stacks::*;
 
-pub(crate) async fn run_with_repository_and_token_until<F>(
+pub async fn run_with_repository_and_token_until<F>(
     config: ControllerConfig,
     token: String,
     repository: StateRepository,

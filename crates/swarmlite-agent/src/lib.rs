@@ -1,3 +1,8 @@
+pub use swarmlite_client as client;
+pub use swarmlite_core::{config, model};
+pub use swarmlite_platform::{config_files, local_state, registry, runtime};
+pub use swarmlite_protocol::data_plane;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
@@ -88,7 +93,7 @@ struct ReconciliationState {
     events: tokio::sync::mpsc::UnboundedSender<()>,
 }
 
-pub(crate) async fn run_with_token_and_updates(
+pub async fn run_with_token_and_updates(
     config: AgentConfig,
     token: String,
     updates: tokio::sync::watch::Sender<NodeControl>,

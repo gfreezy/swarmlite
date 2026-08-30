@@ -4,25 +4,25 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub(crate) use crate::database::DATABASE_FILE;
+pub use crate::database::DATABASE_FILE;
 use crate::database::Database;
-pub(crate) const NODE_KEY: &str = "node";
-pub(crate) const FENCE_KEY: &str = "agent_fence";
+pub const NODE_KEY: &str = "node";
+pub const FENCE_KEY: &str = "agent_fence";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct AgentFence {
+pub struct AgentFence {
     pub generation: u64,
 }
 
 /// A cheap path handle. Each operation uses a short SQLite transaction so the
 /// CLI can read node defaults while `serve` is running.
 #[derive(Clone)]
-pub(crate) struct LocalState {
+pub struct LocalState {
     database: Database,
 }
 
 impl LocalState {
-    pub(crate) fn open(data_dir: &Path) -> Result<Self> {
+    pub fn open(data_dir: &Path) -> Result<Self> {
         let state = Self {
             database: Database::open(data_dir)?,
         };
@@ -38,7 +38,7 @@ impl LocalState {
         Ok(state)
     }
 
-    pub(crate) fn open_existing(data_dir: &Path) -> Result<Option<Self>> {
+    pub fn open_existing(data_dir: &Path) -> Result<Option<Self>> {
         Database::open_existing(data_dir)?
             .map(|database| {
                 let state = Self { database };
@@ -56,17 +56,14 @@ impl LocalState {
             .transpose()
     }
 
-    pub(crate) fn get_read_only<T: DeserializeOwned>(
-        data_dir: &Path,
-        key: &str,
-    ) -> Result<Option<T>> {
+    pub fn get_read_only<T: DeserializeOwned>(data_dir: &Path, key: &str) -> Result<Option<T>> {
         let Some(state) = Self::open_existing(data_dir)? else {
             return Ok(None);
         };
         state.get(key)
     }
 
-    pub(crate) fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+    pub fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
         self.with_connection(|connection| {
             let value = connection
                 .query_row(
@@ -85,12 +82,12 @@ impl LocalState {
         })
     }
 
-    pub(crate) fn put<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
+    pub fn put<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
         let value = serde_json::to_vec(value)?;
         self.put_encoded([(key, value.as_slice())])
     }
 
-    pub(crate) fn put_pair<A: Serialize, B: Serialize>(
+    pub fn put_pair<A: Serialize, B: Serialize>(
         &self,
         first: (&str, &A),
         second: (&str, &B),

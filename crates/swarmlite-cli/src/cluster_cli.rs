@@ -3,10 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::Result;
-use clap::Args;
-use futures_util::{SinkExt, StreamExt};
-use swarmlite::{
+use crate::swarmlite::{
     data_plane::{DATA_STREAM_WRITE_TIMEOUT, DataChannel, DataFrame, DataFrameKind},
     model::{
         DataSessionCreateResponse, DataSessionOperation, DataSessionStream, DesiredTaskState,
@@ -15,6 +12,9 @@ use swarmlite::{
     },
     node,
 };
+use anyhow::Result;
+use clap::Args;
+use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio_tungstenite::tungstenite::Message;
 

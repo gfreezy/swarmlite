@@ -7,15 +7,15 @@ use std::{
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-pub(crate) const DATABASE_FILE: &str = "swarmlite.sqlite";
+pub const DATABASE_FILE: &str = "swarmlite.sqlite";
 
 #[derive(Clone)]
-pub(crate) struct Database {
+pub struct Database {
     path: Arc<PathBuf>,
 }
 
 impl Database {
-    pub(crate) fn open(data_dir: &Path) -> Result<Self> {
+    pub fn open(data_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(data_dir)
             .with_context(|| format!("failed to create {}", data_dir.display()))?;
         let database = Self {
@@ -35,7 +35,7 @@ impl Database {
         Ok(database)
     }
 
-    pub(crate) fn open_existing(data_dir: &Path) -> Result<Option<Self>> {
+    pub fn open_existing(data_dir: &Path) -> Result<Option<Self>> {
         data_dir
             .join(DATABASE_FILE)
             .exists()
@@ -43,7 +43,7 @@ impl Database {
             .transpose()
     }
 
-    pub(crate) fn connect(&self) -> Result<Connection> {
+    pub fn connect(&self) -> Result<Connection> {
         let connection = Connection::open(self.path.as_ref())
             .with_context(|| format!("failed to open {}", self.path.display()))?;
         connection.busy_timeout(Duration::from_secs(5))?;
