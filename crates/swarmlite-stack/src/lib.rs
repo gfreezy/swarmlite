@@ -823,12 +823,11 @@ fn build_proxy_routes(
     for (rule_index, path_match, rule) in expanded {
         let match_index = path_match.map_or(0, |(index, _)| index);
         let path_match = path_match.map(|(_, path_match)| path_match);
-        let mut handle = rule
-            .cache
-            .as_ref()
-            .map(cache_handler)
-            .into_iter()
-            .collect::<Vec<_>>();
+        // Caddy handlers wrap the handlers that follow them. Keeping encode first
+        // lets the cache store the upstream representation and compresses only
+        // the response sent to each client.
+        let mut handle = vec![encode_handler()];
+        handle.extend(rule.cache.as_ref().map(cache_handler).into_iter());
         handle.extend(rewrite_handlers(rule.rewrite.as_ref(), path_match));
         handle.extend(backend_handlers(
             config.stack_name,
@@ -856,6 +855,18 @@ fn build_proxy_routes(
             terminal: true,
         });
     }
+}
+
+fn encode_handler() -> Value {
+    json!({
+        "handler": "encode",
+        "encodings": {
+            "zstd": {},
+            "gzip": {},
+        },
+        "prefer": ["zstd", "gzip"],
+        "minimum_length": 512,
+    })
 }
 
 fn cache_handler(cache: &serde_json::Map<String, Value>) -> Value {
@@ -1219,6 +1230,39 @@ mod tests {
     }
 
     #[test]
+    fn enables_fixed_response_compression_for_every_proxy_route() {
+        let default = parse_stack(
+            r#"
+services:
+  web:
+    image: nginx
+    expose: [80]
+x-swarmlite:
+  tls: disabled
+  http: serve
+  http_routes:
+    - hostnames: [compressed.example.com]
+      rules:
+        - backend: { service: web }
+"#,
+        )
+        .unwrap();
+
+        let value = serde_json::to_value(generate(
+            [("compressed", &default.gateway)],
+            &[":80".into()],
+            |_, _, port, _| vec![format!("10.0.0.21:{port}")],
+        ))
+        .unwrap();
+        let handlers = value["routes"][0]["handle"].as_array().unwrap();
+        assert_eq!(handlers[0]["handler"], "encode");
+        assert_eq!(handlers[0]["encodings"], json!({"zstd": {}, "gzip": {}}));
+        assert_eq!(handlers[0]["prefer"], json!(["zstd", "gzip"]));
+        assert_eq!(handlers[0]["minimum_length"], 512);
+        assert_eq!(handlers[1]["handler"], "reverse_proxy");
+    }
+
+    #[test]
     fn inherits_and_overrides_stack_trusted_proxies() {
         let parsed = parse_stack(
             r#"
@@ -1271,7 +1315,11 @@ x-swarmlite:
                 .unwrap()
                 .iter()
                 .find(|route| route["match"][0]["host"] == json!([hostname]))
-                .unwrap()["handle"][0]
+                .unwrap()["handle"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()
                 .clone()
         };
 
@@ -1331,7 +1379,7 @@ x-swarmlite:
     }
 
     #[test]
-    fn passes_cache_configuration_through_before_rewrite_and_proxy() {
+    fn places_response_compression_outside_cache_rewrite_and_proxy() {
         let parsed = parse_stack(
             r#"
 services:
@@ -1372,19 +1420,20 @@ x-swarmlite:
         .unwrap();
         let handlers = value["routes"][0]["handle"].as_array().unwrap();
 
-        assert_eq!(handlers[0]["handler"], "cache");
-        let cache = &handlers[0]["Configuration"]["DefaultCache"];
+        assert_eq!(handlers[0]["handler"], "encode");
+        assert_eq!(handlers[1]["handler"], "cache");
+        let cache = &handlers[1]["Configuration"]["DefaultCache"];
         assert_eq!(cache["ttl"], "5m");
         assert_eq!(cache["stale"], "30s");
         assert_eq!(cache["key"]["hash"], true);
         assert_eq!(cache["key"]["headers"], json!(["Accept-Language"]));
-        assert_eq!(handlers[0]["Configuration"]["LogLevel"], "debug");
+        assert_eq!(handlers[1]["Configuration"]["LogLevel"], "debug");
         assert_eq!(
-            handlers[0]["Configuration"]["cache_keys"]["^https://cache.example.com/public/.*"]["hide"],
+            handlers[1]["Configuration"]["cache_keys"]["^https://cache.example.com/public/.*"]["hide"],
             true
         );
-        assert_eq!(handlers[1]["handler"], "rewrite");
-        assert_eq!(handlers[2]["handler"], "reverse_proxy");
+        assert_eq!(handlers[2]["handler"], "rewrite");
+        assert_eq!(handlers[3]["handler"], "reverse_proxy");
     }
 
     #[test]
@@ -1477,7 +1526,8 @@ x-swarmlite:
             "https://ieltsbao.com{http.request.uri}"
         );
         assert_eq!(routes[2]["match"][0]["host"], json!(["ieltsbao.com"]));
-        assert_eq!(routes[2]["handle"][0]["handler"], "reverse_proxy");
+        assert_eq!(routes[2]["handle"][0]["handler"], "encode");
+        assert_eq!(routes[2]["handle"][1]["handler"], "reverse_proxy");
     }
 
     #[test]
@@ -1562,12 +1612,13 @@ x-swarmlite:
                 None,
             ]
         );
-        assert_eq!(routes[0]["handle"][0]["uri"], "/health");
+        assert_eq!(routes[0]["handle"][0]["handler"], "encode");
+        assert_eq!(routes[0]["handle"][1]["uri"], "/health");
         assert_eq!(
-            routes[1]["handle"][0]["path_regexp"][0]["replace"],
+            routes[1]["handle"][1]["path_regexp"][0]["replace"],
             "/internal"
         );
-        assert_eq!(routes[2]["handle"][0]["strip_path_prefix"], "/api");
+        assert_eq!(routes[2]["handle"][1]["strip_path_prefix"], "/api");
         assert_eq!(
             value["automatic_https"]["skip"],
             json!(["routes.example.com"])
@@ -1615,13 +1666,13 @@ x-swarmlite:
         ))
         .unwrap();
         let routes = value["routes"].as_array().unwrap();
-        let secure = &routes[0]["handle"][0];
+        let secure = routes[0]["handle"].as_array().unwrap().last().unwrap();
         assert_eq!(secure["transport"]["tls"]["server_name"], "secure_api");
         assert_eq!(
             secure["headers"]["request"]["set"]["Host"][0],
             "{http.request.host}"
         );
-        let h2c = &routes[1]["handle"][0];
+        let h2c = routes[1]["handle"].as_array().unwrap().last().unwrap();
         assert_eq!(h2c["transport"]["versions"], json!(["h2c"]));
         assert_eq!(
             h2c["headers"]["request"]["set"]["Host"][0],

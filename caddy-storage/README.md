@@ -3,7 +3,8 @@
 When a node has its Gateway enabled, `swarmlite serve` creates an independent Caddy container with
 its own restart policy and persistent `/data`, `/config`, and `/cache` volumes. The default gateway
 image includes this directory's `caddy.storage.swarmlite` and
-`http.handlers.swarmlite_gateway_probe` modules, Caddy's `http.handlers.cache`, and the
+`http.handlers.swarmlite_gateway_probe` modules, Caddy's `http.handlers.cache` and
+`http.handlers.encode`, and the standard `zstd` and `gzip` encoders. It also includes the
 `storages.cache.badger` provider. No separately maintained Compose stack is required.
 
 The module consumes Swarmlite's generic KV and lock APIs; those APIs contain no Caddy-specific
@@ -45,8 +46,10 @@ swarmlite config set gateway-image registry.example.com/swarmlite-caddy:1.1.0
 
 The image reference is stored in the controller's SQLite database. The selected image must provide
 `caddy`, `caddy.storage.swarmlite`, `http.handlers.swarmlite_gateway_probe`,
-`http.handlers.cache`, and `storages.cache.badger`. Gateway nodes pull it before replacing an
-existing container, and keep the existing `/data`, `/config`, and `/cache` volumes.
+`http.handlers.cache`, `http.handlers.encode`, `http.encoders.zstd`, `http.encoders.gzip`, and
+`storages.cache.badger`. Gateway
+nodes pull it before replacing an existing container, and keep the existing `/data`, `/config`,
+and `/cache` volumes.
 
 ## Automatic configuration
 
@@ -60,6 +63,11 @@ The generated global cache application uses `mode: bypass` and a Badger database
 `ValueDir` are `/cache/badger`. A route only receives `http.handlers.cache` when its Stack rule has
 a `cache` object. Consequently uncached routes are untouched, while cached routes use their
 declared TTL without consulting upstream `Cache-Control` headers.
+
+Generated proxy routes put `http.handlers.encode` before cache and reverse-proxy handlers. Caddy
+therefore negotiates Zstandard or gzip after the downstream response is produced, uses its
+512-byte minimum response length, preserves an existing upstream `Content-Encoding`, and emits
+`Vary: Accept-Encoding` for responses it compresses.
 
 For a manually configured Caddy instance, export a valid cluster token and stable Gateway ID. The
 example includes the owner-probe handler route also used by [`bootstrap.json`](bootstrap.json):

@@ -367,6 +367,13 @@ inferred. Multiple targets require an explicit declared target. Docker or Podman
 ephemeral host port for every routed task; Gateways connect to
 `node-advertise-address:allocated-host-port`.
 
+Every proxied route enables Caddy response compression automatically; existing Stacks need no
+configuration change. The Gateway prefers Zstandard when the client advertises `zstd`, falls back
+to `gzip`, and leaves responses shorter than Caddy's default 512-byte minimum uncompressed. The
+`encode` handler wraps cache and proxy handlers, so a cached rule stores the upstream representation
+before client-specific content encoding is applied. Caddy also leaves an upstream response with an
+existing `Content-Encoding` untouched and adds `Vary: Accept-Encoding` when it compresses a response.
+
 For replicated routed Services, prefer `expose`. Fixed `ports.published` values are rejected so a
 `start-first` replacement can coexist with the old task on one node.
 

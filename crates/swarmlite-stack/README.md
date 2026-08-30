@@ -24,8 +24,11 @@ completion is kept separately in
 [schema/cache-handler.schema.json](schema/cache-handler.schema.json) and referenced by the main
 schema. The parser stores `cache` as a raw JSON object rather than defining every cache-handler
 field in Rust; generation places those fields in the native `Configuration.DefaultCache` envelope
-before rewrite and reverse-proxy handlers. During deployment, the
-main process passes the normalized services from the same Stack file to `validate_and_normalize`;
+before rewrite and reverse-proxy handlers. Every proxy route starts with Caddy's standard `encode`
+handler using Zstandard, gzip, and the default 512-byte threshold. Placing `encode` outside the
+cache handler keeps cached representations independent of a client's `Accept-Encoding`. During
+deployment, the main process passes the normalized services from the same Stack file to
+`validate_and_normalize`;
 no external validation service or network request is involved. This in-process check is
 authoritative because the standard JSON Schema implementation used by VS Code cannot compare a
 route backend with arbitrary keys and ports in the sibling `services` map.

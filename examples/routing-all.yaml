@@ -27,6 +27,8 @@ services:
       replicas: 2
 
 x-swarmlite:
+  # Every proxied response is compressed by default with zstd or gzip once it
+  # reaches Caddy's 512-byte minimum. No Stack configuration is required.
   # Defaults inherited by routes which do not override these fields.
   tls: serve
   http: redirect
