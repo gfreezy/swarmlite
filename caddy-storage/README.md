@@ -5,8 +5,8 @@ its own restart policy and persistent `/data`, `/config`, and `/cache` volumes. 
 image includes this directory's `caddy.storage.swarmlite` and
 `http.handlers.swarmlite_gateway_probe` modules, Caddy's `http.handlers.cache` and
 `http.handlers.encode`, and the standard `zstd` and `gzip` encoders. It also includes the
-`storages.cache.sqlite` provider. Badger remains bundled for compatibility, but managed response
-caches use SQLite. No separately maintained Compose stack is required.
+`storages.cache.sqlite` provider. The Badger response-cache engine and Caddy storage module are no
+longer linked. No separately maintained Compose stack is required.
 
 The module consumes Swarmlite's generic KV and lock APIs; those APIs contain no Caddy-specific
 behavior. The authoritative certificate storage remains local CertMagic `FileStorage`, while
@@ -48,9 +48,9 @@ swarmlite config set gateway-image registry.example.com/swarmlite-caddy:1.1.0
 The image reference is stored in the controller's SQLite database. The selected image must provide
 `caddy`, `caddy.storage.swarmlite`, `http.handlers.swarmlite_gateway_probe`,
 `http.handlers.cache`, `http.handlers.encode`, `http.encoders.zstd`, `http.encoders.gzip`, and
-`storages.cache.badger`, `storages.cache.sqlite`, and the temporary `storages.cache.simplefs`
-compatibility bridge. Gateway nodes pull it before replacing an existing container, and keep the
-existing `/data`, `/config`, and `/cache` volumes.
+`storages.cache.sqlite`, and the temporary `storages.cache.simplefs` compatibility bridge. Gateway
+nodes pull it before replacing an existing container, and keep the existing `/data`, `/config`,
+and `/cache` volumes.
 
 ## Automatic configuration
 

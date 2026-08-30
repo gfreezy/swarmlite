@@ -18,7 +18,6 @@
       "type": "array",
       "items": { "type": "string" }
     },
-    "badger": { "$ref": "#/$defs/provider" },
     "nats": { "$ref": "#/$defs/provider" },
     "nuts": { "$ref": "#/$defs/provider" },
     "otter": { "$ref": "#/$defs/provider" },
