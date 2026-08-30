@@ -14,6 +14,7 @@ concurrency:
 jobs:
   rust:
     name: Rust
+    if: github.event_name == 'pull_request' || !startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -37,7 +38,8 @@ jobs:
 
   cli-build:
     name: CLI (${{ matrix.artifact }})
-    needs: rust
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: release-gate
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
@@ -109,12 +111,45 @@ jobs:
           path: dist/${{ matrix.artifact }}.tar.gz*
           if-no-files-found: error
 
+  release-gate:
+    name: Wait for main checks
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Wait for matching main CI
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          main_run_id=
+          for _ in {1..60}; do
+            main_run_id=$(gh run list \
+              --workflow CI \
+              --event push \
+              --commit "$GITHUB_SHA" \
+              --limit 20 \
+              --json databaseId,headBranch \
+              --jq '.[] | select(.headBranch == "main") | .databaseId' \
+              | head -n 1)
+            [[ -z "$main_run_id" ]] || break
+            sleep 2
+          done
+          [[ -n "$main_run_id" ]] || {
+            echo "could not find the main CI run for $GITHUB_SHA" >&2
+            exit 1
+          }
+          gh run watch "$main_run_id" --exit-status --interval 10
+
   gateway-release:
     name: Publish Gateway image
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs:
-      - rust
-      - go
+    needs: release-gate
     permissions:
       contents: read
       packages: write
@@ -157,6 +192,7 @@ jobs:
 
   go:
     name: Go
+    if: github.event_name == 'pull_request' || !startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -177,6 +213,7 @@ jobs:
 
   packaging:
     name: Packaging
+    if: github.event_name == 'pull_request' || !startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
