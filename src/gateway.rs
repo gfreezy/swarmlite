@@ -351,9 +351,11 @@ x-swarmlite:
             cached["apps"]["cache"]["simplefs"]["path"],
             "/cache/sqlite/cache.db"
         );
-        assert!(cached["apps"]["cache"]["simplefs"]["configuration"]
-            .get("cache_size_kib")
-            .is_none());
+        assert!(
+            cached["apps"]["cache"]["simplefs"]["configuration"]
+                .get("cache_size_kib")
+                .is_none()
+        );
         assert_eq!(
             cached["apps"]["cache"]["simplefs"]["configuration"]["read_connections"],
             4
