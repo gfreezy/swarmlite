@@ -1503,6 +1503,7 @@ x-swarmlite:
                 image_progress: Vec::new(),
                 gateway: GatewayReport {
                     applied_generation: Some(desired.generation),
+                    image: None,
                     error: None,
                     retryable: true,
                 },
@@ -1584,6 +1585,7 @@ x-swarmlite:
                 image_progress: Vec::new(),
                 gateway: GatewayReport {
                     applied_generation: Some(snapshot.generation),
+                    image: None,
                     error: None,
                     retryable: true,
                 },
@@ -1609,6 +1611,7 @@ x-swarmlite:
                 image_progress: Vec::new(),
                 gateway: GatewayReport {
                     applied_generation: Some(snapshot.generation),
+                    image: None,
                     error: None,
                     retryable: true,
                 },
@@ -1632,6 +1635,7 @@ x-swarmlite:
                 image_progress: Vec::new(),
                 gateway: GatewayReport {
                     applied_generation: Some(gateway_generation),
+                    image: None,
                     error: None,
                     retryable: true,
                 },
@@ -1661,6 +1665,7 @@ x-swarmlite:
                 image_progress: Vec::new(),
                 gateway: GatewayReport {
                     applied_generation: Some(gateway_generation),
+                    image: None,
                     error: None,
                     retryable: true,
                 },
@@ -2097,6 +2102,7 @@ fn test_node() -> NodeRecord {
     NodeRecord {
         id: "node-a".into(),
         address: "127.0.0.1".into(),
+        swarmlite_version: Some("0.1.25".into()),
         labels: BTreeMap::new(),
         cpu_millis: 1000,
         memory_bytes: 1024,
@@ -2250,6 +2256,12 @@ async fn migrates_the_legacy_gateway_image_and_preserves_explicit_pins() {
     cluster.gateway.managed_image = false;
     let directory = tempfile::tempdir().unwrap();
     let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
+    let mut before = repository.initialize_with_cluster(&cluster).await.unwrap();
+    before.state.gateway_generation = 7;
+    repository
+        .replace(before.generation, &before.cluster, &before.state)
+        .await
+        .unwrap();
     let controller = Controller::new(
         test_controller_config(&cluster),
         "0123456789abcdef".into(),
@@ -2258,9 +2270,14 @@ async fn migrates_the_legacy_gateway_image_and_preserves_explicit_pins() {
     .await
     .unwrap();
 
-    let migrated = repository.load().await.unwrap().cluster.gateway;
-    assert_eq!(migrated.image, crate::model::DEFAULT_GATEWAY_IMAGE);
-    assert!(migrated.managed_image);
+    let migrated = repository.load().await.unwrap();
+    assert_eq!(
+        migrated.cluster.gateway.image,
+        crate::model::DEFAULT_GATEWAY_IMAGE
+    );
+    assert!(migrated.cluster.gateway.managed_image);
+    assert_eq!(migrated.state.gateway_generation, 8);
+    assert_eq!(controller.inner.lock().await.gateway_generation, 8);
 
     let pinned = controller
         .update_cluster_config(ClusterConfigUpdate {
@@ -2520,6 +2537,7 @@ async fn caddy_acknowledgement_starts_drain_deadline() {
                 image_progress: Vec::new(),
                 gateway: GatewayReport {
                     applied_generation: Some(desired.generation),
+                    image: Some("ghcr.io/feichao/swarmlite-gateway:v0.1.25".into()),
                     error: None,
                     retryable: true,
                 },
@@ -2556,6 +2574,7 @@ async fn gateway_failures_are_exposed_in_status() {
                 image_progress: Vec::new(),
                 gateway: GatewayReport {
                     applied_generation: None,
+                    image: Some("ghcr.io/feichao/swarmlite-gateway:v0.1.22".into()),
                     error: Some("failed to bind gateway port 80".into()),
                     retryable: false,
                 },
@@ -2588,6 +2607,11 @@ async fn gateway_failures_are_exposed_in_status() {
         Some(gateway_status.desired_generation)
     );
     assert_eq!(node.applied_generation, None);
+    assert_eq!(node.swarmlite_version.as_deref(), Some("0.1.25"));
+    assert_eq!(
+        node.image.as_deref(),
+        Some("ghcr.io/feichao/swarmlite-gateway:v0.1.22")
+    );
     assert_eq!(node.retryable, Some(false));
     assert_eq!(
         node.error.as_deref(),

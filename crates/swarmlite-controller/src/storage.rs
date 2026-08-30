@@ -1005,6 +1005,7 @@ x-swarmlite:
             NodeRecord {
                 id: "soft-node".into(),
                 address: "10.0.0.2".into(),
+                swarmlite_version: None,
                 labels: Default::default(),
                 cpu_millis: 1000,
                 memory_bytes: 1024,

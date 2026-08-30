@@ -490,6 +490,7 @@ mod tests {
                 NodeRecord {
                     id: id.into(),
                     address: "127.0.0.1".into(),
+                    swarmlite_version: None,
                     labels: BTreeMap::new(),
                     cpu_millis: 1000,
                     memory_bytes: 1024,

@@ -841,6 +841,8 @@ pub struct StackDeploymentError {
 pub struct NodeRecord {
     pub id: String,
     pub address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swarmlite_version: Option<String>,
     pub labels: BTreeMap<String, String>,
     pub cpu_millis: u64,
     pub memory_bytes: u64,
@@ -1087,6 +1089,8 @@ pub struct NodeControl {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GatewayReport {
     pub applied_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default = "default_gateway_retryable")]
@@ -1101,6 +1105,7 @@ impl Default for GatewayReport {
     fn default() -> Self {
         Self {
             applied_generation: None,
+            image: None,
             error: None,
             retryable: true,
         }
@@ -1261,6 +1266,10 @@ pub struct GatewayPublicHttpTimeoutsConfig {
 pub struct GatewayNodeStatus {
     pub node_id: String,
     pub address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swarmlite_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
     pub enabled: bool,
     pub status: GatewayNodeStatusKind,
     pub desired_generation: Option<u64>,

@@ -16,10 +16,17 @@ impl Controller {
             .map(|task| (task.node_id.clone(), Instant::now()))
             .collect();
 
-        let mut changed = refresh_managed_gateway_image(&mut versioned.cluster.gateway);
+        let gateway_image_changed = refresh_managed_gateway_image(&mut versioned.cluster.gateway);
+        let mut changed = gateway_image_changed;
         let gateway_generation = if versioned.state.gateway_generation == 0 {
             changed = true;
             versioned.generation.max(1)
+        } else if gateway_image_changed {
+            versioned
+                .state
+                .gateway_generation
+                .checked_add(1)
+                .ok_or_else(|| StorageError::Backend("gateway generation overflow".to_owned()))?
         } else {
             versioned.state.gateway_generation
         };

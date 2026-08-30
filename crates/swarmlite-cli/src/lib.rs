@@ -3353,6 +3353,14 @@ fn format_gateway_status(response: &GatewayClusterStatusResponse, color: bool) -
             vec![
                 ansi(color, "1;36", &node.node_id),
                 node.address.clone(),
+                node.swarmlite_version
+                    .as_deref()
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| ansi(color, "2", "-")),
+                node.image
+                    .as_deref()
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| ansi(color, "2", "-")),
                 style_bool(node.enabled, color),
                 ansi(color, status_color, status),
                 style_optional_generation(node.desired_generation, color, generations_match),
@@ -3372,6 +3380,8 @@ fn format_gateway_status(response: &GatewayClusterStatusResponse, color: bool) -
         &[
             "NODE",
             "ADDRESS",
+            "SWARMLITE",
+            "GATEWAY IMAGE",
             "ENABLED",
             "STATUS",
             "DESIRED",
@@ -4679,6 +4689,8 @@ mod tests {
             nodes: vec![GatewayNodeStatus {
                 node_id: "node-a".into(),
                 address: "10.0.0.1".into(),
+                swarmlite_version: Some("0.1.25".into()),
+                image: Some("ghcr.io/feichao/swarmlite-gateway:v0.1.25".into()),
                 enabled: true,
                 status: GatewayNodeStatusKind::Ready,
                 desired_generation: Some(7),
@@ -4695,6 +4707,10 @@ mod tests {
         assert!(output.contains("Read-header timeout seconds:    0"));
         assert!(output.contains("NODE"));
         assert!(output.contains("node-a"));
+        assert!(output.contains("SWARMLITE"));
+        assert!(output.contains("0.1.25"));
+        assert!(output.contains("GATEWAY IMAGE"));
+        assert!(output.contains("ghcr.io/feichao/swarmlite-gateway:v0.1.25"));
         assert!(output.contains("ready"));
 
         let colored = format_gateway_status(&response, true);

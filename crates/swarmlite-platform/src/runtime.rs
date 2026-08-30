@@ -490,6 +490,17 @@ impl DockerCompatibleRuntime {
         self.create_gateway(spec).await
     }
 
+    pub async fn gateway_image(&self) -> Result<Option<String>> {
+        let gateways = self.gateway_containers().await?;
+        if gateways.len() > 1 {
+            bail!("found multiple managed Gateway containers on this node");
+        }
+        Ok(gateways
+            .into_iter()
+            .next()
+            .and_then(|gateway| gateway.image))
+    }
+
     pub async fn apply_gateway_config(&self, assignment: &GatewayAssignment) -> Result<()> {
         if assignment.recovery_snapshot.generation != assignment.generation {
             bail!(
@@ -1121,8 +1132,17 @@ impl DockerCompatibleRuntime {
             .from_image(image)
             .build();
         let mut pull = self.client.create_image(Some(options), None, credentials);
+        let mut last_progress_at = std::time::Instant::now();
+        let mut layer_progress = HashMap::<String, u64>::new();
         loop {
-            let item = tokio::time::timeout(idle_timeout, pull.next())
+            let remaining = idle_timeout.saturating_sub(last_progress_at.elapsed());
+            if remaining.is_zero() {
+                bail!(
+                    "image pull for {image} made no progress for {} seconds",
+                    idle_timeout.as_secs()
+                );
+            }
+            let item = tokio::time::timeout(remaining, pull.next())
                 .await
                 .with_context(|| {
                     format!(
@@ -1137,12 +1157,20 @@ impl DockerCompatibleRuntime {
             if let Some(message) = item.error_detail.and_then(|detail| detail.message) {
                 bail!("registry rejected image pull for {image}: {message}");
             }
+            let layer = item.id.unwrap_or_default();
             let (current, total) = item.progress_detail.map_or((None, None), |detail| {
                 (
                     detail.current.and_then(|value| u64::try_from(value).ok()),
                     detail.total.and_then(|value| u64::try_from(value).ok()),
                 )
             });
+            if let Some(current) = current {
+                let previous = layer_progress.entry(layer).or_default();
+                if current > *previous {
+                    *previous = current;
+                    last_progress_at = std::time::Instant::now();
+                }
+            }
             report(attempt, current, total);
         }
         Ok(())
@@ -2196,6 +2224,29 @@ mod tests {
             .unwrap()
     }
 
+    async fn noisy_stalled_pull_docker_api(method: Method, uri: Uri) -> axum::response::Response {
+        if method != Method::POST || !uri.path().ends_with("/images/create") {
+            return axum::response::Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::empty())
+                .unwrap();
+        }
+        let retrying = futures_util::stream::unfold((), |()| async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            Some((
+                Ok::<_, Infallible>(Bytes::from_static(
+                    b"{\"status\":\"Retrying in 1 second\"}\n",
+                )),
+                (),
+            ))
+        });
+        axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from_stream(retrying))
+            .unwrap()
+    }
+
     async fn runtime_for_pull_api(
         app: Router,
         policy: DeploymentPolicy,
@@ -2409,6 +2460,27 @@ mod tests {
             .pull_image("example.invalid/demo:latest", |_, _, _| {})
             .await
             .unwrap_err();
+        server.abort();
+
+        assert!(format!("{error:#}").contains("made no progress for 1 seconds"));
+    }
+
+    #[tokio::test]
+    async fn image_pull_status_messages_do_not_reset_the_idle_deadline() {
+        let app = Router::new().fallback(any(noisy_stalled_pull_docker_api));
+        let policy = DeploymentPolicy {
+            image_pull_idle_timeout_seconds: 1,
+            image_pull_max_attempts: 1,
+            ..DeploymentPolicy::default()
+        };
+        let (runtime, server) = runtime_for_pull_api(app, policy).await;
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            runtime.pull_image("example.invalid/demo:latest", |_, _, _| {}),
+        )
+        .await
+        .expect("pull should respect its idle deadline")
+        .unwrap_err();
         server.abort();
 
         assert!(format!("{error:#}").contains("made no progress for 1 seconds"));

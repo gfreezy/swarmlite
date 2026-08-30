@@ -31,6 +31,12 @@ impl Controller {
                 GatewayNodeStatus {
                     node_id: member.id.clone(),
                     address: member.address.clone(),
+                    swarmlite_version: inner
+                        .state
+                        .nodes
+                        .get(&member.id)
+                        .and_then(|node| node.swarmlite_version.clone()),
+                    image: report.and_then(|report| report.image.clone()),
                     enabled: member.gateway_enabled,
                     status,
                     desired_generation: member.gateway_enabled.then_some(inner.gateway_generation),

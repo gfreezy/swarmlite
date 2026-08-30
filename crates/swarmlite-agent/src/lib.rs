@@ -121,6 +121,7 @@ async fn run_with_runtime<R: ContainerRuntime>(
     let mut node = NodeRecord {
         id: config.node_id.clone(),
         address: config.advertise_address.clone(),
+        swarmlite_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
         labels: config.labels.clone(),
         cpu_millis: system.cpu_millis,
         memory_bytes: system.memory_bytes,
@@ -1645,6 +1646,7 @@ mod tests {
         let now = std::time::Instant::now();
         let transient = GatewayReport {
             applied_generation: None,
+            image: None,
             error: Some("Docker temporarily unavailable".into()),
             retryable: true,
         };
@@ -1657,6 +1659,7 @@ mod tests {
 
         let port_conflict = GatewayReport {
             applied_generation: None,
+            image: None,
             error: Some("Gateway port 80 is occupied".into()),
             retryable: false,
         };

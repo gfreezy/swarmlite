@@ -429,24 +429,27 @@ impl NodeSupervisor {
                     local_state.put(NODE_KEY, &settings)?;
                     let has_gateway = settings.gateway_enabled;
                     if has_gateway {
+                        let reconcile_result = runtime.reconcile_gateway(
+                            &gateway_container_spec(
+                                &settings,
+                                &advertise_address,
+                                &public_controller,
+                            ),
+                            true,
+                        ).await;
+                        let gateway_image = observed_gateway_image(&runtime).await;
                         let mut report = gateway_operation_report(
                             "failed to reconcile enabled gateway",
                             None,
-                            runtime.reconcile_gateway(
-                                &gateway_container_spec(
-                                    &settings,
-                                    &advertise_address,
-                                    &public_controller,
-                                ),
-                                true,
-                            )
-                            .await,
+                            gateway_image.clone(),
+                            reconcile_result,
                         );
                         let reconciled = report.error.is_none();
                         if reconciled && let Some(assignment) = &control.gateway_config {
                             report = gateway_operation_report(
                                 "failed to apply gateway configuration",
                                 Some(assignment.generation),
+                                gateway_image,
                                 runtime.apply_gateway_config(assignment).await,
                             );
                         }
@@ -456,18 +459,19 @@ impl NodeSupervisor {
                         }
                         gateway_reconciled = true;
                     } else if had_gateway || !gateway_reconciled {
+                        let reconcile_result = runtime.reconcile_gateway(
+                            &gateway_container_spec(
+                                &settings,
+                                &advertise_address,
+                                &public_controller,
+                            ),
+                            false,
+                        ).await;
                         let report = gateway_operation_report(
                             "failed to remove disabled gateway",
                             None,
-                            runtime.reconcile_gateway(
-                                &gateway_container_spec(
-                                    &settings,
-                                    &advertise_address,
-                                    &public_controller,
-                                ),
-                                false,
-                            )
-                            .await,
+                            observed_gateway_image(&runtime).await,
+                            reconcile_result,
                         );
                         if report.error.is_none() {
                             info!("gateway disabled; removed independent Caddy container");
@@ -520,11 +524,13 @@ fn gateway_container_spec(
 fn gateway_operation_report(
     operation: &'static str,
     applied_generation: Option<u64>,
+    image: Option<String>,
     result: Result<()>,
 ) -> GatewayReport {
     match result {
         Ok(()) => GatewayReport {
             applied_generation,
+            image,
             error: None,
             retryable: true,
         },
@@ -534,9 +540,20 @@ fn gateway_operation_report(
             warn!(%error, retryable, "gateway operation failed; continuing node service");
             GatewayReport {
                 applied_generation: None,
+                image,
                 error: Some(error),
                 retryable,
             }
+        }
+    }
+}
+
+async fn observed_gateway_image(runtime: &DockerCompatibleRuntime) -> Option<String> {
+    match runtime.gateway_image().await {
+        Ok(image) => image,
+        Err(error) => {
+            warn!(%error, "failed to observe the managed Gateway image");
+            None
         }
     }
 }
@@ -1406,18 +1423,31 @@ mod tests {
 
     #[test]
     fn gateway_operations_become_heartbeat_reports() {
-        let success =
-            gateway_operation_report("failed to apply gateway configuration", Some(7), Ok(()));
+        let success = gateway_operation_report(
+            "failed to apply gateway configuration",
+            Some(7),
+            Some("ghcr.io/feichao/swarmlite-gateway:v0.1.25".into()),
+            Ok(()),
+        );
         assert_eq!(success.applied_generation, Some(7));
+        assert_eq!(
+            success.image.as_deref(),
+            Some("ghcr.io/feichao/swarmlite-gateway:v0.1.25")
+        );
         assert_eq!(success.error, None);
         assert!(success.retryable);
 
         let failure = gateway_operation_report(
             "failed to reconcile gateway during node startup",
             Some(7),
+            Some("ghcr.io/feichao/swarmlite-gateway:v0.1.22".into()),
             Err(anyhow::anyhow!("port 80 is already allocated")),
         );
         assert_eq!(failure.applied_generation, None);
+        assert_eq!(
+            failure.image.as_deref(),
+            Some("ghcr.io/feichao/swarmlite-gateway:v0.1.22")
+        );
         assert!(failure.retryable);
         assert_eq!(
             failure.error.as_deref(),
