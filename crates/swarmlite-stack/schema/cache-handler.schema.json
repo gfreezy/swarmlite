@@ -1,109 +1,67 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/gfreezy/swarmlite/main/crates/swarmlite-stack/schema/cache-handler.schema.json",
-  "title": "Caddy cache-handler route configuration",
-  "description": "Cache settings passed through to Caddy's http.handlers.cache DefaultCache configuration. Swarmlite supplies the native handler envelope, bypass mode, and the gateway's managed SQLite storage.",
+  "title": "Swarmlite Gateway response cache",
+  "description": "Route-level settings for Swarmlite's native Caddy HTTP cache handler and managed SQLite response store.",
   "type": "object",
   "properties": {
-    "log_level": { "type": "string" },
-    "allowed_http_verbs": {
+    "ttl": {
+      "$ref": "#/$defs/duration",
+      "default": "5m",
+      "description": "How long a stored response remains fresh."
+    },
+    "methods": {
       "type": "array",
-      "items": { "type": "string" }
-    },
-    "allowed_additional_status_codes": {
-      "type": "array",
-      "items": { "type": "integer", "minimum": 100, "maximum": 599 }
-    },
-    "headers": {
-      "type": "array",
-      "items": { "type": "string" }
-    },
-    "nats": { "$ref": "#/$defs/provider" },
-    "nuts": { "$ref": "#/$defs/provider" },
-    "otter": { "$ref": "#/$defs/provider" },
-    "etcd": { "$ref": "#/$defs/provider" },
-    "redis": { "$ref": "#/$defs/provider" },
-    "olric": { "$ref": "#/$defs/provider" },
-    "simplefs": { "$ref": "#/$defs/provider" },
-    "key": { "$ref": "#/$defs/key" },
-    "cache_keys": {
-      "type": "object",
-      "additionalProperties": { "$ref": "#/$defs/key" }
-    },
-    "timeout": {
-      "type": "object",
-      "properties": {
-        "backend": { "$ref": "#/$defs/duration" },
-        "cache": { "$ref": "#/$defs/duration" }
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$",
+        "not": { "enum": ["CONNECT", "connect"] }
       },
-      "additionalProperties": true
+      "description": "Optional method allowlist. When omitted, every ordinary HTTP method is cacheable; CONNECT and protocol upgrades always bypass the cache."
     },
-    "ttl": { "$ref": "#/$defs/duration" },
-    "stale": { "$ref": "#/$defs/duration" },
-    "storers": {
-      "type": "array",
-      "items": { "type": "string" }
-    },
-    "default_cache_control": { "type": "string" },
-    "cache_name": { "type": "string" },
     "max_cacheable_body_bytes": {
       "type": "integer",
-      "minimum": 0
+      "minimum": 1,
+      "default": 10485760,
+      "description": "Maximum response body captured for one cache entry."
     },
-    "disable_coalescing": { "type": "boolean" },
-    "distributed": { "type": "boolean" },
-    "regex": {
-      "type": "object",
-      "properties": {
-        "exclude": { "type": "string" }
+    "max_request_body_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 1048576,
+      "description": "Maximum request body hashed into a cache key; larger requests bypass the cache."
+    },
+    "key_headers": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
       },
-      "additionalProperties": true
+      "description": "Request headers always included in the variant key, in addition to fields named by the origin response's Vary header."
     },
-    "cdn": {
-      "type": "object",
-      "additionalProperties": true
+    "status_codes": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "integer",
+        "minimum": 200,
+        "maximum": 599,
+        "not": { "const": 304 }
+      },
+      "default": [200],
+      "description": "Response status codes eligible for storage."
     }
   },
-  "propertyNames": {
-    "not": {
-      "enum": ["handler", "Configuration", "mode"]
-    }
-  },
-  "additionalProperties": true,
+  "additionalProperties": false,
   "$defs": {
     "duration": {
       "type": "string",
       "minLength": 1,
-      "description": "A Go duration such as 500ms, 60s, or 5m."
-    },
-    "provider": {
-      "type": "object",
-      "properties": {
-        "found": { "type": "boolean" },
-        "url": { "type": "string" },
-        "path": { "type": "string" },
-        "configuration": { "type": "object" }
-      },
-      "additionalProperties": true
-    },
-    "key": {
-      "type": "object",
-      "properties": {
-        "disable_body": { "type": "boolean" },
-        "disable_host": { "type": "boolean" },
-        "disable_method": { "type": "boolean" },
-        "disable_query": { "type": "boolean" },
-        "disable_scheme": { "type": "boolean" },
-        "disable_vary": { "type": "boolean" },
-        "hash": { "type": "boolean" },
-        "hide": { "type": "boolean" },
-        "template": { "type": "string" },
-        "headers": {
-          "type": "array",
-          "items": { "type": "string" }
-        }
-      },
-      "additionalProperties": true
+      "description": "A duration such as 500ms, 60s, or 5m."
     }
   }
 }

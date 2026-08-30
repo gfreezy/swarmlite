@@ -10,8 +10,6 @@ RUN /out/caddy list-modules | grep -qx 'http.handlers.cache'
 RUN /out/caddy list-modules | grep -qx 'http.handlers.encode'
 RUN /out/caddy list-modules | grep -qx 'http.encoders.zstd'
 RUN /out/caddy list-modules | grep -qx 'http.encoders.gzip'
-RUN /out/caddy list-modules | grep -qx 'storages.cache.sqlite'
-RUN /out/caddy list-modules | grep -qx 'storages.cache.simplefs'
 
 FROM caddy:2.11.2-alpine
 COPY --from=build /out/caddy /usr/bin/caddy

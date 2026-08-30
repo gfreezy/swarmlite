@@ -87,19 +87,7 @@ pub fn config(state: &ClusterState, gateway: &ClusterGatewayConfig, controller: 
     if let Some(seconds) = gateway.shutdown.grace_period_seconds {
         http_object.insert("grace_period".to_owned(), duration(seconds));
     }
-    let mut apps = json!({ "http": http });
-    if state.gateway_routes.values().any(|stack| {
-        stack
-            .gateway
-            .http_routes
-            .iter()
-            .flat_map(|route| &route.rules)
-            .any(|rule| rule.cache.is_some())
-    }) {
-        apps.as_object_mut()
-            .expect("apps is an object")
-            .insert("cache".to_owned(), cache_app());
-    }
+    let apps = json!({ "http": http });
 
     let mut config = json!({
         "admin": {
@@ -275,25 +263,6 @@ fn stack_fragment(state: &ClusterState, stack_name: &str) -> Option<RecoveredSta
     })
 }
 
-fn cache_app() -> Value {
-    json!({
-        // cache-handler v0.16.0 only dispatches a fixed provider list. The
-        // Gateway image registers its SQLite storer through the SimpleFS slot
-        // until cache-handler accepts native third-party provider names.
-        "simplefs": {
-            "found": true,
-            "path": "/cache/sqlite/cache.db",
-            "configuration": {
-                "read_connections": 4,
-                "cleanup_interval": "5m",
-                "mapping_scan_interval": "1m",
-                "journal_size_limit": 67108864
-            }
-        },
-        "mode": "bypass"
-    })
-}
-
 pub fn service_ports(state: &ClusterState, service: &ServiceRecord) -> BTreeSet<u16> {
     state
         .stacks
@@ -413,7 +382,7 @@ x-swarmlite:
     }
 
     #[test]
-    fn only_configures_the_cache_app_for_cached_routes() {
+    fn keeps_cache_configuration_inside_cached_routes() {
         let uncached = config(
             &ClusterState::default(),
             &gateway_with_listen(&[":80"]),
@@ -452,24 +421,17 @@ x-swarmlite:
         assert!(replace_stack_route(&mut state, "demo"));
 
         let cached = config(&state, &gateway_with_listen(&[":80"]), "controller".into());
-        assert_eq!(cached["apps"]["cache"]["mode"], "bypass");
-        assert_eq!(
-            cached["apps"]["cache"]["simplefs"]["path"],
-            "/cache/sqlite/cache.db"
-        );
-        assert!(
-            cached["apps"]["cache"]["simplefs"]["configuration"]
-                .get("cache_size_kib")
-                .is_none()
-        );
-        assert_eq!(
-            cached["apps"]["cache"]["simplefs"]["configuration"]["read_connections"],
-            4
-        );
-        assert_eq!(
-            cached["apps"]["cache"]["simplefs"]["configuration"]["mapping_scan_interval"],
-            "1m"
-        );
+        assert!(cached["apps"].get("cache").is_none());
+        let cache = cached["apps"]["http"]["servers"]["swarmlite"]["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|route| route["handle"].as_array().into_iter().flatten())
+            .find(|handler| handler["handler"] == "cache")
+            .unwrap();
+        assert_eq!(cache["path"], "/cache/sqlite/cache.db");
+        assert_eq!(cache["read_connections"], 4);
+        assert_eq!(cache["cleanup_interval"], "5m");
     }
 
     #[test]

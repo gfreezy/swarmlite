@@ -3,12 +3,9 @@ module github.com/swarmlite/swarmlite/caddy-storage
 go 1.26.1
 
 require (
-	github.com/caddyserver/cache-handler v0.16.0
 	github.com/caddyserver/caddy/v2 v2.11.2
 	github.com/caddyserver/certmagic v0.25.2
-	github.com/darkweak/storages/core v0.0.19
 	github.com/klauspost/compress v1.18.4
-	github.com/pierrec/lz4/v4 v4.1.26
 	go.uber.org/zap v1.27.1
 	modernc.org/sqlite v1.57.0
 )
@@ -41,8 +38,6 @@ require (
 	github.com/cloudflare/circl v1.6.3 // indirect
 	github.com/coreos/go-oidc/v3 v3.17.0 // indirect
 	github.com/cpuguy83/go-md2man/v2 v2.0.7 // indirect
-	github.com/darkweak/go-esi v0.0.5 // indirect
-	github.com/darkweak/souin v1.7.7 // indirect
 	github.com/dgraph-io/badger v1.6.2 // indirect
 	github.com/dgraph-io/badger/v2 v2.2007.4 // indirect
 	github.com/dgraph-io/ristretto v0.2.0 // indirect
@@ -90,7 +85,6 @@ require (
 	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 // indirect
 	github.com/pires/go-proxyproto v0.11.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	github.com/pquerna/cachecontrol v0.2.0 // indirect
 	github.com/prometheus/client_golang v1.23.2 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.67.5 // indirect

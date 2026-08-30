@@ -2,11 +2,11 @@
 
 When a node has its Gateway enabled, `swarmlite serve` creates an independent Caddy container with
 its own restart policy and persistent `/data`, `/config`, and `/cache` volumes. The default gateway
-image includes this directory's `caddy.storage.swarmlite` and
-`http.handlers.swarmlite_gateway_probe` modules, Caddy's `http.handlers.cache` and
-`http.handlers.encode`, and the standard `zstd` and `gzip` encoders. It also includes the
-`storages.cache.sqlite` provider. The Badger response-cache engine and Caddy storage module are no
-longer linked. No separately maintained Compose stack is required.
+image includes this directory's `caddy.storage.swarmlite`,
+`http.handlers.swarmlite_gateway_probe`, and native `http.handlers.cache` modules, Caddy's
+`http.handlers.encode`, and the standard `zstd` and `gzip` encoders. The response cache persists
+directly to SQLite; cache-handler, Souin, and their storage-provider abstraction are not linked.
+No separately maintained Compose stack is required.
 
 The module consumes Swarmlite's generic KV and lock APIs; those APIs contain no Caddy-specific
 behavior. The authoritative certificate storage remains local CertMagic `FileStorage`, while
@@ -47,10 +47,9 @@ swarmlite config set gateway-image registry.example.com/swarmlite-caddy:1.1.0
 
 The image reference is stored in the controller's SQLite database. The selected image must provide
 `caddy`, `caddy.storage.swarmlite`, `http.handlers.swarmlite_gateway_probe`,
-`http.handlers.cache`, `http.handlers.encode`, `http.encoders.zstd`, `http.encoders.gzip`, and
-`storages.cache.sqlite`, and the temporary `storages.cache.simplefs` compatibility bridge. Gateway
-nodes pull it before replacing an existing container, and keep the existing `/data`, `/config`,
-and `/cache` volumes.
+`http.handlers.cache`, `http.handlers.encode`, `http.encoders.zstd`, and `http.encoders.gzip`.
+Gateway nodes pull it before replacing an existing container, and keep the existing `/data`,
+`/config`, and `/cache` volumes.
 
 ## Automatic configuration
 
@@ -60,19 +59,22 @@ injects the cluster token through `SWARMLITE_TOKEN` and the node ID through
 configuration. The node atomically loads the complete configuration through Caddy's loopback-only
 admin API. The token is not written into Caddy's JSON configuration or container labels.
 
-The generated global cache application uses `mode: bypass` and a SQLite database at
+Each Stack rule with a `cache` object receives Swarmlite's native `http.handlers.cache`; uncached
+routes are untouched and no global cache application is generated. The handler stores complete
+status, headers, body, freshness timestamps, and `Vary` dimensions in
 `/cache/sqlite/cache.db`. SQLite runs in WAL mode with one serialized writer and four query-only
-reader connections. Every connection has a 4 MiB page-cache ceiling, mmap is disabled, expiry is
-cleaned every five minutes, and a storage-level guard coalesces Souin's mapping scan to at most
-once per minute. This keeps SQLite's aggregate page-cache budget near 20 MiB while allowing cache
-hits to run concurrently. A route only receives `http.handlers.cache` when its Stack rule has a
-`cache` object. Consequently uncached routes are untouched, while cached routes use their declared
-TTL without consulting upstream `Cache-Control` headers.
+reader connections, mmap is disabled, and expired rows are cleaned every five minutes. A schema
+upgrade drops old response-cache rows because the volume contains disposable cache data.
 
-cache-handler v0.16.0 hard-codes its provider dispatch list. Until it supports third-party names,
-the managed configuration reaches SQLite through the otherwise-unused `simplefs` provider slot;
-the Gateway image registers that slot as a bridge to the same SQLite implementation. Cache data
-is still stored in the SQLite database above, not as SimpleFS files.
+The declared route TTL controls freshness. `no-store`, `private`, `no-cache`, `Set-Cookie`,
+authorization, conditional, range, CONNECT, and protocol-upgrade requests use conservative cache
+behavior. Cache keys contain scheme, host, method, path, query, request-body hash and content type,
+configured `key_headers`, and response `Vary` fields. A `methods` allowlist is optional; when it is
+absent, an explicitly cached route accepts all ordinary HTTP methods. Request bodies above
+`max_request_body_bytes` and responses above `max_cacheable_body_bytes` bypass storage. Concurrent
+misses for the same key are coalesced, and SQLite errors fail open to the upstream. Expired entries
+are never served; stale-while-revalidate, stale-if-error, conditional revalidation, and purge APIs
+remain outside this first native-cache phase.
 
 Generated proxy routes put `http.handlers.encode` before cache and reverse-proxy handlers. Caddy
 therefore negotiates Zstandard or gzip after the downstream response is produced, uses its

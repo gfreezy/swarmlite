@@ -220,8 +220,25 @@ pub struct HttpRouteRule {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rewrite: Option<HttpPathRewrite>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache: Option<serde_json::Map<String, Value>>,
+    pub cache: Option<HttpCacheSpec>,
     pub backend: HttpBackend,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct HttpCacheSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub methods: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cacheable_body_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_request_body_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_headers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_codes: Option<Vec<u16>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -705,18 +722,70 @@ fn validate_rewrite_path(path: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_cache(cache: Option<&serde_json::Map<String, Value>>) -> Result<()> {
+fn validate_cache(cache: Option<&HttpCacheSpec>) -> Result<()> {
     let Some(cache) = cache else {
         return Ok(());
     };
 
-    for field in ["handler", "Configuration", "mode"] {
-        if cache.contains_key(field) {
-            bail!("{field} is managed by Swarmlite and must not be set");
+    if let Some(ttl) = cache.ttl.as_deref() {
+        let duration = humantime::parse_duration(ttl)
+            .with_context(|| format!("cache ttl {ttl:?} is invalid"))?;
+        if duration.is_zero() {
+            bail!("cache ttl must be positive");
+        }
+    }
+    if cache.max_cacheable_body_bytes == Some(0) {
+        bail!("cache max_cacheable_body_bytes must be positive");
+    }
+    if cache
+        .max_cacheable_body_bytes
+        .is_some_and(|value| value > i64::MAX as u64)
+    {
+        bail!("cache max_cacheable_body_bytes is too large");
+    }
+    if cache.max_request_body_bytes == Some(0) {
+        bail!("cache max_request_body_bytes must be positive");
+    }
+    if cache
+        .max_request_body_bytes
+        .is_some_and(|value| value > i64::MAX as u64)
+    {
+        bail!("cache max_request_body_bytes is too large");
+    }
+    if let Some(methods) = cache.methods.as_ref() {
+        if methods.is_empty() {
+            bail!("cache methods must not be empty");
+        }
+        for method in methods {
+            if !valid_http_header_name(method) || method.eq_ignore_ascii_case("CONNECT") {
+                bail!("cache method {method:?} is unsupported");
+            }
+        }
+    }
+    for header in &cache.key_headers {
+        if !valid_http_header_name(header) {
+            bail!("cache key header {header:?} is invalid");
+        }
+    }
+    if let Some(statuses) = cache.status_codes.as_ref() {
+        if statuses.is_empty() {
+            bail!("cache status_codes must not be empty");
+        }
+        for status in statuses {
+            if *status < 200 || *status > 599 || *status == 304 {
+                bail!("cache status code {status} is unsupported");
+            }
         }
     }
 
     Ok(())
+}
+
+fn valid_http_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
 }
 
 fn normalize_backend(
@@ -869,27 +938,18 @@ fn encode_handler() -> Value {
     })
 }
 
-fn cache_handler(cache: &serde_json::Map<String, Value>) -> Value {
-    // cache-handler's native JSON keeps the effective route settings under
-    // Configuration.DefaultCache. Keep the stack syntax flat while passing
-    // every unmodeled field through to that object.
-    let mut default_cache = cache.clone();
-    let cache_keys = default_cache.remove("cache_keys");
-    let log_level = default_cache.remove("log_level");
-
-    let mut configuration = serde_json::Map::new();
-    configuration.insert("DefaultCache".to_owned(), Value::Object(default_cache));
-    if let Some(cache_keys) = cache_keys {
-        configuration.insert("cache_keys".to_owned(), cache_keys);
-    }
-    if let Some(log_level) = log_level {
-        configuration.insert("LogLevel".to_owned(), log_level);
-    }
-
-    json!({
-        "handler": "cache",
-        "Configuration": configuration,
-    })
+fn cache_handler(cache: &HttpCacheSpec) -> Value {
+    let mut handler = serde_json::to_value(cache)
+        .expect("HTTP cache settings serialize")
+        .as_object()
+        .expect("HTTP cache settings serialize as an object")
+        .clone();
+    handler.insert("handler".to_owned(), json!("cache"));
+    handler.insert("path".to_owned(), json!("/cache/sqlite/cache.db"));
+    handler.insert("read_connections".to_owned(), json!(4));
+    handler.insert("cleanup_interval".to_owned(), json!("5m"));
+    handler.insert("journal_size_limit".to_owned(), json!(67_108_864));
+    Value::Object(handler)
 }
 
 fn redirect_route(
@@ -1397,15 +1457,12 @@ x-swarmlite:
           rewrite:
             strip_prefix: true
           cache:
-            log_level: debug
             ttl: 5m
-            stale: 30s
-            key:
-              hash: true
-              headers: [Accept-Language]
-            cache_keys:
-              ^https://cache.example.com/public/.*:
-                hide: true
+            methods: [GET, POST]
+            max_cacheable_body_bytes: 1048576
+            max_request_body_bytes: 65536
+            key_headers: [Accept-Language]
+            status_codes: [200, 404]
           backend:
             service: api
 "#,
@@ -1422,22 +1479,19 @@ x-swarmlite:
 
         assert_eq!(handlers[0]["handler"], "encode");
         assert_eq!(handlers[1]["handler"], "cache");
-        let cache = &handlers[1]["Configuration"]["DefaultCache"];
-        assert_eq!(cache["ttl"], "5m");
-        assert_eq!(cache["stale"], "30s");
-        assert_eq!(cache["key"]["hash"], true);
-        assert_eq!(cache["key"]["headers"], json!(["Accept-Language"]));
-        assert_eq!(handlers[1]["Configuration"]["LogLevel"], "debug");
-        assert_eq!(
-            handlers[1]["Configuration"]["cache_keys"]["^https://cache.example.com/public/.*"]["hide"],
-            true
-        );
+        assert_eq!(handlers[1]["ttl"], "5m");
+        assert_eq!(handlers[1]["methods"], json!(["GET", "POST"]));
+        assert_eq!(handlers[1]["max_cacheable_body_bytes"], 1_048_576);
+        assert_eq!(handlers[1]["max_request_body_bytes"], 65_536);
+        assert_eq!(handlers[1]["key_headers"], json!(["Accept-Language"]));
+        assert_eq!(handlers[1]["status_codes"], json!([200, 404]));
+        assert_eq!(handlers[1]["path"], "/cache/sqlite/cache.db");
         assert_eq!(handlers[2]["handler"], "rewrite");
         assert_eq!(handlers[3]["handler"], "reverse_proxy");
     }
 
     #[test]
-    fn rejects_overriding_the_managed_cache_handler_name() {
+    fn rejects_fields_from_the_removed_cache_handler_abstraction() {
         let error = parse_stack(
             r#"
 services:
@@ -1456,11 +1510,11 @@ x-swarmlite:
         )
         .unwrap_err();
 
-        assert!(format!("{error:#}").contains("handler is managed by Swarmlite"));
+        assert!(format!("{error:#}").contains("unknown field `handler`"));
     }
 
     #[test]
-    fn rejects_overriding_the_gateway_managed_cache_mode() {
+    fn rejects_removed_souin_cache_modes() {
         let error = parse_stack(
             r#"
 services:
@@ -1479,7 +1533,7 @@ x-swarmlite:
         )
         .unwrap_err();
 
-        assert!(format!("{error:#}").contains("mode is managed by Swarmlite"));
+        assert!(format!("{error:#}").contains("unknown field `mode`"));
     }
 
     #[test]

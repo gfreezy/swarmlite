@@ -22,11 +22,13 @@ cluster state.
 The editor schema is at [schema/stack.schema.json](schema/stack.schema.json). Route-level `cache`
 completion is kept separately in
 [schema/cache-handler.schema.json](schema/cache-handler.schema.json) and referenced by the main
-schema. The parser stores `cache` as a raw JSON object rather than defining every cache-handler
-field in Rust; generation places those fields in the native `Configuration.DefaultCache` envelope
-before rewrite and reverse-proxy handlers. Every proxy route starts with Caddy's standard `encode`
-handler using Zstandard, gzip, and the default 512-byte threshold. Placing `encode` outside the
-cache handler keeps cached representations independent of a client's `Accept-Encoding`. During
+schema. The parser models the focused native cache surface—TTL, method and status allowlists,
+request/response body limits, and cache-key headers—and rejects the removed Souin provider fields.
+Generation places Swarmlite's SQLite-backed `http.handlers.cache` directly before rewrite and
+reverse-proxy handlers; no global Caddy cache app or storage-provider bridge is needed. Every proxy
+route starts with Caddy's standard `encode` handler using Zstandard, gzip, and the default 512-byte
+threshold. Placing `encode` outside the cache handler keeps cached representations independent of a
+client's `Accept-Encoding`. During
 deployment, the main process passes the normalized services from the same Stack file to
 `validate_and_normalize`;
 no external validation service or network request is involved. This in-process check is

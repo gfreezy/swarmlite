@@ -387,9 +387,29 @@ Route features include:
 - per-route trusted proxy lists;
 - optional node-local Caddy response caching.
 
+Caching is an explicit route-level choice. The native Gateway handler stores responses directly in
+SQLite and includes the HTTP method, query string, request-body hash, configured key headers, and
+origin `Vary` fields in the cache key. An optional `methods` list restricts a cached route; when it
+is omitted, all ordinary methods—including query-style POST requests—are eligible. For example:
+
+```yaml
+cache:
+  ttl: 5m
+  methods: [GET, POST]
+  max_cacheable_body_bytes: 10485760
+  max_request_body_bytes: 1048576
+  key_headers: [Accept-Language]
+  status_codes: [200]
+```
+
+CONNECT, protocol upgrades, range and conditional requests, authorization, response `no-store`,
+`private` or `no-cache`, and responses carrying `Set-Cookie` bypass storage. Concurrent misses for
+one key share a single origin request. SQLite failures fail open to the origin. Expired entries are
+not served; stale refresh and stale-on-error behavior are not part of the current cache phase.
+
 Rule precedence is exact path, longest prefix, regex, then a rule without matches. `tls` accepts
 `serve|disabled` and `http` accepts `redirect|serve|disabled`; `http: redirect` requires
-`tls: serve`. Advanced cache fields are described by
+`tls: serve`. Native cache fields are described by
 [`cache-handler.schema.json`](https://raw.githubusercontent.com/gfreezy/swarmlite/main/crates/swarmlite-stack/schema/cache-handler.schema.json).
 
 ### Remote management over SSH
