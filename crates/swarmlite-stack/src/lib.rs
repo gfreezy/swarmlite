@@ -827,7 +827,7 @@ fn build_proxy_routes(
         // lets the cache store the upstream representation and compresses only
         // the response sent to each client.
         let mut handle = vec![encode_handler()];
-        handle.extend(rule.cache.as_ref().map(cache_handler).into_iter());
+        handle.extend(rule.cache.as_ref().map(cache_handler));
         handle.extend(rewrite_handlers(rule.rewrite.as_ref(), path_match));
         handle.extend(backend_handlers(
             config.stack_name,
