@@ -60,10 +60,11 @@ jobs:
           fi
 
           package_version=$(awk '
-            $0 == "[package]" { in_package = 1; next }
-            in_package && /^\[/ { exit }
-            in_package && /^version = / {
-              gsub(/^[^\"]*\"|\".*$/, "")
+            $0 == "[workspace.package]" { in_workspace_package = 1; next }
+            in_workspace_package && /^\[/ { exit }
+            in_workspace_package && /^version = / {
+              sub(/^[^"]*"/, "")
+              sub(/".*$/, "")
               print
               exit
             }
