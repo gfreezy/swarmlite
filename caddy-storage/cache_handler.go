@@ -46,6 +46,7 @@ type CacheHandler struct {
 	HitSampleRatio       uint64         `json:"hit_sample_ratio,omitempty"`
 	AccessUpdateInterval caddy.Duration `json:"access_update_interval,omitempty"`
 	CacheSizeKiB         int64          `json:"cache_size_kib,omitempty"`
+	MmapSizeBytes        *int64         `json:"mmap_size_bytes,omitempty"`
 	ReadConnections      int            `json:"read_connections,omitempty"`
 	BusyTimeout          caddy.Duration `json:"busy_timeout,omitempty"`
 	CleanupInterval      caddy.Duration `json:"cleanup_interval,omitempty"`
@@ -177,6 +178,7 @@ func (handler *CacheHandler) Provision(ctx caddy.Context) error {
 		hitSampleRatio:   handler.HitSampleRatio,
 		accessInterval:   time.Duration(handler.AccessUpdateInterval),
 		cacheSizeKiB:     handler.CacheSizeKiB,
+		mmapSizeBytes:    handler.MmapSizeBytes,
 		readConnections:  handler.ReadConnections,
 		busyTimeout:      time.Duration(handler.BusyTimeout),
 		cleanupInterval:  time.Duration(handler.CleanupInterval),
@@ -276,7 +278,7 @@ func (handler *CacheHandler) ServeHTTP(
 		VaryHeaders: varyHeaders,
 		Status:      capture.status,
 		Header:      sanitizedCacheHeader(capture.header),
-		Body:        bytes.Clone(capture.body.Bytes()),
+		Body:        capture.body.Bytes(),
 		StoredAt:    now,
 		ExpiresAt:   now.Add(handler.ttl),
 	}

@@ -573,6 +573,16 @@ define_config_keys! {
         description: "SQLite page-cache budget per connection, distinct from response-cache capacity.",
         apply: "hot reload"
     },
+    GatewayCacheSqliteMmapSizeBytes => {
+        key: "gateway.cache.sqlite.mmap-size-bytes",
+        field: ClusterConfigField::GatewayCacheSqliteMmapSizeBytes,
+        type: "integer",
+        values: None,
+        constraints: "0..=9223372036854775807 bytes; 0 disables mmap",
+        default: "268435456 bytes (256 MiB)",
+        description: "SQLite mmap limit per query-only reader connection; the writer never uses mmap.",
+        apply: "hot reload"
+    },
     GatewayCacheSqliteReadConnections => {
         key: "gateway.cache.sqlite.read-connections",
         field: ClusterConfigField::GatewayCacheSqliteReadConnections,
@@ -865,6 +875,14 @@ fn config_set_update(key: ConfigKey, value: String) -> Result<ClusterConfigUpdat
                 MAX_GATEWAY_CACHE_SIGNED_SIZE,
             )?);
         }
+        ConfigKey::GatewayCacheSqliteMmapSizeBytes => {
+            update.gateway_cache_sqlite_mmap_size_bytes = Some(parse_config_u64(
+                &value,
+                key,
+                0,
+                MAX_GATEWAY_CACHE_SIGNED_SIZE,
+            )?);
+        }
         ConfigKey::GatewayCacheSqliteReadConnections => {
             let connections = parse_config_u32(&value, key, 1)?;
             if connections > u32::from(MAX_GATEWAY_CACHE_SQLITE_READ_CONNECTIONS) {
@@ -1095,6 +1113,9 @@ impl ConfigKey {
             }
             Self::GatewayCacheSqliteCacheSizeKib => {
                 optional_u64(config.gateway.cache.sqlite.cache_size_kib)
+            }
+            Self::GatewayCacheSqliteMmapSizeBytes => {
+                optional_u64(config.gateway.cache.sqlite.mmap_size_bytes)
             }
             Self::GatewayCacheSqliteReadConnections => config
                 .gateway
@@ -4657,6 +4678,7 @@ mod tests {
             ("gateway.cache.hit-sample-ratio", "32"),
             ("gateway.cache.access-update-interval-seconds", "300"),
             ("gateway.cache.sqlite.cache-size-kib", "8192"),
+            ("gateway.cache.sqlite.mmap-size-bytes", "268435456"),
             ("gateway.cache.sqlite.read-connections", "4"),
             ("gateway.cache.sqlite.busy-timeout-seconds", "5"),
             ("gateway.cache.sqlite.cleanup-interval-seconds", "300"),
@@ -4708,6 +4730,10 @@ mod tests {
         let disabled = config_set_update(ConfigKey::GatewayMetricsEnabled, "false".into()).unwrap();
         assert_eq!(disabled.gateway_metrics_enabled, Some(false));
         assert!(disabled.unset.is_empty());
+
+        let mmap_disabled =
+            config_set_update(ConfigKey::GatewayCacheSqliteMmapSizeBytes, "0".into()).unwrap();
+        assert_eq!(mmap_disabled.gateway_cache_sqlite_mmap_size_bytes, Some(0));
     }
 
     #[test]
@@ -4734,6 +4760,7 @@ mod tests {
         assert_eq!(paths.len(), ConfigKey::ALL.len());
         assert!(ConfigKey::from_path("gateway.metrics.enabled").is_some());
         assert!(ConfigKey::from_path("gateway.cache.max-size-bytes").is_some());
+        assert!(ConfigKey::from_path("gateway.cache.sqlite.mmap-size-bytes").is_some());
         assert!(ConfigKey::from_path("gateway-metrics-enabled").is_none());
     }
 

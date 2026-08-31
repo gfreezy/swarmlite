@@ -2354,6 +2354,10 @@ async fn gateway_cache_config_rejects_unsafe_values() {
             ..Default::default()
         },
         ClusterConfigUpdate {
+            gateway_cache_sqlite_mmap_size_bytes: Some(i64::MAX as u64 + 1),
+            ..Default::default()
+        },
+        ClusterConfigUpdate {
             gateway_cache_sqlite_read_connections: Some(17),
             ..Default::default()
         },
@@ -2382,6 +2386,7 @@ async fn gateway_config_preserves_explicit_values_and_unsets_them() {
             gateway_cache_hit_sample_ratio: Some(16),
             gateway_cache_access_update_interval_seconds: Some(120),
             gateway_cache_sqlite_cache_size_kib: Some(8_192),
+            gateway_cache_sqlite_mmap_size_bytes: Some(134_217_728),
             gateway_cache_sqlite_read_connections: Some(6),
             gateway_cache_sqlite_busy_timeout_seconds: Some(3),
             gateway_cache_sqlite_cleanup_interval_seconds: Some(60),
@@ -2412,6 +2417,7 @@ async fn gateway_config_preserves_explicit_values_and_unsets_them() {
     assert_eq!(gateway.cache.hit_sample_ratio, Some(16));
     assert_eq!(gateway.cache.access_update_interval_seconds, Some(120));
     assert_eq!(gateway.cache.sqlite.cache_size_kib, Some(8_192));
+    assert_eq!(gateway.cache.sqlite.mmap_size_bytes, Some(134_217_728));
     assert_eq!(gateway.cache.sqlite.read_connections, Some(6));
     assert_eq!(gateway.logging.access.sampling.first, Some(0));
     assert_eq!(gateway.shutdown.grace_period_seconds, Some(0));
@@ -2431,6 +2437,7 @@ async fn gateway_config_preserves_explicit_values_and_unsets_them() {
                 ClusterConfigField::GatewayCacheHitSampleRatio,
                 ClusterConfigField::GatewayCacheAccessUpdateIntervalSeconds,
                 ClusterConfigField::GatewayCacheSqliteCacheSizeKib,
+                ClusterConfigField::GatewayCacheSqliteMmapSizeBytes,
                 ClusterConfigField::GatewayCacheSqliteReadConnections,
                 ClusterConfigField::GatewayCacheSqliteBusyTimeoutSeconds,
                 ClusterConfigField::GatewayCacheSqliteCleanupIntervalSeconds,

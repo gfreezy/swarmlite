@@ -9,8 +9,9 @@ use crate::model::{
     DEFAULT_GATEWAY_CACHE_MAX_SIZE_BYTES, DEFAULT_GATEWAY_CACHE_SQLITE_BUSY_TIMEOUT_SECONDS,
     DEFAULT_GATEWAY_CACHE_SQLITE_CLEANUP_INTERVAL_SECONDS,
     DEFAULT_GATEWAY_CACHE_SQLITE_JOURNAL_SIZE_LIMIT_BYTES,
-    DEFAULT_GATEWAY_CACHE_SQLITE_READ_CONNECTIONS, DesiredTaskState, GatewayCacheConfig,
-    ObservedTaskState, RecoveredStackGateway, ServicePortKey, ServiceRecord,
+    DEFAULT_GATEWAY_CACHE_SQLITE_MMAP_SIZE_BYTES, DEFAULT_GATEWAY_CACHE_SQLITE_READ_CONNECTIONS,
+    DesiredTaskState, GatewayCacheConfig, ObservedTaskState, RecoveredStackGateway, ServicePortKey,
+    ServiceRecord,
 };
 
 pub use swarmlite_stack::{HttpServer, StorageConfig, routed_service_ports, storage};
@@ -156,6 +157,15 @@ fn apply_cache_runtime_config(value: &mut Value, cache: &GatewayCacheConfig) {
                 if let Some(value) = cache.sqlite.cache_size_kib {
                     object.insert("cache_size_kib".to_owned(), json!(value));
                 }
+                object.insert(
+                    "mmap_size_bytes".to_owned(),
+                    json!(
+                        cache
+                            .sqlite
+                            .mmap_size_bytes
+                            .unwrap_or(DEFAULT_GATEWAY_CACHE_SQLITE_MMAP_SIZE_BYTES)
+                    ),
+                );
                 object.insert(
                     "read_connections".to_owned(),
                     json!(
@@ -521,6 +531,7 @@ x-swarmlite:
         gateway.cache.hit_sample_ratio = Some(16);
         gateway.cache.access_update_interval_seconds = Some(120);
         gateway.cache.sqlite.cache_size_kib = Some(8_192);
+        gateway.cache.sqlite.mmap_size_bytes = Some(0);
         gateway.cache.sqlite.read_connections = Some(6);
         gateway.cache.sqlite.busy_timeout_seconds = Some(3);
         gateway.cache.sqlite.cleanup_interval_seconds = Some(60);
@@ -540,6 +551,7 @@ x-swarmlite:
         assert_eq!(cache["hit_sample_ratio"], 16);
         assert_eq!(cache["access_update_interval"], "120s");
         assert_eq!(cache["cache_size_kib"], 8_192);
+        assert_eq!(cache["mmap_size_bytes"], 0);
         assert_eq!(cache["read_connections"], 6);
         assert_eq!(cache["busy_timeout"], "3s");
         assert_eq!(cache["cleanup_interval"], "60s");

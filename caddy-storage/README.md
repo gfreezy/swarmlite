@@ -63,7 +63,10 @@ Each Stack rule with a `cache` object receives Swarmlite's native `http.handlers
 routes are untouched and no global cache application is generated. The handler stores complete
 status, headers, body, freshness timestamps, and `Vary` dimensions in
 `/cache/native-v1/cache.db`. SQLite runs in WAL mode with one serialized writer and four query-only
-reader connections, mmap is disabled, and expired rows are cleaned every five minutes. WAL
+reader connections. Readers map at most 256 MiB of database pages by default to avoid repeated
+`pread` calls. The cluster-level `gateway.cache.sqlite.mmap-size-bytes` setting changes the limit;
+`0` disables mmap. The writer never uses mmap.
+Expired rows are cleaned every five minutes. WAL
 checkpoints default to 8,192 pages (about 32 MiB) to avoid checkpointing after every large cached
 response. Cached
 response payload is logically capped at 1 GiB per Gateway by default and can be changed through
@@ -71,8 +74,11 @@ the cluster-level `gateway.cache.max-size-bytes` setting. Sampled hits are dedup
 64 KiB Bloom filter and written in batches to a small access-metadata table, avoiding updates to rows
 that contain response bodies. Expired rows are removed first; approximate LRU eviction then returns
 usage to a 90% low-water mark. The logical limit counts the compact key, serialized headers, and
-body; reusable SQLite pages and WAL bytes may make the physical files larger. SQLite secure-delete
-is explicitly disabled for this disposable data. On a schema change, the old database and its
+body; reusable SQLite pages and WAL bytes may make the physical files larger. New databases use
+incremental auto-vacuum. When at least 25% of their pages are free, the periodic cleanup returns at
+most 8,192 pages (about 32 MiB) to the filesystem per pass instead of running a blocking full
+`VACUUM`. SQLite secure-delete is explicitly disabled for this disposable data. On a schema change,
+the old database and its
 WAL/SHM sidecars are renamed out of the active path, a fresh database is opened immediately, and
 the stale files are removed in the background instead of dropping multi-gigabyte tables while
 Caddy provisions the new configuration.

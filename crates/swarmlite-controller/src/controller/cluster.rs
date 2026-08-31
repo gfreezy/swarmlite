@@ -61,6 +61,10 @@ impl Controller {
                 ClusterConfigField::GatewayCacheSqliteCacheSizeKib,
             ),
             (
+                update.gateway_cache_sqlite_mmap_size_bytes.is_some(),
+                ClusterConfigField::GatewayCacheSqliteMmapSizeBytes,
+            ),
+            (
                 update.gateway_cache_sqlite_read_connections.is_some(),
                 ClusterConfigField::GatewayCacheSqliteReadConnections,
             ),
@@ -204,6 +208,9 @@ impl Controller {
                 ClusterConfigField::GatewayCacheSqliteCacheSizeKib => {
                     cluster.gateway.cache.sqlite.cache_size_kib = None
                 }
+                ClusterConfigField::GatewayCacheSqliteMmapSizeBytes => {
+                    cluster.gateway.cache.sqlite.mmap_size_bytes = None
+                }
                 ClusterConfigField::GatewayCacheSqliteReadConnections => {
                     cluster.gateway.cache.sqlite.read_connections = None
                 }
@@ -305,6 +312,9 @@ impl Controller {
         }
         if let Some(value) = update.gateway_cache_sqlite_cache_size_kib {
             cluster.gateway.cache.sqlite.cache_size_kib = Some(value);
+        }
+        if let Some(value) = update.gateway_cache_sqlite_mmap_size_bytes {
+            cluster.gateway.cache.sqlite.mmap_size_bytes = Some(value);
         }
         if let Some(value) = update.gateway_cache_sqlite_read_connections {
             cluster.gateway.cache.sqlite.read_connections = Some(value);
@@ -419,6 +429,18 @@ impl Controller {
         {
             return Err(ControllerError::Invalid(format!(
                 "gateway.cache.sqlite.cache-size-kib cannot exceed {}",
+                crate::model::MAX_GATEWAY_CACHE_SIGNED_SIZE
+            )));
+        }
+        if cluster
+            .gateway
+            .cache
+            .sqlite
+            .mmap_size_bytes
+            .is_some_and(|value| value > crate::model::MAX_GATEWAY_CACHE_SIGNED_SIZE)
+        {
+            return Err(ControllerError::Invalid(format!(
+                "gateway.cache.sqlite.mmap-size-bytes cannot exceed {}",
                 crate::model::MAX_GATEWAY_CACHE_SIGNED_SIZE
             )));
         }

@@ -32,6 +32,7 @@ pub const DEFAULT_GATEWAY_CACHE_MAX_SIZE_BYTES: u64 = 1 << 30;
 pub const DEFAULT_GATEWAY_CACHE_LOW_WATER_PERCENT: u8 = 90;
 pub const DEFAULT_GATEWAY_CACHE_HIT_SAMPLE_RATIO: u32 = 32;
 pub const DEFAULT_GATEWAY_CACHE_ACCESS_UPDATE_INTERVAL_SECONDS: u64 = 5 * 60;
+pub const DEFAULT_GATEWAY_CACHE_SQLITE_MMAP_SIZE_BYTES: u64 = 256 << 20;
 pub const DEFAULT_GATEWAY_CACHE_SQLITE_READ_CONNECTIONS: u8 = 4;
 pub const DEFAULT_GATEWAY_CACHE_SQLITE_BUSY_TIMEOUT_SECONDS: u64 = 5;
 pub const DEFAULT_GATEWAY_CACHE_SQLITE_CLEANUP_INTERVAL_SECONDS: u64 = 5 * 60;
@@ -140,6 +141,8 @@ pub struct GatewayCacheSqliteConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_size_kib: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mmap_size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_connections: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub busy_timeout_seconds: Option<u64>,
@@ -152,6 +155,7 @@ pub struct GatewayCacheSqliteConfig {
 impl GatewayCacheSqliteConfig {
     fn is_empty(&self) -> bool {
         self.cache_size_kib.is_none()
+            && self.mmap_size_bytes.is_none()
             && self.read_connections.is_none()
             && self.busy_timeout_seconds.is_none()
             && self.cleanup_interval_seconds.is_none()
@@ -504,6 +508,8 @@ pub struct ClusterConfigUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway_cache_sqlite_cache_size_kib: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_cache_sqlite_mmap_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway_cache_sqlite_read_connections: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway_cache_sqlite_busy_timeout_seconds: Option<u64>,
@@ -561,6 +567,8 @@ pub enum ClusterConfigField {
     GatewayCacheAccessUpdateIntervalSeconds,
     #[serde(rename = "gateway.cache.sqlite.cache-size-kib")]
     GatewayCacheSqliteCacheSizeKib,
+    #[serde(rename = "gateway.cache.sqlite.mmap-size-bytes")]
+    GatewayCacheSqliteMmapSizeBytes,
     #[serde(rename = "gateway.cache.sqlite.read-connections")]
     GatewayCacheSqliteReadConnections,
     #[serde(rename = "gateway.cache.sqlite.busy-timeout-seconds")]
@@ -1287,6 +1295,7 @@ impl From<&ClusterGatewayConfig> for GatewayPublicConfig {
                 access_update_interval_seconds: config.cache.access_update_interval_seconds,
                 sqlite: GatewayPublicCacheSqliteConfig {
                     cache_size_kib: config.cache.sqlite.cache_size_kib,
+                    mmap_size_bytes: config.cache.sqlite.mmap_size_bytes,
                     read_connections: config.cache.sqlite.read_connections,
                     busy_timeout_seconds: config.cache.sqlite.busy_timeout_seconds,
                     cleanup_interval_seconds: config.cache.sqlite.cleanup_interval_seconds,
@@ -1342,6 +1351,7 @@ pub struct GatewayPublicCacheConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GatewayPublicCacheSqliteConfig {
     pub cache_size_kib: Option<u64>,
+    pub mmap_size_bytes: Option<u64>,
     pub read_connections: Option<u8>,
     pub busy_timeout_seconds: Option<u64>,
     pub cleanup_interval_seconds: Option<u64>,

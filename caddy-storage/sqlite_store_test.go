@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -355,6 +356,29 @@ func TestCacheTouchBloomDeduplicatesAndResets(t *testing.T) {
 	}
 }
 
+func TestSQLiteEvictionSignalIsRateLimited(t *testing.T) {
+	database := sqliteDatabase{evict: make(chan struct{}, 1)}
+	database.signalEviction()
+	select {
+	case <-database.evict:
+	default:
+		t.Fatal("first capacity event did not signal eviction")
+	}
+	database.signalEviction()
+	select {
+	case <-database.evict:
+		t.Fatal("back-to-back capacity events were not coalesced")
+	default:
+	}
+	database.lastEviction.Store(time.Now().Add(-cacheEvictionMinInterval).UnixNano())
+	database.signalEviction()
+	select {
+	case <-database.evict:
+	default:
+		t.Fatal("eviction was not signaled after the rate-limit interval")
+	}
+}
+
 func TestSQLiteResponseStoreEvictsApproximatelyLeastRecentlyUsed(t *testing.T) {
 	store := openTestSQLiteStore(t, filepath.Join(t.TempDir(), "cache.db"))
 	t.Cleanup(func() { _ = store.Close() })
@@ -458,7 +482,7 @@ func TestSQLiteResponseStoreUsesBoundedWALConnectionPools(t *testing.T) {
 		"temp_store":         1,
 		"wal_autocheckpoint": sqliteWALCheckpointPages,
 		"journal_size_limit": defaultSQLiteJournalSizeLimit,
-		"auto_vacuum":        0,
+		"auto_vacuum":        2,
 		"cache_size":         -2000,
 	} {
 		var actual int64
@@ -504,6 +528,84 @@ func TestSQLiteResponseStoreUsesBoundedWALConnectionPools(t *testing.T) {
 		if readerSecureDelete != 0 {
 			t.Fatalf("reader connection %d enabled secure_delete: %d", index, readerSecureDelete)
 		}
+		var readerMmapSize int64
+		if err := connection.QueryRowContext(context.Background(), "PRAGMA mmap_size").Scan(&readerMmapSize); err != nil {
+			t.Fatal(err)
+		}
+		if readerMmapSize != defaultSQLiteMmapSizeBytes {
+			t.Fatalf("reader connection %d has mmap size %d", index, readerMmapSize)
+		}
+	}
+}
+
+func TestSQLiteResponseStoreReclaimsFreePagesIncrementally(t *testing.T) {
+	store := openTestSQLiteStore(t, filepath.Join(t.TempDir(), "cache.db"))
+	t.Cleanup(func() { _ = store.Close() })
+	request := httptest.NewRequest(http.MethodGet, "https://example.test/cached", nil)
+	for index := range 64 {
+		entry := testCacheEntry(
+			request,
+			fmt.Sprintf("vacuum-%d", index),
+			strings.Repeat("x", 16<<10),
+			time.Hour,
+		)
+		if err := store.Put(context.Background(), request, entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var populatedPages int64
+	if err := store.writer.QueryRow("PRAGMA page_count").Scan(&populatedPages); err != nil {
+		t.Fatal(err)
+	}
+	removed, _, err := store.deleteEntryBatch(
+		"SELECT cache_key, size_bytes FROM cache_access LIMIT ?",
+		0,
+		1000,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 64 {
+		t.Fatalf("removed %d entries, want 64", removed)
+	}
+	var freePages int64
+	if err := store.writer.QueryRow("PRAGMA freelist_count").Scan(&freePages); err != nil {
+		t.Fatal(err)
+	}
+	if freePages == 0 {
+		t.Fatal("deleting response bodies did not create reusable pages")
+	}
+	if err := store.reclaimFreePages(); err != nil {
+		t.Fatal(err)
+	}
+	var reclaimedPages int64
+	if err := store.writer.QueryRow("PRAGMA page_count").Scan(&reclaimedPages); err != nil {
+		t.Fatal(err)
+	}
+	if reclaimedPages >= populatedPages {
+		t.Fatalf("incremental vacuum did not shrink page count: before=%d after=%d", populatedPages, reclaimedPages)
+	}
+}
+
+func TestSQLiteResponseStoreRejectsAtCapacityBeforeWritingResourceMetadata(t *testing.T) {
+	store := openTestSQLiteStore(t, filepath.Join(t.TempDir(), "cache.db"))
+	t.Cleanup(func() { _ = store.Close() })
+	request := httptest.NewRequest(http.MethodGet, "https://example.test/cached", nil)
+	if err := store.Put(context.Background(), request, testCacheEntry(request, "stored", "value", time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	usage := store.usageBytes.Load()
+	store.maxSizeBytes = usage
+	store.lowWaterBytes = usage
+	if err := store.Put(context.Background(), request, testCacheEntry(request, "rejected", "value", time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	var resources int
+	if err := store.writer.QueryRow("SELECT COUNT(*) FROM cache_resources").Scan(&resources); err != nil {
+		t.Fatal(err)
+	}
+	if resources != 1 {
+		t.Fatalf("capacity-rejected response created resource metadata: rows=%d", resources)
 	}
 }
 
@@ -524,6 +626,32 @@ func TestSQLiteResponseStoreHonorsExplicitPageCacheSize(t *testing.T) {
 	}
 	if cacheSize != -1024 {
 		t.Fatalf("unexpected explicit page cache size %d", cacheSize)
+	}
+}
+
+func TestSQLiteResponseStoreAllowsDisablingReadMmap(t *testing.T) {
+	disabled := int64(0)
+	store, err := newSQLiteResponseStore(sqliteOptions{
+		path:            filepath.Join(t.TempDir(), "cache.db"),
+		mmapSizeBytes:   &disabled,
+		cleanupInterval: time.Hour,
+	}, zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	connection, err := store.readers.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	var mmapSize int64
+	if err := connection.QueryRowContext(context.Background(), "PRAGMA mmap_size").Scan(&mmapSize); err != nil {
+		t.Fatal(err)
+	}
+	if mmapSize != 0 {
+		t.Fatalf("explicit mmap disable produced size %d", mmapSize)
 	}
 }
 
@@ -557,6 +685,7 @@ func TestSQLiteResponseStoreHonorsCapacityAndAccessTuning(t *testing.T) {
 }
 
 func TestSQLiteResponseStoreRejectsInvalidCapacityTuning(t *testing.T) {
+	negativeMmap := int64(-1)
 	for name, options := range map[string]sqliteOptions{
 		"low water zero after default is not invalid": {
 			path: filepath.Join(t.TempDir(), "default.db"),
@@ -568,6 +697,10 @@ func TestSQLiteResponseStoreRejectsInvalidCapacityTuning(t *testing.T) {
 		"negative access interval": {
 			path:           filepath.Join(t.TempDir(), "interval.db"),
 			accessInterval: -time.Second,
+		},
+		"negative mmap size": {
+			path:          filepath.Join(t.TempDir(), "mmap.db"),
+			mmapSizeBytes: &negativeMmap,
 		},
 	} {
 		store, err := newSQLiteResponseStore(options, zap.NewNop())

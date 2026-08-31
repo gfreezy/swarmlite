@@ -29,10 +29,11 @@ const (
 	defaultSQLiteCleanupInterval  = 5 * time.Minute
 	defaultSQLiteJournalSizeLimit = int64(64 << 20)
 	defaultSQLiteMaxSizeBytes     = int64(1 << 30)
+	defaultSQLiteMmapSizeBytes    = int64(256 << 20)
 	defaultSQLiteLowWaterPercent  = 90
 	defaultCacheHitSampleRatio    = uint64(32)
 	defaultCacheAccessInterval    = 5 * time.Minute
-	sqliteCacheSchemaVersion      = 5
+	sqliteCacheSchemaVersion      = 6
 	// A 128-bit SHA-256 prefix keeps cache identities compact while retaining
 	// negligible collision probability at HTTP-cache scale.
 	cacheKeySize             = 16
@@ -42,9 +43,11 @@ const (
 	cacheTouchQueueSize      = 4096
 	cacheTouchBatchSize      = 256
 	cacheTouchFlushInterval  = time.Second
+	cacheEvictionMinInterval = time.Second
 	cacheTouchBloomWords     = 8192 // 64 KiB / 524,288 bits
 	cacheTouchBloomHashes    = 4
 	sqliteWALCheckpointPages = 8192 // 32 MiB with SQLite's default 4 KiB pages
+	sqliteVacuumBatchPages   = 8192 // Reclaim at most 32 MiB per cleanup pass.
 )
 
 var sqliteDatabases = struct {
@@ -59,6 +62,7 @@ type sqliteOptions struct {
 	hitSampleRatio   uint64
 	accessInterval   time.Duration
 	cacheSizeKiB     int64
+	mmapSizeBytes    *int64
 	readConnections  int
 	busyTimeout      time.Duration
 	cleanupInterval  time.Duration
@@ -80,6 +84,8 @@ type sqliteDatabase struct {
 	touchQueue       chan cacheKey
 	touchBloom       cacheTouchBloom
 	touchSequence    atomic.Uint64
+	usageBytes       atomic.Int64
+	lastEviction     atomic.Int64
 	evict            chan struct{}
 	stopCleanup      chan struct{}
 	background       sync.WaitGroup
@@ -165,6 +171,13 @@ func newSQLiteResponseStore(options sqliteOptions, logger *zap.Logger) (*sqliteR
 	if options.cacheSizeKiB < 0 {
 		return nil, errors.New("SQLite cache cache_size_kib must not be negative")
 	}
+	if options.mmapSizeBytes == nil {
+		mmapSizeBytes := defaultSQLiteMmapSizeBytes
+		options.mmapSizeBytes = &mmapSizeBytes
+	}
+	if *options.mmapSizeBytes < 0 {
+		return nil, errors.New("SQLite cache mmap_size_bytes must not be negative")
+	}
 
 	absolutePath, err := filepath.Abs(options.path)
 	if err != nil {
@@ -172,13 +185,14 @@ func newSQLiteResponseStore(options sqliteOptions, logger *zap.Logger) (*sqliteR
 	}
 	options.path = filepath.Clean(absolutePath)
 	instanceKey := fmt.Sprintf(
-		"%s|%d|%d|%d|%s|%d|%d|%s|%s|%d",
+		"%s|%d|%d|%d|%s|%d|%d|%d|%s|%s|%d",
 		options.path,
 		options.maxSizeBytes,
 		options.lowWaterPercent,
 		options.hitSampleRatio,
 		options.accessInterval,
 		options.cacheSizeKiB,
+		*options.mmapSizeBytes,
 		options.readConnections,
 		options.busyTimeout,
 		options.cleanupInterval,
@@ -231,13 +245,13 @@ func openSQLiteDatabase(
 		writer.Close()
 		return nil, fmt.Errorf("connect SQLite cache writer: %w", err)
 	}
-	if _, err := writer.Exec("PRAGMA journal_mode=WAL"); err != nil {
-		writer.Close()
-		return nil, fmt.Errorf("enable SQLite WAL mode: %w", err)
-	}
 	if err := initializeSQLiteSchema(writer); err != nil {
 		writer.Close()
 		return nil, err
+	}
+	if _, err := writer.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		writer.Close()
+		return nil, fmt.Errorf("enable SQLite WAL mode: %w", err)
 	}
 
 	// WAL permits reads to proceed while the writer commits. Connection-local
@@ -273,6 +287,13 @@ func openSQLiteDatabase(
 		stopCleanup:      make(chan struct{}),
 		refs:             1,
 	}
+	var usageBytes int64
+	if err := writer.QueryRow("SELECT total_bytes FROM cache_usage WHERE id = 1").Scan(&usageBytes); err != nil {
+		readers.Close()
+		writer.Close()
+		return nil, fmt.Errorf("read initial SQLite cache usage: %w", err)
+	}
+	result.usageBytes.Store(usageBytes)
 	result.background.Add(1)
 	go result.cleanupLoop()
 	if len(staleFiles) > 0 {
@@ -415,6 +436,15 @@ func initializeSQLiteSchema(database *sql.DB) error {
 	if err := database.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		return fmt.Errorf("read SQLite cache schema version: %w", err)
 	}
+	if version == 0 {
+		// Incremental auto-vacuum adds a small pointer map to new databases and
+		// lets the background cleanup return cold free pages to the filesystem in
+		// bounded batches. Enabling it after tables exist would require a blocking
+		// full VACUUM, so schema changes rotate this disposable database instead.
+		if _, err := database.Exec("PRAGMA auto_vacuum=INCREMENTAL"); err != nil {
+			return fmt.Errorf("enable incremental SQLite auto-vacuum: %w", err)
+		}
+	}
 	tx, err := database.Begin()
 	if err != nil {
 		return fmt.Errorf("begin SQLite cache schema migration: %w", err)
@@ -479,7 +509,14 @@ func sqliteConnectionDSN(options sqliteOptions, readOnly bool) string {
 	if options.cacheSizeKiB > 0 {
 		query.Add("_pragma", fmt.Sprintf("cache_size(-%d)", options.cacheSizeKiB))
 	}
-	query.Add("_pragma", "mmap_size(0)")
+	if readOnly {
+		query.Add("_pragma", fmt.Sprintf("mmap_size(%d)", *options.mmapSizeBytes))
+	} else {
+		// Mapping response bodies makes in-place replacements more expensive on
+		// the writer. Keep writes on the ordinary page cache while read-only
+		// connections use mmap to avoid random-read pread traffic.
+		query.Add("_pragma", "mmap_size(0)")
+	}
 	query.Add("_pragma", "temp_store(FILE)")
 	// Response-cache data is disposable. Zero-filling deleted payload pages
 	// adds write amplification without protecting durable user data.
@@ -501,21 +538,17 @@ func (store *sqliteResponseStore) Get(
 ) (*cacheEntry, error) {
 	ctx, cancel := store.operationContext(parent)
 	defer cancel()
-	tx, err := store.readers.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return nil, fmt.Errorf("begin SQLite cache read: %w", err)
-	}
-	defer tx.Rollback()
+	now := time.Now().UnixMilli()
 
 	var varyHeadersJSON []byte
 	var generation int64
-	err = tx.QueryRowContext(
+	err := store.readers.QueryRowContext(
 		ctx,
 		`SELECT vary_headers, generation
 		 FROM cache_resources
 		 WHERE base_key = ? AND expires_at > ?`,
 		baseKey[:],
-		time.Now().UnixMilli(),
+		now,
 	).Scan(&varyHeadersJSON, &generation)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -540,13 +573,13 @@ func (store *sqliteResponseStore) Get(
 	var headersJSON []byte
 	var storedAt int64
 	var expiresAt int64
-	err = tx.QueryRowContext(
+	err = store.readers.QueryRowContext(
 		ctx,
 		`SELECT status, headers, body, stored_at, expires_at
 		 FROM cache_entries
 		 WHERE cache_key = ? AND expires_at > ?`,
 		key[:],
-		time.Now().UnixMilli(),
+		now,
 	).Scan(
 		&entry.Status,
 		&headersJSON,
@@ -565,9 +598,6 @@ func (store *sqliteResponseStore) Get(
 	}
 	entry.StoredAt = time.UnixMilli(storedAt)
 	entry.ExpiresAt = time.UnixMilli(expiresAt)
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit SQLite cache read: %w", err)
-	}
 	store.recordCacheHit(key)
 	return &entry, nil
 }
@@ -577,9 +607,18 @@ func (store *sqliteResponseStore) Put(
 	request *http.Request,
 	entry *cacheEntry,
 ) error {
-	varyHeadersJSON, err := json.Marshal(entry.VaryHeaders)
-	if err != nil {
-		return fmt.Errorf("encode SQLite cache Vary fields: %w", err)
+	// At capacity, a new response cannot be admitted until the asynchronous
+	// eviction pass reaches the low-water mark. Avoid opening a transaction and
+	// touching the resource index for work that would be rolled back anyway.
+	// Existing entries may defer one refresh while capacity is being reclaimed;
+	// cache writes are best-effort and the following request can refresh them.
+	if exceedsCacheCapacity(
+		store.usageBytes.Load(),
+		int64(cacheKeySize+len(entry.Body)),
+		store.maxSizeBytes,
+	) {
+		store.signalEviction()
+		return nil
 	}
 	headersJSON, err := json.Marshal(entry.Header)
 	if err != nil {
@@ -588,6 +627,14 @@ func (store *sqliteResponseStore) Put(
 	entrySize := cacheEntrySizeBytes(headersJSON, entry.Body)
 	if entrySize > store.maxSizeBytes {
 		return nil
+	}
+	if exceedsCacheCapacity(store.usageBytes.Load(), entrySize, store.maxSizeBytes) {
+		store.signalEviction()
+		return nil
+	}
+	varyHeadersJSON, err := json.Marshal(entry.VaryHeaders)
+	if err != nil {
+		return fmt.Errorf("encode SQLite cache Vary fields: %w", err)
 	}
 
 	ctx, cancel := store.operationContext(parent)
@@ -621,24 +668,18 @@ func (store *sqliteResponseStore) Put(
 	}
 	entry.Key = responseCacheKey(entry.BaseKey, generation, request, entry.VaryHeaders)
 	var formerSize int64
-	entryExists := true
+	var entryExists bool
+	var totalBytes int64
 	err = tx.QueryRowContext(
 		ctx,
-		"SELECT size_bytes FROM cache_access WHERE cache_key = ?",
+		`SELECT COALESCE(access.size_bytes, 0), access.cache_key IS NOT NULL, usage.total_bytes
+		 FROM cache_usage AS usage
+		 LEFT JOIN cache_access AS access ON access.cache_key = ?
+		 WHERE usage.id = 1`,
 		entry.Key[:],
-	).Scan(&formerSize)
-	if errors.Is(err, sql.ErrNoRows) {
-		entryExists = false
-		formerSize = 0
-	} else if err != nil {
-		return fmt.Errorf("read SQLite cache entry size: %w", err)
-	}
-	var totalBytes int64
-	if err := tx.QueryRowContext(
-		ctx,
-		"SELECT total_bytes FROM cache_usage WHERE id = 1",
-	).Scan(&totalBytes); err != nil {
-		return fmt.Errorf("read SQLite cache usage: %w", err)
+	).Scan(&formerSize, &entryExists, &totalBytes)
+	if err != nil {
+		return fmt.Errorf("read SQLite cache entry and usage: %w", err)
 	}
 	projectedBytes := totalBytes - formerSize + entrySize
 	if projectedBytes > store.maxSizeBytes && entrySize > formerSize {
@@ -695,6 +736,7 @@ func (store *sqliteResponseStore) Put(
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit SQLite cache write: %w", err)
 	}
+	store.usageBytes.Add(entrySize - formerSize)
 	return nil
 }
 
@@ -702,6 +744,10 @@ func cacheEntrySizeBytes(headersJSON, body []byte) int64 {
 	// The capacity is a stable logical payload limit rather than the SQLite
 	// file size, whose WAL and reusable pages vary independently.
 	return int64(cacheKeySize + len(headersJSON) + len(body))
+}
+
+func exceedsCacheCapacity(currentBytes, candidateBytes, maxBytes int64) bool {
+	return currentBytes >= maxBytes || candidateBytes > maxBytes-currentBytes
 }
 
 func percentageBytes(value int64, percent int) int64 {
@@ -781,11 +827,36 @@ func (database *sqliteDatabase) cleanupLoop() {
 			database.flushCacheTouches()
 			database.deleteExpiredEntries()
 			database.enforceCapacity(false)
+			if err := database.reclaimFreePages(); err != nil {
+				database.logger.Error("reclaim free SQLite cache pages", zap.Error(err))
+			}
 		case <-database.evict:
 			database.deleteExpiredEntries()
 			database.enforceCapacity(true)
 		}
 	}
+}
+
+func (database *sqliteDatabase) reclaimFreePages() error {
+	ctx, cancel := context.WithTimeout(context.Background(), database.operationTimeout)
+	defer cancel()
+	var pageCount int64
+	if err := database.writer.QueryRowContext(ctx, "PRAGMA page_count").Scan(&pageCount); err != nil {
+		return err
+	}
+	var freePages int64
+	if err := database.writer.QueryRowContext(ctx, "PRAGMA freelist_count").Scan(&freePages); err != nil {
+		return err
+	}
+	if freePages == 0 || freePages*4 < pageCount {
+		return nil
+	}
+	pages := min(freePages, int64(sqliteVacuumBatchPages))
+	_, err := database.writer.ExecContext(
+		ctx,
+		fmt.Sprintf("PRAGMA incremental_vacuum(%d)", pages),
+	)
+	return err
 }
 
 func (database *sqliteDatabase) flushAllCacheTouches() {
@@ -898,16 +969,7 @@ func (database *sqliteDatabase) enforceCapacity(force bool) {
 }
 
 func (database *sqliteDatabase) cacheUsage() (int64, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), database.operationTimeout)
-	defer cancel()
-	var totalBytes int64
-	if err := database.writer.QueryRowContext(
-		ctx,
-		"SELECT total_bytes FROM cache_usage WHERE id = 1",
-	).Scan(&totalBytes); err != nil {
-		return 0, err
-	}
-	return totalBytes, nil
+	return database.usageBytes.Load(), nil
 }
 
 func (database *sqliteDatabase) deleteEntryBatch(
@@ -984,6 +1046,7 @@ func (database *sqliteDatabase) deleteEntryBatch(
 	if err := tx.Commit(); err != nil {
 		return 0, 0, err
 	}
+	database.usageBytes.Add(-removedBytes)
 	return len(keys), removedBytes, nil
 }
 
@@ -992,6 +1055,16 @@ func placeholders(count int) string {
 }
 
 func (database *sqliteDatabase) signalEviction() {
+	now := time.Now().UnixNano()
+	for {
+		last := database.lastEviction.Load()
+		if now-last < cacheEvictionMinInterval.Nanoseconds() {
+			return
+		}
+		if database.lastEviction.CompareAndSwap(last, now) {
+			break
+		}
+	}
 	select {
 	case database.evict <- struct{}{}:
 	default:
