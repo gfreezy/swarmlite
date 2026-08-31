@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -445,6 +446,29 @@ func TestSQLiteResponseStoreUsesBoundedWALConnectionPools(t *testing.T) {
 	if mmapSize != 0 {
 		t.Fatalf("unexpected mmap size %d", mmapSize)
 	}
+	var secureDelete int
+	if err := store.writer.QueryRow("PRAGMA secure_delete").Scan(&secureDelete); err != nil {
+		t.Fatal(err)
+	}
+	if secureDelete != 0 {
+		t.Fatalf("SQLite secure_delete is enabled: %d", secureDelete)
+	}
+	for pragma, expected := range map[string]int64{
+		"synchronous":        1,
+		"temp_store":         1,
+		"wal_autocheckpoint": sqliteWALCheckpointPages,
+		"journal_size_limit": defaultSQLiteJournalSizeLimit,
+		"auto_vacuum":        0,
+		"cache_size":         -2000,
+	} {
+		var actual int64
+		if err := store.writer.QueryRow("PRAGMA " + pragma).Scan(&actual); err != nil {
+			t.Fatal(err)
+		}
+		if actual != expected {
+			t.Fatalf("unexpected SQLite %s value %d, want %d", pragma, actual, expected)
+		}
+	}
 	if maximum := store.writer.Stats().MaxOpenConnections; maximum != 1 {
 		t.Fatalf("unexpected writer connection limit %d", maximum)
 	}
@@ -472,6 +496,13 @@ func TestSQLiteResponseStoreUsesBoundedWALConnectionPools(t *testing.T) {
 		}
 		if queryOnly != 1 {
 			t.Fatalf("reader connection %d is not query-only: %d", index, queryOnly)
+		}
+		var readerSecureDelete int
+		if err := connection.QueryRowContext(context.Background(), "PRAGMA secure_delete").Scan(&readerSecureDelete); err != nil {
+			t.Fatal(err)
+		}
+		if readerSecureDelete != 0 {
+			t.Fatalf("reader connection %d enabled secure_delete: %d", index, readerSecureDelete)
 		}
 	}
 }
@@ -600,9 +631,19 @@ func TestSQLiteResponseStoreReplacesTheDisposableSouinSchema(t *testing.T) {
 	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
+	oldFile, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	store := openTestSQLiteStore(t, path)
-	t.Cleanup(func() { _ = store.Close() })
+	newFile, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(oldFile, newFile) {
+		t.Fatal("schema replacement reused the old SQLite database file")
+	}
 	var version int
 	if err := store.writer.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
@@ -616,6 +657,16 @@ func TestSQLiteResponseStoreReplacesTheDisposableSouinSchema(t *testing.T) {
 	}
 	if rows != 0 {
 		t.Fatalf("disposable Souin cache rows survived schema replacement: %d", rows)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	staleFiles, err := filepath.Glob(path + ".schema-*.stale-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(staleFiles) != 0 {
+		t.Fatalf("stale SQLite files survived asynchronous cleanup: %v", staleFiles)
 	}
 }
 

@@ -63,14 +63,19 @@ Each Stack rule with a `cache` object receives Swarmlite's native `http.handlers
 routes are untouched and no global cache application is generated. The handler stores complete
 status, headers, body, freshness timestamps, and `Vary` dimensions in
 `/cache/native-v1/cache.db`. SQLite runs in WAL mode with one serialized writer and four query-only
-reader connections, mmap is disabled, and expired rows are cleaned every five minutes. Cached
+reader connections, mmap is disabled, and expired rows are cleaned every five minutes. WAL
+checkpoints default to 8,192 pages (about 32 MiB) to avoid checkpointing after every large cached
+response. Cached
 response payload is logically capped at 1 GiB per Gateway by default and can be changed through
 the cluster-level `gateway.cache.max-size-bytes` setting. Sampled hits are deduplicated through a
 64 KiB Bloom filter and written in batches to a small access-metadata table, avoiding updates to rows
 that contain response bodies. Expired rows are removed first; approximate LRU eviction then returns
 usage to a 90% low-water mark. The logical limit counts the compact key, serialized headers, and
-body; reusable SQLite pages and WAL bytes may make the physical files larger. A schema upgrade drops
-old response-cache rows because the volume contains disposable cache data.
+body; reusable SQLite pages and WAL bytes may make the physical files larger. SQLite secure-delete
+is explicitly disabled for this disposable data. On a schema change, the old database and its
+WAL/SHM sidecars are renamed out of the active path, a fresh database is opened immediately, and
+the stale files are removed in the background instead of dropping multi-gigabyte tables while
+Caddy provisions the new configuration.
 
 The declared route TTL controls freshness. Request `no-store`, conditional, range, CONNECT, and
 protocol-upgrade requests bypass caching, as do responses carrying `Set-Cookie` or

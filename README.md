@@ -418,8 +418,10 @@ cluster-level `gateway.cache.max-size-bytes` setting to change it. It samples ca
 deduplicates recent touches with a small Bloom filter, and asynchronously updates a separate SQLite
 access table so LRU tracking does not rewrite rows containing response bodies. Expired entries are
 removed first; capacity pressure then evicts approximately least-recently-used entries to a 90%
-low-water mark. Expired entries are not served; stale refresh and stale-on-error behavior are not
-part of the current cache phase.
+low-water mark. Cache schema changes switch immediately to a fresh SQLite file and delete the old
+file asynchronously; secure-delete is disabled because response-cache data is disposable. Expired
+entries are not served; stale refresh and stale-on-error behavior are not part of the current cache
+phase.
 
 Rule precedence is exact path, longest prefix, regex, then a rule without matches. `tls` accepts
 `serve|disabled` and `http` accepts `redirect|serve|disabled`; `http: redirect` requires

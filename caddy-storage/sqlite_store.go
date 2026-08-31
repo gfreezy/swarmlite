@@ -35,15 +35,16 @@ const (
 	sqliteCacheSchemaVersion      = 5
 	// A 128-bit SHA-256 prefix keeps cache identities compact while retaining
 	// negligible collision probability at HTTP-cache scale.
-	cacheKeySize            = 16
-	sqliteCleanupBatchSize  = 1000
-	sqliteCleanupMaxBatches = 8
-	sqliteEvictionBatchSize = 512
-	cacheTouchQueueSize     = 4096
-	cacheTouchBatchSize     = 256
-	cacheTouchFlushInterval = time.Second
-	cacheTouchBloomWords    = 8192 // 64 KiB / 524,288 bits
-	cacheTouchBloomHashes   = 4
+	cacheKeySize             = 16
+	sqliteCleanupBatchSize   = 1000
+	sqliteCleanupMaxBatches  = 8
+	sqliteEvictionBatchSize  = 512
+	cacheTouchQueueSize      = 4096
+	cacheTouchBatchSize      = 256
+	cacheTouchFlushInterval  = time.Second
+	cacheTouchBloomWords     = 8192 // 64 KiB / 524,288 bits
+	cacheTouchBloomHashes    = 4
+	sqliteWALCheckpointPages = 8192 // 32 MiB with SQLite's default 4 KiB pages
 )
 
 var sqliteDatabases = struct {
@@ -213,6 +214,10 @@ func openSQLiteDatabase(
 	if err := os.MkdirAll(filepath.Dir(options.path), 0o750); err != nil {
 		return nil, fmt.Errorf("create SQLite cache directory: %w", err)
 	}
+	staleFiles, err := rotateSQLiteDatabaseForSchema(options.path, options.busyTimeout, logger)
+	if err != nil {
+		return nil, err
+	}
 
 	writer, err := sql.Open("sqlite", sqliteConnectionDSN(options, false))
 	if err != nil {
@@ -270,7 +275,139 @@ func openSQLiteDatabase(
 	}
 	result.background.Add(1)
 	go result.cleanupLoop()
+	if len(staleFiles) > 0 {
+		result.background.Add(1)
+		go result.removeStaleFiles(staleFiles)
+	}
 	return result, nil
+}
+
+func rotateSQLiteDatabaseForSchema(
+	path string,
+	busyTimeout time.Duration,
+	logger *zap.Logger,
+) ([]string, error) {
+	staleFiles, err := filepath.Glob(path + ".schema-*.stale-*")
+	if err != nil {
+		return nil, fmt.Errorf("find stale SQLite cache files: %w", err)
+	}
+
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		orphaned, err := rotateSQLiteFileSet(path, 0, false)
+		if err != nil {
+			return nil, err
+		}
+		return append(staleFiles, orphaned...), nil
+	} else if err != nil {
+		return nil, fmt.Errorf("inspect SQLite cache: %w", err)
+	}
+
+	version, err := readSQLiteSchemaVersion(path, busyTimeout)
+	if err != nil {
+		return nil, err
+	}
+	if version == sqliteCacheSchemaVersion {
+		return staleFiles, nil
+	}
+
+	rotated, err := rotateSQLiteFileSet(path, version, true)
+	if err != nil {
+		return nil, err
+	}
+	logger.Info(
+		"rotated disposable SQLite cache for schema change",
+		zap.Int("previous_schema", version),
+		zap.Int("current_schema", sqliteCacheSchemaVersion),
+	)
+	return append(staleFiles, rotated...), nil
+}
+
+func readSQLiteSchemaVersion(path string, busyTimeout time.Duration) (int, error) {
+	query := make(url.Values)
+	query.Set("mode", "ro")
+	query.Set("_query_only", "1")
+	query.Set("_busy_timeout", strconv.FormatInt(busyTimeout.Milliseconds(), 10))
+	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: query.Encode()}).String()
+	database, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return 0, fmt.Errorf("open SQLite cache schema probe: %w", err)
+	}
+	database.SetMaxOpenConns(1)
+	database.SetMaxIdleConns(0)
+	var version int
+	queryErr := database.QueryRow("PRAGMA user_version").Scan(&version)
+	closeErr := database.Close()
+	if queryErr != nil {
+		return 0, fmt.Errorf("read SQLite cache schema version: %w", queryErr)
+	}
+	if closeErr != nil {
+		return 0, fmt.Errorf("close SQLite cache schema probe: %w", closeErr)
+	}
+	return version, nil
+}
+
+func rotateSQLiteFileSet(path string, version int, requireMain bool) ([]string, error) {
+	staleBase := fmt.Sprintf("%s.schema-%d.stale-%d", path, version, time.Now().UnixNano())
+	type fileRename struct {
+		from string
+		to   string
+	}
+	candidates := []fileRename{
+		{from: path + "-wal", to: staleBase + "-wal"},
+		{from: path + "-shm", to: staleBase + "-shm"},
+		{from: path, to: staleBase},
+	}
+	available := make([]fileRename, 0, len(candidates))
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate.from); err == nil {
+			available = append(available, candidate)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("inspect SQLite cache file %q: %w", candidate.from, err)
+		}
+	}
+	if requireMain {
+		foundMain := false
+		for _, candidate := range available {
+			foundMain = foundMain || candidate.from == path
+		}
+		if !foundMain {
+			return nil, fmt.Errorf("SQLite cache disappeared before schema rotation")
+		}
+	}
+
+	moved := make([]fileRename, 0, len(available))
+	for _, candidate := range available {
+		if err := os.Rename(candidate.from, candidate.to); err != nil {
+			var rollbackErr error
+			for index := len(moved) - 1; index >= 0; index-- {
+				rollbackErr = errors.Join(rollbackErr, os.Rename(moved[index].to, moved[index].from))
+			}
+			return nil, errors.Join(
+				fmt.Errorf("rotate SQLite cache file %q: %w", candidate.from, err),
+				rollbackErr,
+			)
+		}
+		moved = append(moved, candidate)
+	}
+	rotated := make([]string, 0, len(moved))
+	for _, candidate := range moved {
+		rotated = append(rotated, candidate.to)
+	}
+	return rotated, nil
+}
+
+func (database *sqliteDatabase) removeStaleFiles(paths []string) {
+	defer database.background.Done()
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		if _, found := seen[path]; found {
+			continue
+		}
+		seen[path] = struct{}{}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			database.logger.Warn("failed to remove stale SQLite cache file", zap.String("path", path), zap.Error(err))
+		}
+	}
 }
 
 func initializeSQLiteSchema(database *sql.DB) error {
@@ -284,18 +421,12 @@ func initializeSQLiteSchema(database *sql.DB) error {
 	}
 	defer tx.Rollback()
 
-	// Cache data is disposable. Recreate the tables when upgrading from the
-	// former Souin key/value layout instead of carrying a migration path for
-	// expired response data.
-	if version != sqliteCacheSchemaVersion {
-		if _, err := tx.Exec(`
-			DROP TABLE IF EXISTS cache_entries;
-			DROP TABLE IF EXISTS cache_resources;
-			DROP TABLE IF EXISTS cache_access;
-			DROP TABLE IF EXISTS cache_usage;
-		`); err != nil {
-			return fmt.Errorf("reset SQLite cache schema: %w", err)
-		}
+	if version != 0 && version != sqliteCacheSchemaVersion {
+		return fmt.Errorf(
+			"SQLite cache schema changed during initialization: found %d, expected %d",
+			version,
+			sqliteCacheSchemaVersion,
+		)
 	}
 	if _, err := tx.Exec(`
 		CREATE TABLE IF NOT EXISTS cache_resources (
@@ -350,12 +481,15 @@ func sqliteConnectionDSN(options sqliteOptions, readOnly bool) string {
 	}
 	query.Add("_pragma", "mmap_size(0)")
 	query.Add("_pragma", "temp_store(FILE)")
+	// Response-cache data is disposable. Zero-filling deleted payload pages
+	// adds write amplification without protecting durable user data.
+	query.Add("_pragma", "secure_delete(OFF)")
 	if readOnly {
 		query.Set("_query_only", "1")
 	} else {
 		query.Set("_synchronous", "NORMAL")
 		query.Add("_pragma", fmt.Sprintf("journal_size_limit(%d)", options.journalSizeLimit))
-		query.Add("_pragma", "wal_autocheckpoint(1000)")
+		query.Add("_pragma", fmt.Sprintf("wal_autocheckpoint(%d)", sqliteWALCheckpointPages))
 	}
 	return (&url.URL{Scheme: "file", Path: options.path, RawQuery: query.Encode()}).String()
 }
