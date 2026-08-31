@@ -74,7 +74,7 @@ func TestNativeCacheHandlerHTTPBehavior(t *testing.T) {
 									"handler":                  "cache",
 									"path":                     filepath.Join(t.TempDir(), "cache.db"),
 									"ttl":                      "5m",
-									"methods":                  []string{"GET", "POST"},
+									"allowed_http_verbs":       []string{"GET", "POST"},
 									"max_cacheable_body_bytes": 64,
 									"max_request_body_bytes":   32,
 								},
@@ -188,6 +188,21 @@ func TestCacheMethodPolicyDefaultsToAllAndHonorsAllowlist(t *testing.T) {
 	head := httptest.NewRequest(http.MethodHead, "https://example.test/query", nil)
 	if decision := restricted.requestCachePolicy(head); !decision.lookup || decision.store {
 		t.Fatalf("GET allowlist did not permit HEAD lookup: %#v", decision)
+	}
+}
+
+func TestCacheBaseKeyHonorsSouinDisableQuery(t *testing.T) {
+	first := httptest.NewRequest(http.MethodGet, "https://example.test/page?utm_source=one", nil)
+	second := httptest.NewRequest(http.MethodGet, "https://example.test/page?utm_source=two", nil)
+
+	includingQuery := &CacheHandler{namespace: "test"}
+	if includingQuery.baseKey(first, "") == includingQuery.baseKey(second, "") {
+		t.Fatal("query-aware cache keys unexpectedly matched")
+	}
+
+	excludingQuery := &CacheHandler{namespace: "test", disableQuery: true}
+	if excludingQuery.baseKey(first, "") != excludingQuery.baseKey(second, "") {
+		t.Fatal("query-independent cache keys unexpectedly differed")
 	}
 }
 

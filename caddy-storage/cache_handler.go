@@ -37,8 +37,8 @@ type CacheHandler struct {
 	TTL                   caddy.Duration `json:"ttl,omitempty"`
 	MaxCacheableBodyBytes int64          `json:"max_cacheable_body_bytes,omitempty"`
 	MaxRequestBodyBytes   int64          `json:"max_request_body_bytes,omitempty"`
-	Methods               *[]string      `json:"methods,omitempty"`
-	KeyHeaders            []string       `json:"key_headers,omitempty"`
+	AllowedHTTPVerbs      *[]string      `json:"allowed_http_verbs,omitempty"`
+	Key                   *CacheKey      `json:"key,omitempty"`
 	StatusCodes           []int          `json:"status_codes,omitempty"`
 
 	CacheSizeKiB     int64          `json:"cache_size_kib,omitempty"`
@@ -47,13 +47,24 @@ type CacheHandler struct {
 	CleanupInterval  caddy.Duration `json:"cleanup_interval,omitempty"`
 	JournalSizeLimit int64          `json:"journal_size_limit,omitempty"`
 
-	store       *sqliteResponseStore
-	logger      *zap.Logger
-	ttl         time.Duration
-	methods     map[string]struct{}
-	statusCodes map[int]struct{}
-	namespace   string
-	flights     cacheFlightGroup
+	store        *sqliteResponseStore
+	logger       *zap.Logger
+	ttl          time.Duration
+	methods      map[string]struct{}
+	statusCodes  map[int]struct{}
+	keyHeaders   []string
+	disableQuery bool
+	namespace    string
+	flights      cacheFlightGroup
+}
+
+// CacheKey keeps the compatible subset of Souin's cache key configuration.
+// Native cache keys are always hashed, so Hash changes representation only and
+// is accepted without changing key identity.
+type CacheKey struct {
+	DisableQuery bool     `json:"disable_query,omitempty"`
+	Hash         bool     `json:"hash,omitempty"`
+	Headers      []string `json:"headers,omitempty"`
 }
 
 func init() {
@@ -88,16 +99,16 @@ func (handler *CacheHandler) Provision(ctx caddy.Context) error {
 	if handler.MaxRequestBodyBytes < 0 {
 		return errors.New("cache max_request_body_bytes must be positive")
 	}
-	if handler.Methods != nil {
-		if len(*handler.Methods) == 0 {
-			return errors.New("cache methods must not be empty")
+	if handler.AllowedHTTPVerbs != nil {
+		if len(*handler.AllowedHTTPVerbs) == 0 {
+			return errors.New("cache allowed_http_verbs must not be empty")
 		}
-		handler.methods = make(map[string]struct{}, len(*handler.Methods))
-		methods := make([]string, 0, len(*handler.Methods))
-		for _, method := range *handler.Methods {
+		handler.methods = make(map[string]struct{}, len(*handler.AllowedHTTPVerbs))
+		methods := make([]string, 0, len(*handler.AllowedHTTPVerbs))
+		for _, method := range *handler.AllowedHTTPVerbs {
 			method = strings.ToUpper(strings.TrimSpace(method))
 			if !validHTTPHeaderName(method) || method == http.MethodConnect {
-				return fmt.Errorf("cache methods contains unsupported method %q", method)
+				return fmt.Errorf("cache allowed_http_verbs contains unsupported method %q", method)
 			}
 			if _, found := handler.methods[method]; found {
 				continue
@@ -106,15 +117,20 @@ func (handler *CacheHandler) Provision(ctx caddy.Context) error {
 			methods = append(methods, method)
 		}
 		sort.Strings(methods)
-		handler.Methods = &methods
+		handler.AllowedHTTPVerbs = &methods
 	}
 
-	seenHeaders := make(map[string]struct{}, len(handler.KeyHeaders))
-	keyHeaders := make([]string, 0, len(handler.KeyHeaders))
-	for _, name := range handler.KeyHeaders {
+	configuredKeyHeaders := []string(nil)
+	if handler.Key != nil {
+		configuredKeyHeaders = append(configuredKeyHeaders, handler.Key.Headers...)
+		handler.disableQuery = handler.Key.DisableQuery
+	}
+	seenHeaders := make(map[string]struct{}, len(configuredKeyHeaders))
+	keyHeaders := make([]string, 0, len(configuredKeyHeaders))
+	for _, name := range configuredKeyHeaders {
 		name = strings.TrimSpace(name)
 		if !validHTTPHeaderName(name) {
-			return fmt.Errorf("cache key_headers contains invalid field %q", name)
+			return fmt.Errorf("cache key.headers contains invalid field %q", name)
 		}
 		name = http.CanonicalHeaderKey(name)
 		if _, found := seenHeaders[name]; found {
@@ -124,7 +140,10 @@ func (handler *CacheHandler) Provision(ctx caddy.Context) error {
 		keyHeaders = append(keyHeaders, name)
 	}
 	sort.Strings(keyHeaders)
-	handler.KeyHeaders = keyHeaders
+	handler.keyHeaders = keyHeaders
+	if handler.Key != nil {
+		handler.Key.Headers = keyHeaders
+	}
 
 	if len(handler.StatusCodes) == 0 {
 		handler.StatusCodes = []int{http.StatusOK}
@@ -202,7 +221,7 @@ func (handler *CacheHandler) ServeHTTP(
 
 	var flight *cacheFlight
 	if decision.lookup {
-		flightKey := baseKey + ":" + requestVaryKey(request, handler.KeyHeaders)
+		flightKey := baseKey + ":" + requestVaryKey(request, handler.keyHeaders)
 		var leader bool
 		flight, leader = handler.flights.acquire(flightKey)
 		if !leader {
@@ -234,7 +253,7 @@ func (handler *CacheHandler) ServeHTTP(
 		return nil
 	}
 
-	varyHeaders, cacheable := responseVaryHeaders(capture.header, handler.KeyHeaders)
+	varyHeaders, cacheable := responseVaryHeaders(capture.header, handler.keyHeaders)
 	if !cacheable {
 		return nil
 	}
@@ -291,13 +310,17 @@ func (handler *CacheHandler) baseKey(request *http.Request, bodyKey string) stri
 		contentType = request.Header.Get("Content-Type")
 		contentEncoding = request.Header.Get("Content-Encoding")
 	}
+	query := request.URL.RawQuery
+	if handler.disableQuery {
+		query = ""
+	}
 	value := strings.Join([]string{
 		handler.namespace,
 		strings.ToLower(scheme),
 		strings.ToLower(request.Host),
 		method,
 		path,
-		request.URL.RawQuery,
+		query,
 		contentType,
 		contentEncoding,
 		bodyKey,
@@ -308,8 +331,8 @@ func (handler *CacheHandler) baseKey(request *http.Request, bodyKey string) stri
 
 func (handler *CacheHandler) cacheNamespace() string {
 	methods := "*"
-	if handler.Methods != nil {
-		methods = strings.Join(*handler.Methods, ",")
+	if handler.AllowedHTTPVerbs != nil {
+		methods = strings.Join(*handler.AllowedHTTPVerbs, ",")
 	}
 	parts := []string{
 		"swarmlite-http-cache-v1",
@@ -317,7 +340,8 @@ func (handler *CacheHandler) cacheNamespace() string {
 		strconv.FormatInt(handler.MaxCacheableBodyBytes, 10),
 		strconv.FormatInt(handler.MaxRequestBodyBytes, 10),
 		methods,
-		strings.Join(handler.KeyHeaders, ","),
+		strings.Join(handler.keyHeaders, ","),
+		strconv.FormatBool(handler.disableQuery),
 	}
 	for _, status := range handler.StatusCodes {
 		parts = append(parts, strconv.Itoa(status))

@@ -225,20 +225,98 @@ pub struct HttpRouteRule {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "HttpCacheSpecInput")]
 pub struct HttpCacheSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub methods: Option<Vec<String>>,
+    pub allowed_http_verbs: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cacheable_body_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_request_body_bytes: Option<u64>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub key_headers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<HttpCacheKeySpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_codes: Option<Vec<u16>>,
+    // Persisted Stack snapshots may contain cache-handler fields removed when
+    // the native response cache replaced Souin. Retain their names long enough
+    // for normal Stack validation to reject them, but omit them when trusted
+    // historical state is serialized again.
+    #[serde(default, flatten, skip_serializing)]
+    ignored_legacy_fields: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+pub struct HttpCacheKeySpec {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disable_query: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hash: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HttpCacheSpecInput {
+    #[serde(default)]
+    ttl: Option<String>,
+    #[serde(default)]
+    allowed_http_verbs: Option<Vec<String>>,
+    #[serde(default)]
+    max_cacheable_body_bytes: Option<u64>,
+    #[serde(default)]
+    max_request_body_bytes: Option<u64>,
+    #[serde(default)]
+    status_codes: Option<Vec<u16>>,
+    #[serde(default)]
+    key: Option<HttpCacheKeySpecInput>,
+    #[serde(default, flatten)]
+    ignored_legacy_fields: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HttpCacheKeySpecInput {
+    #[serde(default)]
+    headers: Vec<String>,
+    #[serde(default)]
+    disable_query: bool,
+    // The native cache always hashes its complete key. This setting is
+    // accepted only so pre-native Stack files and snapshots remain readable.
+    #[serde(default)]
+    hash: bool,
+    #[serde(default, flatten)]
+    ignored_fields: BTreeMap<String, Value>,
+}
+
+impl TryFrom<HttpCacheSpecInput> for HttpCacheSpec {
+    type Error = String;
+
+    fn try_from(mut input: HttpCacheSpecInput) -> std::result::Result<Self, Self::Error> {
+        let key = if let Some(key) = input.key {
+            input.ignored_legacy_fields.extend(
+                key.ignored_fields
+                    .into_iter()
+                    .map(|(field, value)| (format!("key.{field}"), value)),
+            );
+            Some(HttpCacheKeySpec {
+                disable_query: key.disable_query,
+                hash: key.hash,
+                headers: key.headers,
+            })
+        } else {
+            None
+        };
+        Ok(Self {
+            ttl: input.ttl,
+            allowed_http_verbs: input.allowed_http_verbs,
+            max_cacheable_body_bytes: input.max_cacheable_body_bytes,
+            max_request_body_bytes: input.max_request_body_bytes,
+            key,
+            status_codes: input.status_codes,
+            ignored_legacy_fields: input.ignored_legacy_fields,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -727,6 +805,10 @@ fn validate_cache(cache: Option<&HttpCacheSpec>) -> Result<()> {
         return Ok(());
     };
 
+    if let Some(field) = cache.ignored_legacy_fields.keys().next() {
+        bail!("unknown field `{field}`");
+    }
+
     if let Some(ttl) = cache.ttl.as_deref() {
         let duration = humantime::parse_duration(ttl)
             .with_context(|| format!("cache ttl {ttl:?} is invalid"))?;
@@ -752,9 +834,9 @@ fn validate_cache(cache: Option<&HttpCacheSpec>) -> Result<()> {
     {
         bail!("cache max_request_body_bytes is too large");
     }
-    if let Some(methods) = cache.methods.as_ref() {
+    if let Some(methods) = cache.allowed_http_verbs.as_ref() {
         if methods.is_empty() {
-            bail!("cache methods must not be empty");
+            bail!("cache allowed_http_verbs must not be empty");
         }
         for method in methods {
             if !valid_http_header_name(method) || method.eq_ignore_ascii_case("CONNECT") {
@@ -762,9 +844,11 @@ fn validate_cache(cache: Option<&HttpCacheSpec>) -> Result<()> {
             }
         }
     }
-    for header in &cache.key_headers {
-        if !valid_http_header_name(header) {
-            bail!("cache key header {header:?} is invalid");
+    if let Some(key) = cache.key.as_ref() {
+        for header in &key.headers {
+            if !valid_http_header_name(header) {
+                bail!("cache key header {header:?} is invalid");
+            }
         }
     }
     if let Some(statuses) = cache.status_codes.as_ref() {
@@ -1458,10 +1542,11 @@ x-swarmlite:
             strip_prefix: true
           cache:
             ttl: 5m
-            methods: [GET, POST]
+            allowed_http_verbs: [GET, POST]
             max_cacheable_body_bytes: 1048576
             max_request_body_bytes: 65536
-            key_headers: [Accept-Language]
+            key:
+              headers: [Accept-Language]
             status_codes: [200, 404]
           backend:
             service: api
@@ -1480,14 +1565,85 @@ x-swarmlite:
         assert_eq!(handlers[0]["handler"], "encode");
         assert_eq!(handlers[1]["handler"], "cache");
         assert_eq!(handlers[1]["ttl"], "5m");
-        assert_eq!(handlers[1]["methods"], json!(["GET", "POST"]));
+        assert_eq!(handlers[1]["allowed_http_verbs"], json!(["GET", "POST"]));
         assert_eq!(handlers[1]["max_cacheable_body_bytes"], 1_048_576);
         assert_eq!(handlers[1]["max_request_body_bytes"], 65_536);
-        assert_eq!(handlers[1]["key_headers"], json!(["Accept-Language"]));
+        assert_eq!(handlers[1]["key"]["headers"], json!(["Accept-Language"]));
         assert_eq!(handlers[1]["status_codes"], json!([200, 404]));
         assert_eq!(handlers[1]["path"], "/cache/sqlite/cache.db");
         assert_eq!(handlers[2]["handler"], "rewrite");
         assert_eq!(handlers[3]["handler"], "reverse_proxy");
+    }
+
+    #[test]
+    fn preserves_souin_cache_settings_when_serializing() {
+        let cache: HttpCacheSpec = serde_json::from_value(json!({
+            "ttl": "24h",
+            "allowed_http_verbs": ["GET", "HEAD"],
+            "key": {
+                "disable_query": true,
+                "hash": true,
+                "headers": ["accept-encoding"]
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            cache.allowed_http_verbs.as_deref(),
+            Some(["GET".to_owned(), "HEAD".to_owned()].as_slice())
+        );
+        assert_eq!(
+            serde_json::to_value(cache).unwrap(),
+            json!({
+                "ttl": "24h",
+                "allowed_http_verbs": ["GET", "HEAD"],
+                "key": {
+                    "disable_query": true,
+                    "hash": true,
+                    "headers": ["accept-encoding"]
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn accepts_souin_cache_key_settings_in_stack_configuration() {
+        let parsed = parse_stack(
+            r#"
+services:
+  web:
+    image: nginx
+    expose: [80]
+x-swarmlite:
+  http_routes:
+    - hostnames: [example.com]
+      rules:
+        - cache:
+            allowed_http_verbs: [GET, HEAD]
+            key:
+              hash: true
+              disable_query: true
+              headers: [x-preferred-languages, x-app-language]
+          backend:
+            service: web
+"#,
+        )
+        .unwrap();
+
+        let cache = parsed.gateway.http_routes[0].rules[0]
+            .cache
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            cache.allowed_http_verbs.as_deref(),
+            Some(["GET".to_owned(), "HEAD".to_owned()].as_slice())
+        );
+        assert_eq!(
+            cache.key.as_ref().unwrap().headers,
+            ["x-preferred-languages", "x-app-language"]
+        );
+        assert!(cache.key.as_ref().unwrap().disable_query);
+        assert!(cache.key.as_ref().unwrap().hash);
     }
 
     #[test]

@@ -69,8 +69,9 @@ upgrade drops old response-cache rows because the volume contains disposable cac
 The declared route TTL controls freshness. `no-store`, `private`, `no-cache`, `Set-Cookie`,
 authorization, conditional, range, CONNECT, and protocol-upgrade requests use conservative cache
 behavior. Cache keys contain scheme, host, method, path, query, request-body hash and content type,
-configured `key_headers`, and response `Vary` fields. A `methods` allowlist is optional; when it is
-absent, an explicitly cached route accepts all ordinary HTTP methods. Request bodies above
+configured `key.headers`, and response `Vary` fields; Souin's `key.disable_query` omits the query
+component. An `allowed_http_verbs` allowlist is optional; when it is absent, an explicitly cached
+route accepts all ordinary HTTP methods. Request bodies above
 `max_request_body_bytes` and responses above `max_cacheable_body_bytes` bypass storage. Concurrent
 misses for the same key are coalesced, and SQLite errors fail open to the upstream. Expired entries
 are never served; stale-while-revalidate, stale-if-error, conditional revalidation, and purge APIs

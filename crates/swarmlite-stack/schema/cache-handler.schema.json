@@ -10,7 +10,7 @@
       "default": "5m",
       "description": "How long a stored response remains fresh."
     },
-    "methods": {
+    "allowed_http_verbs": {
       "type": "array",
       "minItems": 1,
       "uniqueItems": true,
@@ -19,7 +19,7 @@
         "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$",
         "not": { "enum": ["CONNECT", "connect"] }
       },
-      "description": "Optional method allowlist. When omitted, every ordinary HTTP method is cacheable; CONNECT and protocol upgrades always bypass the cache."
+      "description": "Souin-compatible method allowlist. When omitted, every ordinary HTTP method is cacheable; CONNECT and protocol upgrades always bypass the cache."
     },
     "max_cacheable_body_bytes": {
       "type": "integer",
@@ -33,14 +33,9 @@
       "default": 1048576,
       "description": "Maximum request body hashed into a cache key; larger requests bypass the cache."
     },
-    "key_headers": {
-      "type": "array",
-      "uniqueItems": true,
-      "items": {
-        "type": "string",
-        "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
-      },
-      "description": "Request headers always included in the variant key, in addition to fields named by the origin response's Vary header."
+    "key": {
+      "$ref": "#/$defs/key",
+      "description": "Souin-compatible cache key settings. Native keys are always hashed, so hash is accepted without changing key identity."
     },
     "status_codes": {
       "type": "array",
@@ -62,6 +57,22 @@
       "type": "string",
       "minLength": 1,
       "description": "A duration such as 500ms, 60s, or 5m."
+    },
+    "key": {
+      "type": "object",
+      "properties": {
+        "headers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+          }
+        },
+        "disable_query": { "type": "boolean" },
+        "hash": { "type": "boolean" }
+      },
+      "additionalProperties": false
     }
   }
 }

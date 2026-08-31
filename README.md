@@ -388,19 +388,25 @@ Route features include:
 - optional node-local Caddy response caching.
 
 Caching is an explicit route-level choice. The native Gateway handler stores responses directly in
-SQLite and includes the HTTP method, query string, request-body hash, configured key headers, and
-origin `Vary` fields in the cache key. An optional `methods` list restricts a cached route; when it
-is omitted, all ordinary methods—including query-style POST requests—are eligible. For example:
+SQLite and uses Souin's established `allowed_http_verbs` and `key` configuration names. The cache
+key includes the method, query string, request-body hash, configured headers, and origin `Vary`
+fields unless disabled by the supported key settings. For example:
 
 ```yaml
 cache:
   ttl: 5m
-  methods: [GET, POST]
+  allowed_http_verbs: [GET, POST]
   max_cacheable_body_bytes: 10485760
   max_request_body_bytes: 1048576
-  key_headers: [Accept-Language]
+  key:
+    hash: true
+    disable_query: true
+    headers: [Accept-Language]
   status_codes: [200]
 ```
+
+`key.disable_query` should be enabled only when every query parameter is irrelevant to the upstream
+response.
 
 CONNECT, protocol upgrades, range and conditional requests, authorization, response `no-store`,
 `private` or `no-cache`, and responses carrying `Set-Cookie` bypass storage. Concurrent misses for

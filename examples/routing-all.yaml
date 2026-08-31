@@ -69,8 +69,9 @@ x-swarmlite:
           # and ignores upstream Cache-Control headers.
           cache:
             ttl: 5m
-            methods: [GET, POST]
-            key_headers: [Accept-Language]
+            allowed_http_verbs: [GET, POST]
+            key:
+              headers: [Accept-Language]
           rewrite:
             strip_prefix: true
           backend:

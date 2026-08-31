@@ -835,6 +835,100 @@ x-swarmlite:
         );
     }
 
+    #[tokio::test]
+    async fn loads_legacy_cache_fields_from_persisted_gateway_routes() {
+        let directory = tempfile::tempdir().unwrap();
+        let cluster = cluster();
+        let gateway = swarmlite_stack::parse_stack(
+            r#"
+services:
+  web:
+    image: nginx
+    expose: [80]
+x-swarmlite:
+  http_routes:
+    - hostnames: [legacy-cache.example.com]
+      rules:
+        - cache:
+            ttl: 24h
+            allowed_http_verbs: [GET, HEAD]
+          backend: { service: web, port: 80 }
+"#,
+        )
+        .unwrap()
+        .gateway;
+        let snapshot = GatewayRecoverySnapshot::new(
+            cluster.cluster_id.clone(),
+            12,
+            BTreeMap::from([(
+                "demo".into(),
+                RecoveredStackGateway {
+                    gateway,
+                    upstreams: BTreeMap::from([(
+                        ServicePortKey::new("web", 80, HttpBackendProtocol::Http),
+                        vec!["10.0.0.8:32080".into()],
+                    )]),
+                },
+            )]),
+        );
+        let repository = StateRepository::open(directory.path(), cluster).unwrap();
+        repository
+            .initialize_from_gateway_recovery(&snapshot)
+            .unwrap();
+
+        repository
+            .with_connection(|connection| {
+                let document = connection
+                    .query_row(
+                        "SELECT document FROM control_plane WHERE singleton = 1",
+                        [],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )
+                    .map_err(backend)?;
+                let mut document: serde_json::Value =
+                    serde_json::from_slice(&document).map_err(invalid)?;
+                let cache = document
+                    .pointer_mut("/state/gateway_routes/demo/gateway/http_routes/0/rules/0/cache")
+                    .and_then(serde_json::Value::as_object_mut)
+                    .unwrap();
+                cache.insert(
+                    "key".into(),
+                    serde_json::json!({
+                        "disable_query": true,
+                        "hash": true,
+                        "headers": ["accept-encoding"]
+                    }),
+                );
+                let document = serde_json::to_vec(&document).map_err(invalid)?;
+                connection
+                    .execute(
+                        "UPDATE control_plane SET document = ?1 WHERE singleton = 1",
+                        params![document],
+                    )
+                    .map_err(backend)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let loaded = repository.load().await.unwrap();
+        let cache = loaded.state.gateway_routes["demo"].gateway.http_routes[0].rules[0]
+            .cache
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(cache).unwrap(),
+            serde_json::json!({
+                "ttl": "24h",
+                "allowed_http_verbs": ["GET", "HEAD"],
+                "key": {
+                    "disable_query": true,
+                    "hash": true,
+                    "headers": ["accept-encoding"]
+                }
+            })
+        );
+    }
+
     #[test]
     fn persists_content_addressed_stack_configs() {
         let directory = tempfile::tempdir().unwrap();
