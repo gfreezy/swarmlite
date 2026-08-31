@@ -11,7 +11,7 @@ RUN /out/caddy list-modules | grep -qx 'http.handlers.encode'
 RUN /out/caddy list-modules | grep -qx 'http.encoders.zstd'
 RUN /out/caddy list-modules | grep -qx 'http.encoders.gzip'
 
-FROM caddy:2.11.2-alpine
+FROM caddy:2.11.4-alpine
 COPY --from=build /out/caddy /usr/bin/caddy
 COPY bootstrap.json /etc/caddy/bootstrap.json
 LABEL io.swarmlite.system="true" \
