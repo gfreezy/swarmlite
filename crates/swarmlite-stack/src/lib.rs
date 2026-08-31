@@ -1029,7 +1029,7 @@ fn cache_handler(cache: &HttpCacheSpec) -> Value {
         .expect("HTTP cache settings serialize as an object")
         .clone();
     handler.insert("handler".to_owned(), json!("cache"));
-    handler.insert("path".to_owned(), json!("/cache/sqlite/cache.db"));
+    handler.insert("path".to_owned(), json!("/cache/native-v1/cache.db"));
     handler.insert("read_connections".to_owned(), json!(4));
     handler.insert("cleanup_interval".to_owned(), json!("5m"));
     handler.insert("journal_size_limit".to_owned(), json!(67_108_864));
@@ -1570,7 +1570,7 @@ x-swarmlite:
         assert_eq!(handlers[1]["max_request_body_bytes"], 65_536);
         assert_eq!(handlers[1]["key"]["headers"], json!(["Accept-Language"]));
         assert_eq!(handlers[1]["status_codes"], json!([200, 404]));
-        assert_eq!(handlers[1]["path"], "/cache/sqlite/cache.db");
+        assert_eq!(handlers[1]["path"], "/cache/native-v1/cache.db");
         assert_eq!(handlers[2]["handler"], "rewrite");
         assert_eq!(handlers[3]["handler"], "reverse_proxy");
     }

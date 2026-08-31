@@ -816,7 +816,9 @@ protect them against modification by, a machine on the same network path.
 
 Managed workload and Gateway containers use the runtime's `unless-stopped` restart policy. They are
 not child processes of `swarmlite serve`. Caddy starts with `--resume` and keeps its last accepted
-configuration in a persistent volume. Agents persist task identity, Stack, Service, slot, revision,
+configuration in an autosave-schema-specific directory inside its persistent volume. Incompatible
+Gateway releases start from the generated bootstrap without deleting the previous autosave, so a
+rollback can still resume it. Agents persist task identity, Stack, Service, slot, revision,
 specification hash, ports, and config digests as container labels, then adopt matching containers
 after restarting.
 

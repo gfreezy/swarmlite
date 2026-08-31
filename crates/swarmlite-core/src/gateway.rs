@@ -429,7 +429,7 @@ x-swarmlite:
             .flat_map(|route| route["handle"].as_array().into_iter().flatten())
             .find(|handler| handler["handler"] == "cache")
             .unwrap();
-        assert_eq!(cache["path"], "/cache/sqlite/cache.db");
+        assert_eq!(cache["path"], "/cache/native-v1/cache.db");
         assert_eq!(cache["read_connections"], 4);
         assert_eq!(cache["cleanup_interval"], "5m");
     }

@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	defaultSQLitePath             = "/cache/sqlite/cache.db"
+	defaultSQLitePath             = "/cache/native-v1/cache.db"
 	defaultSQLiteReadConnections  = 4
 	maxSQLiteReadConnections      = 16
 	defaultSQLiteBusyTimeout      = 5 * time.Second

@@ -53,12 +53,14 @@ pub const GATEWAY_COMPONENT: &str = "gateway";
 pub const GATEWAY_ADDRESS_LABEL: &str = "io.swarmlite.advertise_address";
 const GATEWAY_NODE_LABEL: &str = "io.swarmlite.node_id";
 const GATEWAY_SCHEMA_LABEL: &str = "io.swarmlite.gateway_schema";
+const GATEWAY_AUTOSAVE_SCHEMA_LABEL: &str = "io.swarmlite.gateway_autosave_schema";
 const GATEWAY_IMAGE_LABEL: &str = "io.swarmlite.gateway_image";
 const GATEWAY_LISTEN_LABEL: &str = "io.swarmlite.gateway_listen";
 const GATEWAY_GRACE_PERIOD_LABEL: &str = "io.swarmlite.gateway_grace_period_seconds";
 const GATEWAY_HTTP3_LABEL: &str = "io.swarmlite.gateway_http3_enabled";
 const GATEWAY_TOKEN_HASH_LABEL: &str = "io.swarmlite.gateway_token_sha256";
-const GATEWAY_SCHEMA: &str = "8";
+const GATEWAY_SCHEMA: &str = "9";
+const GATEWAY_AUTOSAVE_SCHEMA: &str = "2";
 const GATEWAY_CONTAINER_NAME: &str = "swarmlite-gateway";
 const GATEWAY_ADMIN_URL: &str = "http://127.0.0.1:2019";
 const GATEWAY_RECOVERY_PATH: &str = "/config/swarmlite-recovery.json";
@@ -145,6 +147,7 @@ struct ExistingGatewayContainer {
     http3_enabled: Option<String>,
     token_hash: Option<String>,
     schema: Option<String>,
+    autosave_schema: Option<String>,
     running: bool,
 }
 
@@ -702,6 +705,7 @@ impl DockerCompatibleRuntime {
                     http3_enabled: labels.get(GATEWAY_HTTP3_LABEL).cloned(),
                     token_hash: labels.get(GATEWAY_TOKEN_HASH_LABEL).cloned(),
                     schema: labels.get(GATEWAY_SCHEMA_LABEL).cloned(),
+                    autosave_schema: labels.get(GATEWAY_AUTOSAVE_SCHEMA_LABEL).cloned(),
                     running: summary.state == Some(ContainerSummaryStateEnum::RUNNING),
                 })
             })
@@ -769,7 +773,7 @@ impl DockerCompatibleRuntime {
                     .to_owned(),
             ]),
             env: Some(vec![
-                "XDG_CONFIG_HOME=/config".to_owned(),
+                format!("XDG_CONFIG_HOME={}", gateway_autosave_config_home()),
                 "XDG_DATA_HOME=/data".to_owned(),
                 format!("SWARMLITE_TOKEN={}", spec.token),
                 format!("SWARMLITE_GATEWAY_ID={}", spec.node_id),
@@ -1215,6 +1219,10 @@ fn gateway_labels(spec: &GatewayContainerSpec) -> HashMap<String, String> {
         ),
         (GATEWAY_NODE_LABEL.to_owned(), spec.node_id.clone()),
         (GATEWAY_SCHEMA_LABEL.to_owned(), GATEWAY_SCHEMA.to_owned()),
+        (
+            GATEWAY_AUTOSAVE_SCHEMA_LABEL.to_owned(),
+            GATEWAY_AUTOSAVE_SCHEMA.to_owned(),
+        ),
         (GATEWAY_IMAGE_LABEL.to_owned(), spec.gateway.image.clone()),
         (
             GATEWAY_LISTEN_LABEL.to_owned(),
@@ -1241,6 +1249,10 @@ fn gateway_token_hash(token: &str) -> String {
 
 fn optional_label<T: std::fmt::Display>(value: Option<T>) -> String {
     value.map_or_else(|| "unset".to_owned(), |value| value.to_string())
+}
+
+fn gateway_autosave_config_home() -> String {
+    format!("/config/autosave-v{GATEWAY_AUTOSAVE_SCHEMA}")
 }
 
 fn gateway_stop_timeout(grace_period_seconds: Option<u64>) -> i32 {
@@ -1284,6 +1296,7 @@ fn gateway_matches_spec(container: &ExistingGatewayContainer, spec: &GatewayCont
             == Some(&optional_label(spec.gateway.http.http3_enabled))
         && container.token_hash.as_deref() == Some(&gateway_token_hash(&spec.token))
         && container.schema.as_deref() == Some(GATEWAY_SCHEMA)
+        && container.autosave_schema.as_deref() == Some(GATEWAY_AUTOSAVE_SCHEMA)
 }
 
 fn gateway_ports(listen: &[String]) -> Result<BTreeSet<u16>> {
@@ -2618,6 +2631,10 @@ mod tests {
         assert_eq!(labels[GATEWAY_ADDRESS_LABEL], "10.0.0.21");
         assert_eq!(labels[GATEWAY_NODE_LABEL], "node-a");
         assert_eq!(labels[GATEWAY_SCHEMA_LABEL], GATEWAY_SCHEMA);
+        assert_eq!(
+            labels[GATEWAY_AUTOSAVE_SCHEMA_LABEL],
+            GATEWAY_AUTOSAVE_SCHEMA
+        );
         assert_eq!(labels[GATEWAY_IMAGE_LABEL], DEFAULT_GATEWAY_IMAGE);
         assert_eq!(labels[GATEWAY_LISTEN_LABEL], ":80");
         assert_eq!(labels[GATEWAY_GRACE_PERIOD_LABEL], "unset");
@@ -2643,14 +2660,23 @@ mod tests {
             http3_enabled: Some("unset".into()),
             token_hash: Some(gateway_token_hash("0123456789abcdef")),
             schema: Some(GATEWAY_SCHEMA.into()),
+            autosave_schema: Some(GATEWAY_AUTOSAVE_SCHEMA.into()),
             running: true,
         };
         let mut spec = test_gateway_spec();
         assert!(!gateway_matches_spec(&container, &spec));
         spec.gateway.image = "custom-caddy:v1".into();
         assert!(gateway_matches_spec(&container, &spec));
+        container.autosave_schema = None;
+        assert!(!gateway_matches_spec(&container, &spec));
+        container.autosave_schema = Some(GATEWAY_AUTOSAVE_SCHEMA.into());
         container.node_id = None;
         assert!(!gateway_matches_spec(&container, &spec));
+    }
+
+    #[test]
+    fn isolates_caddy_autosaves_by_compatibility_schema() {
+        assert_eq!(gateway_autosave_config_home(), "/config/autosave-v2");
     }
 
     #[test]

@@ -62,7 +62,7 @@ admin API. The token is not written into Caddy's JSON configuration or container
 Each Stack rule with a `cache` object receives Swarmlite's native `http.handlers.cache`; uncached
 routes are untouched and no global cache application is generated. The handler stores complete
 status, headers, body, freshness timestamps, and `Vary` dimensions in
-`/cache/sqlite/cache.db`. SQLite runs in WAL mode with one serialized writer and four query-only
+`/cache/native-v1/cache.db`. SQLite runs in WAL mode with one serialized writer and four query-only
 reader connections, mmap is disabled, and expired rows are cleaned every five minutes. A schema
 upgrade drops old response-cache rows because the volume contains disposable cache data.
 
