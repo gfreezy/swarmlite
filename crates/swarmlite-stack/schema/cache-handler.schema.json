@@ -19,7 +19,8 @@
         "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$",
         "not": { "enum": ["CONNECT", "connect"] }
       },
-      "description": "Souin-compatible method allowlist. When omitted, every ordinary HTTP method is cacheable; CONNECT and protocol upgrades always bypass the cache."
+      "default": ["GET", "HEAD"],
+      "description": "Souin-compatible method allowlist. When omitted, only GET responses are stored and HEAD may reuse a matching GET response; CONNECT and protocol upgrades always bypass the cache."
     },
     "max_cacheable_body_bytes": {
       "type": "integer",

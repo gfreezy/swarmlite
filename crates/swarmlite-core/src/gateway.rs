@@ -4,8 +4,13 @@ use serde_json::{Value, json};
 use swarmlite_stack::{PathRegexpMatcher, RequestMatcher, Route};
 
 use crate::model::{
-    ClusterGatewayConfig, ClusterState, DesiredTaskState, ObservedTaskState, RecoveredStackGateway,
-    ServicePortKey, ServiceRecord,
+    ClusterGatewayConfig, ClusterState, DEFAULT_GATEWAY_CACHE_ACCESS_UPDATE_INTERVAL_SECONDS,
+    DEFAULT_GATEWAY_CACHE_HIT_SAMPLE_RATIO, DEFAULT_GATEWAY_CACHE_LOW_WATER_PERCENT,
+    DEFAULT_GATEWAY_CACHE_MAX_SIZE_BYTES, DEFAULT_GATEWAY_CACHE_SQLITE_BUSY_TIMEOUT_SECONDS,
+    DEFAULT_GATEWAY_CACHE_SQLITE_CLEANUP_INTERVAL_SECONDS,
+    DEFAULT_GATEWAY_CACHE_SQLITE_JOURNAL_SIZE_LIMIT_BYTES,
+    DEFAULT_GATEWAY_CACHE_SQLITE_READ_CONNECTIONS, DesiredTaskState, GatewayCacheConfig,
+    ObservedTaskState, RecoveredStackGateway, ServicePortKey, ServiceRecord,
 };
 
 pub use swarmlite_stack::{HttpServer, StorageConfig, routed_service_ports, storage};
@@ -39,6 +44,7 @@ pub fn config(state: &ClusterState, gateway: &ClusterGatewayConfig, controller: 
     let mut server = generate(state, &gateway.listen);
     server.routes.insert(0, gateway_probe_route());
     let mut server = serde_json::to_value(server).expect("HTTP server serializes to JSON");
+    apply_cache_runtime_config(&mut server, &gateway.cache);
     let server_object = server.as_object_mut().expect("HTTP server is an object");
     if gateway.logging.access.enabled == Some(true) {
         server_object.insert(
@@ -104,6 +110,95 @@ pub fn config(state: &ClusterState, gateway: &ClusterGatewayConfig, controller: 
             .insert("logging".to_owned(), logging);
     }
     config
+}
+
+fn apply_cache_runtime_config(value: &mut Value, cache: &GatewayCacheConfig) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                apply_cache_runtime_config(value, cache);
+            }
+        }
+        Value::Object(object) => {
+            if object.get("handler").and_then(Value::as_str) == Some("cache") {
+                object.insert(
+                    "max_size_bytes".to_owned(),
+                    json!(
+                        cache
+                            .max_size_bytes
+                            .unwrap_or(DEFAULT_GATEWAY_CACHE_MAX_SIZE_BYTES)
+                    ),
+                );
+                object.insert(
+                    "low_water_percent".to_owned(),
+                    json!(
+                        cache
+                            .low_water_percent
+                            .unwrap_or(DEFAULT_GATEWAY_CACHE_LOW_WATER_PERCENT)
+                    ),
+                );
+                object.insert(
+                    "hit_sample_ratio".to_owned(),
+                    json!(
+                        cache
+                            .hit_sample_ratio
+                            .unwrap_or(DEFAULT_GATEWAY_CACHE_HIT_SAMPLE_RATIO)
+                    ),
+                );
+                object.insert(
+                    "access_update_interval".to_owned(),
+                    duration(
+                        cache
+                            .access_update_interval_seconds
+                            .unwrap_or(DEFAULT_GATEWAY_CACHE_ACCESS_UPDATE_INTERVAL_SECONDS),
+                    ),
+                );
+                if let Some(value) = cache.sqlite.cache_size_kib {
+                    object.insert("cache_size_kib".to_owned(), json!(value));
+                }
+                object.insert(
+                    "read_connections".to_owned(),
+                    json!(
+                        cache
+                            .sqlite
+                            .read_connections
+                            .unwrap_or(DEFAULT_GATEWAY_CACHE_SQLITE_READ_CONNECTIONS)
+                    ),
+                );
+                object.insert(
+                    "busy_timeout".to_owned(),
+                    duration(
+                        cache
+                            .sqlite
+                            .busy_timeout_seconds
+                            .unwrap_or(DEFAULT_GATEWAY_CACHE_SQLITE_BUSY_TIMEOUT_SECONDS),
+                    ),
+                );
+                object.insert(
+                    "cleanup_interval".to_owned(),
+                    duration(
+                        cache
+                            .sqlite
+                            .cleanup_interval_seconds
+                            .unwrap_or(DEFAULT_GATEWAY_CACHE_SQLITE_CLEANUP_INTERVAL_SECONDS),
+                    ),
+                );
+                object.insert(
+                    "journal_size_limit".to_owned(),
+                    json!(
+                        cache
+                            .sqlite
+                            .journal_size_limit_bytes
+                            .unwrap_or(DEFAULT_GATEWAY_CACHE_SQLITE_JOURNAL_SIZE_LIMIT_BYTES)
+                    ),
+                );
+            }
+            for value in object.values_mut() {
+                apply_cache_runtime_config(value, cache);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn duration(seconds: u64) -> Value {
@@ -420,7 +515,17 @@ x-swarmlite:
         );
         assert!(replace_stack_route(&mut state, "demo"));
 
-        let cached = config(&state, &gateway_with_listen(&[":80"]), "controller".into());
+        let mut gateway = gateway_with_listen(&[":80"]);
+        gateway.cache.max_size_bytes = Some(2_147_483_648);
+        gateway.cache.low_water_percent = Some(80);
+        gateway.cache.hit_sample_ratio = Some(16);
+        gateway.cache.access_update_interval_seconds = Some(120);
+        gateway.cache.sqlite.cache_size_kib = Some(8_192);
+        gateway.cache.sqlite.read_connections = Some(6);
+        gateway.cache.sqlite.busy_timeout_seconds = Some(3);
+        gateway.cache.sqlite.cleanup_interval_seconds = Some(60);
+        gateway.cache.sqlite.journal_size_limit_bytes = Some(33_554_432);
+        let cached = config(&state, &gateway, "controller".into());
         assert!(cached["apps"].get("cache").is_none());
         let cache = cached["apps"]["http"]["servers"]["swarmlite"]["routes"]
             .as_array()
@@ -430,8 +535,15 @@ x-swarmlite:
             .find(|handler| handler["handler"] == "cache")
             .unwrap();
         assert_eq!(cache["path"], "/cache/native-v1/cache.db");
-        assert_eq!(cache["read_connections"], 4);
-        assert_eq!(cache["cleanup_interval"], "5m");
+        assert_eq!(cache["max_size_bytes"], 2_147_483_648_u64);
+        assert_eq!(cache["low_water_percent"], 80);
+        assert_eq!(cache["hit_sample_ratio"], 16);
+        assert_eq!(cache["access_update_interval"], "120s");
+        assert_eq!(cache["cache_size_kib"], 8_192);
+        assert_eq!(cache["read_connections"], 6);
+        assert_eq!(cache["busy_timeout"], "3s");
+        assert_eq!(cache["cleanup_interval"], "60s");
+        assert_eq!(cache["journal_size_limit"], 33_554_432);
     }
 
     #[test]

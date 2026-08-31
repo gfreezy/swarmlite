@@ -41,11 +41,15 @@ type CacheHandler struct {
 	Key                   *CacheKey      `json:"key,omitempty"`
 	StatusCodes           []int          `json:"status_codes,omitempty"`
 
-	CacheSizeKiB     int64          `json:"cache_size_kib,omitempty"`
-	ReadConnections  int            `json:"read_connections,omitempty"`
-	BusyTimeout      caddy.Duration `json:"busy_timeout,omitempty"`
-	CleanupInterval  caddy.Duration `json:"cleanup_interval,omitempty"`
-	JournalSizeLimit int64          `json:"journal_size_limit,omitempty"`
+	MaxSizeBytes         int64          `json:"max_size_bytes,omitempty"`
+	LowWaterPercent      int            `json:"low_water_percent,omitempty"`
+	HitSampleRatio       uint64         `json:"hit_sample_ratio,omitempty"`
+	AccessUpdateInterval caddy.Duration `json:"access_update_interval,omitempty"`
+	CacheSizeKiB         int64          `json:"cache_size_kib,omitempty"`
+	ReadConnections      int            `json:"read_connections,omitempty"`
+	BusyTimeout          caddy.Duration `json:"busy_timeout,omitempty"`
+	CleanupInterval      caddy.Duration `json:"cleanup_interval,omitempty"`
+	JournalSizeLimit     int64          `json:"journal_size_limit,omitempty"`
 
 	store        *sqliteResponseStore
 	logger       *zap.Logger
@@ -99,26 +103,28 @@ func (handler *CacheHandler) Provision(ctx caddy.Context) error {
 	if handler.MaxRequestBodyBytes < 0 {
 		return errors.New("cache max_request_body_bytes must be positive")
 	}
+	configuredMethods := []string{http.MethodGet, http.MethodHead}
 	if handler.AllowedHTTPVerbs != nil {
 		if len(*handler.AllowedHTTPVerbs) == 0 {
 			return errors.New("cache allowed_http_verbs must not be empty")
 		}
-		handler.methods = make(map[string]struct{}, len(*handler.AllowedHTTPVerbs))
-		methods := make([]string, 0, len(*handler.AllowedHTTPVerbs))
-		for _, method := range *handler.AllowedHTTPVerbs {
-			method = strings.ToUpper(strings.TrimSpace(method))
-			if !validHTTPHeaderName(method) || method == http.MethodConnect {
-				return fmt.Errorf("cache allowed_http_verbs contains unsupported method %q", method)
-			}
-			if _, found := handler.methods[method]; found {
-				continue
-			}
-			handler.methods[method] = struct{}{}
-			methods = append(methods, method)
-		}
-		sort.Strings(methods)
-		handler.AllowedHTTPVerbs = &methods
+		configuredMethods = *handler.AllowedHTTPVerbs
 	}
+	handler.methods = make(map[string]struct{}, len(configuredMethods))
+	methods := make([]string, 0, len(configuredMethods))
+	for _, method := range configuredMethods {
+		method = strings.ToUpper(strings.TrimSpace(method))
+		if !validHTTPHeaderName(method) || method == http.MethodConnect {
+			return fmt.Errorf("cache allowed_http_verbs contains unsupported method %q", method)
+		}
+		if _, found := handler.methods[method]; found {
+			continue
+		}
+		handler.methods[method] = struct{}{}
+		methods = append(methods, method)
+	}
+	sort.Strings(methods)
+	handler.AllowedHTTPVerbs = &methods
 
 	configuredKeyHeaders := []string(nil)
 	if handler.Key != nil {
@@ -166,6 +172,10 @@ func (handler *CacheHandler) Provision(ctx caddy.Context) error {
 	handler.namespace = handler.cacheNamespace()
 	store, err := newSQLiteResponseStore(sqliteOptions{
 		path:             handler.Path,
+		maxSizeBytes:     handler.MaxSizeBytes,
+		lowWaterPercent:  handler.LowWaterPercent,
+		hitSampleRatio:   handler.HitSampleRatio,
+		accessInterval:   time.Duration(handler.AccessUpdateInterval),
 		cacheSizeKiB:     handler.CacheSizeKiB,
 		readConnections:  handler.ReadConnections,
 		busyTimeout:      time.Duration(handler.BusyTimeout),
@@ -221,7 +231,10 @@ func (handler *CacheHandler) ServeHTTP(
 
 	var flight *cacheFlight
 	if decision.lookup {
-		flightKey := baseKey + ":" + requestVaryKey(request, handler.keyHeaders)
+		flightKey := cacheFlightKey{
+			base: baseKey,
+			vary: requestVaryKey(request, handler.keyHeaders),
+		}
 		var leader bool
 		flight, leader = handler.flights.acquire(flightKey)
 		if !leader {
@@ -260,7 +273,6 @@ func (handler *CacheHandler) ServeHTTP(
 	now := time.Now()
 	entry := &cacheEntry{
 		BaseKey:     baseKey,
-		VaryKey:     requestVaryKey(request, varyHeaders),
 		VaryHeaders: varyHeaders,
 		Status:      capture.status,
 		Header:      sanitizedCacheHeader(capture.header),
@@ -268,7 +280,7 @@ func (handler *CacheHandler) ServeHTTP(
 		StoredAt:    now,
 		ExpiresAt:   now.Add(handler.ttl),
 	}
-	if err := handler.store.Put(request.Context(), entry); err != nil {
+	if err := handler.store.Put(request.Context(), request, entry); err != nil {
 		handler.logger.Error("store HTTP response in SQLite cache", zap.Error(err))
 	}
 	return nil
@@ -276,7 +288,7 @@ func (handler *CacheHandler) ServeHTTP(
 
 func (handler *CacheHandler) load(
 	ctx context.Context,
-	baseKey string,
+	baseKey cacheKey,
 	request *http.Request,
 ) *cacheEntry {
 	entry, err := handler.store.Get(ctx, baseKey, request)
@@ -287,7 +299,7 @@ func (handler *CacheHandler) load(
 	return entry
 }
 
-func (handler *CacheHandler) baseKey(request *http.Request, bodyKey string) string {
+func (handler *CacheHandler) baseKey(request *http.Request, bodyKey string) cacheKey {
 	scheme := request.URL.Scheme
 	if scheme == "" {
 		if request.TLS != nil {
@@ -326,7 +338,9 @@ func (handler *CacheHandler) baseKey(request *http.Request, bodyKey string) stri
 		bodyKey,
 	}, "\n")
 	sum := sha256.Sum256([]byte(value))
-	return hex.EncodeToString(sum[:])
+	var key cacheKey
+	copy(key[:], sum[:])
+	return key
 }
 
 func (handler *CacheHandler) cacheNamespace() string {
@@ -359,16 +373,17 @@ func (handler *CacheHandler) requestCachePolicy(request *http.Request) requestCa
 	if request.Method == http.MethodConnect || request.Header.Get("Upgrade") != "" {
 		return requestCacheDecision{}
 	}
+	allowed := request.Method == http.MethodGet || request.Method == http.MethodHead
 	if handler.methods != nil {
-		_, allowed := handler.methods[request.Method]
+		_, allowed = handler.methods[request.Method]
 		if request.Method == http.MethodHead && !allowed {
 			_, allowed = handler.methods[http.MethodGet]
 		}
-		if !allowed {
-			return requestCacheDecision{}
-		}
 	}
-	if request.Header.Get("Authorization") != "" || request.Header.Get("Range") != "" {
+	if !allowed {
+		return requestCacheDecision{}
+	}
+	if request.Header.Get("Range") != "" {
 		return requestCacheDecision{}
 	}
 	for _, field := range []string{
@@ -461,8 +476,27 @@ func serveCacheEntry(
 	return err
 }
 
-func requestVaryKey(request *http.Request, fields []string) string {
+func requestVaryKey(request *http.Request, fields []string) cacheKey {
 	hash := sha256.New()
+	writeRequestHeaderFingerprint(hash, request, fields)
+	return compactCacheKey(hash.Sum(nil))
+}
+
+func responseCacheKey(
+	baseKey cacheKey,
+	generation int64,
+	request *http.Request,
+	fields []string,
+) cacheKey {
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("swarmlite-http-cache-entry-v1"))
+	_, _ = hash.Write(baseKey[:])
+	writeFingerprintPart(hash, strconv.FormatInt(generation, 10))
+	writeRequestHeaderFingerprint(hash, request, fields)
+	return compactCacheKey(hash.Sum(nil))
+}
+
+func writeRequestHeaderFingerprint(hash io.Writer, request *http.Request, fields []string) {
 	for _, field := range fields {
 		writeFingerprintPart(hash, http.CanonicalHeaderKey(field))
 		values := request.Header.Values(field)
@@ -471,7 +505,12 @@ func requestVaryKey(request *http.Request, fields []string) string {
 			writeFingerprintPart(hash, value)
 		}
 	}
-	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func compactCacheKey(sum []byte) cacheKey {
+	var key cacheKey
+	copy(key[:], sum)
+	return key
 }
 
 func writeFingerprintPart(writer io.Writer, value string) {
@@ -527,16 +566,7 @@ func responseMayBeStored(statusCodes map[int]struct{}, status int, header http.H
 	if _, allowed := statusCodes[status]; !allowed {
 		return false
 	}
-	if header.Get("Set-Cookie") != "" || header.Get("Content-Range") != "" {
-		return false
-	}
-	directives := cacheControlDirectives(header.Values("Cache-Control"))
-	for _, directive := range []string{"no-store", "private", "no-cache"} {
-		if _, found := directives[directive]; found {
-			return false
-		}
-	}
-	return true
+	return header.Get("Set-Cookie") == "" && header.Get("Content-Range") == ""
 }
 
 func sanitizedCacheHeader(header http.Header) http.Header {
@@ -691,16 +721,21 @@ type cacheFlight struct {
 	done chan struct{}
 }
 
-type cacheFlightGroup struct {
-	sync.Mutex
-	calls map[string]*cacheFlight
+type cacheFlightKey struct {
+	base cacheKey
+	vary cacheKey
 }
 
-func (group *cacheFlightGroup) acquire(key string) (*cacheFlight, bool) {
+type cacheFlightGroup struct {
+	sync.Mutex
+	calls map[cacheFlightKey]*cacheFlight
+}
+
+func (group *cacheFlightGroup) acquire(key cacheFlightKey) (*cacheFlight, bool) {
 	group.Lock()
 	defer group.Unlock()
 	if group.calls == nil {
-		group.calls = make(map[string]*cacheFlight)
+		group.calls = make(map[cacheFlightKey]*cacheFlight)
 	}
 	if call := group.calls[key]; call != nil {
 		return call, false
@@ -710,7 +745,7 @@ func (group *cacheFlightGroup) acquire(key string) (*cacheFlight, bool) {
 	return call, true
 }
 
-func (group *cacheFlightGroup) release(key string, call *cacheFlight) {
+func (group *cacheFlightGroup) release(key cacheFlightKey, call *cacheFlight) {
 	group.Lock()
 	if group.calls[key] == call {
 		delete(group.calls, key)

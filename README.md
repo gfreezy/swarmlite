@@ -408,10 +408,18 @@ cache:
 `key.disable_query` should be enabled only when every query parameter is irrelevant to the upstream
 response.
 
-CONNECT, protocol upgrades, range and conditional requests, authorization, response `no-store`,
-`private` or `no-cache`, and responses carrying `Set-Cookie` bypass storage. Concurrent misses for
-one key share a single origin request. SQLite failures fail open to the origin. Expired entries are
-not served; stale refresh and stale-on-error behavior are not part of the current cache phase.
+When `allowed_http_verbs` is omitted, only `GET` responses are stored and `HEAD` may reuse a
+matching `GET` response. CONNECT, protocol upgrades, range and conditional requests, request
+`no-store`, and responses carrying `Set-Cookie` or `Content-Range` bypass storage. Authorization
+does not affect cache eligibility or key identity, and response `Cache-Control` directives are
+ignored. Concurrent misses for one key share a single origin request. SQLite failures fail open to
+the origin. Each Gateway limits the logical cached response payload to 1 GiB by default; use the
+cluster-level `gateway.cache.max-size-bytes` setting to change it. It samples cache hits,
+deduplicates recent touches with a small Bloom filter, and asynchronously updates a separate SQLite
+access table so LRU tracking does not rewrite rows containing response bodies. Expired entries are
+removed first; capacity pressure then evicts approximately least-recently-used entries to a 90%
+low-water mark. Expired entries are not served; stale refresh and stale-on-error behavior are not
+part of the current cache phase.
 
 Rule precedence is exact path, longest prefix, regex, then a rule without matches. `tls` accepts
 `serve|disabled` and `http` accepts `redirect|serve|disabled`; `http: redirect` requires
@@ -582,6 +590,8 @@ swarmlite config get gateway.metrics.enabled
 # All keys, a dotted scope, or one key with its current/default/apply details.
 swarmlite config explain
 swarmlite config explain gateway.logging
+swarmlite config explain gateway.cache
+swarmlite config explain gateway.cache.sqlite
 swarmlite config explain gateway.http.timeouts
 swarmlite config explain gateway.logging.access.format
 
@@ -598,6 +608,15 @@ one segment use `-`. Invalid values report the applicable enum candidates or num
 | `gateway.listen` | comma-separated addresses | Published Gateway listeners; recreates the container |
 | `gateway.metrics.enabled` | `true`/`false` | HTTP request metrics at local `127.0.0.1:2019/metrics` |
 | `gateway.metrics.per-host` | `true`/`false` | Host-labelled metrics; high-cardinality hosts can consume more memory |
+| `gateway.cache.max-size-bytes` | positive integer | Logical response-cache capacity per Gateway; default 1 GiB |
+| `gateway.cache.low-water-percent` | `1`–`99` | Target usage after LRU eviction; default 90% |
+| `gateway.cache.hit-sample-ratio` | positive integer | Sample one in N hits for LRU metadata; default 32 |
+| `gateway.cache.access-update-interval-seconds` | positive integer | Minimum persisted access-update interval; default 300 seconds |
+| `gateway.cache.sqlite.cache-size-kib` | non-negative integer | SQLite page cache per connection; `0` uses SQLite default |
+| `gateway.cache.sqlite.read-connections` | `1`–`16` | Query-only SQLite reader pool; default 4 |
+| `gateway.cache.sqlite.busy-timeout-seconds` | positive integer | SQLite operation/lock timeout; default 5 seconds |
+| `gateway.cache.sqlite.cleanup-interval-seconds` | positive integer | Expiry cleanup and capacity-check interval; default 300 seconds |
+| `gateway.cache.sqlite.journal-size-limit-bytes` | positive integer | WAL retention limit after checkpoints; default 64 MiB |
 | `gateway.logging.runtime.level` | `debug`, `info`, `warn`, `error` | Caddy runtime log level; output is fixed to stderr |
 | `gateway.logging.access.enabled` | `true`/`false` | HTTP access logs; output is fixed to stdout |
 | `gateway.logging.access.format` | `json`, `console` | Access log encoder |
@@ -616,6 +635,8 @@ For example:
 
 ```bash
 swarmlite config set gateway.metrics.enabled true
+swarmlite config set gateway.cache.max-size-bytes 2147483648
+swarmlite config set gateway.cache.low-water-percent 85
 swarmlite config set gateway.logging.access.enabled true
 swarmlite config set gateway.logging.access.format json
 swarmlite config set gateway.http.timeouts.read-header-seconds 10

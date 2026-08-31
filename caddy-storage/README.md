@@ -63,15 +63,23 @@ Each Stack rule with a `cache` object receives Swarmlite's native `http.handlers
 routes are untouched and no global cache application is generated. The handler stores complete
 status, headers, body, freshness timestamps, and `Vary` dimensions in
 `/cache/native-v1/cache.db`. SQLite runs in WAL mode with one serialized writer and four query-only
-reader connections, mmap is disabled, and expired rows are cleaned every five minutes. A schema
-upgrade drops old response-cache rows because the volume contains disposable cache data.
+reader connections, mmap is disabled, and expired rows are cleaned every five minutes. Cached
+response payload is logically capped at 1 GiB per Gateway by default and can be changed through
+the cluster-level `gateway.cache.max-size-bytes` setting. Sampled hits are deduplicated through a
+64 KiB Bloom filter and written in batches to a small access-metadata table, avoiding updates to rows
+that contain response bodies. Expired rows are removed first; approximate LRU eviction then returns
+usage to a 90% low-water mark. The logical limit counts the compact key, serialized headers, and
+body; reusable SQLite pages and WAL bytes may make the physical files larger. A schema upgrade drops
+old response-cache rows because the volume contains disposable cache data.
 
-The declared route TTL controls freshness. `no-store`, `private`, `no-cache`, `Set-Cookie`,
-authorization, conditional, range, CONNECT, and protocol-upgrade requests use conservative cache
-behavior. Cache keys contain scheme, host, method, path, query, request-body hash and content type,
-configured `key.headers`, and response `Vary` fields; Souin's `key.disable_query` omits the query
-component. An `allowed_http_verbs` allowlist is optional; when it is absent, an explicitly cached
-route accepts all ordinary HTTP methods. Request bodies above
+The declared route TTL controls freshness. Request `no-store`, conditional, range, CONNECT, and
+protocol-upgrade requests bypass caching, as do responses carrying `Set-Cookie` or
+`Content-Range`. Authorization does not affect cache eligibility or key identity, and response
+`Cache-Control` directives are ignored. Cache keys contain scheme, host, method, path, query,
+request-body hash and content type, configured `key.headers`, and response `Vary` fields; Souin's
+`key.disable_query` omits the query component. An `allowed_http_verbs` allowlist is optional; when
+it is absent, only `GET` responses are stored and `HEAD` may reuse a matching `GET` response.
+Request bodies above
 `max_request_body_bytes` and responses above `max_cacheable_body_bytes` bypass storage. Concurrent
 misses for the same key are coalesced, and SQLite errors fail open to the upstream. Expired entries
 are never served; stale-while-revalidate, stale-if-error, conditional revalidation, and purge APIs

@@ -28,6 +28,16 @@ pub const MAX_CADDY_DURATION_SECONDS: u64 = i64::MAX as u64 / 1_000_000_000;
 pub const MAX_CONFIG_FILE_BYTES: usize = 1024 * 1024;
 pub const MAX_STACK_CONFIG_BYTES: usize = 8 * 1024 * 1024;
 pub const CONFIG_GC_GRACE_PERIOD_SECONDS: u64 = 7 * 24 * 60 * 60;
+pub const DEFAULT_GATEWAY_CACHE_MAX_SIZE_BYTES: u64 = 1 << 30;
+pub const DEFAULT_GATEWAY_CACHE_LOW_WATER_PERCENT: u8 = 90;
+pub const DEFAULT_GATEWAY_CACHE_HIT_SAMPLE_RATIO: u32 = 32;
+pub const DEFAULT_GATEWAY_CACHE_ACCESS_UPDATE_INTERVAL_SECONDS: u64 = 5 * 60;
+pub const DEFAULT_GATEWAY_CACHE_SQLITE_READ_CONNECTIONS: u8 = 4;
+pub const DEFAULT_GATEWAY_CACHE_SQLITE_BUSY_TIMEOUT_SECONDS: u64 = 5;
+pub const DEFAULT_GATEWAY_CACHE_SQLITE_CLEANUP_INTERVAL_SECONDS: u64 = 5 * 60;
+pub const DEFAULT_GATEWAY_CACHE_SQLITE_JOURNAL_SIZE_LIMIT_BYTES: u64 = 64 << 20;
+pub const MAX_GATEWAY_CACHE_SIGNED_SIZE: u64 = i64::MAX as u64;
+pub const MAX_GATEWAY_CACHE_SQLITE_READ_CONNECTIONS: u8 = 16;
 
 pub fn service_config_digests(spec: &ServiceSpec) -> Vec<String> {
     spec.configs
@@ -74,6 +84,8 @@ pub struct ClusterGatewayConfig {
     pub managed_image: bool,
     #[serde(default, skip_serializing_if = "GatewayMetricsConfig::is_empty")]
     pub metrics: GatewayMetricsConfig,
+    #[serde(default, skip_serializing_if = "GatewayCacheConfig::is_empty")]
+    pub cache: GatewayCacheConfig,
     #[serde(default, skip_serializing_if = "GatewayLoggingConfig::is_empty")]
     pub logging: GatewayLoggingConfig,
     #[serde(default, skip_serializing_if = "GatewayShutdownConfig::is_empty")]
@@ -89,10 +101,61 @@ impl Default for ClusterGatewayConfig {
             image: DEFAULT_GATEWAY_IMAGE.to_owned(),
             managed_image: true,
             metrics: GatewayMetricsConfig::default(),
+            cache: GatewayCacheConfig::default(),
             logging: GatewayLoggingConfig::default(),
             shutdown: GatewayShutdownConfig::default(),
             http: GatewayHttpConfig::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayCacheConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low_water_percent: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hit_sample_ratio: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_update_interval_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "GatewayCacheSqliteConfig::is_empty")]
+    pub sqlite: GatewayCacheSqliteConfig,
+}
+
+impl GatewayCacheConfig {
+    fn is_empty(&self) -> bool {
+        self.max_size_bytes.is_none()
+            && self.low_water_percent.is_none()
+            && self.hit_sample_ratio.is_none()
+            && self.access_update_interval_seconds.is_none()
+            && self.sqlite.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayCacheSqliteConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_size_kib: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_connections: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_timeout_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_interval_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_size_limit_bytes: Option<u64>,
+}
+
+impl GatewayCacheSqliteConfig {
+    fn is_empty(&self) -> bool {
+        self.cache_size_kib.is_none()
+            && self.read_connections.is_none()
+            && self.busy_timeout_seconds.is_none()
+            && self.cleanup_interval_seconds.is_none()
+            && self.journal_size_limit_bytes.is_none()
     }
 }
 
@@ -431,6 +494,24 @@ pub struct ClusterConfigUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway_metrics_per_host: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_cache_max_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_cache_low_water_percent: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_cache_hit_sample_ratio: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_cache_access_update_interval_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_cache_sqlite_cache_size_kib: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_cache_sqlite_read_connections: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_cache_sqlite_busy_timeout_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_cache_sqlite_cleanup_interval_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_cache_sqlite_journal_size_limit_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway_logging_runtime_level: Option<GatewayLogLevel>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway_logging_access_enabled: Option<bool>,
@@ -470,6 +551,24 @@ pub enum ClusterConfigField {
     GatewayMetricsEnabled,
     #[serde(rename = "gateway.metrics.per-host")]
     GatewayMetricsPerHost,
+    #[serde(rename = "gateway.cache.max-size-bytes")]
+    GatewayCacheMaxSizeBytes,
+    #[serde(rename = "gateway.cache.low-water-percent")]
+    GatewayCacheLowWaterPercent,
+    #[serde(rename = "gateway.cache.hit-sample-ratio")]
+    GatewayCacheHitSampleRatio,
+    #[serde(rename = "gateway.cache.access-update-interval-seconds")]
+    GatewayCacheAccessUpdateIntervalSeconds,
+    #[serde(rename = "gateway.cache.sqlite.cache-size-kib")]
+    GatewayCacheSqliteCacheSizeKib,
+    #[serde(rename = "gateway.cache.sqlite.read-connections")]
+    GatewayCacheSqliteReadConnections,
+    #[serde(rename = "gateway.cache.sqlite.busy-timeout-seconds")]
+    GatewayCacheSqliteBusyTimeoutSeconds,
+    #[serde(rename = "gateway.cache.sqlite.cleanup-interval-seconds")]
+    GatewayCacheSqliteCleanupIntervalSeconds,
+    #[serde(rename = "gateway.cache.sqlite.journal-size-limit-bytes")]
+    GatewayCacheSqliteJournalSizeLimitBytes,
     #[serde(rename = "gateway.logging.runtime.level")]
     GatewayLoggingRuntimeLevel,
     #[serde(rename = "gateway.logging.access.enabled")]
@@ -1166,6 +1265,7 @@ pub struct GatewayPublicConfig {
     pub image: String,
     pub listen: Vec<String>,
     pub metrics: GatewayPublicMetricsConfig,
+    pub cache: GatewayPublicCacheConfig,
     pub logging: GatewayPublicLoggingConfig,
     pub shutdown: GatewayPublicShutdownConfig,
     pub http: GatewayPublicHttpConfig,
@@ -1179,6 +1279,19 @@ impl From<&ClusterGatewayConfig> for GatewayPublicConfig {
             metrics: GatewayPublicMetricsConfig {
                 enabled: config.metrics.enabled,
                 per_host: config.metrics.per_host,
+            },
+            cache: GatewayPublicCacheConfig {
+                max_size_bytes: config.cache.max_size_bytes,
+                low_water_percent: config.cache.low_water_percent,
+                hit_sample_ratio: config.cache.hit_sample_ratio,
+                access_update_interval_seconds: config.cache.access_update_interval_seconds,
+                sqlite: GatewayPublicCacheSqliteConfig {
+                    cache_size_kib: config.cache.sqlite.cache_size_kib,
+                    read_connections: config.cache.sqlite.read_connections,
+                    busy_timeout_seconds: config.cache.sqlite.busy_timeout_seconds,
+                    cleanup_interval_seconds: config.cache.sqlite.cleanup_interval_seconds,
+                    journal_size_limit_bytes: config.cache.sqlite.journal_size_limit_bytes,
+                },
             },
             logging: GatewayPublicLoggingConfig {
                 runtime: GatewayPublicRuntimeLogConfig {
@@ -1215,6 +1328,24 @@ impl From<&ClusterGatewayConfig> for GatewayPublicConfig {
 pub struct GatewayPublicMetricsConfig {
     pub enabled: Option<bool>,
     pub per_host: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayPublicCacheConfig {
+    pub max_size_bytes: Option<u64>,
+    pub low_water_percent: Option<u8>,
+    pub hit_sample_ratio: Option<u32>,
+    pub access_update_interval_seconds: Option<u64>,
+    pub sqlite: GatewayPublicCacheSqliteConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayPublicCacheSqliteConfig {
+    pub cache_size_kib: Option<u64>,
+    pub read_connections: Option<u8>,
+    pub busy_timeout_seconds: Option<u64>,
+    pub cleanup_interval_seconds: Option<u64>,
+    pub journal_size_limit_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1697,6 +1828,7 @@ mod tests {
         .unwrap();
         assert!(!decoded.managed_image);
         assert_eq!(decoded.metrics, GatewayMetricsConfig::default());
+        assert_eq!(decoded.cache, GatewayCacheConfig::default());
         assert_eq!(decoded.logging, GatewayLoggingConfig::default());
         assert_eq!(decoded.shutdown, GatewayShutdownConfig::default());
         assert_eq!(decoded.http, GatewayHttpConfig::default());
@@ -1707,13 +1839,16 @@ mod tests {
     fn gateway_config_serialization_distinguishes_unset_zero_and_false() {
         let unset = serde_json::to_value(ClusterGatewayConfig::default()).unwrap();
         assert!(unset.get("metrics").is_none());
+        assert!(unset.get("cache").is_none());
         assert!(unset.get("http").is_none());
 
         let mut configured = ClusterGatewayConfig::default();
         configured.metrics.enabled = Some(false);
+        configured.cache.max_size_bytes = Some(2_147_483_648);
         configured.http.timeouts.read_header_seconds = Some(0);
         let configured = serde_json::to_value(configured).unwrap();
         assert_eq!(configured["metrics"]["enabled"], false);
+        assert_eq!(configured["cache"]["max_size_bytes"], 2_147_483_648_u64);
         assert_eq!(configured["http"]["timeouts"]["read_header_seconds"], 0);
     }
 

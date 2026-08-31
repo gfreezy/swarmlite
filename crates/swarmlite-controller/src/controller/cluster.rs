@@ -39,6 +39,48 @@ impl Controller {
                 ClusterConfigField::GatewayMetricsPerHost,
             ),
             (
+                update.gateway_cache_max_size_bytes.is_some(),
+                ClusterConfigField::GatewayCacheMaxSizeBytes,
+            ),
+            (
+                update.gateway_cache_low_water_percent.is_some(),
+                ClusterConfigField::GatewayCacheLowWaterPercent,
+            ),
+            (
+                update.gateway_cache_hit_sample_ratio.is_some(),
+                ClusterConfigField::GatewayCacheHitSampleRatio,
+            ),
+            (
+                update
+                    .gateway_cache_access_update_interval_seconds
+                    .is_some(),
+                ClusterConfigField::GatewayCacheAccessUpdateIntervalSeconds,
+            ),
+            (
+                update.gateway_cache_sqlite_cache_size_kib.is_some(),
+                ClusterConfigField::GatewayCacheSqliteCacheSizeKib,
+            ),
+            (
+                update.gateway_cache_sqlite_read_connections.is_some(),
+                ClusterConfigField::GatewayCacheSqliteReadConnections,
+            ),
+            (
+                update.gateway_cache_sqlite_busy_timeout_seconds.is_some(),
+                ClusterConfigField::GatewayCacheSqliteBusyTimeoutSeconds,
+            ),
+            (
+                update
+                    .gateway_cache_sqlite_cleanup_interval_seconds
+                    .is_some(),
+                ClusterConfigField::GatewayCacheSqliteCleanupIntervalSeconds,
+            ),
+            (
+                update
+                    .gateway_cache_sqlite_journal_size_limit_bytes
+                    .is_some(),
+                ClusterConfigField::GatewayCacheSqliteJournalSizeLimitBytes,
+            ),
+            (
                 update.gateway_logging_runtime_level.is_some(),
                 ClusterConfigField::GatewayLoggingRuntimeLevel,
             ),
@@ -147,6 +189,33 @@ impl Controller {
                 ClusterConfigField::GatewayMetricsPerHost => {
                     cluster.gateway.metrics.per_host = None
                 }
+                ClusterConfigField::GatewayCacheMaxSizeBytes => {
+                    cluster.gateway.cache.max_size_bytes = None
+                }
+                ClusterConfigField::GatewayCacheLowWaterPercent => {
+                    cluster.gateway.cache.low_water_percent = None
+                }
+                ClusterConfigField::GatewayCacheHitSampleRatio => {
+                    cluster.gateway.cache.hit_sample_ratio = None
+                }
+                ClusterConfigField::GatewayCacheAccessUpdateIntervalSeconds => {
+                    cluster.gateway.cache.access_update_interval_seconds = None
+                }
+                ClusterConfigField::GatewayCacheSqliteCacheSizeKib => {
+                    cluster.gateway.cache.sqlite.cache_size_kib = None
+                }
+                ClusterConfigField::GatewayCacheSqliteReadConnections => {
+                    cluster.gateway.cache.sqlite.read_connections = None
+                }
+                ClusterConfigField::GatewayCacheSqliteBusyTimeoutSeconds => {
+                    cluster.gateway.cache.sqlite.busy_timeout_seconds = None
+                }
+                ClusterConfigField::GatewayCacheSqliteCleanupIntervalSeconds => {
+                    cluster.gateway.cache.sqlite.cleanup_interval_seconds = None
+                }
+                ClusterConfigField::GatewayCacheSqliteJournalSizeLimitBytes => {
+                    cluster.gateway.cache.sqlite.journal_size_limit_bytes = None
+                }
                 ClusterConfigField::GatewayLoggingRuntimeLevel => {
                     cluster.gateway.logging.runtime.level = None
                 }
@@ -222,6 +291,33 @@ impl Controller {
         if let Some(value) = update.gateway_metrics_per_host {
             cluster.gateway.metrics.per_host = Some(value);
         }
+        if let Some(value) = update.gateway_cache_max_size_bytes {
+            cluster.gateway.cache.max_size_bytes = Some(value);
+        }
+        if let Some(value) = update.gateway_cache_low_water_percent {
+            cluster.gateway.cache.low_water_percent = Some(value);
+        }
+        if let Some(value) = update.gateway_cache_hit_sample_ratio {
+            cluster.gateway.cache.hit_sample_ratio = Some(value);
+        }
+        if let Some(value) = update.gateway_cache_access_update_interval_seconds {
+            cluster.gateway.cache.access_update_interval_seconds = Some(value);
+        }
+        if let Some(value) = update.gateway_cache_sqlite_cache_size_kib {
+            cluster.gateway.cache.sqlite.cache_size_kib = Some(value);
+        }
+        if let Some(value) = update.gateway_cache_sqlite_read_connections {
+            cluster.gateway.cache.sqlite.read_connections = Some(value);
+        }
+        if let Some(value) = update.gateway_cache_sqlite_busy_timeout_seconds {
+            cluster.gateway.cache.sqlite.busy_timeout_seconds = Some(value);
+        }
+        if let Some(value) = update.gateway_cache_sqlite_cleanup_interval_seconds {
+            cluster.gateway.cache.sqlite.cleanup_interval_seconds = Some(value);
+        }
+        if let Some(value) = update.gateway_cache_sqlite_journal_size_limit_bytes {
+            cluster.gateway.cache.sqlite.journal_size_limit_bytes = Some(value);
+        }
         if let Some(value) = update.gateway_logging_runtime_level {
             cluster.gateway.logging.runtime.level = Some(value);
         }
@@ -286,10 +382,87 @@ impl Controller {
             return Err(ControllerError::Invalid(
                 "gateway.listen must contain at least one non-empty address without surrounding whitespace"
                     .into(),
+			));
+        }
+        if cluster
+            .gateway
+            .cache
+            .max_size_bytes
+            .is_some_and(|value| value == 0 || value > crate::model::MAX_GATEWAY_CACHE_SIGNED_SIZE)
+        {
+            return Err(ControllerError::Invalid(format!(
+                "gateway.cache.max-size-bytes must be between 1 and {}",
+                crate::model::MAX_GATEWAY_CACHE_SIGNED_SIZE
+            )));
+        }
+        if cluster
+            .gateway
+            .cache
+            .low_water_percent
+            .is_some_and(|value| !(1..100).contains(&value))
+        {
+            return Err(ControllerError::Invalid(
+                "gateway.cache.low-water-percent must be between 1 and 99".into(),
             ));
+        }
+        if cluster.gateway.cache.hit_sample_ratio == Some(0) {
+            return Err(ControllerError::Invalid(
+                "gateway.cache.hit-sample-ratio must be greater than zero".into(),
+            ));
+        }
+        if cluster
+            .gateway
+            .cache
+            .sqlite
+            .cache_size_kib
+            .is_some_and(|value| value > crate::model::MAX_GATEWAY_CACHE_SIGNED_SIZE)
+        {
+            return Err(ControllerError::Invalid(format!(
+                "gateway.cache.sqlite.cache-size-kib cannot exceed {}",
+                crate::model::MAX_GATEWAY_CACHE_SIGNED_SIZE
+            )));
+        }
+        if cluster
+            .gateway
+            .cache
+            .sqlite
+            .read_connections
+            .is_some_and(|value| {
+                value == 0 || value > crate::model::MAX_GATEWAY_CACHE_SQLITE_READ_CONNECTIONS
+            })
+        {
+            return Err(ControllerError::Invalid(format!(
+                "gateway.cache.sqlite.read-connections must be between 1 and {}",
+                crate::model::MAX_GATEWAY_CACHE_SQLITE_READ_CONNECTIONS
+            )));
+        }
+        if cluster.gateway.cache.sqlite.busy_timeout_seconds == Some(0) {
+            return Err(ControllerError::Invalid(
+                "gateway.cache.sqlite.busy-timeout-seconds must be greater than zero".into(),
+            ));
+        }
+        if cluster.gateway.cache.sqlite.cleanup_interval_seconds == Some(0) {
+            return Err(ControllerError::Invalid(
+                "gateway.cache.sqlite.cleanup-interval-seconds must be greater than zero".into(),
+            ));
+        }
+        if cluster
+            .gateway
+            .cache
+            .sqlite
+            .journal_size_limit_bytes
+            .is_some_and(|value| value == 0 || value > crate::model::MAX_GATEWAY_CACHE_SIGNED_SIZE)
+        {
+            return Err(ControllerError::Invalid(format!(
+                "gateway.cache.sqlite.journal-size-limit-bytes must be between 1 and {}",
+                crate::model::MAX_GATEWAY_CACHE_SIGNED_SIZE
+            )));
         }
         let caddy_durations = [
             cluster.gateway.shutdown.grace_period_seconds,
+            cluster.gateway.cache.access_update_interval_seconds,
+            cluster.gateway.cache.sqlite.busy_timeout_seconds,
+            cluster.gateway.cache.sqlite.cleanup_interval_seconds,
             cluster.gateway.http.timeouts.read_header_seconds,
             cluster.gateway.http.timeouts.read_body_seconds,
             cluster.gateway.http.timeouts.write_seconds,
@@ -303,6 +476,11 @@ impl Controller {
             return Err(ControllerError::Invalid(format!(
                 "Gateway Caddy durations cannot exceed {MAX_CADDY_DURATION_SECONDS} seconds"
             )));
+        }
+        if cluster.gateway.cache.access_update_interval_seconds == Some(0) {
+            return Err(ControllerError::Invalid(
+                "gateway.cache.access-update-interval-seconds must be greater than zero".into(),
+            ));
         }
         if cluster.deployment.progress_deadline_seconds == 0 {
             return Err(ControllerError::Invalid(

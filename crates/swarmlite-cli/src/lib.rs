@@ -22,12 +22,13 @@ use crate::swarmlite::{
         ClusterGatewayConfig, ClusterSettings, ConfigBlobCheckRequest, ConfigBlobCheckResponse,
         DEFAULT_GATEWAY_IMAGE, DeploymentListResponse, GatewayAccessLogFormat,
         GatewayClusterStatusResponse, GatewayLogLevel, GatewayNodeStatusKind,
-        MAX_CADDY_DURATION_SECONDS, MAX_CONFIG_FILE_BYTES, MAX_STACK_CONFIG_BYTES,
-        NodeGatewayResponse, NodeGatewayUpdate, NodeLabelRemoveRequest, NodeLabelSetRequest,
-        NodeLabelsResponse, RegistryLoginRequest, RegistryLoginResponse, StackApplyRequest,
-        StackConfigPayload, StackDeploymentListResponse, StackDeploymentResponse,
-        StackDeploymentStatus, StackRollbackRequest, StackValidationResponse, StatusResponse,
-        config_digest, valid_gateway_image,
+        MAX_CADDY_DURATION_SECONDS, MAX_CONFIG_FILE_BYTES, MAX_GATEWAY_CACHE_SIGNED_SIZE,
+        MAX_GATEWAY_CACHE_SQLITE_READ_CONNECTIONS, MAX_STACK_CONFIG_BYTES, NodeGatewayResponse,
+        NodeGatewayUpdate, NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse,
+        RegistryLoginRequest, RegistryLoginResponse, StackApplyRequest, StackConfigPayload,
+        StackDeploymentListResponse, StackDeploymentResponse, StackDeploymentStatus,
+        StackRollbackRequest, StackValidationResponse, StatusResponse, config_digest,
+        valid_gateway_image,
     },
     node, registry,
 };
@@ -522,6 +523,96 @@ define_config_keys! {
         description: "Add host labels to metrics; high-cardinality hosts can increase memory use.",
         apply: "hot reload"
     },
+    GatewayCacheMaxSizeBytes => {
+        key: "gateway.cache.max-size-bytes",
+        field: ClusterConfigField::GatewayCacheMaxSizeBytes,
+        type: "integer",
+        values: None,
+        constraints: "1..=9223372036854775807 bytes",
+        default: "1073741824 bytes (1 GiB)",
+        description: "Logical response-cache capacity shared by all cached routes on each Gateway.",
+        apply: "hot reload"
+    },
+    GatewayCacheLowWaterPercent => {
+        key: "gateway.cache.low-water-percent",
+        field: ClusterConfigField::GatewayCacheLowWaterPercent,
+        type: "integer",
+        values: None,
+        constraints: "1..=99 percent",
+        default: "90 percent",
+        description: "Target logical cache usage after capacity eviction.",
+        apply: "hot reload"
+    },
+    GatewayCacheHitSampleRatio => {
+        key: "gateway.cache.hit-sample-ratio",
+        field: ClusterConfigField::GatewayCacheHitSampleRatio,
+        type: "integer",
+        values: None,
+        constraints: "1..=4294967295; 1 samples every hit, N samples one in N hits",
+        default: "32",
+        description: "Sampling denominator used before queuing approximate-LRU access updates.",
+        apply: "hot reload"
+    },
+    GatewayCacheAccessUpdateIntervalSeconds => {
+        key: "gateway.cache.access-update-interval-seconds",
+        field: ClusterConfigField::GatewayCacheAccessUpdateIntervalSeconds,
+        type: "integer",
+        values: None,
+        constraints: "1..=9223372036 seconds",
+        default: "300 seconds",
+        description: "Minimum interval between persisted access timestamps for one cache entry.",
+        apply: "hot reload"
+    },
+    GatewayCacheSqliteCacheSizeKib => {
+        key: "gateway.cache.sqlite.cache-size-kib",
+        field: ClusterConfigField::GatewayCacheSqliteCacheSizeKib,
+        type: "integer",
+        values: None,
+        constraints: "0..=9223372036854775807 KiB; 0 uses SQLite default",
+        default: "SQLite default",
+        description: "SQLite page-cache budget per connection, distinct from response-cache capacity.",
+        apply: "hot reload"
+    },
+    GatewayCacheSqliteReadConnections => {
+        key: "gateway.cache.sqlite.read-connections",
+        field: ClusterConfigField::GatewayCacheSqliteReadConnections,
+        type: "integer",
+        values: None,
+        constraints: "1..=16",
+        default: "4",
+        description: "Maximum query-only SQLite reader connections per Gateway cache database.",
+        apply: "hot reload"
+    },
+    GatewayCacheSqliteBusyTimeoutSeconds => {
+        key: "gateway.cache.sqlite.busy-timeout-seconds",
+        field: ClusterConfigField::GatewayCacheSqliteBusyTimeoutSeconds,
+        type: "integer",
+        values: None,
+        constraints: "1..=9223372036 seconds",
+        default: "5 seconds",
+        description: "Maximum SQLite operation and lock-wait time before the cache fails open.",
+        apply: "hot reload"
+    },
+    GatewayCacheSqliteCleanupIntervalSeconds => {
+        key: "gateway.cache.sqlite.cleanup-interval-seconds",
+        field: ClusterConfigField::GatewayCacheSqliteCleanupIntervalSeconds,
+        type: "integer",
+        values: None,
+        constraints: "1..=9223372036 seconds",
+        default: "300 seconds",
+        description: "Interval for expired-row cleanup and periodic capacity enforcement.",
+        apply: "hot reload"
+    },
+    GatewayCacheSqliteJournalSizeLimitBytes => {
+        key: "gateway.cache.sqlite.journal-size-limit-bytes",
+        field: ClusterConfigField::GatewayCacheSqliteJournalSizeLimitBytes,
+        type: "integer",
+        values: None,
+        constraints: "1..=9223372036854775807 bytes",
+        default: "67108864 bytes (64 MiB)",
+        description: "SQLite WAL journal-size retention limit after checkpoints.",
+        apply: "hot reload"
+    },
     GatewayLoggingRuntimeLevel => {
         key: "gateway.logging.runtime.level",
         field: ClusterConfigField::GatewayLoggingRuntimeLevel,
@@ -740,6 +831,71 @@ fn config_set_update(key: ConfigKey, value: String) -> Result<ClusterConfigUpdat
         ConfigKey::GatewayMetricsPerHost => {
             update.gateway_metrics_per_host = Some(parse_config_bool(&value, key)?);
         }
+        ConfigKey::GatewayCacheMaxSizeBytes => {
+            update.gateway_cache_max_size_bytes = Some(parse_config_u64(
+                &value,
+                key,
+                1,
+                MAX_GATEWAY_CACHE_SIGNED_SIZE,
+            )?);
+        }
+        ConfigKey::GatewayCacheLowWaterPercent => {
+            let percent = parse_config_u32(&value, key, 1)?;
+            if percent > 99 {
+                return Err(invalid_config_value(key, &value));
+            }
+            update.gateway_cache_low_water_percent = Some(percent as u8);
+        }
+        ConfigKey::GatewayCacheHitSampleRatio => {
+            update.gateway_cache_hit_sample_ratio = Some(parse_config_u32(&value, key, 1)?);
+        }
+        ConfigKey::GatewayCacheAccessUpdateIntervalSeconds => {
+            update.gateway_cache_access_update_interval_seconds = Some(parse_config_u64(
+                &value,
+                key,
+                1,
+                MAX_CADDY_DURATION_SECONDS,
+            )?);
+        }
+        ConfigKey::GatewayCacheSqliteCacheSizeKib => {
+            update.gateway_cache_sqlite_cache_size_kib = Some(parse_config_u64(
+                &value,
+                key,
+                0,
+                MAX_GATEWAY_CACHE_SIGNED_SIZE,
+            )?);
+        }
+        ConfigKey::GatewayCacheSqliteReadConnections => {
+            let connections = parse_config_u32(&value, key, 1)?;
+            if connections > u32::from(MAX_GATEWAY_CACHE_SQLITE_READ_CONNECTIONS) {
+                return Err(invalid_config_value(key, &value));
+            }
+            update.gateway_cache_sqlite_read_connections = Some(connections as u8);
+        }
+        ConfigKey::GatewayCacheSqliteBusyTimeoutSeconds => {
+            update.gateway_cache_sqlite_busy_timeout_seconds = Some(parse_config_u64(
+                &value,
+                key,
+                1,
+                MAX_CADDY_DURATION_SECONDS,
+            )?);
+        }
+        ConfigKey::GatewayCacheSqliteCleanupIntervalSeconds => {
+            update.gateway_cache_sqlite_cleanup_interval_seconds = Some(parse_config_u64(
+                &value,
+                key,
+                1,
+                MAX_CADDY_DURATION_SECONDS,
+            )?);
+        }
+        ConfigKey::GatewayCacheSqliteJournalSizeLimitBytes => {
+            update.gateway_cache_sqlite_journal_size_limit_bytes = Some(parse_config_u64(
+                &value,
+                key,
+                1,
+                MAX_GATEWAY_CACHE_SIGNED_SIZE,
+            )?);
+        }
         ConfigKey::GatewayLoggingRuntimeLevel => {
             update.gateway_logging_runtime_level = Some(
                 value
@@ -919,6 +1075,44 @@ impl ConfigKey {
             Self::GatewayListen => CurrentConfigValue::List(config.gateway.listen.clone()),
             Self::GatewayMetricsEnabled => optional_bool(config.gateway.metrics.enabled),
             Self::GatewayMetricsPerHost => optional_bool(config.gateway.metrics.per_host),
+            Self::GatewayCacheMaxSizeBytes => optional_u64(config.gateway.cache.max_size_bytes),
+            Self::GatewayCacheLowWaterPercent => config
+                .gateway
+                .cache
+                .low_water_percent
+                .map_or(CurrentConfigValue::Unset, |value| {
+                    CurrentConfigValue::Integer(u64::from(value))
+                }),
+            Self::GatewayCacheHitSampleRatio => config
+                .gateway
+                .cache
+                .hit_sample_ratio
+                .map_or(CurrentConfigValue::Unset, |value| {
+                    CurrentConfigValue::Integer(u64::from(value))
+                }),
+            Self::GatewayCacheAccessUpdateIntervalSeconds => {
+                optional_u64(config.gateway.cache.access_update_interval_seconds)
+            }
+            Self::GatewayCacheSqliteCacheSizeKib => {
+                optional_u64(config.gateway.cache.sqlite.cache_size_kib)
+            }
+            Self::GatewayCacheSqliteReadConnections => config
+                .gateway
+                .cache
+                .sqlite
+                .read_connections
+                .map_or(CurrentConfigValue::Unset, |value| {
+                    CurrentConfigValue::Integer(u64::from(value))
+                }),
+            Self::GatewayCacheSqliteBusyTimeoutSeconds => {
+                optional_u64(config.gateway.cache.sqlite.busy_timeout_seconds)
+            }
+            Self::GatewayCacheSqliteCleanupIntervalSeconds => {
+                optional_u64(config.gateway.cache.sqlite.cleanup_interval_seconds)
+            }
+            Self::GatewayCacheSqliteJournalSizeLimitBytes => {
+                optional_u64(config.gateway.cache.sqlite.journal_size_limit_bytes)
+            }
             Self::GatewayLoggingRuntimeLevel => config
                 .gateway
                 .logging
@@ -4438,6 +4632,8 @@ mod tests {
         for target in [
             None,
             Some("gateway"),
+            Some("gateway.cache"),
+            Some("gateway.cache.sqlite"),
             Some("gateway.logging"),
             Some("gateway.http.timeouts"),
             Some("gateway.logging.access.format"),
@@ -4456,6 +4652,15 @@ mod tests {
             ("gateway.listen", ":80,:443"),
             ("gateway.metrics.enabled", "true"),
             ("gateway.metrics.per-host", "false"),
+            ("gateway.cache.max-size-bytes", "1073741824"),
+            ("gateway.cache.low-water-percent", "90"),
+            ("gateway.cache.hit-sample-ratio", "32"),
+            ("gateway.cache.access-update-interval-seconds", "300"),
+            ("gateway.cache.sqlite.cache-size-kib", "8192"),
+            ("gateway.cache.sqlite.read-connections", "4"),
+            ("gateway.cache.sqlite.busy-timeout-seconds", "5"),
+            ("gateway.cache.sqlite.cleanup-interval-seconds", "300"),
+            ("gateway.cache.sqlite.journal-size-limit-bytes", "67108864"),
             ("gateway.logging.runtime.level", "info"),
             ("gateway.logging.access.enabled", "true"),
             ("gateway.logging.access.format", "json"),
@@ -4528,6 +4733,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(paths.len(), ConfigKey::ALL.len());
         assert!(ConfigKey::from_path("gateway.metrics.enabled").is_some());
+        assert!(ConfigKey::from_path("gateway.cache.max-size-bytes").is_some());
         assert!(ConfigKey::from_path("gateway-metrics-enabled").is_none());
     }
 
@@ -4535,6 +4741,7 @@ mod tests {
     fn config_get_response_preserves_null_zero_and_false() {
         let mut gateway = ClusterGatewayConfig::default();
         gateway.metrics.enabled = Some(false);
+        gateway.cache.max_size_bytes = Some(2_147_483_648);
         gateway.http.timeouts.read_header_seconds = Some(0);
         let response = ClusterConfigResponse {
             generation: 9,
@@ -4557,6 +4764,10 @@ mod tests {
         assert_eq!(
             values.values["gateway.http.timeouts.read-header-seconds"],
             serde_json::json!(0)
+        );
+        assert_eq!(
+            values.values["gateway.cache.max-size-bytes"],
+            serde_json::json!(2_147_483_648_u64)
         );
         assert_eq!(
             values.values["gateway.metrics.per-host"],
@@ -4623,6 +4834,12 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(listen_error.contains("port 2019 is reserved"));
+
+        let low_water_error =
+            config_set_update(ConfigKey::GatewayCacheLowWaterPercent, "100".into())
+                .unwrap_err()
+                .to_string();
+        assert!(low_water_error.contains("1..=99 percent"));
     }
 
     #[test]

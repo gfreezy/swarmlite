@@ -60,7 +60,7 @@ const GATEWAY_GRACE_PERIOD_LABEL: &str = "io.swarmlite.gateway_grace_period_seco
 const GATEWAY_HTTP3_LABEL: &str = "io.swarmlite.gateway_http3_enabled";
 const GATEWAY_TOKEN_HASH_LABEL: &str = "io.swarmlite.gateway_token_sha256";
 const GATEWAY_SCHEMA: &str = "9";
-const GATEWAY_AUTOSAVE_SCHEMA: &str = "2";
+const GATEWAY_AUTOSAVE_SCHEMA: &str = "3";
 const GATEWAY_CONTAINER_NAME: &str = "swarmlite-gateway";
 const GATEWAY_ADMIN_URL: &str = "http://127.0.0.1:2019";
 const GATEWAY_RECOVERY_PATH: &str = "/config/swarmlite-recovery.json";
@@ -2676,7 +2676,7 @@ mod tests {
 
     #[test]
     fn isolates_caddy_autosaves_by_compatibility_schema() {
-        assert_eq!(gateway_autosave_config_home(), "/config/autosave-v2");
+        assert_eq!(gateway_autosave_config_home(), "/config/autosave-v3");
     }
 
     #[test]

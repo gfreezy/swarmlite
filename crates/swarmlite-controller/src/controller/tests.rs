@@ -2338,6 +2338,38 @@ async fn deployment_policy_updates_are_validated_and_persisted() {
 }
 
 #[tokio::test]
+async fn gateway_cache_config_rejects_unsafe_values() {
+    let (controller, _repository, _directory) = test_controller("gateway-cache-validation").await;
+    for update in [
+        ClusterConfigUpdate {
+            gateway_cache_max_size_bytes: Some(0),
+            ..Default::default()
+        },
+        ClusterConfigUpdate {
+            gateway_cache_low_water_percent: Some(100),
+            ..Default::default()
+        },
+        ClusterConfigUpdate {
+            gateway_cache_hit_sample_ratio: Some(0),
+            ..Default::default()
+        },
+        ClusterConfigUpdate {
+            gateway_cache_sqlite_read_connections: Some(17),
+            ..Default::default()
+        },
+        ClusterConfigUpdate {
+            gateway_cache_sqlite_cleanup_interval_seconds: Some(0),
+            ..Default::default()
+        },
+    ] {
+        assert!(matches!(
+            controller.update_cluster_config(update).await,
+            Err(ControllerError::Invalid(_))
+        ));
+    }
+}
+
+#[tokio::test]
 async fn gateway_config_preserves_explicit_values_and_unsets_them() {
     let (controller, repository, _directory) = test_controller("gateway-config-test").await;
     let updated = controller
@@ -2345,6 +2377,15 @@ async fn gateway_config_preserves_explicit_values_and_unsets_them() {
             gateway_listen: Some(vec![":8080".into()]),
             gateway_metrics_enabled: Some(false),
             gateway_metrics_per_host: Some(true),
+            gateway_cache_max_size_bytes: Some(2_147_483_648),
+            gateway_cache_low_water_percent: Some(80),
+            gateway_cache_hit_sample_ratio: Some(16),
+            gateway_cache_access_update_interval_seconds: Some(120),
+            gateway_cache_sqlite_cache_size_kib: Some(8_192),
+            gateway_cache_sqlite_read_connections: Some(6),
+            gateway_cache_sqlite_busy_timeout_seconds: Some(3),
+            gateway_cache_sqlite_cleanup_interval_seconds: Some(60),
+            gateway_cache_sqlite_journal_size_limit_bytes: Some(33_554_432),
             gateway_logging_runtime_level: Some(crate::model::GatewayLogLevel::Debug),
             gateway_logging_access_enabled: Some(true),
             gateway_logging_access_format: Some(crate::model::GatewayAccessLogFormat::Console),
@@ -2366,6 +2407,12 @@ async fn gateway_config_preserves_explicit_values_and_unsets_them() {
     assert_eq!(gateway.listen, vec![":8080"]);
     assert_eq!(gateway.metrics.enabled, Some(false));
     assert_eq!(gateway.metrics.per_host, Some(true));
+    assert_eq!(gateway.cache.max_size_bytes, Some(2_147_483_648));
+    assert_eq!(gateway.cache.low_water_percent, Some(80));
+    assert_eq!(gateway.cache.hit_sample_ratio, Some(16));
+    assert_eq!(gateway.cache.access_update_interval_seconds, Some(120));
+    assert_eq!(gateway.cache.sqlite.cache_size_kib, Some(8_192));
+    assert_eq!(gateway.cache.sqlite.read_connections, Some(6));
     assert_eq!(gateway.logging.access.sampling.first, Some(0));
     assert_eq!(gateway.shutdown.grace_period_seconds, Some(0));
     assert_eq!(gateway.http.timeouts.read_header_seconds, Some(0));
@@ -2379,6 +2426,15 @@ async fn gateway_config_preserves_explicit_values_and_unsets_them() {
                 ClusterConfigField::GatewayListen,
                 ClusterConfigField::GatewayMetricsEnabled,
                 ClusterConfigField::GatewayMetricsPerHost,
+                ClusterConfigField::GatewayCacheMaxSizeBytes,
+                ClusterConfigField::GatewayCacheLowWaterPercent,
+                ClusterConfigField::GatewayCacheHitSampleRatio,
+                ClusterConfigField::GatewayCacheAccessUpdateIntervalSeconds,
+                ClusterConfigField::GatewayCacheSqliteCacheSizeKib,
+                ClusterConfigField::GatewayCacheSqliteReadConnections,
+                ClusterConfigField::GatewayCacheSqliteBusyTimeoutSeconds,
+                ClusterConfigField::GatewayCacheSqliteCleanupIntervalSeconds,
+                ClusterConfigField::GatewayCacheSqliteJournalSizeLimitBytes,
                 ClusterConfigField::GatewayLoggingRuntimeLevel,
                 ClusterConfigField::GatewayLoggingAccessEnabled,
                 ClusterConfigField::GatewayLoggingAccessFormat,

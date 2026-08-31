@@ -42,6 +42,12 @@ func TestNativeCacheHandlerHTTPBehavior(t *testing.T) {
 		case "/no-store":
 			response.Header().Set("Cache-Control", "no-store")
 			fmt.Fprintf(response, "no-store:%d", invocation)
+		case "/private":
+			response.Header().Set("Cache-Control", "private")
+			fmt.Fprintf(response, "private:%d", invocation)
+		case "/no-cache":
+			response.Header().Set("Cache-Control", "no-cache")
+			fmt.Fprintf(response, "no-cache:%d", invocation)
 		case "/cookie":
 			response.Header().Set("Set-Cookie", "session=private")
 			fmt.Fprintf(response, "cookie:%d", invocation)
@@ -127,20 +133,34 @@ func TestNativeCacheHandlerHTTPBehavior(t *testing.T) {
 	}
 
 	for range 2 {
-		cacheRequest(t, tester.Client, http.MethodGet, baseURL+"/no-store", "", nil)
+		for _, path := range []string{"/no-store", "/private", "/no-cache"} {
+			cacheRequest(t, tester.Client, http.MethodGet, baseURL+path, "", nil)
+		}
 		cacheRequest(t, tester.Client, http.MethodGet, baseURL+"/cookie", "", nil)
-		cacheRequest(t, tester.Client, http.MethodGet, baseURL+"/auth", "", http.Header{
-			"Authorization": []string{"Bearer private"},
-		})
 		cacheRequest(t, tester.Client, http.MethodGet, baseURL+"/large", "", nil)
 		cacheRequest(t, tester.Client, http.MethodPost, baseURL+"/large-request", strings.Repeat("q", 40), nil)
 		cacheRequest(t, tester.Client, http.MethodPut, baseURL+"/put", "value", nil)
 	}
-	for _, path := range []string{"/no-store", "/cookie", "/auth", "/large", "/large-request", "/put"} {
+	for _, path := range []string{"/no-store", "/private", "/no-cache"} {
+		if currentCount(path) != 1 {
+			t.Fatalf("%s response was not cached after ignoring Cache-Control: %d", path, currentCount(path))
+		}
+	}
+	for _, path := range []string{"/cookie", "/large", "/large-request", "/put"} {
 		if currentCount(path) != 2 {
 			t.Fatalf("%s was unexpectedly cached: %d", path, currentCount(path))
 		}
 	}
+	authOne, _ := cacheRequest(t, tester.Client, http.MethodGet, baseURL+"/auth", "", http.Header{
+		"Authorization": []string{"Bearer one"},
+	})
+	authTwo, authHit := cacheRequest(t, tester.Client, http.MethodGet, baseURL+"/auth", "", http.Header{
+		"Authorization": []string{"Bearer two"},
+	})
+	if authOne != authTwo || currentCount("/auth") != 1 {
+		t.Fatalf("Authorization unexpectedly changed cache identity: %q %q count=%d", authOne, authTwo, currentCount("/auth"))
+	}
+	assertCacheStatus(t, authHit, "hit")
 
 	cacheRequest(t, tester.Client, http.MethodGet, baseURL+"/head", "", nil)
 	headBody, headHeader := cacheRequest(t, tester.Client, http.MethodHead, baseURL+"/head", "", nil)
@@ -175,19 +195,40 @@ func TestNativeCacheHandlerHTTPBehavior(t *testing.T) {
 	}
 }
 
-func TestCacheMethodPolicyDefaultsToAllAndHonorsAllowlist(t *testing.T) {
-	request := httptest.NewRequest(http.MethodPost, "https://example.test/query", strings.NewReader("query"))
-	if decision := new(CacheHandler).requestCachePolicy(request); !decision.lookup || !decision.store {
-		t.Fatalf("explicit cache route did not accept POST by default: %#v", decision)
+func TestCacheMethodPolicyDefaultsToGetAndHeadAndHonorsAllowlist(t *testing.T) {
+	post := httptest.NewRequest(http.MethodPost, "https://example.test/query", strings.NewReader("query"))
+	if decision := new(CacheHandler).requestCachePolicy(post); decision.lookup || decision.store {
+		t.Fatalf("default cache method policy accepted POST: %#v", decision)
+	}
+	get := httptest.NewRequest(http.MethodGet, "https://example.test/query", nil)
+	if decision := new(CacheHandler).requestCachePolicy(get); !decision.lookup || !decision.store {
+		t.Fatalf("default cache method policy rejected GET: %#v", decision)
+	}
+	head := httptest.NewRequest(http.MethodHead, "https://example.test/query", nil)
+	if decision := new(CacheHandler).requestCachePolicy(head); !decision.lookup || decision.store {
+		t.Fatalf("default cache method policy rejected HEAD lookup: %#v", decision)
 	}
 
 	restricted := &CacheHandler{methods: map[string]struct{}{http.MethodGet: {}}}
-	if decision := restricted.requestCachePolicy(request); decision.lookup || decision.store {
+	if decision := restricted.requestCachePolicy(post); decision.lookup || decision.store {
 		t.Fatalf("method allowlist did not bypass POST: %#v", decision)
 	}
-	head := httptest.NewRequest(http.MethodHead, "https://example.test/query", nil)
 	if decision := restricted.requestCachePolicy(head); !decision.lookup || decision.store {
 		t.Fatalf("GET allowlist did not permit HEAD lookup: %#v", decision)
+	}
+}
+
+func TestCacheRequestControlStillBypassesOrRefreshes(t *testing.T) {
+	noStore := httptest.NewRequest(http.MethodGet, "https://example.test/query", nil)
+	noStore.Header.Set("Cache-Control", "no-store")
+	if decision := new(CacheHandler).requestCachePolicy(noStore); decision.lookup || decision.store {
+		t.Fatalf("request no-store did not bypass cache: %#v", decision)
+	}
+
+	noCache := httptest.NewRequest(http.MethodGet, "https://example.test/query", nil)
+	noCache.Header.Set("Cache-Control", "no-cache")
+	if decision := new(CacheHandler).requestCachePolicy(noCache); decision.lookup || !decision.store {
+		t.Fatalf("request no-cache did not force a refresh: %#v", decision)
 	}
 }
 
