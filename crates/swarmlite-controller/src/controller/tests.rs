@@ -1,6 +1,9 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 use swarmlite_stack::{ParsedStack, parse_stack};
 
 use crate::{
@@ -26,7 +29,7 @@ fn test_cluster(id: &str) -> ClusterSettings {
     }
 }
 
-fn test_controller_config(cluster: &ClusterSettings) -> ControllerConfig {
+fn test_controller_config(cluster: &ClusterSettings, directory: &Path) -> ControllerConfig {
     ControllerConfig {
         gateway_enabled: true,
         labels: BTreeMap::new(),
@@ -35,6 +38,7 @@ fn test_controller_config(cluster: &ClusterSettings) -> ControllerConfig {
         node_timeout_seconds: 20,
         reconcile_interval_seconds: 1,
         gateway_drain_timeout_seconds: DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS,
+        image_cache_dir: directory.join("image-cache"),
         cluster: cluster.clone(),
     }
 }
@@ -44,13 +48,47 @@ async fn test_controller(id: &str) -> (Controller, StateRepository, tempfile::Te
     let directory = tempfile::tempdir().unwrap();
     let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
     let controller = Controller::new(
-        test_controller_config(&cluster),
+        test_controller_config(&cluster, directory.path()),
         "0123456789abcdef".into(),
         repository.clone(),
     )
     .await
     .unwrap();
     (controller, repository, directory)
+}
+
+#[tokio::test]
+async fn image_registry_v2_reuses_controller_authentication() {
+    let (controller, _, _directory) = test_controller("image-registry-api-test").await;
+    let app = super::api::router(std::sync::Arc::new(controller));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+
+    let unauthorized = client
+        .get(format!("http://{address}/v2/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let authorized = client
+        .head(format!("http://{address}/v2/"))
+        .bearer_auth("0123456789abcdef")
+        .send()
+        .await
+        .unwrap();
+    server.abort();
+    assert_eq!(authorized.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        authorized
+            .headers()
+            .get("docker-distribution-api-version")
+            .unwrap(),
+        "registry/2.0"
+    );
+    assert!(authorized.headers().contains_key("x-swarmlite-image-proxy"));
 }
 
 #[tokio::test]
@@ -1371,7 +1409,7 @@ async fn routed_deployment_waits_for_gateway_application() {
     let cluster = test_cluster("deployment-gateway-wait-test");
     let directory = tempfile::tempdir().unwrap();
     let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
-    let mut config = test_controller_config(&cluster);
+    let mut config = test_controller_config(&cluster, directory.path());
     config.gateway_enabled = false;
     let controller = Controller::new(config, "test-token".into(), repository)
         .await
@@ -1556,7 +1594,7 @@ x-swarmlite:
     repository
         .initialize_from_gateway_recovery(&snapshot)
         .unwrap();
-    let mut config = test_controller_config(&cluster);
+    let mut config = test_controller_config(&cluster, directory.path());
     config.gateway_enabled = false;
     let controller = Controller::new(config, "0123456789abcdef".into(), repository.clone())
         .await
@@ -1752,7 +1790,7 @@ x-swarmlite:
         .initialize_from_gateway_recovery(&snapshot)
         .unwrap();
     let controller = Controller::new(
-        test_controller_config(&cluster),
+        test_controller_config(&cluster, directory.path()),
         "0123456789abcdef".into(),
         repository,
     )
@@ -2263,7 +2301,7 @@ async fn migrates_the_legacy_gateway_image_and_preserves_explicit_pins() {
         .await
         .unwrap();
     let controller = Controller::new(
-        test_controller_config(&cluster),
+        test_controller_config(&cluster, directory.path()),
         "0123456789abcdef".into(),
         repository.clone(),
     )
@@ -2469,7 +2507,7 @@ async fn node_labels_are_authoritative_and_persisted() {
     let directory = tempfile::tempdir().unwrap();
     let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
     let observer = repository.clone();
-    let mut config = test_controller_config(&cluster);
+    let mut config = test_controller_config(&cluster, directory.path());
     config.labels = BTreeMap::from([("region".into(), "cn-east".into())]);
     let controller = Controller::new(config, "secret".into(), repository)
         .await
@@ -2521,7 +2559,7 @@ async fn caddy_acknowledgement_starts_drain_deadline() {
     cluster.gateway.listen = vec![":18089".into()];
     let directory = tempfile::tempdir().unwrap();
     let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
-    let mut config = test_controller_config(&cluster);
+    let mut config = test_controller_config(&cluster, directory.path());
     config.gateway_enabled = false;
     config.gateway_drain_timeout_seconds = 3;
     let controller = Controller::new(config, "test-token".into(), repository)

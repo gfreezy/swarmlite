@@ -36,6 +36,9 @@ jobs:
       - name: Run Rust tests
         run: cargo test --workspace --all-features --locked
 
+      - name: Run Docker image proxy E2E
+        run: cargo test -p swarmlite-platform --test image_proxy_e2e --locked -- --ignored --nocapture
+
   cli-build:
     name: CLI (${{ matrix.artifact }})
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')

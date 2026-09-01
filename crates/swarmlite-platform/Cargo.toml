@@ -17,6 +17,7 @@ serde_json.workspace = true
 sha2.workspace = true
 swarmlite-core.workspace = true
 swarmlite-protocol.workspace = true
+swarmlite-registry.workspace = true
 swarmlite-stack.workspace = true
 tar.workspace = true
 thiserror.workspace = true

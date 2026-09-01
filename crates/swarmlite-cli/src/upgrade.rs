@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use swarmlite_registry::OutboundProxyConfig;
 use tokio::io::AsyncWriteExt;
 
 use super::{ansi, stderr_color};
@@ -17,13 +18,7 @@ pub(super) async fn run(version: &str) -> Result<()> {
         )
     );
 
-    let response = reqwest::Client::new()
-        .get(&installer_url)
-        .send()
-        .await
-        .with_context(|| format!("failed to download installer from {installer_url}"))?
-        .error_for_status()
-        .with_context(|| format!("failed to download installer from {installer_url}"))?;
+    let response = download(&installer_url).await?;
 
     if response
         .content_length()
@@ -63,6 +58,79 @@ pub(super) async fn run(version: &str) -> Result<()> {
         bail!("Swarmlite upgrade failed with {status}");
     }
     Ok(())
+}
+
+async fn download(url: &str) -> Result<reqwest::Response> {
+    let proxy = match OutboundProxyConfig::from_env() {
+        Ok(proxy) => proxy,
+        Err(error) => {
+            eprintln!(
+                "Swarmlite proxy configuration is invalid ({error}); retrying the upgrade download directly"
+            );
+            return direct_download(url).await;
+        }
+    };
+    if proxy.enabled() {
+        let response = match proxy_client(&proxy) {
+            Ok(client) => client.get(url).send().await,
+            Err(error) => {
+                eprintln!(
+                    "Swarmlite proxy configuration is invalid ({error}); retrying the upgrade download directly"
+                );
+                return direct_download(url).await;
+            }
+        };
+        match response {
+            Ok(response) if response.status().is_success() => return Ok(response),
+            Ok(response) if proxy_failure_status(response.status()) => {
+                eprintln!(
+                    "Swarmlite proxy returned HTTP {}; retrying the upgrade download directly",
+                    response.status()
+                );
+            }
+            Ok(response) => {
+                return response
+                    .error_for_status()
+                    .with_context(|| format!("failed to download installer from {url}"));
+            }
+            Err(error) => {
+                eprintln!(
+                    "Swarmlite proxy could not download the upgrade ({error}); retrying directly"
+                );
+            }
+        }
+    }
+    direct_download(url).await
+}
+
+async fn direct_download(url: &str) -> Result<reqwest::Response> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()?
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("failed to download installer from {url}"))?
+        .error_for_status()
+        .with_context(|| format!("failed to download installer from {url}"))
+}
+
+fn proxy_failure_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED
+        || status == reqwest::StatusCode::BAD_GATEWAY
+        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        || status == reqwest::StatusCode::GATEWAY_TIMEOUT
+}
+
+fn proxy_client(proxy: &OutboundProxyConfig) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(std::time::Duration::from_secs(30));
+    for proxy in proxy.reqwest_proxies()? {
+        builder = builder.proxy(proxy);
+    }
+    builder.build().map_err(Into::into)
 }
 
 pub(super) fn validate_version(value: &str) -> std::result::Result<String, String> {

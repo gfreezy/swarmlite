@@ -94,6 +94,7 @@ pub struct ControllerConfig {
     pub node_timeout_seconds: u64,
     pub reconcile_interval_seconds: u64,
     pub gateway_drain_timeout_seconds: u64,
+    pub image_cache_dir: PathBuf,
     pub cluster: ClusterSettings,
 }
 

@@ -13,6 +13,7 @@ swarmlite-client.workspace = true
 swarmlite-controller.workspace = true
 swarmlite-core.workspace = true
 swarmlite-platform.workspace = true
+swarmlite-registry.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true

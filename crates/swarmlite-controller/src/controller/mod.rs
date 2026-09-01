@@ -125,6 +125,7 @@ pub struct Controller {
     kv_repository: kv::KvRepository,
     commands: commands::AgentCommandBroker,
     sessions: sessions::DataSessionBroker,
+    image_registry: swarmlite_registry::RegistryService,
     deploying_stacks: std::sync::Mutex<BTreeSet<String>>,
     status_changes: watch::Sender<u64>,
     inner: Mutex<Inner>,

@@ -17,6 +17,7 @@ swarmlite-core.workspace = true
 swarmlite-node.workspace = true
 swarmlite-platform.workspace = true
 swarmlite-protocol.workspace = true
+swarmlite-registry.workspace = true
 swarmlite-stack.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true

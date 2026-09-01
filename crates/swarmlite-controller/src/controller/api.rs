@@ -7,9 +7,9 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{Path, Query, State, WebSocketUpgrade},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{any, get, post, put},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::Deserialize;
@@ -36,6 +36,9 @@ use super::{Controller, ControllerError};
 pub(super) fn router(controller: Arc<Controller>) -> Router {
     Router::new()
         .route("/healthz", get(health))
+        .route("/v2", any(image_registry_ping))
+        .route("/v2/", any(image_registry_ping))
+        .route("/v2/{*path}", any(image_registry_request))
         .route("/v1/status", get(status))
         .route("/v1/cluster", get(bootstrap))
         .route(
@@ -100,6 +103,42 @@ pub(super) fn router(controller: Arc<Controller>) -> Router {
         .route("/v1/kv/locks/renew", post(renew_kv_lock))
         .route("/v1/kv/locks/release", post(release_kv_lock))
         .with_state(controller)
+}
+
+async fn image_registry_ping(
+    State(controller): State<Arc<Controller>>,
+    headers: HeaderMap,
+    method: Method,
+) -> Response {
+    if let Err(error) = require_auth(&controller, &headers) {
+        return error.into_response();
+    }
+    if method != Method::GET && method != Method::HEAD {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    controller.image_registry.ping()
+}
+
+async fn image_registry_request(
+    State(controller): State<Arc<Controller>>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+    method: Method,
+) -> Response {
+    if let Err(error) = require_auth(&controller, &headers) {
+        return error.into_response();
+    }
+    let registry = swarmlite_registry::RegistryRequest::parse(&path)
+        .ok()
+        .map(|request| request.registry);
+    let auth = match registry {
+        Some(registry) => controller.image_registry_auth(&registry).await,
+        None => swarmlite_registry::RegistryAuth::Anonymous,
+    };
+    controller
+        .image_registry
+        .handle(method, &path, &headers, auth)
+        .await
 }
 
 async fn health(State(controller): State<Arc<Controller>>) -> Json<serde_json::Value> {

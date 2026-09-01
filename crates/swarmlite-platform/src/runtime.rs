@@ -19,8 +19,8 @@ use bollard::{
     query_parameters::{
         CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
         DownloadFromContainerOptionsBuilder, ListContainersOptionsBuilder, LogsOptionsBuilder,
-        RemoveContainerOptionsBuilder, RemoveVolumeOptionsBuilder, StopContainerOptionsBuilder,
-        UploadToContainerOptionsBuilder,
+        RemoveContainerOptionsBuilder, RemoveImageOptionsBuilder, RemoveVolumeOptionsBuilder,
+        StopContainerOptionsBuilder, TagImageOptionsBuilder, UploadToContainerOptionsBuilder,
     },
 };
 use bytes::Bytes;
@@ -304,6 +304,10 @@ pub struct DockerCompatibleRuntime {
     registry_credentials: Option<RegistryCredentialStore>,
     config_root: Option<PathBuf>,
     deployment_policy: Arc<std::sync::RwLock<DeploymentPolicy>>,
+    image_relay: Option<String>,
+    relay_http: Option<reqwest::Client>,
+    podman_http: Option<reqwest::Client>,
+    prepared_images: Arc<std::sync::RwLock<HashMap<String, String>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,7 +318,7 @@ enum TaskNameConflictResolution {
 
 impl DockerCompatibleRuntime {
     pub fn connect(config: &ResolvedRuntimeConfig) -> Result<Self> {
-        Self::connect_inner(config, None, None, DeploymentPolicy::default())
+        Self::connect_inner(config, None, None, DeploymentPolicy::default(), None)
     }
 
     pub fn connect_with_registry_credentials(
@@ -328,6 +332,23 @@ impl DockerCompatibleRuntime {
             Some(registry_credentials),
             Some(config_root),
             deployment_policy,
+            None,
+        )
+    }
+
+    pub fn connect_with_image_relay(
+        config: &ResolvedRuntimeConfig,
+        registry_credentials: RegistryCredentialStore,
+        config_root: PathBuf,
+        deployment_policy: DeploymentPolicy,
+        image_relay: String,
+    ) -> Result<Self> {
+        Self::connect_inner(
+            config,
+            Some(registry_credentials),
+            Some(config_root),
+            deployment_policy,
+            Some(image_relay),
         )
     }
 
@@ -336,6 +357,7 @@ impl DockerCompatibleRuntime {
         registry_credentials: Option<RegistryCredentialStore>,
         config_root: Option<PathBuf>,
         deployment_policy: DeploymentPolicy,
+        image_relay: Option<String>,
     ) -> Result<Self> {
         let client = Docker::connect_with_socket(&config.socket, 120, API_DEFAULT_VERSION)
             .with_context(|| {
@@ -344,6 +366,19 @@ impl DockerCompatibleRuntime {
                     config.kind, config.socket
                 )
             })?;
+        let podman_http = (config.kind == RuntimeKind::Podman)
+            .then(|| {
+                reqwest::Client::builder()
+                    .unix_socket(config.socket.clone())
+                    .build()
+            })
+            .transpose()
+            .context("failed to construct Podman image API client")?;
+        let relay_http = image_relay
+            .as_ref()
+            .map(|_| reqwest::Client::builder().no_proxy().build())
+            .transpose()
+            .context("failed to construct local image relay client")?;
         Ok(Self {
             client,
             kind: config.kind,
@@ -351,6 +386,10 @@ impl DockerCompatibleRuntime {
             registry_credentials,
             config_root,
             deployment_policy: Arc::new(std::sync::RwLock::new(deployment_policy)),
+            image_relay,
+            relay_http,
+            podman_http,
+            prepared_images: Arc::new(std::sync::RwLock::new(HashMap::new())),
         })
     }
 
@@ -713,7 +752,7 @@ impl DockerCompatibleRuntime {
     }
 
     async fn create_gateway(&self, spec: &GatewayContainerSpec) -> Result<()> {
-        self.ensure_image_if_missing(&spec.gateway.image).await?;
+        let gateway_image = self.ensure_image_if_missing(&spec.gateway.image).await?;
         let bootstrap = gateway_bootstrap(spec)?;
         let ports = gateway_ports(&spec.gateway.listen)?;
         let mut port_bindings = HashMap::new();
@@ -766,7 +805,7 @@ impl DockerCompatibleRuntime {
         };
         let labels = gateway_labels(spec);
         let body = ContainerCreateBody {
-            image: Some(spec.gateway.image.clone()),
+            image: Some(gateway_image),
             entrypoint: Some(vec!["/bin/sh".to_owned(), "-ec".to_owned()]),
             cmd: Some(vec![
                 "printf '%s' \"$SWARMLITE_CADDY_BOOTSTRAP\" > /config/bootstrap.json; exec caddy run --resume --config /config/bootstrap.json"
@@ -1039,43 +1078,48 @@ impl DockerCompatibleRuntime {
         image: &str,
         pull_policy: PullPolicy,
         progress: &RuntimeTaskProgress,
-    ) -> Result<()> {
+    ) -> Result<String> {
         match pull_policy {
             PullPolicy::Never => {
-                return self
-                    .client
-                    .inspect_image(image)
+                let local_image = self.local_image_reference(image);
+                self.client
+                    .inspect_image(&local_image)
                     .await
-                    .map(|_| ())
                     .with_context(|| {
                         format!("pull_policy=never requires image {image} in the local cache")
-                    });
+                    })?;
+                return Ok(local_image);
             }
             PullPolicy::Missing if !pull_policy.refreshes_cached_image(image) => {
-                if self.client.inspect_image(image).await.is_ok() {
-                    return Ok(());
+                let local_image = self.local_image_reference(image);
+                if self.client.inspect_image(&local_image).await.is_ok() {
+                    return Ok(local_image);
                 }
             }
             PullPolicy::Always | PullPolicy::Missing => {}
         }
-        self.pull_image(image, |attempt, current, total| {
-            progress.report_pull(attempt, current, total);
-        })
-        .await
+        let image_id = self
+            .pull_image(image, |attempt, current, total| {
+                progress.report_pull(attempt, current, total);
+            })
+            .await?;
+        Ok(self.local_image_reference_with_id(image, image_id))
     }
 
-    async fn ensure_image_if_missing(&self, image: &str) -> Result<()> {
-        if self.client.inspect_image(image).await.is_ok() {
-            return Ok(());
+    async fn ensure_image_if_missing(&self, image: &str) -> Result<String> {
+        let local_image = self.local_image_reference(image);
+        if self.client.inspect_image(&local_image).await.is_ok() {
+            return Ok(local_image);
         }
-        self.pull_image(image, |_, _, _| {}).await
+        let image_id = self.pull_image(image, |_, _, _| {}).await?;
+        Ok(self.local_image_reference_with_id(image, image_id))
     }
 
     async fn pull_image(
         &self,
         image: &str,
         mut report: impl FnMut(u32, Option<u64>, Option<u64>),
-    ) -> Result<()> {
+    ) -> Result<String> {
         let policy = self
             .deployment_policy
             .read()
@@ -1096,7 +1140,7 @@ impl DockerCompatibleRuntime {
                 .pull_image_once(image, attempt, idle_timeout, &mut report)
                 .await
             {
-                Ok(()) => return Ok(()),
+                Ok(image_id) => return Ok(image_id),
                 Err(error) => {
                     let retryable = image_pull_error_is_retryable(&error);
                     last_error = Some(error);
@@ -1125,15 +1169,165 @@ impl DockerCompatibleRuntime {
         attempt: u32,
         idle_timeout: std::time::Duration,
         report: &mut impl FnMut(u32, Option<u64>, Option<u64>),
-    ) -> Result<()> {
-        let credentials = self
-            .registry_credentials
+    ) -> Result<String> {
+        let mut parsed = self.proxy_reference(image, idle_timeout).await;
+        let mut image_to_pull = parsed
             .as_ref()
-            .map(|store| store.credentials_for_image(image))
-            .transpose()?
-            .flatten();
+            .map_or_else(|| image.to_owned(), |(temporary, _)| temporary.clone());
+        let pull_result = if self.kind == RuntimeKind::Podman && parsed.is_some() {
+            self.pull_podman_image(&image_to_pull, attempt, idle_timeout, report)
+                .await
+        } else {
+            let credentials = if parsed.is_none() {
+                self.registry_credentials
+                    .as_ref()
+                    .map(|store| store.credentials_for_image(image))
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
+            self.pull_docker_image(
+                &image_to_pull,
+                image,
+                attempt,
+                idle_timeout,
+                report,
+                credentials,
+            )
+            .await
+        };
+        if let Err(error) = pull_result {
+            if parsed.is_none() {
+                return Err(error);
+            }
+            warn!(
+                %error,
+                image,
+                "Controller image proxy pull failed; retrying with the runtime's default pull path"
+            );
+            let remove = RemoveImageOptionsBuilder::default().noprune(true).build();
+            let _ = self
+                .client
+                .remove_image(&image_to_pull, Some(remove), None)
+                .await;
+            parsed = None;
+            image_to_pull = image.to_owned();
+            let credentials = self
+                .registry_credentials
+                .as_ref()
+                .map(|store| store.credentials_for_image(image))
+                .transpose()?
+                .flatten();
+            self.pull_docker_image(
+                &image_to_pull,
+                image,
+                attempt,
+                idle_timeout,
+                report,
+                credentials,
+            )
+            .await?;
+        }
+        let image_id = self.inspect_image_id(&image_to_pull).await?;
+        if let Some((temporary, reference)) = parsed {
+            if let Some((repository, tag)) = reference.tag_parts() {
+                let options = TagImageOptionsBuilder::default()
+                    .repo(&repository)
+                    .tag(&tag)
+                    .build();
+                self.client
+                    .tag_image(&image_id, Some(options))
+                    .await
+                    .with_context(|| format!("failed to restore original image tag {image}"))?;
+                let remove = RemoveImageOptionsBuilder::default().noprune(true).build();
+                if let Err(error) = self
+                    .client
+                    .remove_image(&temporary, Some(remove), None)
+                    .await
+                {
+                    warn!(%error, image = %temporary, "failed to remove temporary image relay tag");
+                }
+            } else {
+                self.prepared_images
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(image.to_owned(), image_id.clone());
+            }
+        }
+        Ok(image_id)
+    }
+
+    async fn proxy_reference(
+        &self,
+        image: &str,
+        idle_timeout: std::time::Duration,
+    ) -> Option<(String, swarmlite_registry::ImageReference)> {
+        let relay = self.image_relay.as_deref()?;
+        let client = self.relay_http.as_ref()?;
+        let reference = swarmlite_registry::ImageReference::parse(image).ok()?;
+        let probe_timeout = idle_timeout.min(std::time::Duration::from_secs(10));
+        let ping = tokio::time::timeout(
+            probe_timeout,
+            client.head(format!("http://{relay}/v2/")).send(),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        if !ping.status().is_success()
+            || ping
+                .headers()
+                .get("x-swarmlite-image-proxy")
+                .and_then(|value| value.to_str().ok())
+                != Some("enabled")
+        {
+            return None;
+        }
+        let probe = tokio::time::timeout(
+            probe_timeout,
+            client
+                .head(format!("http://{relay}{}", reference.relay_manifest_path()))
+                .header("x-swarmlite-proxy-probe", "1")
+                .send(),
+        )
+        .await;
+        match probe {
+            Ok(Ok(response)) if response.status().is_success() => {
+                Some((reference.relay_reference(relay), reference))
+            }
+            Ok(Ok(response)) => {
+                warn!(
+                    image,
+                    status = %response.status(),
+                    "Controller image proxy probe failed; using the runtime's default pull path"
+                );
+                None
+            }
+            Ok(Err(error)) => {
+                warn!(%error, image, "Controller image proxy probe failed; using the runtime's default pull path");
+                None
+            }
+            Err(_) => {
+                warn!(
+                    image,
+                    "Controller image proxy probe timed out; using the runtime's default pull path"
+                );
+                None
+            }
+        }
+    }
+
+    async fn pull_docker_image(
+        &self,
+        image_to_pull: &str,
+        original_image: &str,
+        attempt: u32,
+        idle_timeout: std::time::Duration,
+        report: &mut impl FnMut(u32, Option<u64>, Option<u64>),
+        credentials: Option<bollard::auth::DockerCredentials>,
+    ) -> Result<()> {
         let options = CreateImageOptionsBuilder::default()
-            .from_image(image)
+            .from_image(image_to_pull)
             .build();
         let mut pull = self.client.create_image(Some(options), None, credentials);
         let mut last_progress_at = std::time::Instant::now();
@@ -1142,7 +1336,7 @@ impl DockerCompatibleRuntime {
             let remaining = idle_timeout.saturating_sub(last_progress_at.elapsed());
             if remaining.is_zero() {
                 bail!(
-                    "image pull for {image} made no progress for {} seconds",
+                    "image pull for {original_image} made no progress for {} seconds",
                     idle_timeout.as_secs()
                 );
             }
@@ -1150,16 +1344,16 @@ impl DockerCompatibleRuntime {
                 .await
                 .with_context(|| {
                     format!(
-                        "image pull for {image} made no progress for {} seconds",
+                        "image pull for {original_image} made no progress for {} seconds",
                         idle_timeout.as_secs()
                     )
                 })?;
             let Some(item) = item else {
                 break;
             };
-            let item = item.with_context(|| format!("failed to pull {image}"))?;
+            let item = item.with_context(|| format!("failed to pull {original_image}"))?;
             if let Some(message) = item.error_detail.and_then(|detail| detail.message) {
-                bail!("registry rejected image pull for {image}: {message}");
+                bail!("registry rejected image pull for {original_image}: {message}");
             }
             let layer = item.id.unwrap_or_default();
             let (current, total) = item.progress_detail.map_or((None, None), |detail| {
@@ -1178,6 +1372,83 @@ impl DockerCompatibleRuntime {
             report(attempt, current, total);
         }
         Ok(())
+    }
+
+    async fn pull_podman_image(
+        &self,
+        image: &str,
+        attempt: u32,
+        idle_timeout: std::time::Duration,
+        report: &mut impl FnMut(u32, Option<u64>, Option<u64>),
+    ) -> Result<()> {
+        let client = self
+            .podman_http
+            .as_ref()
+            .context("Podman image API client is unavailable")?;
+        let response = tokio::time::timeout(
+            idle_timeout,
+            client
+                .post("http://localhost/libpod/images/pull")
+                .query(&[("reference", image), ("tlsVerify", "false")])
+                .send(),
+        )
+        .await
+        .with_context(|| format!("Podman image pull for {image} timed out"))??;
+        let status = response.status();
+        let mut stream = response.bytes_stream();
+        let mut response_body = Vec::new();
+        let mut received = 0_u64;
+        loop {
+            let item = tokio::time::timeout(idle_timeout, stream.next())
+                .await
+                .with_context(|| {
+                    format!(
+                        "image pull for {image} made no progress for {} seconds",
+                        idle_timeout.as_secs()
+                    )
+                })?;
+            let Some(item) = item else { break };
+            let bytes = item.with_context(|| format!("failed to pull {image} through Podman"))?;
+            received = received.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+            if response_body.len() < 1024 * 1024 {
+                let remaining = 1024 * 1024 - response_body.len();
+                response_body.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+            }
+            report(attempt, Some(received), None);
+        }
+        let body = String::from_utf8_lossy(&response_body);
+        if !status.is_success() {
+            bail!("Podman rejected image pull for {image}: HTTP {status}: {body}");
+        }
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&response_body)
+            && let Some(error) = value.get("error").and_then(|value| value.as_str())
+            && !error.is_empty()
+        {
+            bail!("Podman rejected image pull for {image}: {error}");
+        }
+        Ok(())
+    }
+
+    fn local_image_reference(&self, image: &str) -> String {
+        self.prepared_images
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(image)
+            .cloned()
+            .unwrap_or_else(|| image.to_owned())
+    }
+
+    fn local_image_reference_with_id(&self, image: &str, image_id: String) -> String {
+        if self
+            .prepared_images
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(image)
+        {
+            image_id
+        } else {
+            image.to_owned()
+        }
     }
 
     async fn inspect_image_id(&self, image: &str) -> Result<String> {
@@ -1526,12 +1797,13 @@ impl ContainerRuntime for DockerCompatibleRuntime {
     async fn resolve_image(&self, image: &str, progress: &RuntimeImageProgress) -> Result<String> {
         progress.report(ImageResolutionStatus::Checking);
         progress.report(ImageResolutionStatus::Pulling);
-        self.pull_image(image, |attempt, current, total| {
-            progress.report_pull(attempt, current, total);
-        })
-        .await?;
+        let image_id = self
+            .pull_image(image, |attempt, current, total| {
+                progress.report_pull(attempt, current, total);
+            })
+            .await?;
         progress.report(ImageResolutionStatus::Comparing);
-        self.inspect_image_id(image).await
+        Ok(image_id)
     }
 
     async fn create_task(
@@ -1545,9 +1817,16 @@ impl ContainerRuntime for DockerCompatibleRuntime {
             runtime = %self.kind,
             "creating task container"
         );
-        if assignment.image_resolved {
+        let container_image = if assignment.image_resolved {
             progress.report(TaskReconcilePhase::Inspect);
-            self.inspect_image_id(&assignment.spec.image).await?;
+            let local_image = self.local_image_reference(&assignment.spec.image);
+            if self.inspect_image_id(&local_image).await.is_ok() {
+                local_image
+            } else {
+                progress.report(TaskReconcilePhase::Pull);
+                self.ensure_image(&assignment.spec.image, PullPolicy::Missing, progress)
+                    .await?
+            }
         } else {
             progress.report(TaskReconcilePhase::Pull);
             self.ensure_image(
@@ -1555,8 +1834,8 @@ impl ContainerRuntime for DockerCompatibleRuntime {
                 assignment.spec.pull_policy,
                 progress,
             )
-            .await?;
-        }
+            .await?
+        };
 
         let port_bindings = task_port_bindings(assignment);
         let exposed_ports = assignment
@@ -1585,7 +1864,7 @@ impl ContainerRuntime for DockerCompatibleRuntime {
             ..Default::default()
         };
         let body = ContainerCreateBody {
-            image: Some(assignment.spec.image.clone()),
+            image: Some(container_image),
             cmd: (!assignment.spec.command.is_empty()).then_some(assignment.spec.command.clone()),
             entrypoint: (!assignment.spec.entrypoint.is_empty())
                 .then_some(assignment.spec.entrypoint.clone()),
@@ -2183,6 +2462,14 @@ mod tests {
         method: Method,
         uri: Uri,
     ) -> axum::response::Response {
+        if method == Method::GET && uri.path().contains("/images/") && uri.path().ends_with("/json")
+        {
+            return axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"Id":"sha256:resolved-image"}"#))
+                .unwrap();
+        }
         if method != Method::POST || !uri.path().ends_with("/images/create") {
             return axum::response::Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -2260,6 +2547,108 @@ mod tests {
             .unwrap()
     }
 
+    async fn relay_pull_docker_api(
+        State(calls): State<Arc<Mutex<Vec<String>>>>,
+        method: Method,
+        uri: Uri,
+    ) -> axum::response::Response {
+        calls.lock().unwrap().push(format!("{method} {uri}"));
+        let path = uri.path();
+        let (status, body) = if method == Method::POST && path.ends_with("/images/create") {
+            (
+                StatusCode::OK,
+                r#"{"status":"downloaded","progressDetail":{"current":64,"total":64}}
+"#,
+            )
+        } else if method == Method::GET && path.contains("/images/") && path.ends_with("/json") {
+            (StatusCode::OK, r#"{"Id":"sha256:proxied-image"}"#)
+        } else if method == Method::POST && path.ends_with("/tag") {
+            (StatusCode::CREATED, "")
+        } else if method == Method::DELETE && path.contains("/images/") {
+            (StatusCode::OK, "[]")
+        } else {
+            (StatusCode::NOT_FOUND, r#"{"message":"unexpected request"}"#)
+        };
+        axum::response::Response::builder()
+            .status(status)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn failing_relay_pull_docker_api(
+        State(calls): State<Arc<Mutex<Vec<String>>>>,
+        method: Method,
+        uri: Uri,
+    ) -> axum::response::Response {
+        calls.lock().unwrap().push(format!("{method} {uri}"));
+        let path = uri.path();
+        let (status, body) = if method == Method::POST && path.ends_with("/images/create") {
+            let proxied = uri
+                .query()
+                .and_then(|query| {
+                    url::form_urlencoded::parse(query.as_bytes())
+                        .find(|(name, _)| name == "fromImage")
+                })
+                .is_some_and(|(_, image)| image.contains("/f/ghcr.io/"));
+            if proxied {
+                (
+                    StatusCode::OK,
+                    r#"{"errorDetail":{"message":"proxy blob download failed"}}
+"#,
+                )
+            } else {
+                (
+                    StatusCode::OK,
+                    r#"{"status":"downloaded","progressDetail":{"current":64,"total":64}}
+"#,
+                )
+            }
+        } else if method == Method::GET && path.contains("/images/") && path.ends_with("/json") {
+            (StatusCode::OK, r#"{"Id":"sha256:direct-image"}"#)
+        } else if method == Method::DELETE && path.contains("/images/") {
+            (StatusCode::NOT_FOUND, r#"{"message":"not found"}"#)
+        } else {
+            (StatusCode::NOT_FOUND, r#"{"message":"unexpected request"}"#)
+        };
+        axum::response::Response::builder()
+            .status(status)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn image_proxy_probe(method: Method, uri: Uri) -> axum::response::Response {
+        let mut builder = axum::response::Response::builder().status(StatusCode::OK);
+        if uri.path() == "/v2/" {
+            builder = builder.header("x-swarmlite-image-proxy", "enabled");
+        } else if method != Method::HEAD || !uri.path().contains("/manifests/") {
+            builder = builder.status(StatusCode::NOT_FOUND);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    async fn unavailable_image_proxy(method: Method, uri: Uri) -> axum::response::Response {
+        let mut builder = axum::response::Response::builder();
+        if uri.path() == "/v2/" {
+            builder = builder
+                .status(StatusCode::OK)
+                .header("x-swarmlite-image-proxy", "enabled");
+        } else if method == Method::HEAD && uri.path().contains("/manifests/") {
+            builder = builder.status(StatusCode::BAD_GATEWAY);
+        } else {
+            builder = builder.status(StatusCode::NOT_FOUND);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    async fn start_test_server(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (address.to_string(), server)
+    }
+
     async fn runtime_for_pull_api(
         app: Router,
         policy: DeploymentPolicy,
@@ -2277,6 +2666,10 @@ mod tests {
                 registry_credentials: None,
                 config_root: None,
                 deployment_policy: Arc::new(std::sync::RwLock::new(policy)),
+                image_relay: None,
+                relay_http: None,
+                podman_http: None,
+                prepared_images: Arc::new(std::sync::RwLock::new(HashMap::new())),
             },
             server,
         )
@@ -2304,6 +2697,10 @@ mod tests {
                 registry_credentials: None,
                 config_root: None,
                 deployment_policy: Arc::new(std::sync::RwLock::new(DeploymentPolicy::default())),
+                image_relay: None,
+                relay_http: None,
+                podman_http: None,
+                prepared_images: Arc::new(std::sync::RwLock::new(HashMap::new())),
             },
             calls,
             server,
@@ -2458,6 +2855,109 @@ mod tests {
                 .iter()
                 .any(|report| report == &(2, Some(64), Some(64)))
         );
+    }
+
+    #[tokio::test]
+    async fn reachable_configured_proxy_retags_and_removes_the_relay_reference() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let docker_app = Router::new()
+            .fallback(any(relay_pull_docker_api))
+            .with_state(calls.clone());
+        let (mut runtime, docker_server) =
+            runtime_for_pull_api(docker_app, DeploymentPolicy::default()).await;
+        let (proxy, proxy_server) =
+            start_test_server(Router::new().fallback(any(image_proxy_probe))).await;
+        runtime.image_relay = Some(proxy.clone());
+        runtime.relay_http = Some(reqwest::Client::builder().no_proxy().build().unwrap());
+
+        runtime
+            .pull_image("ghcr.io/acme/api:1.2", |_, _, _| {})
+            .await
+            .unwrap();
+        docker_server.abort();
+        proxy_server.abort();
+
+        let calls = calls.lock().unwrap();
+        let create = calls
+            .iter()
+            .find(|call| call.starts_with("POST ") && call.contains("/images/create?"))
+            .unwrap();
+        let query = create.split_once('?').unwrap().1;
+        let from_image = url::form_urlencoded::parse(query.as_bytes())
+            .find(|(name, _)| name == "fromImage")
+            .map(|(_, value)| value.into_owned())
+            .unwrap();
+        assert_eq!(from_image, format!("{proxy}/f/ghcr.io/acme/api:1.2"));
+        let tag = calls.iter().find(|call| call.contains("/tag?")).unwrap();
+        assert!(tag.contains("repo=ghcr.io%2Facme%2Fapi"));
+        assert!(tag.contains("tag=1.2"));
+        assert!(calls.iter().any(|call| call.starts_with("DELETE ")));
+    }
+
+    #[tokio::test]
+    async fn unreachable_proxy_uses_the_original_runtime_pull_path() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let docker_app = Router::new()
+            .fallback(any(relay_pull_docker_api))
+            .with_state(calls.clone());
+        let (mut runtime, docker_server) =
+            runtime_for_pull_api(docker_app, DeploymentPolicy::default()).await;
+        let (proxy, proxy_server) =
+            start_test_server(Router::new().fallback(any(unavailable_image_proxy))).await;
+        runtime.image_relay = Some(proxy);
+        runtime.relay_http = Some(reqwest::Client::builder().no_proxy().build().unwrap());
+
+        runtime
+            .pull_image("ghcr.io/acme/api:1.2", |_, _, _| {})
+            .await
+            .unwrap();
+        docker_server.abort();
+        proxy_server.abort();
+
+        let calls = calls.lock().unwrap();
+        let create = calls
+            .iter()
+            .find(|call| call.starts_with("POST ") && call.contains("/images/create?"))
+            .unwrap();
+        let query = create.split_once('?').unwrap().1;
+        let from_image = url::form_urlencoded::parse(query.as_bytes())
+            .find(|(name, _)| name == "fromImage")
+            .map(|(_, value)| value.into_owned())
+            .unwrap();
+        assert_eq!(from_image, "ghcr.io/acme/api:1.2");
+        assert!(!calls.iter().any(|call| call.contains("/tag?")));
+        assert!(!calls.iter().any(|call| call.starts_with("DELETE ")));
+    }
+
+    #[tokio::test]
+    async fn proxy_pull_failure_falls_back_to_the_original_runtime_pull() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let docker_app = Router::new()
+            .fallback(any(failing_relay_pull_docker_api))
+            .with_state(calls.clone());
+        let (mut runtime, docker_server) =
+            runtime_for_pull_api(docker_app, DeploymentPolicy::default()).await;
+        let (proxy, proxy_server) =
+            start_test_server(Router::new().fallback(any(image_proxy_probe))).await;
+        runtime.image_relay = Some(proxy);
+        runtime.relay_http = Some(reqwest::Client::builder().no_proxy().build().unwrap());
+
+        runtime
+            .pull_image("ghcr.io/acme/api:1.2", |_, _, _| {})
+            .await
+            .unwrap();
+        docker_server.abort();
+        proxy_server.abort();
+
+        let calls = calls.lock().unwrap();
+        let pulls = calls
+            .iter()
+            .filter(|call| call.starts_with("POST ") && call.contains("/images/create?"))
+            .collect::<Vec<_>>();
+        assert_eq!(pulls.len(), 2);
+        assert!(pulls[0].contains("%2Ff%2Fghcr.io%2Facme%2Fapi"));
+        assert!(pulls[1].contains("fromImage=ghcr.io%2Facme%2Fapi%3A1.2"));
+        assert!(!calls.iter().any(|call| call.contains("/tag?")));
     }
 
     #[tokio::test]

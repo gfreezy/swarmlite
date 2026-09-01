@@ -9,6 +9,7 @@ members = [
     "crates/swarmlite-node",
     "crates/swarmlite-platform",
     "crates/swarmlite-protocol",
+    "crates/swarmlite-registry",
     "crates/swarmlite-stack",
 ]
 resolver = "3"
@@ -20,13 +21,16 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 anyhow = "1.0"
+async-stream = "0.3"
 axum = { version = "0.8", features = ["json", "ws"] }
 base64 = "0.22"
 bollard = "0.21"
 bytes = "1.10"
 clap = { version = "4.5", features = ["derive", "env"] }
 futures-util = "0.3"
-reqwest = { version = "0.13", features = ["json"] }
+filetime = "0.2"
+oci-client = { version = "0.17", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13", features = ["json", "socks", "stream"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -50,6 +54,7 @@ swarmlite-core = { path = "crates/swarmlite-core" }
 swarmlite-node = { path = "crates/swarmlite-node" }
 swarmlite-platform = { path = "crates/swarmlite-platform" }
 swarmlite-protocol = { path = "crates/swarmlite-protocol" }
+swarmlite-registry = { path = "crates/swarmlite-registry" }
 swarmlite-stack = { path = "crates/swarmlite-stack" }
 
 [package]

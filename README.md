@@ -289,6 +289,48 @@ Stack file. Keep that file private and never commit real credentials. Registry c
 stored in protected Controller and Agent state; they are omitted from status and Service
 specifications.
 
+When an image proxy is configured and can reach the target Registry, image pulls are relayed
+through the Controller without changing Docker or Podman service settings. Before each pull, the
+Agent probes the target manifest through its ephemeral loopback-only Registry relay. A successful
+probe enables reference rewriting for that pull; no proxy configuration, an unreachable proxy, or
+an unreachable target Registry preserves the runtime's normal direct pull path. Gateway image
+upgrades use this same decision path. After a proxied pull, Swarmlite restores the original tag and
+removes the temporary relay tag, so normal tagged images remain visible under their original names
+in `docker image ls` and container inspection. Digest-pinned images are created by image ID and may
+retain their relay repository digest until the runtime prunes the image.
+
+The Controller serves this pull-only Registry on its existing port under `/v2/*`. It handles
+upstream authentication and keeps a content-addressed cache shared by all nodes. Cached objects
+expire 30 minutes after their last access; a scan runs every 5 minutes, and abandoned partial
+downloads expire after one hour. There is no size or LRU policy. A cache write failure falls back
+to an uncached upstream pull. Node image storage is owned by Docker or Podman; use the runtime's
+normal `image prune` policy when node disk reclamation is required.
+
+Only the Controller needs outbound proxy settings. HTTP and HTTPS destinations can use separate
+HTTP-style proxies; when only `SWARMLITE_HTTP_PROXY` is set, it is also used for HTTPS destinations:
+
+```bash
+export SWARMLITE_HTTP_PROXY=http://proxy.example.com:3128
+export SWARMLITE_HTTPS_PROXY=http://proxy.example.com:3128
+export SWARMLITE_NO_PROXY=registry.internal.example.com
+```
+
+Alternatively, configure one SOCKS5 proxy for both HTTP and HTTPS destinations. `socks5h` is
+recommended so DNS resolution also happens through the proxy:
+
+```bash
+export SWARMLITE_SOCKS5_PROXY=socks5h://proxy.example.com:1080
+export SWARMLITE_NO_PROXY=registry.internal.example.com
+```
+
+`SWARMLITE_SOCKS5_PROXY` cannot be combined with `SWARMLITE_HTTP_PROXY` or
+`SWARMLITE_HTTPS_PROXY`. Setting any proxy variable enables probing; `SWARMLITE_NO_PROXY` alone
+does not. `swarmlite upgrade` uses the same settings for its GitHub Release download and retries
+directly when the configured proxy is unavailable. These variables do not modify or restart
+`docker.service` or `podman.service`. A manual
+`docker pull ghcr.io/example/api:latest` still contacts the original Registry directly; a later
+`docker run` can reuse the original tag restored by Swarmlite.
+
 ### Config files, volumes, and placement
 
 Use Compose `configs` to distribute a file beside the Stack file to every node that runs a Service:
@@ -978,6 +1020,8 @@ dependency boundaries:
   client boundaries;
 - `swarmlite-platform` contains Docker/Podman, SQLite local state, registry credentials, and config
   cache adapters;
+- `swarmlite-registry` isolates image reference rewriting, the Controller pull-through cache, and
+  the Agent's loopback relay;
 - `swarmlite-stack` parses and validates Stack documents and renders routing structures.
 
 Only `swarmlite-node` composes Agent and Controller. Those role crates do not depend on each other.
@@ -995,6 +1039,15 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 (cd caddy-storage && go test ./...)
+```
+
+The real image-proxy E2E requires a Linux Docker daemon plus outbound access to
+`registry.k8s.io`. It verifies the Controller Registry with real HTTP CONNECT and SOCKS5 proxies,
+the Agent relay, Docker pull, cache-hit, temporary-tag cleanup, and direct-fallback path. Run it
+explicitly with:
+
+```bash
+cargo test -p swarmlite-platform --test image_proxy_e2e --locked -- --ignored --nocapture
 ```
 
 The project [`Dockerfile`](Dockerfile) builds Swarmlite. Gateway nodes pull the official image

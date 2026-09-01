@@ -111,6 +111,7 @@ struct NodeSupervisor {
     events_rx: mpsc::UnboundedReceiver<NodeEvent>,
     agent_handle: tokio::task::JoinHandle<()>,
     runtime: DockerCompatibleRuntime,
+    image_relay: swarmlite_registry::RelayHandle,
     gateway_report_tx: watch::Sender<GatewayReport>,
     advertise_address: String,
 }
@@ -297,15 +298,6 @@ pub async fn run(options: ServeOptions) -> Result<()> {
         options.runtime_socket.as_deref(),
         settings.runtime.as_ref(),
     );
-    let registry_credentials = RegistryCredentialStore::new(local_state.clone());
-    let config_dir = options.data_dir.join("configs");
-    let runtime = DockerCompatibleRuntime::connect_with_registry_credentials(
-        &runtime_config.resolve()?,
-        registry_credentials.clone(),
-        config_dir.clone(),
-        settings.cluster.deployment.clone(),
-    )?;
-    let initial_gateway_report = GatewayReport::default();
     let agent_controller = if is_controller(&settings) {
         local_controller
     } else {
@@ -314,6 +306,18 @@ pub async fn run(options: ServeOptions) -> Result<()> {
     if agent_controller.is_empty() {
         bail!("node configuration has no controller addresses");
     }
+    let image_relay =
+        swarmlite_registry::spawn_relay(agent_controller.clone(), settings.token.clone()).await?;
+    let registry_credentials = RegistryCredentialStore::new(local_state.clone());
+    let config_dir = options.data_dir.join("configs");
+    let runtime = DockerCompatibleRuntime::connect_with_image_relay(
+        &runtime_config.resolve()?,
+        registry_credentials.clone(),
+        config_dir.clone(),
+        settings.cluster.deployment.clone(),
+        image_relay.authority().to_owned(),
+    )?;
+    let initial_gateway_report = GatewayReport::default();
 
     let agent_config = AgentConfig {
         cluster_id: settings.cluster.cluster_id.clone(),
@@ -371,6 +375,7 @@ pub async fn run(options: ServeOptions) -> Result<()> {
         events_rx,
         agent_handle,
         runtime,
+        image_relay,
         gateway_report_tx,
         advertise_address,
     }
@@ -390,6 +395,7 @@ impl NodeSupervisor {
             mut events_rx,
             agent_handle,
             runtime,
+            image_relay: _image_relay,
             gateway_report_tx,
             advertise_address,
         } = self;
@@ -578,6 +584,9 @@ async fn start_controller(
         node_timeout_seconds: 20,
         reconcile_interval_seconds: 1,
         gateway_drain_timeout_seconds: DEFAULT_GATEWAY_DRAIN_TIMEOUT_SECONDS,
+        image_cache_dir: data_dir
+            .join("image-cache")
+            .join(&settings.cluster.cluster_id),
         cluster,
     };
     let token = settings.token.clone();
