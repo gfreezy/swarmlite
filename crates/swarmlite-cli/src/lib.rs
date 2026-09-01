@@ -491,17 +491,17 @@ define_config_keys! {
         constraints: "non-empty OCI image reference without whitespace; at most 512 bytes",
         default: "Swarmlite-managed Gateway image matching this version",
         description: "OCI image used by every Gateway container.",
-        apply: "recreate gateway"
+        apply: "hot reload or blue/green replacement by digest"
     },
     GatewayListen => {
         key: "gateway.listen",
         field: ClusterConfigField::GatewayListen,
         type: "list",
         values: None,
-        constraints: "comma-separated addresses ending in numeric TCP ports; port 2019 is reserved",
+        constraints: "comma-separated addresses ending in numeric TCP ports; ports 2019..=2021 are reserved",
         default: ":80, :443",
-        description: "Caddy listeners and host ports published by every Gateway.",
-        apply: "recreate gateway"
+        description: "Public Caddy listeners used by every Gateway.",
+        apply: "hot reload"
     },
     GatewayMetricsEnabled => {
         key: "gateway.metrics.enabled",
@@ -510,7 +510,7 @@ define_config_keys! {
         values: Some("true, false"),
         constraints: "must be true or false",
         default: "Caddy default",
-        description: "Enable Caddy HTTP request metrics at the fixed local endpoint 127.0.0.1:2019/metrics.",
+        description: "Enable Caddy HTTP request metrics on the online Gateway's fixed local admin endpoint, port 2019.",
         apply: "hot reload"
     },
     GatewayMetricsPerHost => {
@@ -750,8 +750,8 @@ define_config_keys! {
         values: Some("true, false"),
         constraints: "must be true or false",
         default: "Caddy default",
-        description: "Enable HTTP/3 and UDP port 443 publication.",
-        apply: "recreate gateway"
+        description: "Enable HTTP/3 on UDP port 443.",
+        apply: "hot reload"
     },
     DeploymentProgressDeadlineSeconds => {
         key: "deployment.progress-deadline-seconds",
@@ -828,7 +828,7 @@ fn config_set_update(key: ConfigKey, value: String) -> Result<ClusterConfigUpdat
                         .map(|(_, port)| port)
                         .unwrap_or_default()
                         .parse::<u16>()
-                        .map_or(true, |port| port == 2019)
+                        .map_or(true, |port| (2019..=2021).contains(&port))
                 })
             {
                 return Err(invalid_config_value(key, &value));
@@ -4860,7 +4860,12 @@ mod tests {
         let listen_error = config_set_update(ConfigKey::GatewayListen, ":2019".into())
             .unwrap_err()
             .to_string();
-        assert!(listen_error.contains("port 2019 is reserved"));
+        assert!(listen_error.contains("ports 2019..=2021 are reserved"));
+
+        assert!(
+            config_set_update(ConfigKey::GatewayListen, ":2020".into()).is_err(),
+            "the alternate blue/green admin port must also stay reserved"
+        );
 
         let low_water_error =
             config_set_update(ConfigKey::GatewayCacheLowWaterPercent, "100".into())

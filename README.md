@@ -598,8 +598,10 @@ configuration fields as `null`.
 At least one Gateway must be enabled before deploying a Stack with HTTP routes.
 
 > [!WARNING]
-> Disabling a Gateway deletes its Caddy container and persistent volumes, including local
-> certificates, its last accepted configuration, recovery snapshot, and response cache.
+> Disabling a Gateway first commits and verifies its exact certificate manifest in the Controller;
+> if that barrier fails, the Gateway is preserved. A successful disable then deletes the Caddy
+> container and local volumes, including its autosave, recovery snapshot, and response cache. A
+> later enable restores certificates from the Controller and regenerates the remaining state.
 
 Gateway startup and configuration are best-effort. A Gateway error does not stop the Agent or
 Controller, and the previously accepted Caddy configuration remains active when a new
@@ -615,8 +617,38 @@ sudo swarmlite config set gateway.image registry.example.com/swarmlite-caddy:1.1
 sudo swarmlite config get
 ```
 
-Image and listener replacements retain the Gateway's `/data`, `/config`, and `/cache` volumes.
-Custom images and listeners are described in
+Gateway configuration changes are normally loaded in place without restarting Caddy. When the
+requested image resolves to the same local image digest and the container runtime settings have
+not changed, an image-reference change is also handled in place.
+
+An actual image-digest or runtime change uses a single-node blue/green replacement. Swarmlite
+starts an empty candidate on host networking with only its loopback admin endpoint, restores its
+certificate snapshot from the Controller, writes the Controller-generated recovery snapshot, and
+loads the public `80`/`443` listeners only after preparation succeeds. Caddy's listener reuse lets
+the prepared candidate overlap the active Gateway; Swarmlite then gracefully drains and removes
+the old container. The online Gateway always exposes its loopback admin API on `127.0.0.1:2019`;
+the candidate uses `127.0.0.1:2020` only while it overlaps the old process, then moves its admin
+listener to `2019` without restarting. A failed preparation leaves the old Gateway serving.
+
+Each candidate receives fresh `/data`, `/config`, and `/cache` volumes. Certificate files are
+verified against an exact Controller manifest; Caddy autosave and Swarmlite recovery data are
+regenerated from the Controller; the response cache is disposable and starts cold. Consequently,
+Gateway container compatibility is not controlled by a Gateway or autosave schema label. The
+native cache keeps its own internal SQLite migration behavior, and the Controller recovery
+snapshot keeps its existing recovery-format validation.
+
+| Data | Replacement source and compatibility rule |
+| --- | --- |
+| TLS certificates and account state | Opaque files from the exact Controller manifest; size and SHA-256 must match, with no new format/version conversion |
+| Active Caddy config and autosave | The Controller sends the complete current config; the candidate writes a fresh autosave after `/load` |
+| Swarmlite recovery snapshot | The Controller sends the current snapshot; its existing cluster/generation validation still applies |
+| Native response cache | Not transferred; Green starts with a fresh cache database, whose SQLite schema remains internal to the cache module |
+| Caddy instance ID, storage-clean timestamps, and lock files | Not transferred; they are instance-local and regenerated |
+
+The first replacement of a legacy bridge-network Gateway has one short stop/bind transition,
+because Docker's old host-port proxy cannot share `80`/`443` with the new host-network listener.
+After that one-time migration, replacements use the overlapping blue/green path. Custom images and
+listeners are described in
 [`caddy-storage/README.md`](caddy-storage/README.md).
 
 Gateway and Caddy settings use dotted scopes. Optional settings are omitted until explicitly set;
@@ -651,9 +683,9 @@ one segment use `-`. Invalid values report the applicable enum candidates or num
 
 | Key | Value | Effect |
 | --- | --- | --- |
-| `gateway.image` | OCI image reference | Gateway image; recreates the container |
-| `gateway.listen` | comma-separated addresses | Published Gateway listeners; recreates the container |
-| `gateway.metrics.enabled` | `true`/`false` | HTTP request metrics at local `127.0.0.1:2019/metrics` |
+| `gateway.image` | OCI image reference | Gateway image; replaces the container only when the resolved image digest changes |
+| `gateway.listen` | comma-separated addresses | Published Gateway listeners; loaded through Caddy's Admin API |
+| `gateway.metrics.enabled` | `true`/`false` | HTTP request metrics on the online Gateway's fixed local admin endpoint (`127.0.0.1:2019`) |
 | `gateway.metrics.per-host` | `true`/`false` | Host-labelled metrics; high-cardinality hosts can consume more memory |
 | `gateway.cache.max-size-bytes` | positive integer | Logical response-cache capacity per Gateway; default 1 GiB |
 | `gateway.cache.low-water-percent` | `1`–`99` | Target usage after LRU eviction; default 90% |
@@ -677,7 +709,7 @@ one segment use `-`. Invalid values report the applicable enum candidates or num
 | `gateway.http.timeouts.write-seconds` | non-negative integer | Response write timeout |
 | `gateway.http.timeouts.idle-seconds` | non-negative integer | Keep-Alive idle timeout |
 | `gateway.http.max-header-bytes` | non-negative integer | Maximum request-header bytes |
-| `gateway.http.http3-enabled` | `true`/`false` | HTTP/3 and the Gateway UDP 443 publication |
+| `gateway.http.http3-enabled` | `true`/`false` | HTTP/3 on the Gateway UDP 443 listener |
 
 For example:
 
@@ -885,10 +917,10 @@ protect them against modification by, a machine on the same network path.
 ### Availability model and non-goals
 
 Managed workload and Gateway containers use the runtime's `unless-stopped` restart policy. They are
-not child processes of `swarmlite serve`. Caddy starts with `--resume` and keeps its last accepted
-configuration in an autosave-schema-specific directory inside its persistent volume. Incompatible
-Gateway releases start from the generated bootstrap without deleting the previous autosave, so a
-rollback can still resume it. Agents persist task identity, Stack, Service, slot, revision,
+not child processes of `swarmlite serve`. An active Caddy starts with `--resume` and keeps its last
+accepted configuration in its slot-local config volume. Replacement Gateways always start with
+fresh slot volumes and rebuild Controller-owned state before they accept traffic; retired volumes
+are deleted after a successful handoff. Agents persist task identity, Stack, Service, slot, revision,
 specification hash, ports, and config digests as container labels, then adopt matching containers
 after restarting.
 
@@ -967,6 +999,8 @@ output (`--json`, `ps --quiet`, and `logs --raw`) never adds styling.
 | Gateway HTTP | TCP `80` | HTTP serving and redirect |
 | Gateway HTTPS | TCP `443` | HTTPS serving |
 | Caddy admin API | `127.0.0.1:2019` | Local atomic configuration |
+| Staged Caddy admin API | `127.0.0.1:2020` | Temporary endpoint during Gateway replacement |
+| Certificate sync admin API | `127.0.0.1:2021` | Temporary legacy-migration helper endpoint |
 | CLI and node process | `/usr/local/bin/swarmlite` | System installation binary |
 | Node data | `/var/lib/swarmlite` | Identity, SQLite state, and Agent config cache |
 | Installed runtime settings | `/etc/swarmlite/runtime.env` | Data directory, runtime, and socket |

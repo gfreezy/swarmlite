@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -14,12 +15,16 @@ import (
 
 func init() {
 	caddy.RegisterModule(Module{})
+	caddy.RegisterModule(storageAdmin{})
 }
 
+var activeStorage atomic.Pointer[storage]
+
 // Module configures local-first Caddy storage with optional Swarmlite
-// coordination. The local filesystem is always authoritative. Controller
-// errors only reduce cross-instance certificate reuse; they never make local
-// storage unavailable.
+// coordination. During normal serving, the local filesystem is authoritative
+// and Controller errors only reduce cross-instance certificate reuse. The
+// explicit replacement barrier is stricter and refuses a handoff unless the
+// Controller has verified the complete local snapshot.
 type Module struct {
 	Root          string         `json:"root,omitempty"`
 	Controller    string         `json:"controller,omitempty"`
@@ -90,7 +95,7 @@ func (m Module) CertMagicStorage() (certmagic.Storage, error) {
 	if ownerCacheTTL < time.Second || ownerCacheTTL > time.Hour {
 		return nil, fmt.Errorf("owner_cache_ttl must be between 1s and 1h")
 	}
-	return newStorage(
+	configured := newStorage(
 		root,
 		m.Controller,
 		token,
@@ -99,7 +104,9 @@ func (m Module) CertMagicStorage() (certmagic.Storage, error) {
 		probeTimeout,
 		ownerCacheTTL,
 		lease,
-	), nil
+	)
+	activeStorage.Store(configured)
+	return configured, nil
 }
 
 func (m *Module) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {

@@ -1,7 +1,7 @@
 # Independent Caddy gateway storage
 
 When a node has its Gateway enabled, `swarmlite serve` creates an independent Caddy container with
-its own restart policy and persistent `/data`, `/config`, and `/cache` volumes. The default gateway
+its own restart policy and slot-local `/data`, `/config`, and `/cache` volumes. The default gateway
 image includes this directory's `caddy.storage.swarmlite`,
 `http.handlers.swarmlite_gateway_probe`, and native `http.handlers.cache` modules, Caddy's
 `http.handlers.encode`, and the standard `zstd` and `gzip` encoders. The response cache persists
@@ -9,8 +9,14 @@ directly to SQLite; cache-handler, Souin, and their storage-provider abstraction
 No separately maintained Compose stack is required.
 
 The module consumes Swarmlite's generic KV and lock APIs; those APIs contain no Caddy-specific
-behavior. The authoritative certificate storage remains local CertMagic `FileStorage`, while
-remote keys use the fixed `caddy/` namespace as a best-effort cache and distributed lock service.
+behavior. During normal serving, the authoritative certificate storage remains local CertMagic
+`FileStorage`, while remote keys use the fixed `caddy/` namespace as a best-effort cache and
+distributed lock service. Before a Gateway replacement, the admin sync API synchronously uploads
+every certificate and account object, verifies it by reading it back, and commits an exact manifest
+under `swarmlite/gateway-certificates/`. The candidate restores only manifest members and verifies their
+size and SHA-256 before public listeners are activated. This manifest intentionally has no format
+version: it describes opaque CertMagic files for one handoff rather than a versioned Gateway data
+schema.
 
 ## Publish the gateway image
 
@@ -46,10 +52,15 @@ swarmlite config set gateway-image registry.example.com/swarmlite-caddy:1.1.0
 ```
 
 The image reference is stored in the controller's SQLite database. The selected image must provide
-`caddy`, `caddy.storage.swarmlite`, `http.handlers.swarmlite_gateway_probe`,
+`caddy`, `caddy.storage.swarmlite`, `admin.api.swarmlite_storage`,
+`http.handlers.swarmlite_gateway_probe`,
 `http.handlers.cache`, `http.handlers.encode`, `http.encoders.zstd`, and `http.encoders.gzip`.
-Gateway nodes pull it before replacing an existing container, and keep the existing `/data`,
-`/config`, and `/cache` volumes.
+Gateway nodes resolve the actual local image ID. A different reference with the same image digest
+does not restart Caddy. A different digest starts a blank blue/green candidate with fresh `/data`,
+`/config`, and `/cache` volumes; Controller-owned state is restored before it binds public ports.
+The online process always uses `127.0.0.1:2019` for Caddy administration. A replacement candidate
+uses `127.0.0.1:2020` during overlap and moves the admin listener to `2019` after the retired
+process exits; the legacy certificate sync helper temporarily uses `127.0.0.1:2021`.
 
 ## Automatic configuration
 
@@ -149,6 +160,13 @@ Keep that directory on persistent local storage. The equivalent Caddyfile global
 
 - `Store` and `Delete` complete locally first; publishing to KV is best effort.
 - `Load` reads locally first. A KV hit on a local miss is copied into local storage.
+- `POST /swarmlite/storage/push` is the upgrade barrier: it synchronously publishes and verifies
+  all local CertMagic files, writes the exact manifest, then quiesces further certificate writes in
+  the retiring process. Any failure blocks replacement; `/swarmlite/storage/resume` releases the
+  barrier when Swarmlite rolls the replacement back.
+- `POST /swarmlite/storage/restore` clears the blank candidate's staged files, restores exactly the
+  committed manifest, and validates every object's size and SHA-256. Any failure keeps the old
+  Gateway active.
 - Certificate issuance first probes the target hostname over HTTP and verifies the reached
   Gateway's signed node ID. Only that Gateway may request the shared hostname lock.
 - A valid owner result is cached for `owner_cache_ttl`; a probe failure without a cached result

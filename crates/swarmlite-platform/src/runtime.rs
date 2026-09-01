@@ -52,17 +52,17 @@ pub const COMPONENT_LABEL: &str = "io.swarmlite.component";
 pub const GATEWAY_COMPONENT: &str = "gateway";
 pub const GATEWAY_ADDRESS_LABEL: &str = "io.swarmlite.advertise_address";
 const GATEWAY_NODE_LABEL: &str = "io.swarmlite.node_id";
-const GATEWAY_SCHEMA_LABEL: &str = "io.swarmlite.gateway_schema";
-const GATEWAY_AUTOSAVE_SCHEMA_LABEL: &str = "io.swarmlite.gateway_autosave_schema";
 const GATEWAY_IMAGE_LABEL: &str = "io.swarmlite.gateway_image";
 const GATEWAY_LISTEN_LABEL: &str = "io.swarmlite.gateway_listen";
 const GATEWAY_GRACE_PERIOD_LABEL: &str = "io.swarmlite.gateway_grace_period_seconds";
 const GATEWAY_HTTP3_LABEL: &str = "io.swarmlite.gateway_http3_enabled";
 const GATEWAY_TOKEN_HASH_LABEL: &str = "io.swarmlite.gateway_token_sha256";
-const GATEWAY_SCHEMA: &str = "9";
-const GATEWAY_AUTOSAVE_SCHEMA: &str = "3";
-const GATEWAY_CONTAINER_NAME: &str = "swarmlite-gateway";
-const GATEWAY_ADMIN_URL: &str = "http://127.0.0.1:2019";
+const GATEWAY_SLOT_LABEL: &str = "io.swarmlite.gateway_slot";
+const GATEWAY_RUNTIME_SPEC_LABEL: &str = "io.swarmlite.gateway_runtime_spec_sha256";
+const GATEWAY_SYNC_COMPONENT: &str = "gateway-storage-sync";
+const GATEWAY_ACTIVE_ADMIN_PORT: u16 = 2019;
+const GATEWAY_STAGED_ADMIN_PORT: u16 = 2020;
+const GATEWAY_SYNC_ADMIN_PORT: u16 = 2021;
 const GATEWAY_RECOVERY_PATH: &str = "/config/swarmlite-recovery.json";
 const GATEWAY_RECOVERY_TEMP_NAME: &str = ".swarmlite-recovery.json.tmp";
 const MAX_GATEWAY_RECOVERY_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
@@ -138,17 +138,48 @@ pub struct GatewayContainerSpec {
 #[derive(Debug)]
 struct ExistingGatewayContainer {
     id: String,
+    created: i64,
+    image_id: Option<String>,
     cluster_id: Option<String>,
-    node_id: Option<String>,
-    advertise_address: Option<String>,
     image: Option<String>,
-    listen: Option<String>,
     grace_period_seconds: Option<String>,
-    http3_enabled: Option<String>,
-    token_hash: Option<String>,
-    schema: Option<String>,
-    autosave_schema: Option<String>,
+    slot: Option<GatewaySlot>,
+    runtime_spec_hash: Option<String>,
     running: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewaySlot {
+    Blue,
+    Green,
+}
+
+impl GatewaySlot {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Blue => "blue",
+            Self::Green => "green",
+        }
+    }
+
+    fn opposite(self) -> Self {
+        match self {
+            Self::Blue => Self::Green,
+            Self::Green => Self::Blue,
+        }
+    }
+}
+
+impl std::str::FromStr for GatewaySlot {
+    type Err = ();
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "blue" => Ok(Self::Blue),
+            "green" => Ok(Self::Green),
+            _ => Err(()),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -396,47 +427,41 @@ impl DockerCompatibleRuntime {
     pub async fn managed_cluster_inventory(&self) -> Result<ManagedClusterInventory> {
         let summaries = self.list_managed_summaries().await?;
         let mut inventory = ManagedClusterInventory::default();
+        let mut newest_gateway = HashMap::<String, i64>::new();
         for summary in summaries {
+            let created = summary.created.unwrap_or_default();
             let labels = summary.labels.unwrap_or_default();
             match labels.get(CLUSTER_LABEL).filter(|value| !value.is_empty()) {
                 Some(cluster_id) => {
                     inventory.cluster_ids.insert(cluster_id.clone());
                     if is_gateway_system_container(&labels) {
                         inventory.gateway_cluster_ids.insert(cluster_id.clone());
-                        if let Some(listen) = labels
-                            .get(GATEWAY_LISTEN_LABEL)
-                            .map(|value| {
-                                value
-                                    .split(',')
-                                    .map(str::trim)
-                                    .filter(|value| !value.is_empty())
-                                    .map(ToOwned::to_owned)
-                                    .collect::<Vec<_>>()
-                            })
-                            .filter(|listen| !listen.is_empty())
-                        {
-                            match inventory
-                                .gateway_listen
-                                .insert(cluster_id.clone(), listen.clone())
+                        let is_newest = newest_gateway
+                            .get(cluster_id)
+                            .is_none_or(|existing| created > *existing);
+                        if is_newest {
+                            newest_gateway.insert(cluster_id.clone(), created);
+                            if let Some(listen) = labels
+                                .get(GATEWAY_LISTEN_LABEL)
+                                .map(|value| {
+                                    value
+                                        .split(',')
+                                        .map(str::trim)
+                                        .filter(|value| !value.is_empty())
+                                        .map(ToOwned::to_owned)
+                                        .collect::<Vec<_>>()
+                                })
+                                .filter(|listen| !listen.is_empty())
                             {
-                                Some(existing) if existing != listen => bail!(
-                                    "managed gateway containers for cluster {cluster_id} have conflicting listener labels"
-                                ),
-                                _ => {}
+                                inventory.gateway_listen.insert(cluster_id.clone(), listen);
                             }
-                        }
-                        if let Some(image) = labels
-                            .get(GATEWAY_IMAGE_LABEL)
-                            .filter(|value| !value.is_empty())
-                        {
-                            match inventory
-                                .gateway_images
-                                .insert(cluster_id.clone(), image.clone())
+                            if let Some(image) = labels
+                                .get(GATEWAY_IMAGE_LABEL)
+                                .filter(|value| !value.is_empty())
                             {
-                                Some(existing) if existing != *image => bail!(
-                                    "managed gateway containers for cluster {cluster_id} have conflicting image labels"
-                                ),
-                                _ => {}
+                                inventory
+                                    .gateway_images
+                                    .insert(cluster_id.clone(), image.clone());
                             }
                         }
                     }
@@ -463,6 +488,7 @@ impl DockerCompatibleRuntime {
         &self,
         spec: &GatewayContainerSpec,
         enabled: bool,
+        assignment: Option<&GatewayAssignment>,
     ) -> Result<()> {
         let ports = enabled
             .then(|| {
@@ -471,65 +497,177 @@ impl DockerCompatibleRuntime {
                 })
             })
             .transpose()?;
-        let gateways = self.gateway_containers().await?;
-        if gateways.len() > 1 {
-            bail!(
-                "found multiple managed gateway containers; keep exactly one on this node before serving"
-            );
-        }
-        let existing = gateways.into_iter().next();
-        if let Some(existing) = &existing
-            && existing.cluster_id.as_deref() != Some(&spec.cluster_id)
-        {
-            bail!(
-                "managed gateway container belongs to cluster {:?}, not {}; recover the old cluster or remove that container",
-                existing.cluster_id,
-                spec.cluster_id
-            );
+        let mut gateways = self.gateway_containers().await?;
+        for existing in &gateways {
+            if existing.cluster_id.as_deref() != Some(&spec.cluster_id) {
+                bail!(
+                    "managed gateway container belongs to cluster {:?}, not {}; recover the old cluster or remove that container",
+                    existing.cluster_id,
+                    spec.cluster_id
+                );
+            }
         }
 
         if !enabled {
-            if let Some(existing) = existing {
+            let active_admin_port = self.gateway_public_admin_port().await;
+            let active = gateways
+                .iter()
+                .find(|gateway| gateway.running)
+                .or_else(|| gateways.first());
+            if let Some(active) = active {
+                self.commit_gateway_snapshot_before_removal(spec, active, active_admin_port)
+                    .await?;
+            }
+            for existing in gateways {
                 self.remove_gateway(&existing).await?;
             }
+            self.remove_gateway_sync_helper(
+                &gateway_sync_container_name(&spec.cluster_id),
+                &spec.cluster_id,
+            )
+            .await?;
             self.remove_gateway_volumes(&spec.cluster_id).await?;
             return Ok(());
         }
 
-        if let Some(existing) = existing {
-            if gateway_matches_spec(&existing, spec) {
-                if !existing.running {
+        let assignment = assignment.context(
+            "Controller did not provide a Gateway configuration; preserving the current Gateway",
+        )?;
+        validate_gateway_assignment(assignment, &spec.cluster_id)?;
+        if gateways.len() > 2 {
+            bail!("found more than two managed Gateway containers on this node");
+        }
+
+        let gateway_image = self.ensure_image_if_missing(&spec.gateway.image).await?;
+        let desired_image_id = self.inspect_image_id(&gateway_image).await?;
+        let runtime_spec_hash = gateway_runtime_spec_hash(spec)?;
+        if let Some(index) = gateways.iter().position(|gateway| {
+            gateway.image_id.as_deref() == Some(desired_image_id.as_str())
+                && gateway.runtime_spec_hash.as_deref() == Some(runtime_spec_hash.as_str())
+                && gateway.slot.is_some()
+        }) {
+            let desired = gateways.remove(index);
+            let desired_is_staged = gateways
+                .iter()
+                .any(|stale| desired.created >= stale.created);
+            if !desired.running {
+                if gateways.is_empty() {
                     ensure_gateway_ports_available(
                         ports.as_ref().expect("enabled Gateway ports"),
                         spec.gateway.http.http3_enabled.unwrap_or(true),
+                        GATEWAY_ACTIVE_ADMIN_PORT,
                     )?;
-                    self.client
-                        .start_container(&existing.id, None)
-                        .await
-                        .context("failed to start the managed gateway container")?;
-                    info!(runtime = %self.kind, "started existing gateway container");
+                    ensure_gateway_admin_port_available(GATEWAY_STAGED_ADMIN_PORT)?;
                 }
-                return Ok(());
+                self.client
+                    .start_container(&desired.id, None)
+                    .await
+                    .context("failed to start the managed Gateway container")?;
             }
-            self.ensure_image_if_missing(&spec.gateway.image).await?;
-            info!(
-                previous_address = ?existing.advertise_address,
-                address = %spec.advertise_address,
-                "recreating gateway container for the current gateway settings"
+            let desired_admin_port = if desired_is_staged {
+                self.wait_gateway_admin(GATEWAY_STAGED_ADMIN_PORT).await?;
+                GATEWAY_STAGED_ADMIN_PORT
+            } else {
+                self.wait_gateway_admin_any().await?
+            };
+            let has_public_config = self.gateway_has_public_config(desired_admin_port).await?;
+            if let Some(legacy_index) = gateways.iter().position(|gateway| gateway.slot.is_none())
+                && !has_public_config
+            {
+                let mut legacy = gateways.remove(legacy_index);
+                if !legacy.running {
+                    self.client
+                        .start_container(&legacy.id, None)
+                        .await
+                        .context("failed to restart the legacy Gateway during upgrade recovery")?;
+                    legacy.running = true;
+                }
+                self.remove_gateway(&desired).await?;
+                self.remove_gateway_slot_volumes(&spec.cluster_id, desired.slot)
+                    .await?;
+                return self
+                    .replace_gateway(
+                        spec,
+                        assignment,
+                        Some(&legacy),
+                        &gateway_image,
+                        &runtime_spec_hash,
+                    )
+                    .await;
+            }
+            if !has_public_config {
+                self.restore_gateway_certificates(
+                    &reqwest::Client::new(),
+                    desired_admin_port,
+                    !gateways.is_empty(),
+                )
+                .await
+                .context("failed to resume preparation of the staged Gateway")?;
+            } else {
+                self.post_gateway_action(
+                    &reqwest::Client::new(),
+                    desired_admin_port,
+                    "/swarmlite/storage/resume",
+                )
+                .await
+                .context("failed to release a previous Gateway replacement barrier")?;
+            }
+            let configured_admin_port = if desired_is_staged {
+                GATEWAY_STAGED_ADMIN_PORT
+            } else {
+                GATEWAY_ACTIVE_ADMIN_PORT
+            };
+            self.apply_gateway_config_to(
+                &desired,
+                assignment,
+                desired_admin_port,
+                configured_admin_port,
+            )
+            .await?;
+            for stale in gateways {
+                self.remove_gateway(&stale).await?;
+                if let Err(error) = self
+                    .remove_gateway_slot_volumes(&spec.cluster_id, stale.slot)
+                    .await
+                {
+                    warn!(%error, "failed to remove stale Gateway volumes");
+                }
+            }
+            if configured_admin_port != GATEWAY_ACTIVE_ADMIN_PORT {
+                self.move_gateway_admin(
+                    &reqwest::Client::new(),
+                    configured_admin_port,
+                    GATEWAY_ACTIVE_ADMIN_PORT,
+                )
+                .await
+                .context("failed to move the recovered Gateway admin API to the active port")?;
+            }
+            return Ok(());
+        }
+
+        if gateways.len() > 1 {
+            bail!(
+                "found two stale managed Gateway containers and neither matches the desired runtime"
             );
-            self.remove_gateway(&existing).await?;
+        }
+        let existing = gateways.pop();
+        if existing.is_none() {
             ensure_gateway_ports_available(
                 ports.as_ref().expect("enabled Gateway ports"),
                 spec.gateway.http.http3_enabled.unwrap_or(true),
+                GATEWAY_ACTIVE_ADMIN_PORT,
             )?;
-            return self.create_gateway(spec).await;
+            ensure_gateway_admin_port_available(GATEWAY_STAGED_ADMIN_PORT)?;
         }
 
-        ensure_gateway_ports_available(
-            ports.as_ref().expect("enabled Gateway ports"),
-            spec.gateway.http.http3_enabled.unwrap_or(true),
-        )?;
-        self.create_gateway(spec).await
+        self.replace_gateway(
+            spec,
+            assignment,
+            existing.as_ref(),
+            &gateway_image,
+            &runtime_spec_hash,
+        )
+        .await
     }
 
     pub async fn gateway_image(&self) -> Result<Option<String>> {
@@ -543,37 +681,29 @@ impl DockerCompatibleRuntime {
             .and_then(|gateway| gateway.image))
     }
 
-    pub async fn apply_gateway_config(&self, assignment: &GatewayAssignment) -> Result<()> {
-        if assignment.recovery_snapshot.generation != assignment.generation {
-            bail!(
-                "Gateway assignment generation {} does not match recovery snapshot generation {}",
-                assignment.generation,
-                assignment.recovery_snapshot.generation
-            );
-        }
-        let gateways = self.gateway_containers().await?;
-        let gateway = match gateways.as_slice() {
-            [gateway] => gateway,
-            [] => bail!("managed Gateway container is missing"),
-            _ => bail!("found multiple managed Gateway containers on this node"),
-        };
+    async fn apply_gateway_config_to(
+        &self,
+        gateway: &ExistingGatewayContainer,
+        assignment: &GatewayAssignment,
+        current_admin_port: u16,
+        configured_admin_port: u16,
+    ) -> Result<()> {
         let cluster_id = gateway
             .cluster_id
             .as_deref()
             .context("managed Gateway container has no cluster identity")?;
-        assignment
-            .recovery_snapshot
-            .validate_for_cluster(cluster_id)
-            .map_err(anyhow::Error::msg)?;
+        validate_gateway_assignment(assignment, cluster_id)?;
+        let config = gateway_config_for_admin(&assignment.config, configured_admin_port);
         let client = reqwest::Client::new();
-        self.post_gateway_config(&client, "/load", &assignment.config)
+        self.post_gateway_config(&client, current_admin_port, "/load", &config)
             .await?;
-        self.persist_gateway_recovery_snapshot(&assignment.recovery_snapshot)
+        self.wait_gateway_admin(configured_admin_port).await?;
+        self.persist_gateway_recovery_snapshot_to(&gateway.id, &assignment.recovery_snapshot)
             .await?;
         info!(
             generation = assignment.generation,
             runtime = %self.kind,
-            "applied local gateway configuration"
+            "applied local Gateway configuration"
         );
         Ok(())
     }
@@ -640,8 +770,9 @@ impl DockerCompatibleRuntime {
         serde_json::from_slice(&payload).context("invalid Gateway recovery snapshot JSON")
     }
 
-    async fn persist_gateway_recovery_snapshot(
+    async fn persist_gateway_recovery_snapshot_to(
         &self,
+        container_id: &str,
         snapshot: &GatewayRecoverySnapshot,
     ) -> Result<()> {
         let payload = serde_json::to_vec(snapshot)?;
@@ -649,18 +780,12 @@ impl DockerCompatibleRuntime {
             bail!("Gateway recovery snapshot is too large");
         }
         let archive = gateway_recovery_snapshot_archive(&payload)?;
-        let gateway = self
-            .gateway_containers()
-            .await?
-            .into_iter()
-            .find(|gateway| gateway.cluster_id.as_deref() == Some(&snapshot.cluster_id))
-            .context("managed Gateway container disappeared after Caddy accepted its config")?;
         let options = UploadToContainerOptionsBuilder::default()
             .path("/config")
             .build();
         self.client
             .upload_to_container(
-                &gateway.id,
+                container_id,
                 Some(options),
                 bollard::body_full(Bytes::from(archive)),
             )
@@ -673,7 +798,7 @@ impl DockerCompatibleRuntime {
         let exec = self
             .client
             .create_exec(
-                &gateway.id,
+                container_id,
                 CreateExecOptions {
                     attach_stdout: Some(true),
                     attach_stderr: Some(true),
@@ -705,10 +830,11 @@ impl DockerCompatibleRuntime {
     async fn post_gateway_config(
         &self,
         client: &reqwest::Client,
+        admin_port: u16,
         path: &str,
         value: &serde_json::Value,
     ) -> Result<()> {
-        let url = format!("{GATEWAY_ADMIN_URL}{path}");
+        let url = format!("{}{path}", gateway_admin_url(admin_port));
         let response = client.post(&url).json(value).send().await?;
         if response.status().is_success() {
             return Ok(());
@@ -724,101 +850,565 @@ impl DockerCompatibleRuntime {
         bail!("Caddy Admin API {url} returned {status}: {body}")
     }
 
+    async fn move_gateway_admin(
+        &self,
+        client: &reqwest::Client,
+        current_admin_port: u16,
+        target_admin_port: u16,
+    ) -> Result<()> {
+        if current_admin_port == target_admin_port {
+            return Ok(());
+        }
+        let url = format!("{}/config/", gateway_admin_url(current_admin_port));
+        let response = client.get(&url).send().await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(512)
+                .collect::<String>();
+            bail!("Caddy Admin API {url} returned {status}: {body}");
+        }
+        let mut config: serde_json::Value = response
+            .json()
+            .await
+            .context("Caddy Admin API returned an invalid configuration")?;
+        config["admin"]["listen"] = serde_json::json!(format!("127.0.0.1:{target_admin_port}"));
+        self.post_gateway_config(client, current_admin_port, "/load", &config)
+            .await?;
+        self.wait_gateway_admin(target_admin_port).await
+    }
+
+    async fn post_gateway_action(
+        &self,
+        client: &reqwest::Client,
+        admin_port: u16,
+        path: &str,
+    ) -> Result<()> {
+        let url = format!("{}{path}", gateway_admin_url(admin_port));
+        let response = client.post(&url).send().await?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(512)
+            .collect::<String>();
+        bail!("Caddy Admin API {url} returned {status}: {body}")
+    }
+
+    async fn restore_gateway_certificates(
+        &self,
+        client: &reqwest::Client,
+        admin_port: u16,
+        required: bool,
+    ) -> Result<bool> {
+        let path = "/swarmlite/storage/restore";
+        let url = format!("{}{path}", gateway_admin_url(admin_port));
+        let response = client.post(&url).send().await?;
+        if response.status().is_success() {
+            return Ok(true);
+        }
+        if response.status() == reqwest::StatusCode::NOT_FOUND && !required {
+            return Ok(false);
+        }
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(512)
+            .collect::<String>();
+        bail!("Caddy Admin API {url} returned {status}: {body}")
+    }
+
+    async fn wait_gateway_admin(&self, admin_port: u16) -> Result<()> {
+        let client = reqwest::Client::new();
+        let url = format!("{}/config/", gateway_admin_url(admin_port));
+        let mut last_error = None;
+        for _ in 0..100 {
+            match client.get(&url).send().await {
+                Ok(response) if response.status().is_success() => return Ok(()),
+                Ok(response) => last_error = Some(format!("HTTP {}", response.status())),
+                Err(error) => last_error = Some(error.to_string()),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        bail!(
+            "Caddy Admin API {url} did not become ready: {}",
+            last_error.unwrap_or_else(|| "no response".to_owned())
+        )
+    }
+
+    async fn wait_gateway_admin_any(&self) -> Result<u16> {
+        let client = reqwest::Client::new();
+        let mut last_error = None;
+        for _ in 0..100 {
+            for admin_port in [GATEWAY_ACTIVE_ADMIN_PORT, GATEWAY_STAGED_ADMIN_PORT] {
+                let url = format!("{}/config/", gateway_admin_url(admin_port));
+                match client.get(&url).send().await {
+                    Ok(response) if response.status().is_success() => return Ok(admin_port),
+                    Ok(response) => {
+                        last_error = Some(format!("{url} returned HTTP {}", response.status()))
+                    }
+                    Err(error) => last_error = Some(format!("{url}: {error}")),
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        bail!(
+            "Caddy Admin API did not become ready on active port {} or staged port {}: {}",
+            GATEWAY_ACTIVE_ADMIN_PORT,
+            GATEWAY_STAGED_ADMIN_PORT,
+            last_error.unwrap_or_else(|| "no response".to_owned())
+        )
+    }
+
+    async fn gateway_public_admin_port(&self) -> Option<u16> {
+        // During an interrupted overlap, the staged process contains the newly restored state.
+        // Prefer it for a final snapshot; after a completed promotion only 2019 responds.
+        for admin_port in [GATEWAY_STAGED_ADMIN_PORT, GATEWAY_ACTIVE_ADMIN_PORT] {
+            if self
+                .gateway_has_public_config(admin_port)
+                .await
+                .unwrap_or(false)
+            {
+                return Some(admin_port);
+            }
+        }
+        None
+    }
+
+    async fn gateway_has_public_config(&self, admin_port: u16) -> Result<bool> {
+        let url = format!(
+            "{}/config/apps/http/servers/swarmlite/",
+            gateway_admin_url(admin_port)
+        );
+        let response = reqwest::Client::new().get(&url).send().await?;
+        match response.status() {
+            status if status.is_success() => Ok(true),
+            reqwest::StatusCode::NOT_FOUND => Ok(false),
+            status => bail!("Caddy Admin API {url} returned {status}"),
+        }
+    }
+
     async fn gateway_containers(&self) -> Result<Vec<ExistingGatewayContainer>> {
         let summaries = self.list_managed_summaries().await?;
         Ok(summaries
             .into_iter()
             .filter_map(|summary| {
+                let created = summary.created.unwrap_or_default();
                 let labels = summary.labels.unwrap_or_default();
                 if !is_gateway_system_container(&labels) {
                     return None;
                 }
                 Some(ExistingGatewayContainer {
                     id: summary.id?,
+                    created,
+                    image_id: summary.image_id,
                     cluster_id: labels.get(CLUSTER_LABEL).cloned(),
-                    node_id: labels.get(GATEWAY_NODE_LABEL).cloned(),
-                    advertise_address: labels.get(GATEWAY_ADDRESS_LABEL).cloned(),
                     image: labels.get(GATEWAY_IMAGE_LABEL).cloned(),
-                    listen: labels.get(GATEWAY_LISTEN_LABEL).cloned(),
                     grace_period_seconds: labels.get(GATEWAY_GRACE_PERIOD_LABEL).cloned(),
-                    http3_enabled: labels.get(GATEWAY_HTTP3_LABEL).cloned(),
-                    token_hash: labels.get(GATEWAY_TOKEN_HASH_LABEL).cloned(),
-                    schema: labels.get(GATEWAY_SCHEMA_LABEL).cloned(),
-                    autosave_schema: labels.get(GATEWAY_AUTOSAVE_SCHEMA_LABEL).cloned(),
+                    slot: labels
+                        .get(GATEWAY_SLOT_LABEL)
+                        .and_then(|value| value.parse().ok()),
+                    runtime_spec_hash: labels.get(GATEWAY_RUNTIME_SPEC_LABEL).cloned(),
                     running: summary.state == Some(ContainerSummaryStateEnum::RUNNING),
                 })
             })
             .collect())
     }
 
-    async fn create_gateway(&self, spec: &GatewayContainerSpec) -> Result<()> {
-        let gateway_image = self.ensure_image_if_missing(&spec.gateway.image).await?;
-        let bootstrap = gateway_bootstrap(spec)?;
-        let ports = gateway_ports(&spec.gateway.listen)?;
-        let mut port_bindings = HashMap::new();
-        let mut exposed_ports = Vec::new();
-        for port in ports {
-            let key = format!("{port}/tcp");
-            exposed_ports.push(key.clone());
-            port_bindings.insert(
-                key,
-                Some(vec![DockerPortBinding {
-                    host_ip: Some("0.0.0.0".to_owned()),
-                    host_port: Some(port.to_string()),
-                }]),
-            );
-            if port == 443 && spec.gateway.http.http3_enabled.unwrap_or(true) {
-                let key = "443/udp".to_owned();
-                exposed_ports.push(key.clone());
-                port_bindings.insert(
-                    key,
-                    Some(vec![DockerPortBinding {
-                        host_ip: Some("0.0.0.0".to_owned()),
-                        host_port: Some("443".to_owned()),
-                    }]),
-                );
+    async fn replace_gateway(
+        &self,
+        spec: &GatewayContainerSpec,
+        assignment: &GatewayAssignment,
+        existing: Option<&ExistingGatewayContainer>,
+        gateway_image: &str,
+        runtime_spec_hash: &str,
+    ) -> Result<()> {
+        let target_slot = existing.and_then(|gateway| gateway.slot).map_or_else(
+            || {
+                if existing.is_some() {
+                    GatewaySlot::Green
+                } else {
+                    GatewaySlot::Blue
+                }
+            },
+            GatewaySlot::opposite,
+        );
+        self.remove_gateway_slot_volumes(&spec.cluster_id, Some(target_slot))
+            .await?;
+
+        let client = reqwest::Client::new();
+        let mut existing_admin_port = GATEWAY_ACTIVE_ADMIN_PORT;
+        if existing.is_some_and(|gateway| gateway.running) {
+            existing_admin_port = self.wait_gateway_admin_any().await?;
+            if existing_admin_port == GATEWAY_STAGED_ADMIN_PORT {
+                self.move_gateway_admin(
+                    &client,
+                    GATEWAY_STAGED_ADMIN_PORT,
+                    GATEWAY_ACTIVE_ADMIN_PORT,
+                )
+                .await
+                .context("failed to normalize the current Gateway admin API before replacement")?;
+                existing_admin_port = GATEWAY_ACTIVE_ADMIN_PORT;
             }
         }
-        let admin = "2019/tcp".to_owned();
-        exposed_ports.push(admin.clone());
-        port_bindings.insert(
-            admin,
-            Some(vec![DockerPortBinding {
-                host_ip: Some("127.0.0.1".to_owned()),
-                host_port: Some("2019".to_owned()),
-            }]),
-        );
+        let mut helper_id = None;
+        let mut candidate = None;
+        let mut candidate_public = false;
+        let mut legacy_stopped = false;
+        let mut active_quiesced = false;
+        let mut retired_removed = existing.is_none();
+        let result: Result<()> = async {
+            if let Some(active) = existing {
+                if active.slot.is_some() {
+                    self.post_gateway_action(
+                        &client,
+                        existing_admin_port,
+                        "/swarmlite/storage/push",
+                    )
+                    .await
+                    .context("failed to commit the active Gateway certificate snapshot")?;
+                    active_quiesced = true;
+                } else {
+                    let id = self
+                        .create_gateway_sync_helper(spec, gateway_image, None)
+                        .await?;
+                    helper_id = Some(id);
+                    self.post_gateway_action(
+                        &client,
+                        GATEWAY_SYNC_ADMIN_PORT,
+                        "/swarmlite/storage/push",
+                    )
+                    .await
+                    .context("failed to commit the legacy Gateway certificate snapshot")?;
+                }
+            }
 
-        let [data_volume, config_volume, cache_volume] = gateway_volume_names(&spec.cluster_id);
+            let green = self
+                .create_gateway(spec, gateway_image, target_slot, runtime_spec_hash)
+                .await?;
+            candidate = Some(green);
+            let green = candidate.as_ref().expect("candidate was just created");
+            self.restore_gateway_certificates(
+                &client,
+                GATEWAY_STAGED_ADMIN_PORT,
+                existing.is_some(),
+            )
+            .await
+            .context("failed to restore the staged Gateway certificate snapshot")?;
+            self.persist_gateway_recovery_snapshot_to(&green.id, &assignment.recovery_snapshot)
+                .await?;
+
+            if let Some(active) = existing.filter(|gateway| gateway.slot.is_none()) {
+                self.stop_gateway(active).await?;
+                legacy_stopped = true;
+                self.post_gateway_action(
+                    &client,
+                    GATEWAY_SYNC_ADMIN_PORT,
+                    "/swarmlite/storage/push",
+                )
+                    .await
+                    .context("failed to finalize the stopped legacy Gateway certificate snapshot")?;
+                self.post_gateway_action(
+                    &client,
+                    GATEWAY_STAGED_ADMIN_PORT,
+                    "/swarmlite/storage/restore",
+                )
+                .await
+                .context("failed to restore the final legacy Gateway certificate snapshot")?;
+            }
+
+            let config =
+                gateway_config_for_admin(&assignment.config, GATEWAY_STAGED_ADMIN_PORT);
+            self.post_gateway_config(
+                &client,
+                GATEWAY_STAGED_ADMIN_PORT,
+                "/load",
+                &config,
+            )
+            .await
+            .context("failed to activate the staged Gateway public listeners")?;
+            candidate_public = true;
+
+            if let Some(active) = existing {
+                if let Err(error) = self.remove_gateway(active).await {
+                    warn!(%error, "new Gateway is active but the retired Gateway could not be removed");
+                    return Err(error).context(
+                        "the candidate is serving traffic on staged admin port 2020, but the retired Gateway still owns active admin port 2019",
+                    );
+                }
+                retired_removed = true;
+            }
+            self.move_gateway_admin(
+                &client,
+                GATEWAY_STAGED_ADMIN_PORT,
+                GATEWAY_ACTIVE_ADMIN_PORT,
+            )
+            .await
+            .context("failed to move the promoted Gateway admin API to the active port")?;
+            Ok(())
+        }
+        .await;
+
+        if let Some(id) = helper_id.as_deref()
+            && let Err(error) = self.remove_gateway_sync_helper(id, &spec.cluster_id).await
+        {
+            warn!(%error, "failed to clean up the Gateway certificate sync helper");
+        }
+
+        if let Err(error) = result {
+            if active_quiesced
+                && !retired_removed
+                && existing.is_some()
+                && let Err(resume_error) = self
+                    .post_gateway_action(&client, existing_admin_port, "/swarmlite/storage/resume")
+                    .await
+            {
+                warn!(%resume_error, "failed to resume certificate writes on the preserved Gateway");
+            }
+            if candidate_public {
+                if retired_removed
+                    && let Some(active) = existing
+                    && let Err(cleanup_error) = self
+                        .remove_gateway_slot_volumes(&spec.cluster_id, active.slot)
+                        .await
+                {
+                    warn!(%cleanup_error, "failed to remove retired Gateway volumes after admin-port promotion was interrupted");
+                }
+                return Err(error).context(
+                    "the replacement Gateway is preserving public traffic and will retry admin-port promotion",
+                );
+            }
+            if let Some(green) = candidate.as_ref()
+                && let Err(cleanup_error) = self.remove_gateway(green).await
+            {
+                warn!(%cleanup_error, "failed to remove the staged Gateway after upgrade failure");
+            }
+            if let Err(cleanup_error) = self
+                .remove_gateway_slot_volumes(&spec.cluster_id, Some(target_slot))
+                .await
+            {
+                warn!(%cleanup_error, "failed to remove staged Gateway volumes after upgrade failure");
+            }
+            if legacy_stopped
+                && let Some(active) = existing
+                && let Err(start_error) = self.client.start_container(&active.id, None).await
+            {
+                return Err(error.context(format!(
+                    "the legacy Gateway was stopped and rollback also failed: {start_error}"
+                )));
+            }
+            return Err(error);
+        }
+
+        if let Some(active) = existing
+            && let Err(error) = self
+                .remove_gateway_slot_volumes(&spec.cluster_id, active.slot)
+                .await
+        {
+            warn!(%error, "failed to remove the retired Gateway volumes");
+        }
+        info!(
+            image = %spec.gateway.image,
+            slot = target_slot.label(),
+            generation = assignment.generation,
+            "completed the Gateway blue/green replacement"
+        );
+        Ok(())
+    }
+
+    async fn commit_gateway_snapshot_before_removal(
+        &self,
+        spec: &GatewayContainerSpec,
+        active: &ExistingGatewayContainer,
+        active_admin_port: Option<u16>,
+    ) -> Result<()> {
+        let client = reqwest::Client::new();
+        if active.running
+            && active.slot.is_some()
+            && let Some(active_admin_port) = active_admin_port
+        {
+            return self
+                .post_gateway_action(&client, active_admin_port, "/swarmlite/storage/push")
+                .await
+                .context("failed to commit certificates before removing the Gateway");
+        }
+
+        let gateway_image = self.ensure_image_if_missing(&spec.gateway.image).await?;
+        let helper_id = self
+            .create_gateway_sync_helper(spec, &gateway_image, active.slot)
+            .await?;
+        let mut stopped = false;
+        let result: Result<()> = async {
+            self.post_gateway_action(&client, GATEWAY_SYNC_ADMIN_PORT, "/swarmlite/storage/push")
+                .await?;
+            if active.running {
+                self.stop_gateway(active).await?;
+                stopped = true;
+                self.post_gateway_action(
+                    &client,
+                    GATEWAY_SYNC_ADMIN_PORT,
+                    "/swarmlite/storage/push",
+                )
+                .await?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = self
+            .remove_gateway_sync_helper(&helper_id, &spec.cluster_id)
+            .await
+        {
+            warn!(%error, "failed to clean up the Gateway certificate sync helper");
+        }
+        if let Err(error) = result {
+            if stopped && let Err(start_error) = self.client.start_container(&active.id, None).await
+            {
+                return Err(error.context(format!(
+                    "certificate snapshot failed and the Gateway rollback also failed: {start_error}"
+                )));
+            }
+            return Err(error).context("failed to commit certificates before removing the Gateway");
+        }
+        Ok(())
+    }
+
+    async fn create_gateway_sync_helper(
+        &self,
+        spec: &GatewayContainerSpec,
+        gateway_image: &str,
+        data_slot: Option<GatewaySlot>,
+    ) -> Result<String> {
+        let name = gateway_sync_container_name(&spec.cluster_id);
+        let remove = RemoveContainerOptionsBuilder::default().force(true).build();
+        match self.client.remove_container(&name, Some(remove)).await {
+            Ok(()) => {}
+            Err(error) if docker_not_found(&error) => {}
+            Err(error) => {
+                return Err(error).context("failed to remove a stale Gateway sync helper");
+            }
+        }
+        self.remove_gateway_sync_volumes(&spec.cluster_id).await?;
+        let [data_volume, _, _] = gateway_volume_names(&spec.cluster_id, data_slot);
+        let [config_volume, cache_volume] = gateway_sync_volume_names(&spec.cluster_id);
+        let bootstrap = gateway_bootstrap(spec, GATEWAY_SYNC_ADMIN_PORT, false)?;
+        let body = ContainerCreateBody {
+            image: Some(gateway_image.to_owned()),
+            entrypoint: Some(vec!["/bin/sh".to_owned(), "-ec".to_owned()]),
+            cmd: Some(vec![
+                "printf '%s' \"$SWARMLITE_CADDY_BOOTSTRAP\" > /config/bootstrap.json; exec caddy run --config /config/bootstrap.json"
+                    .to_owned(),
+            ]),
+            env: Some(vec![
+                "XDG_CONFIG_HOME=/config".to_owned(),
+                "XDG_DATA_HOME=/data".to_owned(),
+                format!("SWARMLITE_TOKEN={}", spec.token),
+                format!("SWARMLITE_GATEWAY_ID={}", spec.node_id),
+                format!("SWARMLITE_CADDY_BOOTSTRAP={bootstrap}"),
+            ]),
+            labels: Some(HashMap::from([
+                (MANAGED_LABEL.to_owned(), "true".to_owned()),
+                (CLUSTER_LABEL.to_owned(), spec.cluster_id.clone()),
+                (SYSTEM_LABEL.to_owned(), "true".to_owned()),
+                (COMPONENT_LABEL.to_owned(), GATEWAY_SYNC_COMPONENT.to_owned()),
+            ])),
+            host_config: Some(HostConfig {
+                binds: Some(vec![
+                    format!("{data_volume}:/data"),
+                    format!("{config_volume}:/config"),
+                    format!("{cache_volume}:/cache"),
+                ]),
+                network_mode: Some("host".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let options = CreateContainerOptionsBuilder::default().name(&name).build();
+        let created = match self.client.create_container(Some(options), body).await {
+            Ok(created) => created,
+            Err(error) => {
+                let _ = self.remove_gateway_sync_volumes(&spec.cluster_id).await;
+                return Err(error).context("failed to create the Gateway sync helper");
+            }
+        };
+        if let Err(error) = self.client.start_container(&created.id, None).await {
+            let error =
+                anyhow::Error::new(error).context("failed to start the Gateway sync helper");
+            let _ = self
+                .remove_new_container_after_failed_start(&created.id, "Gateway sync helper")
+                .await;
+            let _ = self.remove_gateway_sync_volumes(&spec.cluster_id).await;
+            return Err(error);
+        }
+        if let Err(error) = self.wait_gateway_admin(GATEWAY_SYNC_ADMIN_PORT).await {
+            let _ = self
+                .remove_new_container_after_failed_start(&created.id, "Gateway sync helper")
+                .await;
+            let _ = self.remove_gateway_sync_volumes(&spec.cluster_id).await;
+            return Err(error);
+        }
+        Ok(created.id)
+    }
+
+    async fn remove_gateway_sync_helper(&self, id: &str, cluster_id: &str) -> Result<()> {
+        let remove = RemoveContainerOptionsBuilder::default().force(true).build();
+        match self.client.remove_container(id, Some(remove)).await {
+            Ok(()) => {}
+            Err(error) if docker_not_found(&error) => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.remove_gateway_sync_volumes(cluster_id).await
+    }
+
+    async fn create_gateway(
+        &self,
+        spec: &GatewayContainerSpec,
+        gateway_image: &str,
+        slot: GatewaySlot,
+        runtime_spec_hash: &str,
+    ) -> Result<ExistingGatewayContainer> {
+        let bootstrap = gateway_bootstrap(spec, GATEWAY_STAGED_ADMIN_PORT, false)?;
+        let [data_volume, config_volume, cache_volume] =
+            gateway_volume_names(&spec.cluster_id, Some(slot));
         let host_config = HostConfig {
             binds: Some(vec![
                 format!("{data_volume}:/data"),
                 format!("{config_volume}:/config"),
                 format!("{cache_volume}:/cache"),
             ]),
-            port_bindings: Some(port_bindings),
+            network_mode: Some("host".to_owned()),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
                 maximum_retry_count: None,
             }),
             ..Default::default()
         };
-        let labels = gateway_labels(spec);
+        let labels = gateway_labels(spec, slot, runtime_spec_hash);
         let body = ContainerCreateBody {
-            image: Some(gateway_image),
+            image: Some(gateway_image.to_owned()),
             entrypoint: Some(vec!["/bin/sh".to_owned(), "-ec".to_owned()]),
             cmd: Some(vec![
                 "printf '%s' \"$SWARMLITE_CADDY_BOOTSTRAP\" > /config/bootstrap.json; exec caddy run --resume --config /config/bootstrap.json"
                     .to_owned(),
             ]),
             env: Some(vec![
-                format!("XDG_CONFIG_HOME={}", gateway_autosave_config_home()),
+                "XDG_CONFIG_HOME=/config".to_owned(),
                 "XDG_DATA_HOME=/data".to_owned(),
                 format!("SWARMLITE_TOKEN={}", spec.token),
                 format!("SWARMLITE_GATEWAY_ID={}", spec.node_id),
                 format!("SWARMLITE_CADDY_BOOTSTRAP={bootstrap}"),
             ]),
-            exposed_ports: Some(exposed_ports),
             labels: Some(labels),
             stop_timeout: Some(i64::from(gateway_stop_timeout(
                 spec.gateway.shutdown.grace_period_seconds,
@@ -826,8 +1416,9 @@ impl DockerCompatibleRuntime {
             host_config: Some(host_config),
             ..Default::default()
         };
+        let container_name = gateway_container_name(slot);
         let options = CreateContainerOptionsBuilder::default()
-            .name(GATEWAY_CONTAINER_NAME)
+            .name(&container_name)
             .build();
         let created = self
             .client
@@ -835,7 +1426,7 @@ impl DockerCompatibleRuntime {
             .await
             .with_context(|| {
                 format!(
-                    "failed to create gateway container {GATEWAY_CONTAINER_NAME}; remove any unrelated container using that name"
+                    "failed to create Gateway container {container_name}; remove any unrelated container using that name"
                 )
             })?;
         if let Err(error) = self.client.start_container(&created.id, None).await {
@@ -855,9 +1446,31 @@ impl DockerCompatibleRuntime {
             image = %spec.gateway.image,
             address = %spec.advertise_address,
             runtime = %self.kind,
-            "started independent gateway container"
+            slot = slot.label(),
+            "started staged Gateway container"
         );
-        Ok(())
+        if let Err(error) = self.wait_gateway_admin(GATEWAY_STAGED_ADMIN_PORT).await {
+            if let Err(cleanup_error) = self
+                .remove_new_container_after_failed_start(&created.id, "Gateway")
+                .await
+            {
+                return Err(error.context(format!(
+                    "also failed to remove the staged Gateway: {cleanup_error:#}"
+                )));
+            }
+            return Err(error);
+        }
+        Ok(ExistingGatewayContainer {
+            id: created.id,
+            created: i64::MAX,
+            image_id: None,
+            cluster_id: Some(spec.cluster_id.clone()),
+            image: Some(spec.gateway.image.clone()),
+            grace_period_seconds: Some(optional_label(spec.gateway.shutdown.grace_period_seconds)),
+            slot: Some(slot),
+            runtime_spec_hash: Some(runtime_spec_hash.to_owned()),
+            running: true,
+        })
     }
 
     async fn remove_new_container_after_failed_start(
@@ -1033,18 +1646,10 @@ impl DockerCompatibleRuntime {
     }
 
     async fn remove_gateway(&self, container: &ExistingGatewayContainer) -> Result<()> {
-        if container.running {
-            let stop = StopContainerOptionsBuilder::default()
-                .t(gateway_stop_timeout(
-                    container
-                        .grace_period_seconds
-                        .as_deref()
-                        .and_then(|value| value.parse().ok()),
-                ))
-                .build();
-            if let Err(error) = self.client.stop_container(&container.id, Some(stop)).await {
-                warn!(%error, "graceful gateway stop failed; forcing removal");
-            }
+        if container.running
+            && let Err(error) = self.stop_gateway(container).await
+        {
+            warn!(%error, "graceful gateway stop failed; forcing removal");
         }
         let remove = RemoveContainerOptionsBuilder::default().force(true).build();
         self.client
@@ -1055,8 +1660,50 @@ impl DockerCompatibleRuntime {
         Ok(())
     }
 
+    async fn stop_gateway(&self, container: &ExistingGatewayContainer) -> Result<()> {
+        let stop = StopContainerOptionsBuilder::default()
+            .t(gateway_stop_timeout(
+                container
+                    .grace_period_seconds
+                    .as_deref()
+                    .and_then(|value| value.parse().ok()),
+            ))
+            .build();
+        match self.client.stop_container(&container.id, Some(stop)).await {
+            Ok(()) => Ok(()),
+            Err(error) if docker_not_found(&error) || docker_already_stopped(&error) => Ok(()),
+            Err(error) => Err(error).context("failed to stop the managed Gateway container"),
+        }
+    }
+
     async fn remove_gateway_volumes(&self, cluster_id: &str) -> Result<()> {
-        for volume in gateway_volume_names(cluster_id) {
+        for slot in [None, Some(GatewaySlot::Blue), Some(GatewaySlot::Green)] {
+            self.remove_gateway_slot_volumes(cluster_id, slot).await?;
+        }
+        self.remove_gateway_sync_volumes(cluster_id).await?;
+        info!(runtime = %self.kind, "removed Gateway persistent volumes");
+        Ok(())
+    }
+
+    async fn remove_gateway_slot_volumes(
+        &self,
+        cluster_id: &str,
+        slot: Option<GatewaySlot>,
+    ) -> Result<()> {
+        self.remove_named_gateway_volumes(gateway_volume_names(cluster_id, slot))
+            .await
+    }
+
+    async fn remove_gateway_sync_volumes(&self, cluster_id: &str) -> Result<()> {
+        self.remove_named_gateway_volumes(gateway_sync_volume_names(cluster_id))
+            .await
+    }
+
+    async fn remove_named_gateway_volumes<const N: usize>(
+        &self,
+        volumes: [String; N],
+    ) -> Result<()> {
+        for volume in volumes {
             let options = RemoveVolumeOptionsBuilder::default().force(true).build();
             match self.client.remove_volume(&volume, Some(options)).await {
                 Ok(())
@@ -1069,7 +1716,6 @@ impl DockerCompatibleRuntime {
                 }
             }
         }
-        info!(runtime = %self.kind, "removed gateway persistent volumes");
         Ok(())
     }
 
@@ -1478,7 +2124,11 @@ fn image_pull_error_is_retryable(error: &anyhow::Error) -> bool {
     .any(|needle| message.contains(needle))
 }
 
-fn gateway_labels(spec: &GatewayContainerSpec) -> HashMap<String, String> {
+fn gateway_labels(
+    spec: &GatewayContainerSpec,
+    slot: GatewaySlot,
+    runtime_spec_hash: &str,
+) -> HashMap<String, String> {
     HashMap::from([
         (MANAGED_LABEL.to_owned(), "true".to_owned()),
         (CLUSTER_LABEL.to_owned(), spec.cluster_id.clone()),
@@ -1489,10 +2139,10 @@ fn gateway_labels(spec: &GatewayContainerSpec) -> HashMap<String, String> {
             spec.advertise_address.clone(),
         ),
         (GATEWAY_NODE_LABEL.to_owned(), spec.node_id.clone()),
-        (GATEWAY_SCHEMA_LABEL.to_owned(), GATEWAY_SCHEMA.to_owned()),
+        (GATEWAY_SLOT_LABEL.to_owned(), slot.label().to_owned()),
         (
-            GATEWAY_AUTOSAVE_SCHEMA_LABEL.to_owned(),
-            GATEWAY_AUTOSAVE_SCHEMA.to_owned(),
+            GATEWAY_RUNTIME_SPEC_LABEL.to_owned(),
+            runtime_spec_hash.to_owned(),
         ),
         (GATEWAY_IMAGE_LABEL.to_owned(), spec.gateway.image.clone()),
         (
@@ -1522,10 +2172,6 @@ fn optional_label<T: std::fmt::Display>(value: Option<T>) -> String {
     value.map_or_else(|| "unset".to_owned(), |value| value.to_string())
 }
 
-fn gateway_autosave_config_home() -> String {
-    format!("/config/autosave-v{GATEWAY_AUTOSAVE_SCHEMA}")
-}
-
 fn gateway_stop_timeout(grace_period_seconds: Option<u64>) -> i32 {
     match grace_period_seconds {
         None => 10,
@@ -1534,13 +2180,29 @@ fn gateway_stop_timeout(grace_period_seconds: Option<u64>) -> i32 {
     }
 }
 
-fn gateway_volume_names(cluster_id: &str) -> [String; 3] {
-    let prefix = format!("swarmlite-gateway-{cluster_id}");
+fn gateway_container_name(slot: GatewaySlot) -> String {
+    format!("swarmlite-gateway-{}", slot.label())
+}
+
+fn gateway_sync_container_name(cluster_id: &str) -> String {
+    format!("swarmlite-gateway-{cluster_id}-storage-sync")
+}
+
+fn gateway_volume_names(cluster_id: &str, slot: Option<GatewaySlot>) -> [String; 3] {
+    let prefix = slot.map_or_else(
+        || format!("swarmlite-gateway-{cluster_id}"),
+        |slot| format!("swarmlite-gateway-{cluster_id}-{}", slot.label()),
+    );
     [
         format!("{prefix}-data"),
         format!("{prefix}-config"),
         format!("{prefix}-cache"),
     ]
+}
+
+fn gateway_sync_volume_names(cluster_id: &str) -> [String; 2] {
+    let prefix = format!("swarmlite-gateway-{cluster_id}-storage-sync");
+    [format!("{prefix}-config"), format!("{prefix}-cache")]
 }
 
 fn gateway_recovery_snapshot_archive(payload: &[u8]) -> Result<Vec<u8>> {
@@ -1556,18 +2218,20 @@ fn gateway_recovery_snapshot_archive(payload: &[u8]) -> Result<Vec<u8>> {
     archive.into_inner().map_err(Into::into)
 }
 
-fn gateway_matches_spec(container: &ExistingGatewayContainer, spec: &GatewayContainerSpec) -> bool {
-    container.node_id.as_deref() == Some(&spec.node_id)
-        && container.advertise_address.as_deref() == Some(&spec.advertise_address)
-        && container.image.as_deref() == Some(&spec.gateway.image)
-        && container.listen.as_deref() == Some(&spec.gateway.listen.join(","))
-        && container.grace_period_seconds.as_deref()
-            == Some(&optional_label(spec.gateway.shutdown.grace_period_seconds))
-        && container.http3_enabled.as_deref()
-            == Some(&optional_label(spec.gateway.http.http3_enabled))
-        && container.token_hash.as_deref() == Some(&gateway_token_hash(&spec.token))
-        && container.schema.as_deref() == Some(GATEWAY_SCHEMA)
-        && container.autosave_schema.as_deref() == Some(GATEWAY_AUTOSAVE_SCHEMA)
+fn gateway_runtime_spec_hash(spec: &GatewayContainerSpec) -> Result<String> {
+    let material = serde_json::json!({
+        "runtime": "host-network-blue-green-v2-fixed-active-admin",
+        "cluster_id": spec.cluster_id,
+        "node_id": spec.node_id,
+        "token_sha256": gateway_token_hash(&spec.token),
+        "shutdown_grace_period_seconds": spec.gateway.shutdown.grace_period_seconds,
+        "xdg_config_home": "/config",
+        "xdg_data_home": "/data",
+    });
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&material)?)
+    ))
 }
 
 fn gateway_ports(listen: &[String]) -> Result<BTreeSet<u16>> {
@@ -1582,15 +2246,21 @@ fn gateway_ports(listen: &[String]) -> Result<BTreeSet<u16>> {
                 .with_context(|| {
                     format!("gateway listen address {address:?} must end in a numeric TCP port")
                 })?;
-            if port == 2019 {
-                bail!("gateway listen port 2019 is reserved for the Caddy admin API");
+            if (2019..=2021).contains(&port) {
+                bail!(
+                    "gateway listen port {port} is reserved for Caddy administration and Gateway upgrades"
+                );
             }
             Ok(port)
         })
         .collect()
 }
 
-fn ensure_gateway_ports_available(ports: &BTreeSet<u16>, http3_enabled: bool) -> Result<()> {
+fn ensure_gateway_ports_available(
+    ports: &BTreeSet<u16>,
+    http3_enabled: bool,
+    admin_port: u16,
+) -> Result<()> {
     for &port in ports {
         let address = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
         check_gateway_port(
@@ -1606,13 +2276,16 @@ fn ensure_gateway_ports_available(ports: &BTreeSet<u16>, http3_enabled: bool) ->
             )?;
         }
     }
-    let admin = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 2019);
+    ensure_gateway_admin_port_available(admin_port)
+}
+
+fn ensure_gateway_admin_port_available(admin_port: u16) -> Result<()> {
+    let admin = SocketAddrV4::new(Ipv4Addr::LOCALHOST, admin_port);
     check_gateway_port(
         TcpListener::bind(admin),
         format!("{admin}/tcp"),
         "free the local Caddy admin port or disable Gateway on this node",
-    )?;
-    Ok(())
+    )
 }
 
 fn check_gateway_port<T>(
@@ -1644,12 +2317,45 @@ pub fn gateway_error_is_retryable(error: &anyhow::Error) -> bool {
     error.downcast_ref::<NonRetryableGatewayError>().is_none() && !is_host_port_conflict(error)
 }
 
-fn gateway_bootstrap(spec: &GatewayContainerSpec) -> Result<String> {
-    Ok(serde_json::to_string(&gateway::config(
+fn gateway_bootstrap(
+    spec: &GatewayContainerSpec,
+    admin_port: u16,
+    public_listeners: bool,
+) -> Result<String> {
+    let mut config = gateway::config(
         &ClusterState::default(),
         &spec.gateway,
         spec.controller.clone(),
-    ))?)
+    );
+    config["admin"]["listen"] = serde_json::json!(format!("127.0.0.1:{admin_port}"));
+    if !public_listeners && let Some(root) = config.as_object_mut() {
+        root.remove("apps");
+    }
+    Ok(serde_json::to_string(&config)?)
+}
+
+fn gateway_config_for_admin(config: &serde_json::Value, admin_port: u16) -> serde_json::Value {
+    let mut config = config.clone();
+    config["admin"]["listen"] = serde_json::json!(format!("127.0.0.1:{admin_port}"));
+    config
+}
+
+fn gateway_admin_url(admin_port: u16) -> String {
+    format!("http://127.0.0.1:{admin_port}")
+}
+
+fn validate_gateway_assignment(assignment: &GatewayAssignment, cluster_id: &str) -> Result<()> {
+    if assignment.recovery_snapshot.generation != assignment.generation {
+        bail!(
+            "Gateway assignment generation {} does not match recovery snapshot generation {}",
+            assignment.generation,
+            assignment.recovery_snapshot.generation
+        );
+    }
+    assignment
+        .recovery_snapshot
+        .validate_for_cluster(cluster_id)
+        .map_err(anyhow::Error::msg)
 }
 
 fn is_gateway_system_container(labels: &HashMap<String, String>) -> bool {
@@ -2143,6 +2849,16 @@ fn docker_not_found(error: &bollard::errors::Error) -> bool {
 }
 
 fn docker_already_running(error: &bollard::errors::Error) -> bool {
+    matches!(
+        error,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 304,
+            ..
+        }
+    )
+}
+
+fn docker_already_stopped(error: &bollard::errors::Error) -> bool {
     matches!(
         error,
         bollard::errors::Error::DockerResponseServerError {
@@ -3054,7 +3770,12 @@ mod tests {
     async fn removes_a_new_gateway_container_when_start_fails() {
         let (runtime, calls, server) = runtime_with_start_failure_api().await;
         let error = runtime
-            .create_gateway(&test_gateway_spec())
+            .create_gateway(
+                &test_gateway_spec(),
+                "gateway-image-id",
+                GatewaySlot::Blue,
+                "runtime-spec-hash",
+            )
             .await
             .unwrap_err();
         server.abort();
@@ -3123,18 +3844,18 @@ mod tests {
     #[test]
     fn builds_gateway_recovery_labels() {
         let spec = test_gateway_spec();
-        let labels = gateway_labels(&spec);
+        let runtime_hash = gateway_runtime_spec_hash(&spec).unwrap();
+        let labels = gateway_labels(&spec, GatewaySlot::Blue, &runtime_hash);
         assert_eq!(labels[MANAGED_LABEL], "true");
         assert_eq!(labels[CLUSTER_LABEL], "cluster-old");
         assert_eq!(labels[SYSTEM_LABEL], "true");
         assert_eq!(labels[COMPONENT_LABEL], GATEWAY_COMPONENT);
         assert_eq!(labels[GATEWAY_ADDRESS_LABEL], "10.0.0.21");
         assert_eq!(labels[GATEWAY_NODE_LABEL], "node-a");
-        assert_eq!(labels[GATEWAY_SCHEMA_LABEL], GATEWAY_SCHEMA);
-        assert_eq!(
-            labels[GATEWAY_AUTOSAVE_SCHEMA_LABEL],
-            GATEWAY_AUTOSAVE_SCHEMA
-        );
+        assert_eq!(labels[GATEWAY_SLOT_LABEL], "blue");
+        assert_eq!(labels[GATEWAY_RUNTIME_SPEC_LABEL], runtime_hash);
+        assert!(!labels.contains_key("io.swarmlite.gateway_schema"));
+        assert!(!labels.contains_key("io.swarmlite.gateway_autosave_schema"));
         assert_eq!(labels[GATEWAY_IMAGE_LABEL], DEFAULT_GATEWAY_IMAGE);
         assert_eq!(labels[GATEWAY_LISTEN_LABEL], ":80");
         assert_eq!(labels[GATEWAY_GRACE_PERIOD_LABEL], "unset");
@@ -3148,35 +3869,18 @@ mod tests {
     }
 
     #[test]
-    fn replaces_a_gateway_when_the_cluster_image_changes() {
-        let mut container = ExistingGatewayContainer {
-            id: "gateway".into(),
-            cluster_id: Some("cluster-old".into()),
-            node_id: Some("node-a".into()),
-            advertise_address: Some("10.0.0.21".into()),
-            image: Some("custom-caddy:v1".into()),
-            listen: Some(":80".into()),
-            grace_period_seconds: Some("unset".into()),
-            http3_enabled: Some("unset".into()),
-            token_hash: Some(gateway_token_hash("0123456789abcdef")),
-            schema: Some(GATEWAY_SCHEMA.into()),
-            autosave_schema: Some(GATEWAY_AUTOSAVE_SCHEMA.into()),
-            running: true,
-        };
+    fn gateway_runtime_hash_ignores_hot_config_but_tracks_immutable_inputs() {
         let mut spec = test_gateway_spec();
-        assert!(!gateway_matches_spec(&container, &spec));
+        let original = gateway_runtime_spec_hash(&spec).unwrap();
         spec.gateway.image = "custom-caddy:v1".into();
-        assert!(gateway_matches_spec(&container, &spec));
-        container.autosave_schema = None;
-        assert!(!gateway_matches_spec(&container, &spec));
-        container.autosave_schema = Some(GATEWAY_AUTOSAVE_SCHEMA.into());
-        container.node_id = None;
-        assert!(!gateway_matches_spec(&container, &spec));
-    }
-
-    #[test]
-    fn isolates_caddy_autosaves_by_compatibility_schema() {
-        assert_eq!(gateway_autosave_config_home(), "/config/autosave-v3");
+        assert_eq!(gateway_runtime_spec_hash(&spec).unwrap(), original);
+        spec.gateway.listen.push(":443".into());
+        spec.gateway.http.http3_enabled = Some(false);
+        spec.controller = "http://10.0.0.22:17080".into();
+        spec.advertise_address = "10.0.0.22".into();
+        assert_eq!(gateway_runtime_spec_hash(&spec).unwrap(), original);
+        spec.token = "fedcba9876543210".into();
+        assert_ne!(gateway_runtime_spec_hash(&spec).unwrap(), original);
     }
 
     #[test]
@@ -3186,6 +3890,8 @@ mod tests {
             BTreeSet::from([80, 443])
         );
         assert!(gateway_ports(&[":2019".into()]).is_err());
+        assert!(gateway_ports(&[":2020".into()]).is_err());
+        assert!(gateway_ports(&[":2021".into()]).is_err());
         assert!(gateway_ports(&["unix/socket".into()]).is_err());
     }
 
@@ -3201,7 +3907,8 @@ mod tests {
         let occupied = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
         let port = occupied.local_addr().unwrap().port();
 
-        let error = ensure_gateway_ports_available(&BTreeSet::from([port]), true).unwrap_err();
+        let error =
+            ensure_gateway_ports_available(&BTreeSet::from([port]), true, 2019).unwrap_err();
 
         assert!(format!("{error:#}").contains(&format!("0.0.0.0:{port}/tcp")));
         assert!(!gateway_error_is_retryable(&error));
@@ -3210,12 +3917,16 @@ mod tests {
     #[test]
     fn scopes_gateway_volumes_to_the_cluster() {
         assert_eq!(
-            gateway_volume_names("cluster-old"),
+            gateway_volume_names("cluster-old", Some(GatewaySlot::Blue)),
             [
-                "swarmlite-gateway-cluster-old-data".to_owned(),
-                "swarmlite-gateway-cluster-old-config".to_owned(),
-                "swarmlite-gateway-cluster-old-cache".to_owned(),
+                "swarmlite-gateway-cluster-old-blue-data".to_owned(),
+                "swarmlite-gateway-cluster-old-blue-config".to_owned(),
+                "swarmlite-gateway-cluster-old-blue-cache".to_owned(),
             ]
+        );
+        assert_eq!(
+            gateway_volume_names("cluster-old", None)[0],
+            "swarmlite-gateway-cluster-old-data"
         );
     }
 
@@ -3239,12 +3950,12 @@ mod tests {
     }
 
     #[test]
-    fn gateway_bootstrap_persists_admin_updates() {
+    fn gateway_bootstrap_stages_only_the_admin_and_storage_planes() {
         let mut spec = test_gateway_spec();
         spec.token = "do-not-persist-this-token".into();
-        let encoded = gateway_bootstrap(&spec).unwrap();
+        let encoded = gateway_bootstrap(&spec, 2020, false).unwrap();
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(value["admin"]["listen"], "0.0.0.0:2019");
+        assert_eq!(value["admin"]["listen"], "127.0.0.1:2020");
         assert_eq!(value["admin"]["config"]["persist"], true);
         assert_eq!(value["storage"]["module"], "swarmlite");
         assert_eq!(value["storage"]["controller"], "http://10.0.0.21:17080");
@@ -3253,8 +3964,20 @@ mod tests {
         assert_eq!(value["storage"]["gateway_id_env"], "SWARMLITE_GATEWAY_ID");
         assert_eq!(value["storage"]["probe_timeout"], "2s");
         assert_eq!(value["storage"]["owner_cache_ttl"], "1m");
-        assert!(value["apps"].get("cache").is_none());
+        assert!(value.get("apps").is_none());
         assert!(!encoded.contains("do-not-persist-this-token"));
+    }
+
+    #[test]
+    fn gateway_final_config_keeps_public_apps_and_uses_the_requested_admin_port() {
+        let spec = test_gateway_spec();
+        let config = gateway::config(
+            &ClusterState::default(),
+            &spec.gateway,
+            spec.controller.clone(),
+        );
+        let value = gateway_config_for_admin(&config, 2020);
+        assert_eq!(value["admin"]["listen"], "127.0.0.1:2020");
         assert_eq!(
             value["apps"]["http"]["servers"]["swarmlite"]["listen"][0],
             ":80"

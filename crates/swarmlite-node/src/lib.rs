@@ -442,23 +442,20 @@ impl NodeSupervisor {
                                 &public_controller,
                             ),
                             true,
+                            control.gateway_config.as_ref(),
                         ).await;
-                        let gateway_image = observed_gateway_image(&runtime).await;
-                        let mut report = gateway_operation_report(
+                        let gateway_image = if reconcile_result.is_ok() {
+                            Some(settings.cluster.gateway.image.clone())
+                        } else {
+                            observed_gateway_image(&runtime).await
+                        };
+                        let report = gateway_operation_report(
                             "failed to reconcile enabled gateway",
-                            None,
-                            gateway_image.clone(),
+                            control.gateway_config.as_ref().map(|assignment| assignment.generation),
+                            gateway_image,
                             reconcile_result,
                         );
                         let reconciled = report.error.is_none();
-                        if reconciled && let Some(assignment) = &control.gateway_config {
-                            report = gateway_operation_report(
-                                "failed to apply gateway configuration",
-                                Some(assignment.generation),
-                                gateway_image,
-                                runtime.apply_gateway_config(assignment).await,
-                            );
-                        }
                         gateway_report_tx.send_replace(report);
                         if !had_gateway && reconciled {
                             info!("gateway enabled; started independent Caddy container");
@@ -472,6 +469,7 @@ impl NodeSupervisor {
                                 &public_controller,
                             ),
                             false,
+                            None,
                         ).await;
                         let report = gateway_operation_report(
                             "failed to remove disabled gateway",

@@ -96,6 +96,10 @@ func (c *coordinator) configured() bool {
 
 func (c *coordinator) put(ctx context.Context, request putRequest) error {
 	request.Key = namespacedKey(request.Key)
+	return c.putRaw(ctx, request)
+}
+
+func (c *coordinator) putRaw(ctx context.Context, request putRequest) error {
 	return c.doJSON(ctx, http.MethodPut, "/v1/kv", nil, request, nil)
 }
 
@@ -105,10 +109,15 @@ func (c *coordinator) delete(ctx context.Context, request deleteRequest) error {
 }
 
 func (c *coordinator) object(ctx context.Context, key string) (objectResponse, error) {
-	var response objectResponse
-	query := url.Values{"key": []string{namespacedKey(key)}}
-	err := c.doJSON(ctx, http.MethodGet, "/v1/kv", query, nil, &response)
+	response, err := c.objectRaw(ctx, namespacedKey(key))
 	response.Key = localKey(response.Key)
+	return response, err
+}
+
+func (c *coordinator) objectRaw(ctx context.Context, key string) (objectResponse, error) {
+	var response objectResponse
+	query := url.Values{"key": []string{key}}
+	err := c.doJSON(ctx, http.MethodGet, "/v1/kv", query, nil, &response)
 	return response, err
 }
 

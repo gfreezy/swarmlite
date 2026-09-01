@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/certmagic"
@@ -25,6 +26,8 @@ type storage struct {
 	gatewayID   string
 	ownerProbe  gatewayOwnerProbe
 	ownerTTL    time.Duration
+	dataMu      sync.RWMutex
+	quiesced    atomic.Bool
 
 	locksMu  sync.Mutex
 	locks    map[string]*heldLock
@@ -70,6 +73,11 @@ func newStorage(
 }
 
 func (s *storage) Store(ctx context.Context, key string, value []byte) error {
+	s.dataMu.RLock()
+	defer s.dataMu.RUnlock()
+	if s.quiesced.Load() {
+		return errors.New("Swarmlite certificate storage is quiesced for Gateway replacement")
+	}
 	if err := s.local.Store(ctx, key, value); err != nil {
 		return err
 	}
@@ -84,6 +92,8 @@ func (s *storage) Store(ctx context.Context, key string, value []byte) error {
 }
 
 func (s *storage) Load(ctx context.Context, key string) ([]byte, error) {
+	s.dataMu.RLock()
+	defer s.dataMu.RUnlock()
 	value, err := s.local.Load(ctx, key)
 	if err == nil || !errors.Is(err, fs.ErrNotExist) {
 		return value, err
@@ -98,13 +108,20 @@ func (s *storage) Load(ctx context.Context, key string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode Swarmlite cache value: %w", err)
 	}
-	if err := s.local.Store(ctx, key, value); err != nil {
-		return nil, err
+	if !s.quiesced.Load() {
+		if err := s.local.Store(ctx, key, value); err != nil {
+			return nil, err
+		}
 	}
 	return value, nil
 }
 
 func (s *storage) Delete(ctx context.Context, key string) error {
+	s.dataMu.RLock()
+	defer s.dataMu.RUnlock()
+	if s.quiesced.Load() {
+		return errors.New("Swarmlite certificate storage is quiesced for Gateway replacement")
+	}
 	if err := s.local.Delete(ctx, key); err != nil {
 		return err
 	}
