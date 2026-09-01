@@ -81,6 +81,7 @@ workspace_packages = [
     "swarmlite-node",
     "swarmlite-platform",
     "swarmlite-protocol",
+    "swarmlite-registry",
     "swarmlite-stack",
 ]
 
