@@ -15,23 +15,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  caddy-image:
-    name: Caddy image
-    runs-on: ubuntu-latest
+  strategy:
+    name: Select Caddy image strategy
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
-      packages: write
+      packages: read
+    outputs:
+      mode: ${{ steps.strategy.outputs.mode }}
+      source_digest: ${{ steps.strategy.outputs.source_digest }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-        with:
-          platforms: arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -113,49 +111,180 @@ jobs:
             "source_digest=$previous_digest" \
             "previous_tag=$previous_tag"
 
+  build:
+    name: Caddy image (${{ matrix.platform }})
+    needs: strategy
+    if: needs.strategy.outputs.mode == 'build'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            artifact-suffix: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            artifact-suffix: arm64
+    env:
+      IMAGE_REPOSITORY: ghcr.io/${{ github.repository_owner }}/swarmlite-caddy
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Generate image metadata
-        if: steps.strategy.outputs.mode == 'build'
         id: meta
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository_owner }}/swarmlite-caddy
-          tags: |
-            type=sha,format=long
-            type=ref,event=tag
-            type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and optionally push Caddy image
-        if: steps.strategy.outputs.mode == 'build'
+      - name: Build Caddy image
+        if: github.event_name == 'pull_request'
         uses: docker/build-push-action@v7
         with:
           context: caddy-storage
           file: caddy-storage/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          platforms: ${{ matrix.platform }}
+          push: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=caddy-image
-          cache-to: type=gha,mode=max,scope=caddy-image
 
-      - name: Reuse the previous release image
-        if: steps.strategy.outputs.mode == 'reuse'
+      - name: Build and push Caddy image
+        if: github.event_name != 'pull_request'
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: caddy-storage
+          file: caddy-storage/Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE_REPOSITORY }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export image digest
+        if: github.event_name != 'pull_request'
         shell: bash
         env:
-          IMAGE_REPOSITORY: ghcr.io/${{ github.repository_owner }}/swarmlite-caddy
-          SOURCE_DIGEST: ${{ steps.strategy.outputs.source_digest }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST_DIRECTORY: ${{ runner.temp }}/caddy-digests
         run: |
           set -euo pipefail
-          docker buildx imagetools create \
-            --tag "$IMAGE_REPOSITORY:$GITHUB_REF_NAME" \
-            --tag "$IMAGE_REPOSITORY:sha-$GITHUB_SHA" \
-            "$IMAGE_REPOSITORY@$SOURCE_DIGEST"
+          if [[ "$IMAGE_DIGEST" != sha256:* ]]; then
+            echo "unexpected image digest: $IMAGE_DIGEST" >&2
+            exit 1
+          fi
+          mkdir -p "$DIGEST_DIRECTORY"
+          touch "$DIGEST_DIRECTORY/${IMAGE_DIGEST#sha256:}"
+
+      - name: Upload image digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: caddy-digest-${{ matrix.artifact-suffix }}
+          path: ${{ runner.temp }}/caddy-digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish Caddy image
+    needs:
+      - strategy
+      - build
+    if: >-
+      always() &&
+      github.event_name != 'pull_request' &&
+      needs.strategy.result == 'success' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE_REPOSITORY: ghcr.io/${{ github.repository_owner }}/swarmlite-caddy
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download image digests
+        if: needs.strategy.outputs.mode == 'build'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: caddy-digest-*
+          path: ${{ runner.temp }}/caddy-digests
+          merge-multiple: true
+
+      - name: Publish image manifest
+        env:
+          MODE: ${{ needs.strategy.outputs.mode }}
+          SOURCE_DIGEST: ${{ needs.strategy.outputs.source_digest }}
+          DIGEST_DIRECTORY: ${{ runner.temp }}/caddy-digests
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          tag_arguments=(--tag "$IMAGE_REPOSITORY:sha-$GITHUB_SHA")
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag_arguments+=(
+              --tag "$IMAGE_REPOSITORY:$GITHUB_REF_NAME"
+              --tag "$IMAGE_REPOSITORY:latest"
+            )
+          elif [[ "$GITHUB_REF" == "refs/heads/$DEFAULT_BRANCH" ]]; then
+            tag_arguments+=(--tag "$IMAGE_REPOSITORY:latest")
+          fi
+
+          case "$MODE" in
+            build)
+              mapfile -t digest_files < <(find "$DIGEST_DIRECTORY" -maxdepth 1 -type f | sort)
+              if [[ "${#digest_files[@]}" -ne 2 ]]; then
+                echo "expected two platform digests, found ${#digest_files[@]}" >&2
+                exit 1
+              fi
+              image_sources=()
+              for digest_file in "${digest_files[@]}"; do
+                image_sources+=("$IMAGE_REPOSITORY@sha256:$(basename "$digest_file")")
+              done
+              docker buildx imagetools create "${tag_arguments[@]}" "${image_sources[@]}"
+              ;;
+            reuse)
+              docker buildx imagetools create \
+                "${tag_arguments[@]}" \
+                "$IMAGE_REPOSITORY@$SOURCE_DIGEST"
+              ;;
+            existing)
+              ;;
+            *)
+              echo "unsupported image strategy: $MODE" >&2
+              exit 1
+              ;;
+          esac
 
       - name: Verify release image
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         env:
-          IMAGE_REPOSITORY: ghcr.io/${{ github.repository_owner }}/swarmlite-caddy
-          REUSED_DIGEST: ${{ steps.strategy.outputs.source_digest }}
+          MODE: ${{ needs.strategy.outputs.mode }}
+          REUSED_DIGEST: ${{ needs.strategy.outputs.source_digest }}
         run: |
           set -euo pipefail
           inspect_digest() {
@@ -170,7 +299,7 @@ jobs:
             echo "release and commit tags do not resolve to the same image digest" >&2
             exit 1
           fi
-          if [[ "${{ steps.strategy.outputs.mode }}" == "reuse" && "$release_digest" != "$REUSED_DIGEST" ]]; then
+          if [[ "$MODE" == "reuse" && "$release_digest" != "$REUSED_DIGEST" ]]; then
             echo "retagged release digest $release_digest differs from source $REUSED_DIGEST" >&2
             exit 1
           fi
@@ -182,5 +311,5 @@ jobs:
             echo
             echo "- Tag: \`$release_ref\`"
             echo "- Digest: \`$release_digest\`"
-            echo "- Strategy: \`${{ steps.strategy.outputs.mode }}\`"
+            echo "- Strategy: \`$MODE\`"
           } >> "$GITHUB_STEP_SUMMARY"
