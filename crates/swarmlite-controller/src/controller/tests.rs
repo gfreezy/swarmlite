@@ -25,6 +25,7 @@ fn test_cluster(id: &str) -> ClusterSettings {
         controller_id: "controller-a".into(),
         controller_port: DEFAULT_CONTROLLER_PORT,
         proxy: Default::default(),
+        agent: Default::default(),
         gateway: ClusterGatewayConfig::default(),
         deployment: Default::default(),
     }
@@ -2374,6 +2375,72 @@ async fn deployment_policy_updates_are_validated_and_persisted() {
             .await,
         Err(ControllerError::Invalid(message)) if message.contains("greater than zero")
     ));
+}
+
+#[tokio::test]
+async fn agent_image_prune_config_is_validated_persisted_and_resettable() {
+    let (controller, repository, _directory) = test_controller("agent-image-prune-test").await;
+    assert!(
+        controller
+            .get_cluster_config()
+            .await
+            .unwrap()
+            .config
+            .agent
+            .image_prune
+            .enabled
+    );
+    assert_eq!(
+        controller
+            .get_cluster_config()
+            .await
+            .unwrap()
+            .config
+            .agent
+            .image_prune
+            .interval_seconds,
+        crate::model::DEFAULT_AGENT_IMAGE_PRUNE_INTERVAL_SECONDS
+    );
+
+    let updated = controller
+        .update_cluster_config(ClusterConfigUpdate {
+            agent_image_prune_enabled: Some(false),
+            agent_image_prune_interval_seconds: Some(86_400),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(!updated.config.agent.image_prune.enabled);
+    assert_eq!(updated.config.agent.image_prune.interval_seconds, 86_400);
+    assert_eq!(
+        repository.load().await.unwrap().cluster.agent,
+        updated.config.agent
+    );
+
+    assert!(matches!(
+        controller
+            .update_cluster_config(ClusterConfigUpdate {
+                agent_image_prune_interval_seconds: Some(0),
+                ..Default::default()
+            })
+            .await,
+        Err(ControllerError::Invalid(message)) if message.contains("greater than zero")
+    ));
+
+    let reset = controller
+        .update_cluster_config(ClusterConfigUpdate {
+            unset: BTreeSet::from([
+                ClusterConfigField::AgentImagePruneEnabled,
+                ClusterConfigField::AgentImagePruneIntervalSeconds,
+            ]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        reset.config.agent,
+        crate::model::ClusterAgentConfig::default()
+    );
 }
 
 #[tokio::test]

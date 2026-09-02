@@ -22,6 +22,14 @@ impl Controller {
             ));
         }
         let conflicts_with_unset = [
+            (
+                update.agent_image_prune_enabled.is_some(),
+                ClusterConfigField::AgentImagePruneEnabled,
+            ),
+            (
+                update.agent_image_prune_interval_seconds.is_some(),
+                ClusterConfigField::AgentImagePruneIntervalSeconds,
+            ),
             (update.proxy_http.is_some(), ClusterConfigField::ProxyHttp),
             (update.proxy_https.is_some(), ClusterConfigField::ProxyHttps),
             (update.proxy_all.is_some(), ClusterConfigField::ProxyAll),
@@ -184,11 +192,19 @@ impl Controller {
 
         let mut cluster = inner.cluster.clone();
         let previous_cluster = inner.cluster.clone();
+        let agent_defaults = crate::model::ClusterAgentConfig::default();
         let gateway_defaults = crate::model::ClusterGatewayConfig::default();
         let deployment_defaults = crate::model::DeploymentPolicy::default();
 
         for field in &update.unset {
             match field {
+                ClusterConfigField::AgentImagePruneEnabled => {
+                    cluster.agent.image_prune.enabled = agent_defaults.image_prune.enabled
+                }
+                ClusterConfigField::AgentImagePruneIntervalSeconds => {
+                    cluster.agent.image_prune.interval_seconds =
+                        agent_defaults.image_prune.interval_seconds
+                }
                 ClusterConfigField::ProxyHttp => cluster.proxy.http = None,
                 ClusterConfigField::ProxyHttps => cluster.proxy.https = None,
                 ClusterConfigField::ProxyAll => cluster.proxy.all = None,
@@ -296,6 +312,12 @@ impl Controller {
             }
         }
 
+        if let Some(value) = update.agent_image_prune_enabled {
+            cluster.agent.image_prune.enabled = value;
+        }
+        if let Some(value) = update.agent_image_prune_interval_seconds {
+            cluster.agent.image_prune.interval_seconds = value;
+        }
         if let Some(value) = update.proxy_http {
             cluster.proxy.http = Some(value);
         }
@@ -525,6 +547,11 @@ impl Controller {
         if cluster.gateway.cache.access_update_interval_seconds == Some(0) {
             return Err(ControllerError::Invalid(
                 "gateway.cache.access-update-interval-seconds must be greater than zero".into(),
+            ));
+        }
+        if cluster.agent.image_prune.interval_seconds == 0 {
+            return Err(ControllerError::Invalid(
+                "agent.image-prune.interval-seconds must be greater than zero".into(),
             ));
         }
         if cluster.deployment.progress_deadline_seconds == 0 {

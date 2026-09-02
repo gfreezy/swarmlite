@@ -881,6 +881,9 @@ fn validate_cluster(cluster: &ClusterSettings) -> Result<()> {
     if !valid_gateway_image(&cluster.gateway.image) {
         bail!("gateway.image must be a non-empty OCI image reference without whitespace");
     }
+    if cluster.agent.image_prune.interval_seconds == 0 {
+        bail!("agent.image-prune.interval-seconds must be greater than zero");
+    }
     Ok(())
 }
 
@@ -1430,6 +1433,7 @@ mod tests {
             controller_id: "controller-a".into(),
             controller_port: crate::config::DEFAULT_CONTROLLER_PORT,
             proxy: Default::default(),
+            agent: Default::default(),
             gateway: Default::default(),
             deployment: Default::default(),
         };
@@ -1517,6 +1521,7 @@ mod tests {
             controller_id: "controller-a".into(),
             controller_port: crate::config::DEFAULT_CONTROLLER_PORT,
             proxy: Default::default(),
+            agent: Default::default(),
             gateway: Default::default(),
             deployment: Default::default(),
         };
@@ -1635,6 +1640,7 @@ mod tests {
             controller_id: "controller-a".into(),
             controller_port: 18080,
             proxy: Default::default(),
+            agent: Default::default(),
             gateway: Default::default(),
             deployment: Default::default(),
         };
@@ -1686,6 +1692,7 @@ mod tests {
                 controller_id: "controller-b".into(),
                 controller_port: 18080,
                 proxy: Default::default(),
+                agent: Default::default(),
                 gateway: Default::default(),
                 deployment: Default::default(),
             },
@@ -1719,6 +1726,7 @@ mod tests {
             controller_id: "controller-a".into(),
             controller_port: 18080,
             proxy: Default::default(),
+            agent: Default::default(),
             gateway: Default::default(),
             deployment: Default::default(),
         };
@@ -1755,6 +1763,7 @@ mod tests {
             controller_id: "controller-a".into(),
             controller_port: 18081,
             proxy: Default::default(),
+            agent: Default::default(),
             gateway: Default::default(),
             deployment: Default::default(),
         };
@@ -1827,6 +1836,7 @@ mod tests {
             controller_id: "controller-a".into(),
             controller_port: 18080,
             proxy: Default::default(),
+            agent: Default::default(),
             gateway: Default::default(),
             deployment: Default::default(),
         };
@@ -1889,6 +1899,7 @@ mod tests {
             controller_id: "controller-a".into(),
             controller_port: 18082,
             proxy: Default::default(),
+            agent: Default::default(),
             gateway: Default::default(),
             deployment: Default::default(),
         };
@@ -1972,6 +1983,7 @@ mod tests {
                         controller_id: "controller-a".into(),
                         controller_port: crate::config::DEFAULT_CONTROLLER_PORT,
                         proxy: Default::default(),
+                        agent: Default::default(),
                         gateway: Default::default(),
                         deployment: Default::default(),
                     },

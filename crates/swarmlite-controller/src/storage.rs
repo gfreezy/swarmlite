@@ -778,6 +778,7 @@ mod tests {
             controller_id: "controller-node".into(),
             controller_port: 19090,
             proxy: Default::default(),
+            agent: Default::default(),
             gateway: ClusterGatewayConfig::default(),
             deployment: Default::default(),
         }

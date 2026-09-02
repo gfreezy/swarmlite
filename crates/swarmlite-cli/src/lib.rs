@@ -483,6 +483,26 @@ macro_rules! define_config_keys {
 }
 
 define_config_keys! {
+    AgentImagePruneEnabled => {
+        key: "agent.image-prune.enabled",
+        field: ClusterConfigField::AgentImagePruneEnabled,
+        type: "bool",
+        values: Some("true, false"),
+        constraints: "must be true or false",
+        default: "true",
+        description: "Periodically remove all images unused by any container on every Agent runtime.",
+        apply: "agent hot reload"
+    },
+    AgentImagePruneIntervalSeconds => {
+        key: "agent.image-prune.interval-seconds",
+        field: ClusterConfigField::AgentImagePruneIntervalSeconds,
+        type: "integer",
+        values: None,
+        constraints: "1..=18446744073709551615 seconds",
+        default: "604800 seconds (7 days)",
+        description: "Interval between automatic unused-image prune operations on every Agent.",
+        apply: "agent hot reload"
+    },
     ProxyHttp => {
         key: "proxy.http",
         field: ClusterConfigField::ProxyHttp,
@@ -848,6 +868,13 @@ define_config_keys! {
 fn config_set_update(key: ConfigKey, value: String) -> Result<ClusterConfigUpdate> {
     let mut update = ClusterConfigUpdate::default();
     match key {
+        ConfigKey::AgentImagePruneEnabled => {
+            update.agent_image_prune_enabled = Some(parse_config_bool(&value, key)?);
+        }
+        ConfigKey::AgentImagePruneIntervalSeconds => {
+            update.agent_image_prune_interval_seconds =
+                Some(parse_config_u64(&value, key, 1, u64::MAX)?);
+        }
         ConfigKey::ProxyHttp => {
             validate_proxy_config_value(key, &value, Some(ProxyKind::Http))?;
             update.proxy_http = Some(value);
@@ -1177,6 +1204,12 @@ impl ConfigKey {
             value.map_or(CurrentConfigValue::Unset, CurrentConfigValue::Integer)
         };
         match self {
+            Self::AgentImagePruneEnabled => {
+                CurrentConfigValue::Bool(config.agent.image_prune.enabled)
+            }
+            Self::AgentImagePruneIntervalSeconds => {
+                CurrentConfigValue::Integer(config.agent.image_prune.interval_seconds)
+            }
             Self::ProxyHttp => config
                 .proxy
                 .http
@@ -1519,6 +1552,7 @@ async fn run() -> Result<()> {
                 controller_id: String::new(),
                 controller_port: options.controller_port,
                 proxy: Default::default(),
+                agent: Default::default(),
                 gateway: ClusterGatewayConfig {
                     listen: options.gateway_listen.clone(),
                     image: options
@@ -4873,6 +4907,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(paths.len(), ConfigKey::ALL.len());
         assert!(ConfigKey::from_path("gateway.metrics.enabled").is_some());
+        assert!(ConfigKey::from_path("agent.image-prune.enabled").is_some());
         assert!(ConfigKey::from_path("proxy.all").is_some());
         assert!(ConfigKey::from_path("gateway.cache.max-size-bytes").is_some());
         assert!(ConfigKey::from_path("gateway.cache.sqlite.mmap-size-bytes").is_some());
@@ -4897,6 +4932,7 @@ mod tests {
                 controller_id: "node-a".into(),
                 controller_port: 17080,
                 proxy,
+                agent: Default::default(),
                 gateway,
                 deployment: Default::default(),
             },
@@ -4924,6 +4960,14 @@ mod tests {
             values.values["proxy.all"],
             serde_json::json!("socks5h://proxy.example.com:1080")
         );
+        assert_eq!(
+            values.values["agent.image-prune.enabled"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            values.values["agent.image-prune.interval-seconds"],
+            serde_json::json!(604_800_u64)
+        );
         assert_eq!(values.values.len(), ConfigKey::ALL.len());
     }
 
@@ -4938,6 +4982,7 @@ mod tests {
             controller_id: "node-a".into(),
             controller_port: 17080,
             proxy: Default::default(),
+            agent: Default::default(),
             gateway,
             deployment: Default::default(),
         };
@@ -4981,6 +5026,12 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(positive_error.contains("1..=18446744073709551615 seconds"));
+
+        let prune_interval_error =
+            config_set_update(ConfigKey::AgentImagePruneIntervalSeconds, "0".into())
+                .unwrap_err()
+                .to_string();
+        assert!(prune_interval_error.contains("1..=18446744073709551615 seconds"));
 
         let listen_error = config_set_update(ConfigKey::GatewayListen, ":2019".into())
             .unwrap_err()

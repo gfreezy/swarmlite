@@ -24,6 +24,7 @@ pub const DEFAULT_IMAGE_PULL_IDLE_TIMEOUT_SECONDS: u64 = 60;
 pub const DEFAULT_IMAGE_PULL_MAX_ATTEMPTS: u32 = 5;
 pub const DEFAULT_IMAGE_PULL_INITIAL_BACKOFF_SECONDS: u64 = 2;
 pub const DEFAULT_IMAGE_PULL_MAX_BACKOFF_SECONDS: u64 = 60;
+pub const DEFAULT_AGENT_IMAGE_PRUNE_INTERVAL_SECONDS: u64 = 7 * 24 * 60 * 60;
 pub const MAX_CADDY_DURATION_SECONDS: u64 = i64::MAX as u64 / 1_000_000_000;
 pub const MAX_CONFIG_FILE_BYTES: usize = 1024 * 1024;
 pub const MAX_STACK_CONFIG_BYTES: usize = 8 * 1024 * 1024;
@@ -466,8 +467,43 @@ pub struct ClusterSettings {
     pub controller_port: u16,
     #[serde(default, skip_serializing_if = "ClusterProxyConfig::is_empty")]
     pub proxy: ClusterProxyConfig,
+    #[serde(default)]
+    pub agent: ClusterAgentConfig,
     pub gateway: ClusterGatewayConfig,
     pub deployment: DeploymentPolicy,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterAgentConfig {
+    #[serde(default)]
+    pub image_prune: AgentImagePruneConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentImagePruneConfig {
+    #[serde(default = "default_agent_image_prune_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_agent_image_prune_interval_seconds")]
+    pub interval_seconds: u64,
+}
+
+impl Default for AgentImagePruneConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_agent_image_prune_enabled(),
+            interval_seconds: default_agent_image_prune_interval_seconds(),
+        }
+    }
+}
+
+const fn default_agent_image_prune_enabled() -> bool {
+    true
+}
+
+const fn default_agent_image_prune_interval_seconds() -> u64 {
+    DEFAULT_AGENT_IMAGE_PRUNE_INTERVAL_SECONDS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -500,6 +536,10 @@ pub struct ClusterConfigResponse {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClusterConfigUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_image_prune_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_image_prune_interval_seconds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_http: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -578,6 +618,10 @@ pub struct ClusterConfigUpdate {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ClusterConfigField {
+    #[serde(rename = "agent.image-prune.enabled")]
+    AgentImagePruneEnabled,
+    #[serde(rename = "agent.image-prune.interval-seconds")]
+    AgentImagePruneIntervalSeconds,
     #[serde(rename = "proxy.http")]
     ProxyHttp,
     #[serde(rename = "proxy.https")]
@@ -1868,18 +1912,20 @@ mod tests {
     }
 
     #[test]
-    fn cluster_settings_without_proxy_remain_compatible() {
+    fn cluster_settings_without_optional_sections_remain_compatible() {
         let expected = ClusterSettings {
             schema_version: CLUSTER_SCHEMA_VERSION,
             cluster_id: "cluster-a".into(),
             controller_id: "controller-a".into(),
             controller_port: 17_080,
             proxy: ClusterProxyConfig::default(),
+            agent: ClusterAgentConfig::default(),
             gateway: ClusterGatewayConfig::default(),
             deployment: DeploymentPolicy::default(),
         };
         let mut value = serde_json::to_value(&expected).unwrap();
         value.as_object_mut().unwrap().remove("proxy");
+        value.as_object_mut().unwrap().remove("agent");
         assert_eq!(
             serde_json::from_value::<ClusterSettings>(value).unwrap(),
             expected

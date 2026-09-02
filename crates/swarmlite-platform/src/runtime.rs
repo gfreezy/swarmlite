@@ -19,8 +19,9 @@ use bollard::{
     query_parameters::{
         CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
         DownloadFromContainerOptionsBuilder, ListContainersOptionsBuilder, LogsOptionsBuilder,
-        RemoveContainerOptionsBuilder, RemoveImageOptionsBuilder, RemoveVolumeOptionsBuilder,
-        StopContainerOptionsBuilder, TagImageOptionsBuilder, UploadToContainerOptionsBuilder,
+        PruneImagesOptionsBuilder, RemoveContainerOptionsBuilder, RemoveImageOptionsBuilder,
+        RemoveVolumeOptionsBuilder, StopContainerOptionsBuilder, TagImageOptionsBuilder,
+        UploadToContainerOptionsBuilder,
     },
 };
 use bytes::Bytes;
@@ -81,6 +82,12 @@ const CONFIG_REFS_LABEL: &str = "io.swarmlite.config_refs";
 pub struct RuntimeSystemInfo {
     pub cpu_millis: u64,
     pub memory_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeImagePrune {
+    pub deleted_images: usize,
+    pub reclaimed_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -289,6 +296,8 @@ pub trait ContainerRuntime: Send + Sync + 'static {
 
     fn system_info(&self) -> impl Future<Output = Result<RuntimeSystemInfo>> + Send;
 
+    fn prune_images(&self) -> impl Future<Output = Result<RuntimeImagePrune>> + Send;
+
     fn list_managed(
         &self,
         cluster_id: &str,
@@ -339,6 +348,7 @@ pub struct DockerCompatibleRuntime {
     relay_http: Option<reqwest::Client>,
     podman_http: Option<reqwest::Client>,
     prepared_images: Arc<std::sync::RwLock<HashMap<String, String>>>,
+    image_operations: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -421,6 +431,7 @@ impl DockerCompatibleRuntime {
             relay_http,
             podman_http,
             prepared_images: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            image_operations: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -490,6 +501,7 @@ impl DockerCompatibleRuntime {
         enabled: bool,
         assignment: Option<&GatewayAssignment>,
     ) -> Result<()> {
+        let _image_operation = self.image_operations.lock().await;
         let ports = enabled
             .then(|| {
                 gateway_ports(&spec.gateway.listen).map_err(|error| NonRetryableGatewayError {
@@ -2399,6 +2411,35 @@ impl ContainerRuntime for DockerCompatibleRuntime {
         })
     }
 
+    async fn prune_images(&self) -> Result<RuntimeImagePrune> {
+        let _image_operation = self.image_operations.lock().await;
+        let filters = HashMap::from([("dangling".to_owned(), vec!["false".to_owned()])]);
+        let options = PruneImagesOptionsBuilder::default()
+            .filters(&filters)
+            .build();
+        let response = self
+            .client
+            .prune_images(Some(options))
+            .await
+            .with_context(|| format!("failed to prune unused {} images", self.kind))?;
+        let deleted = response
+            .images_deleted
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|item| item.deleted)
+            .collect::<BTreeSet<_>>();
+        if !deleted.is_empty() {
+            self.prepared_images
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|_, image_id| !deleted.contains(image_id));
+        }
+        Ok(RuntimeImagePrune {
+            deleted_images: deleted.len(),
+            reclaimed_bytes: response.space_reclaimed.unwrap_or_default().max(0) as u64,
+        })
+    }
+
     async fn list_managed(&self, cluster_id: &str) -> Result<HashMap<String, ManagedContainer>> {
         let summaries = self.list_managed_summaries().await?;
         let mut result = HashMap::new();
@@ -2501,6 +2542,7 @@ impl ContainerRuntime for DockerCompatibleRuntime {
     }
 
     async fn resolve_image(&self, image: &str, progress: &RuntimeImageProgress) -> Result<String> {
+        let _image_operation = self.image_operations.lock().await;
         progress.report(ImageResolutionStatus::Checking);
         progress.report(ImageResolutionStatus::Pulling);
         let image_id = self
@@ -2517,6 +2559,7 @@ impl ContainerRuntime for DockerCompatibleRuntime {
         assignment: &TaskAssignment,
         progress: &RuntimeTaskProgress,
     ) -> Result<()> {
+        let _image_operation = self.image_operations.lock().await;
         info!(
             task_id = %assignment.id,
             image = %assignment.spec.image,
@@ -3240,6 +3283,27 @@ mod tests {
             .unwrap()
     }
 
+    async fn prune_docker_api(
+        State(calls): State<Arc<Mutex<Vec<String>>>>,
+        method: Method,
+        uri: Uri,
+    ) -> axum::response::Response {
+        calls.lock().unwrap().push(format!("{method} {uri}"));
+        let (status, body) = if method == Method::POST && uri.path().ends_with("/images/prune") {
+            (
+                StatusCode::OK,
+                r#"{"ImagesDeleted":[{"Deleted":"sha256:old"}],"SpaceReclaimed":4096}"#,
+            )
+        } else {
+            (StatusCode::NOT_FOUND, r#"{"message":"unexpected request"}"#)
+        };
+        axum::response::Response::builder()
+            .status(status)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
     async fn noisy_stalled_pull_docker_api(method: Method, uri: Uri) -> axum::response::Response {
         if method != Method::POST || !uri.path().ends_with("/images/create") {
             return axum::response::Response::builder()
@@ -3386,6 +3450,7 @@ mod tests {
                 relay_http: None,
                 podman_http: None,
                 prepared_images: Arc::new(std::sync::RwLock::new(HashMap::new())),
+                image_operations: Arc::new(tokio::sync::Mutex::new(())),
             },
             server,
         )
@@ -3417,6 +3482,7 @@ mod tests {
                 relay_http: None,
                 podman_http: None,
                 prepared_images: Arc::new(std::sync::RwLock::new(HashMap::new())),
+                image_operations: Arc::new(tokio::sync::Mutex::new(())),
             },
             calls,
             server,
@@ -3464,6 +3530,32 @@ mod tests {
     #[test]
     fn sanitizes_runtime_container_names() {
         assert_eq!(sanitize_name("demo/web:v1"), "demo-web-v1");
+    }
+
+    #[tokio::test]
+    async fn image_prune_removes_all_unused_images() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .fallback(any(prune_docker_api))
+            .with_state(Arc::clone(&calls));
+        let (runtime, server) = runtime_for_pull_api(app, DeploymentPolicy::default()).await;
+
+        let result = runtime.prune_images().await.unwrap();
+        server.abort();
+
+        assert_eq!(result.deleted_images, 1);
+        assert_eq!(result.reclaimed_bytes, 4096);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let query = calls[0].split_once('?').unwrap().1;
+        let filters = url::form_urlencoded::parse(query.as_bytes())
+            .find(|(key, _)| key == "filters")
+            .map(|(_, value)| value.into_owned())
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&filters).unwrap(),
+            serde_json::json!({"dangling": ["false"]})
+        );
     }
 
     #[tokio::test]

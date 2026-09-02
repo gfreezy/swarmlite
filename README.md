@@ -733,6 +733,8 @@ one segment use `-`. Invalid values report the applicable enum candidates or num
 
 | Key | Value | Effect |
 | --- | --- | --- |
+| `agent.image-prune.enabled` | `true`/`false` | Periodically remove all images unused by any container on every node; default `true` |
+| `agent.image-prune.interval-seconds` | positive integer | Delay between unused-image prune operations; default 604800 seconds (7 days) |
 | `proxy.http` | absolute proxy URL | Controller proxy for HTTP destinations; supports HTTP, HTTPS, SOCKS5, and SOCKS5H URLs |
 | `proxy.https` | absolute proxy URL | Controller proxy for HTTPS destinations; supports HTTP, HTTPS, SOCKS5, and SOCKS5H URLs |
 | `proxy.all` | absolute proxy URL | Fallback Controller proxy for protocols without a specific proxy |
@@ -768,6 +770,8 @@ one segment use `-`. Invalid values report the applicable enum candidates or num
 For example:
 
 ```bash
+swarmlite config set agent.image-prune.enabled false
+swarmlite config set agent.image-prune.interval-seconds 86400
 swarmlite config set gateway.metrics.enabled true
 swarmlite config set gateway.cache.max-size-bytes 2147483648
 swarmlite config set gateway.cache.low-water-percent 85
@@ -777,6 +781,11 @@ swarmlite config set gateway.logging.access.format json
 swarmlite config set gateway.http.timeouts.read-header-seconds 10
 swarmlite config unset gateway.http.timeouts.read-header-seconds
 ```
+
+Image pruning uses the node's Docker-compatible native prune API with `dangling=false`, equivalent
+to `docker image prune -a -f`. It affects every image unused by both running and stopped containers
+on that node, including images pulled outside Swarmlite. The first cleanup waits for one complete
+interval after the Agent starts or after either image-prune setting changes.
 
 ### Configure labels and deployment policy
 

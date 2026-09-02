@@ -151,6 +151,12 @@ async fn run_with_runtime<R: ContainerRuntime>(
         events: reconcile_events_tx,
     };
     let runtime = Arc::new(runtime);
+    let initial_image_prune = updates.borrow().cluster.agent.image_prune.clone();
+    let (image_prune_tx, image_prune_rx) = tokio::sync::watch::channel(initial_image_prune);
+    let image_prune_runtime = Arc::clone(&runtime);
+    tokio::spawn(async move {
+        image_prune_loop(image_prune_runtime, image_prune_rx).await;
+    });
     let reconcile_runtime = Arc::clone(&runtime);
     let reconcile_cluster_id = config.cluster_id.clone();
     let reconcile_template_node = TemplateNode {
@@ -300,6 +306,14 @@ async fn run_with_runtime<R: ContainerRuntime>(
         node.gateway_enabled = response.gateway_enabled;
         node.labels.clone_from(&response.labels);
         runtime.update_deployment_policy(response.cluster.deployment.clone());
+        image_prune_tx.send_if_modified(|current| {
+            if *current == response.cluster.agent.image_prune {
+                false
+            } else {
+                current.clone_from(&response.cluster.agent.image_prune);
+                true
+            }
+        });
         let retry_due = if control_changed || !gateway_needs_apply {
             gateway_retry.reset();
             false
@@ -332,6 +346,45 @@ async fn run_with_runtime<R: ContainerRuntime>(
                 true
             }
         });
+    }
+}
+
+async fn image_prune_loop<R: ContainerRuntime>(
+    runtime: Arc<R>,
+    mut config: tokio::sync::watch::Receiver<crate::model::AgentImagePruneConfig>,
+) {
+    loop {
+        let current = config.borrow().clone();
+        if !current.enabled || current.interval_seconds == 0 {
+            if current.enabled {
+                warn!("image prune interval is zero; automatic image pruning is paused");
+            }
+            if config.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
+        let delay = tokio::time::sleep(Duration::from_secs(current.interval_seconds));
+        tokio::pin!(delay);
+        tokio::select! {
+            _ = &mut delay => {
+                match runtime.prune_images().await {
+                    Ok(result) if result.deleted_images > 0 || result.reclaimed_bytes > 0 => info!(
+                        deleted_images = result.deleted_images,
+                        reclaimed_bytes = result.reclaimed_bytes,
+                        runtime = %runtime.kind(),
+                        "pruned unused container images"
+                    ),
+                    Ok(_) => debug!(runtime = %runtime.kind(), "image prune found no unused images"),
+                    Err(error) => warn!(%error, runtime = %runtime.kind(), "failed to prune unused container images"),
+                }
+            }
+            changed = config.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -1482,6 +1535,7 @@ mod tests {
         fail_create: bool,
         start_port_conflicts: Arc<AtomicUsize>,
         resolve_count: Arc<AtomicUsize>,
+        prune_count: Arc<AtomicUsize>,
         resolved_image_id: Option<String>,
         fail_resolve: bool,
         list_delay: Option<Duration>,
@@ -1505,6 +1559,11 @@ mod tests {
                 cpu_millis: 1,
                 memory_bytes: 1,
             })
+        }
+
+        async fn prune_images(&self) -> Result<crate::runtime::RuntimeImagePrune> {
+            self.prune_count.fetch_add(1, Ordering::Relaxed);
+            Ok(crate::runtime::RuntimeImagePrune::default())
         }
 
         async fn list_managed(
@@ -2039,9 +2098,37 @@ mod tests {
             controller_id: "controller-a".into(),
             controller_port: crate::config::DEFAULT_CONTROLLER_PORT,
             proxy: Default::default(),
+            agent: Default::default(),
             gateway: ClusterGatewayConfig::default(),
             deployment: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn image_prune_waits_for_the_configured_interval_and_honors_enablement() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let observed = Arc::clone(&runtime);
+        let (config_tx, config_rx) =
+            tokio::sync::watch::channel(crate::model::AgentImagePruneConfig {
+                enabled: false,
+                interval_seconds: 1,
+            });
+        let handle = tokio::spawn(image_prune_loop(runtime, config_rx));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(observed.prune_count.load(Ordering::Relaxed), 0);
+        config_tx.send_modify(|config| config.enabled = true);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(observed.prune_count.load(Ordering::Relaxed), 0);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while observed.prune_count.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        handle.abort();
+        assert_eq!(observed.prune_count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
