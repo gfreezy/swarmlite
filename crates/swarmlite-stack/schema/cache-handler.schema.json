@@ -71,8 +71,28 @@
           }
         },
         "disable_query": { "type": "boolean" },
-        "hash": { "type": "boolean" }
+        "hash": { "type": "boolean" },
+        "query_parameters": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Case-sensitive allowlist of query parameter names included in the cache key. Cannot be combined with disable_query."
+        }
       },
+      "allOf": [
+        {
+          "not": {
+            "properties": {
+              "disable_query": { "const": true }
+            },
+            "required": ["disable_query", "query_parameters"]
+          }
+        }
+      ],
       "additionalProperties": false
     }
   }

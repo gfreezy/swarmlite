@@ -257,6 +257,8 @@ pub struct HttpCacheKeySpec {
     pub hash: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_parameters: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -287,6 +289,8 @@ struct HttpCacheKeySpecInput {
     // accepted only so pre-native Stack files and snapshots remain readable.
     #[serde(default)]
     hash: bool,
+    #[serde(default)]
+    query_parameters: Option<Vec<String>>,
     #[serde(default, flatten)]
     ignored_fields: BTreeMap<String, Value>,
 }
@@ -305,6 +309,7 @@ impl TryFrom<HttpCacheSpecInput> for HttpCacheSpec {
                 disable_query: key.disable_query,
                 hash: key.hash,
                 headers: key.headers,
+                query_parameters: key.query_parameters,
             })
         } else {
             None
@@ -850,6 +855,23 @@ fn validate_cache(cache: Option<&HttpCacheSpec>) -> Result<()> {
         for header in &key.headers {
             if !valid_http_header_name(header) {
                 bail!("cache key header {header:?} is invalid");
+            }
+        }
+        if let Some(parameters) = key.query_parameters.as_ref() {
+            if key.disable_query {
+                bail!("cache key.disable_query and key.query_parameters cannot be combined");
+            }
+            if parameters.is_empty() {
+                bail!("cache key.query_parameters must not be empty");
+            }
+            let mut seen = BTreeSet::new();
+            for parameter in parameters {
+                if parameter.is_empty() {
+                    bail!("cache key.query_parameters contains an empty parameter name");
+                }
+                if !seen.insert(parameter) {
+                    bail!("cache key.query_parameters contains duplicate parameter {parameter:?}");
+                }
             }
         }
     }
@@ -1551,6 +1573,7 @@ x-swarmlite:
             max_request_body_bytes: 65536
             key:
               headers: [Accept-Language]
+              query_parameters: [embedded]
             status_codes: [200, 404]
           backend:
             service: api
@@ -1573,6 +1596,7 @@ x-swarmlite:
         assert_eq!(handlers[1]["max_cacheable_body_bytes"], 1_048_576);
         assert_eq!(handlers[1]["max_request_body_bytes"], 65_536);
         assert_eq!(handlers[1]["key"]["headers"], json!(["Accept-Language"]));
+        assert_eq!(handlers[1]["key"]["query_parameters"], json!(["embedded"]));
         assert_eq!(handlers[1]["status_codes"], json!([200, 404]));
         assert_eq!(handlers[1]["path"], "/cache/native-v1/cache.db");
         assert_eq!(handlers[1]["max_size_bytes"], 1_073_741_824_u64);

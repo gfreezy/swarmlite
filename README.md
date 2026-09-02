@@ -491,13 +491,15 @@ cache:
   max_request_body_bytes: 1048576
   key:
     hash: true
-    disable_query: true
+    query_parameters: [embedded]
     headers: [Accept-Language]
   status_codes: [200]
 ```
 
 `key.disable_query` should be enabled only when every query parameter is irrelevant to the upstream
-response.
+response. To keep only selected query parameters, use the case-sensitive `key.query_parameters`
+allowlist. It replaces only the query component, preserving scheme, host, method, path, content type,
+and request-body identity. It cannot be combined with `key.disable_query`.
 
 When `allowed_http_verbs` is omitted, only `GET` responses are stored and `HEAD` may reuse a
 matching `GET` response. CONNECT, protocol upgrades, range and conditional requests, request

@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -52,24 +53,26 @@ type CacheHandler struct {
 	CleanupInterval      caddy.Duration `json:"cleanup_interval,omitempty"`
 	JournalSizeLimit     int64          `json:"journal_size_limit,omitempty"`
 
-	store        *sqliteResponseStore
-	logger       *zap.Logger
-	ttl          time.Duration
-	methods      map[string]struct{}
-	statusCodes  map[int]struct{}
-	keyHeaders   []string
-	disableQuery bool
-	namespace    string
-	flights      cacheFlightGroup
+	store           *sqliteResponseStore
+	logger          *zap.Logger
+	ttl             time.Duration
+	methods         map[string]struct{}
+	statusCodes     map[int]struct{}
+	keyHeaders      []string
+	disableQuery    bool
+	queryParameters []string
+	namespace       string
+	flights         cacheFlightGroup
 }
 
-// CacheKey keeps the compatible subset of Souin's cache key configuration.
-// Native cache keys are always hashed, so Hash changes representation only and
-// is accepted without changing key identity.
+// CacheKey keeps the compatible subset of Souin's cache key configuration and
+// adds a structured query-parameter allowlist. Native cache keys are always
+// hashed, so Hash is accepted without changing key identity.
 type CacheKey struct {
-	DisableQuery bool     `json:"disable_query,omitempty"`
-	Hash         bool     `json:"hash,omitempty"`
-	Headers      []string `json:"headers,omitempty"`
+	DisableQuery    bool     `json:"disable_query,omitempty"`
+	Hash            bool     `json:"hash,omitempty"`
+	Headers         []string `json:"headers,omitempty"`
+	QueryParameters []string `json:"query_parameters,omitempty"`
 }
 
 func init() {
@@ -150,6 +153,30 @@ func (handler *CacheHandler) Provision(ctx caddy.Context) error {
 	handler.keyHeaders = keyHeaders
 	if handler.Key != nil {
 		handler.Key.Headers = keyHeaders
+	}
+
+	if handler.Key != nil && handler.Key.QueryParameters != nil {
+		if handler.disableQuery {
+			return errors.New("cache key.disable_query and key.query_parameters cannot be combined")
+		}
+		if len(handler.Key.QueryParameters) == 0 {
+			return errors.New("cache key.query_parameters must not be empty")
+		}
+		seenParameters := make(map[string]struct{}, len(handler.Key.QueryParameters))
+		queryParameters := make([]string, 0, len(handler.Key.QueryParameters))
+		for _, name := range handler.Key.QueryParameters {
+			if name == "" {
+				return errors.New("cache key.query_parameters contains an empty parameter name")
+			}
+			if _, found := seenParameters[name]; found {
+				return fmt.Errorf("cache key.query_parameters contains duplicate parameter %q", name)
+			}
+			seenParameters[name] = struct{}{}
+			queryParameters = append(queryParameters, name)
+		}
+		sort.Strings(queryParameters)
+		handler.queryParameters = queryParameters
+		handler.Key.QueryParameters = queryParameters
 	}
 
 	if len(handler.StatusCodes) == 0 {
@@ -327,6 +354,8 @@ func (handler *CacheHandler) baseKey(request *http.Request, bodyKey string) cach
 	query := request.URL.RawQuery
 	if handler.disableQuery {
 		query = ""
+	} else if len(handler.queryParameters) != 0 {
+		query = selectedQuery(request.URL.Query(), handler.queryParameters)
 	}
 	value := strings.Join([]string{
 		handler.namespace,
@@ -358,12 +387,23 @@ func (handler *CacheHandler) cacheNamespace() string {
 		methods,
 		strings.Join(handler.keyHeaders, ","),
 		strconv.FormatBool(handler.disableQuery),
+		url.Values{"parameter": handler.queryParameters}.Encode(),
 	}
 	for _, status := range handler.StatusCodes {
 		parts = append(parts, strconv.Itoa(status))
 	}
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\n")))
 	return hex.EncodeToString(sum[:])
+}
+
+func selectedQuery(query url.Values, parameters []string) string {
+	selected := make(url.Values, len(parameters))
+	for _, name := range parameters {
+		if values, found := query[name]; found {
+			selected[name] = values
+		}
+	}
+	return selected.Encode()
 }
 
 type requestCacheDecision struct {

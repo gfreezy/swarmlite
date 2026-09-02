@@ -99,8 +99,11 @@ protocol-upgrade requests bypass caching, as do responses carrying `Set-Cookie` 
 `Content-Range`. Authorization does not affect cache eligibility or key identity, and response
 `Cache-Control` directives are ignored. Cache keys contain scheme, host, method, path, query,
 request-body hash and content type, configured `key.headers`, and response `Vary` fields; Souin's
-`key.disable_query` omits the query component. An `allowed_http_verbs` allowlist is optional; when
-it is absent, only `GET` responses are stored and `HEAD` may reuse a matching `GET` response.
+`key.disable_query` omits the query component. Native `key.query_parameters` accepts a case-sensitive
+allowlist of query parameter names, so `[embedded]` keeps only `embedded` while preserving every
+other default key component. It cannot be combined with `key.disable_query`. An
+`allowed_http_verbs` allowlist is optional; when it is absent, only `GET` responses are stored and
+`HEAD` may reuse a matching `GET` response.
 Request bodies above
 `max_request_body_bytes` and responses above `max_cacheable_body_bytes` bypass storage. Concurrent
 misses for the same key are coalesced, and SQLite errors fail open to the upstream. Expired entries

@@ -247,6 +247,32 @@ func TestCacheBaseKeyHonorsSouinDisableQuery(t *testing.T) {
 	}
 }
 
+func TestCacheBaseKeyHonorsQueryParameterAllowlist(t *testing.T) {
+	handler := &CacheHandler{
+		namespace:       "test",
+		queryParameters: []string{"embedded"},
+	}
+	requestKey := func(rawURL string) cacheKey {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodGet, rawURL, nil)
+		return handler.baseKey(request, "")
+	}
+
+	first := requestKey("https://example.test/page?embedded=true&utm_source=one")
+	sameEmbedded := requestKey("https://example.test/page?utm_source=two&embedded=true")
+	differentEmbedded := requestKey("https://example.test/page?embedded=false&utm_source=one")
+	differentCase := requestKey("https://example.test/page?Embedded=true&utm_source=one")
+	if first != sameEmbedded {
+		t.Fatal("query allowlist included an unselected parameter")
+	}
+	if first == differentEmbedded {
+		t.Fatal("query allowlist omitted the selected parameter")
+	}
+	if first == differentCase {
+		t.Fatal("query allowlist matched a parameter with different casing")
+	}
+}
+
 func cacheRequest(
 	t *testing.T,
 	client *http.Client,
