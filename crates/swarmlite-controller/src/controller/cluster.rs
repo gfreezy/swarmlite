@@ -62,14 +62,18 @@ impl Controller {
                 ClusterConfigField::GatewayCacheLowWaterPercent,
             ),
             (
-                update.gateway_cache_hit_sample_ratio.is_some(),
-                ClusterConfigField::GatewayCacheHitSampleRatio,
+                update.gateway_cache_admission_window_seconds.is_some(),
+                ClusterConfigField::GatewayCacheAdmissionWindowSeconds,
             ),
             (
                 update
-                    .gateway_cache_access_update_interval_seconds
+                    .gateway_cache_admission_cache_after_requests
                     .is_some(),
-                ClusterConfigField::GatewayCacheAccessUpdateIntervalSeconds,
+                ClusterConfigField::GatewayCacheAdmissionCacheAfterRequests,
+            ),
+            (
+                update.gateway_cache_sqlite_touch_window_seconds.is_some(),
+                ClusterConfigField::GatewayCacheSqliteTouchWindowSeconds,
             ),
             (
                 update.gateway_cache_sqlite_cache_size_kib.is_some(),
@@ -226,11 +230,14 @@ impl Controller {
                 ClusterConfigField::GatewayCacheLowWaterPercent => {
                     cluster.gateway.cache.low_water_percent = None
                 }
-                ClusterConfigField::GatewayCacheHitSampleRatio => {
-                    cluster.gateway.cache.hit_sample_ratio = None
+                ClusterConfigField::GatewayCacheAdmissionWindowSeconds => {
+                    cluster.gateway.cache.admission.window_seconds = None
                 }
-                ClusterConfigField::GatewayCacheAccessUpdateIntervalSeconds => {
-                    cluster.gateway.cache.access_update_interval_seconds = None
+                ClusterConfigField::GatewayCacheAdmissionCacheAfterRequests => {
+                    cluster.gateway.cache.admission.cache_after_requests = None
+                }
+                ClusterConfigField::GatewayCacheSqliteTouchWindowSeconds => {
+                    cluster.gateway.cache.sqlite.touch_window_seconds = None
                 }
                 ClusterConfigField::GatewayCacheSqliteCacheSizeKib => {
                     cluster.gateway.cache.sqlite.cache_size_kib = None
@@ -349,11 +356,14 @@ impl Controller {
         if let Some(value) = update.gateway_cache_low_water_percent {
             cluster.gateway.cache.low_water_percent = Some(value);
         }
-        if let Some(value) = update.gateway_cache_hit_sample_ratio {
-            cluster.gateway.cache.hit_sample_ratio = Some(value);
+        if let Some(value) = update.gateway_cache_admission_window_seconds {
+            cluster.gateway.cache.admission.window_seconds = Some(value);
         }
-        if let Some(value) = update.gateway_cache_access_update_interval_seconds {
-            cluster.gateway.cache.access_update_interval_seconds = Some(value);
+        if let Some(value) = update.gateway_cache_admission_cache_after_requests {
+            cluster.gateway.cache.admission.cache_after_requests = Some(value);
+        }
+        if let Some(value) = update.gateway_cache_sqlite_touch_window_seconds {
+            cluster.gateway.cache.sqlite.touch_window_seconds = Some(value);
         }
         if let Some(value) = update.gateway_cache_sqlite_cache_size_kib {
             cluster.gateway.cache.sqlite.cache_size_kib = Some(value);
@@ -460,10 +470,19 @@ impl Controller {
                 "gateway.cache.low-water-percent must be between 1 and 99".into(),
             ));
         }
-        if cluster.gateway.cache.hit_sample_ratio == Some(0) {
-            return Err(ControllerError::Invalid(
-                "gateway.cache.hit-sample-ratio must be greater than zero".into(),
-            ));
+        if cluster
+            .gateway
+            .cache
+            .admission
+            .cache_after_requests
+            .is_some_and(|value| {
+                value == 0 || value > crate::model::MAX_GATEWAY_CACHE_AFTER_REQUESTS
+            })
+        {
+            return Err(ControllerError::Invalid(format!(
+                "gateway.cache.admission.cache-after-requests must be between 1 and {}",
+                crate::model::MAX_GATEWAY_CACHE_AFTER_REQUESTS
+            )));
         }
         if cluster
             .gateway
@@ -527,7 +546,8 @@ impl Controller {
         }
         let caddy_durations = [
             cluster.gateway.shutdown.grace_period_seconds,
-            cluster.gateway.cache.access_update_interval_seconds,
+            cluster.gateway.cache.admission.window_seconds,
+            cluster.gateway.cache.sqlite.touch_window_seconds,
             cluster.gateway.cache.sqlite.busy_timeout_seconds,
             cluster.gateway.cache.sqlite.cleanup_interval_seconds,
             cluster.gateway.http.timeouts.read_header_seconds,
@@ -544,9 +564,14 @@ impl Controller {
                 "Gateway Caddy durations cannot exceed {MAX_CADDY_DURATION_SECONDS} seconds"
             )));
         }
-        if cluster.gateway.cache.access_update_interval_seconds == Some(0) {
+        if cluster.gateway.cache.admission.window_seconds == Some(0) {
             return Err(ControllerError::Invalid(
-                "gateway.cache.access-update-interval-seconds must be greater than zero".into(),
+                "gateway.cache.admission.window-seconds must be greater than zero".into(),
+            ));
+        }
+        if cluster.gateway.cache.sqlite.touch_window_seconds == Some(0) {
+            return Err(ControllerError::Invalid(
+                "gateway.cache.sqlite.touch-window-seconds must be greater than zero".into(),
             ));
         }
         if cluster.agent.image_prune.interval_seconds == 0 {

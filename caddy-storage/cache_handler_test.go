@@ -80,6 +80,7 @@ func TestNativeCacheHandlerHTTPBehavior(t *testing.T) {
 									"handler":                  "cache",
 									"path":                     filepath.Join(t.TempDir(), "cache.db"),
 									"ttl":                      "5m",
+									"cache_after_requests":     1,
 									"allowed_http_verbs":       []string{"GET", "POST"},
 									"max_cacheable_body_bytes": 64,
 									"max_request_body_bytes":   32,

@@ -2512,7 +2512,15 @@ async fn gateway_cache_config_rejects_unsafe_values() {
             ..Default::default()
         },
         ClusterConfigUpdate {
-            gateway_cache_hit_sample_ratio: Some(0),
+            gateway_cache_admission_window_seconds: Some(0),
+            ..Default::default()
+        },
+        ClusterConfigUpdate {
+            gateway_cache_admission_cache_after_requests: Some(9),
+            ..Default::default()
+        },
+        ClusterConfigUpdate {
+            gateway_cache_sqlite_touch_window_seconds: Some(0),
             ..Default::default()
         },
         ClusterConfigUpdate {
@@ -2545,8 +2553,9 @@ async fn gateway_config_preserves_explicit_values_and_unsets_them() {
             gateway_metrics_per_host: Some(true),
             gateway_cache_max_size_bytes: Some(2_147_483_648),
             gateway_cache_low_water_percent: Some(80),
-            gateway_cache_hit_sample_ratio: Some(16),
-            gateway_cache_access_update_interval_seconds: Some(120),
+            gateway_cache_admission_window_seconds: Some(120),
+            gateway_cache_admission_cache_after_requests: Some(4),
+            gateway_cache_sqlite_touch_window_seconds: Some(180),
             gateway_cache_sqlite_cache_size_kib: Some(8_192),
             gateway_cache_sqlite_mmap_size_bytes: Some(134_217_728),
             gateway_cache_sqlite_read_connections: Some(6),
@@ -2576,8 +2585,9 @@ async fn gateway_config_preserves_explicit_values_and_unsets_them() {
     assert_eq!(gateway.metrics.per_host, Some(true));
     assert_eq!(gateway.cache.max_size_bytes, Some(2_147_483_648));
     assert_eq!(gateway.cache.low_water_percent, Some(80));
-    assert_eq!(gateway.cache.hit_sample_ratio, Some(16));
-    assert_eq!(gateway.cache.access_update_interval_seconds, Some(120));
+    assert_eq!(gateway.cache.admission.window_seconds, Some(120));
+    assert_eq!(gateway.cache.admission.cache_after_requests, Some(4));
+    assert_eq!(gateway.cache.sqlite.touch_window_seconds, Some(180));
     assert_eq!(gateway.cache.sqlite.cache_size_kib, Some(8_192));
     assert_eq!(gateway.cache.sqlite.mmap_size_bytes, Some(134_217_728));
     assert_eq!(gateway.cache.sqlite.read_connections, Some(6));
@@ -2596,8 +2606,9 @@ async fn gateway_config_preserves_explicit_values_and_unsets_them() {
                 ClusterConfigField::GatewayMetricsPerHost,
                 ClusterConfigField::GatewayCacheMaxSizeBytes,
                 ClusterConfigField::GatewayCacheLowWaterPercent,
-                ClusterConfigField::GatewayCacheHitSampleRatio,
-                ClusterConfigField::GatewayCacheAccessUpdateIntervalSeconds,
+                ClusterConfigField::GatewayCacheAdmissionWindowSeconds,
+                ClusterConfigField::GatewayCacheAdmissionCacheAfterRequests,
+                ClusterConfigField::GatewayCacheSqliteTouchWindowSeconds,
                 ClusterConfigField::GatewayCacheSqliteCacheSizeKib,
                 ClusterConfigField::GatewayCacheSqliteMmapSizeBytes,
                 ClusterConfigField::GatewayCacheSqliteReadConnections,

@@ -81,8 +81,11 @@ Expired rows are cleaned every five minutes. WAL
 checkpoints default to 8,192 pages (about 32 MiB) to avoid checkpointing after every large cached
 response. Cached
 response payload is logically capped at 1 GiB per Gateway by default and can be changed through
-the cluster-level `gateway.cache.max-size-bytes` setting. Sampled hits are deduplicated through a
-64 KiB Bloom filter and written in batches to a small access-metadata table, avoiding updates to rows
+the cluster-level `gateway.cache.max-size-bytes` setting. Uncached keys are admitted on their third
+request in a five-minute window by default. The threshold supports one through eight requests and
+allocates one 64 KiB Bloom-filter level per preceding request. Cached hits are deduplicated through
+a separate 64 KiB Bloom filter and written in batches to a small access-metadata table, avoiding
+updates to rows
 that contain response bodies. Expired rows are removed first; approximate LRU eviction then returns
 usage to a 90% low-water mark. The logical limit counts the compact key, serialized headers, and
 body; reusable SQLite pages and WAL bytes may make the physical files larger. New databases use

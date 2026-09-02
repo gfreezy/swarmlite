@@ -31,8 +31,10 @@ const (
 	defaultSQLiteMaxSizeBytes     = int64(1 << 30)
 	defaultSQLiteMmapSizeBytes    = int64(256 << 20)
 	defaultSQLiteLowWaterPercent  = 90
-	defaultCacheHitSampleRatio    = uint64(32)
-	defaultCacheAccessInterval    = 5 * time.Minute
+	defaultCacheAdmissionWindow   = 5 * time.Minute
+	defaultCacheAfterRequests     = uint8(3)
+	maxCacheAfterRequests         = uint8(8)
+	defaultCacheTouchWindow       = 5 * time.Minute
 	sqliteCacheSchemaVersion      = 6
 	// A 128-bit SHA-256 prefix keeps cache identities compact while retaining
 	// negligible collision probability at HTTP-cache scale.
@@ -44,8 +46,10 @@ const (
 	cacheTouchBatchSize      = 256
 	cacheTouchFlushInterval  = time.Second
 	cacheEvictionMinInterval = time.Second
-	cacheTouchBloomWords     = 8192 // 64 KiB / 524,288 bits
-	cacheTouchBloomHashes    = 4
+	cacheBloomWords          = 8192 // 64 KiB / 524,288 bits
+	cacheBloomHashes         = 4
+	cacheBloomShards         = 64
+	cacheBloomWordsPerShard  = cacheBloomWords / cacheBloomShards
 	sqliteWALCheckpointPages = 8192 // 32 MiB with SQLite's default 4 KiB pages
 	sqliteVacuumBatchPages   = 8192 // Reclaim at most 32 MiB per cleanup pass.
 )
@@ -56,41 +60,43 @@ var sqliteDatabases = struct {
 }{items: make(map[string]*sqliteDatabase)}
 
 type sqliteOptions struct {
-	path             string
-	maxSizeBytes     int64
-	lowWaterPercent  int
-	hitSampleRatio   uint64
-	accessInterval   time.Duration
-	cacheSizeKiB     int64
-	mmapSizeBytes    *int64
-	readConnections  int
-	busyTimeout      time.Duration
-	cleanupInterval  time.Duration
-	journalSizeLimit int64
+	path               string
+	maxSizeBytes       int64
+	lowWaterPercent    int
+	admissionWindow    time.Duration
+	cacheAfterRequests uint8
+	cacheSizeKiB       int64
+	mmapSizeBytes      *int64
+	readConnections    int
+	busyTimeout        time.Duration
+	cleanupInterval    time.Duration
+	journalSizeLimit   int64
+	touchWindow        time.Duration
 }
 
 type sqliteDatabase struct {
-	writer           *sql.DB
-	readers          *sql.DB
-	path             string
-	instanceKey      string
-	logger           *zap.Logger
-	operationTimeout time.Duration
-	cleanupInterval  time.Duration
-	maxSizeBytes     int64
-	lowWaterBytes    int64
-	hitSampleRatio   uint64
-	accessInterval   time.Duration
-	touchQueue       chan cacheKey
-	touchBloom       cacheTouchBloom
-	touchSequence    atomic.Uint64
-	usageBytes       atomic.Int64
-	lastEviction     atomic.Int64
-	evict            chan struct{}
-	stopCleanup      chan struct{}
-	background       sync.WaitGroup
-	closeOnce        sync.Once
-	refs             int
+	writer             *sql.DB
+	readers            *sql.DB
+	path               string
+	instanceKey        string
+	logger             *zap.Logger
+	operationTimeout   time.Duration
+	cleanupInterval    time.Duration
+	maxSizeBytes       int64
+	lowWaterBytes      int64
+	admissionWindow    time.Duration
+	cacheAfterRequests uint8
+	touchWindow        time.Duration
+	admissionBlooms    []*cacheBloom
+	touchQueue         chan cacheKey
+	touchBloom         cacheBloom
+	usageBytes         atomic.Int64
+	lastEviction       atomic.Int64
+	evict              chan struct{}
+	stopCleanup        chan struct{}
+	background         sync.WaitGroup
+	closeOnce          sync.Once
+	refs               int
 }
 
 type sqliteResponseStore struct {
@@ -100,9 +106,14 @@ type sqliteResponseStore struct {
 
 type cacheKey [cacheKeySize]byte
 
-type cacheTouchBloom struct {
+type cacheBloomShard struct {
 	sync.Mutex
-	words [cacheTouchBloomWords]uint64
+	words [cacheBloomWordsPerShard]uint64
+}
+
+type cacheBloom struct {
+	seed   uint64
+	shards [cacheBloomShards]cacheBloomShard
 }
 
 type cacheEntry struct {
@@ -159,14 +170,23 @@ func newSQLiteResponseStore(options sqliteOptions, logger *zap.Logger) (*sqliteR
 	if options.lowWaterPercent < 1 || options.lowWaterPercent >= 100 {
 		return nil, errors.New("SQLite cache low_water_percent must be between 1 and 99")
 	}
-	if options.hitSampleRatio == 0 {
-		options.hitSampleRatio = defaultCacheHitSampleRatio
+	if options.admissionWindow == 0 {
+		options.admissionWindow = defaultCacheAdmissionWindow
 	}
-	if options.accessInterval == 0 {
-		options.accessInterval = defaultCacheAccessInterval
+	if options.admissionWindow < 0 {
+		return nil, errors.New("cache admission_window must be positive")
 	}
-	if options.accessInterval < 0 {
-		return nil, errors.New("SQLite cache access_update_interval must be positive")
+	if options.cacheAfterRequests == 0 {
+		options.cacheAfterRequests = defaultCacheAfterRequests
+	}
+	if options.cacheAfterRequests > maxCacheAfterRequests {
+		return nil, fmt.Errorf("cache cache_after_requests must be between 1 and %d", maxCacheAfterRequests)
+	}
+	if options.touchWindow == 0 {
+		options.touchWindow = defaultCacheTouchWindow
+	}
+	if options.touchWindow < 0 {
+		return nil, errors.New("SQLite cache touch_window must be positive")
 	}
 	if options.cacheSizeKiB < 0 {
 		return nil, errors.New("SQLite cache cache_size_kib must not be negative")
@@ -185,18 +205,19 @@ func newSQLiteResponseStore(options sqliteOptions, logger *zap.Logger) (*sqliteR
 	}
 	options.path = filepath.Clean(absolutePath)
 	instanceKey := fmt.Sprintf(
-		"%s|%d|%d|%d|%s|%d|%d|%d|%s|%s|%d",
+		"%s|%d|%d|%s|%d|%d|%d|%d|%s|%s|%d|%s",
 		options.path,
 		options.maxSizeBytes,
 		options.lowWaterPercent,
-		options.hitSampleRatio,
-		options.accessInterval,
+		options.admissionWindow,
+		options.cacheAfterRequests,
 		options.cacheSizeKiB,
 		*options.mmapSizeBytes,
 		options.readConnections,
 		options.busyTimeout,
 		options.cleanupInterval,
 		options.journalSizeLimit,
+		options.touchWindow,
 	)
 
 	sqliteDatabases.Lock()
@@ -271,21 +292,26 @@ func openSQLiteDatabase(
 	}
 
 	result := &sqliteDatabase{
-		writer:           writer,
-		readers:          readers,
-		path:             options.path,
-		instanceKey:      instanceKey,
-		logger:           logger,
-		operationTimeout: options.busyTimeout,
-		cleanupInterval:  options.cleanupInterval,
-		maxSizeBytes:     options.maxSizeBytes,
-		lowWaterBytes:    percentageBytes(options.maxSizeBytes, options.lowWaterPercent),
-		hitSampleRatio:   options.hitSampleRatio,
-		accessInterval:   options.accessInterval,
-		touchQueue:       make(chan cacheKey, cacheTouchQueueSize),
-		evict:            make(chan struct{}, 1),
-		stopCleanup:      make(chan struct{}),
-		refs:             1,
+		writer:             writer,
+		readers:            readers,
+		path:               options.path,
+		instanceKey:        instanceKey,
+		logger:             logger,
+		operationTimeout:   options.busyTimeout,
+		cleanupInterval:    options.cleanupInterval,
+		maxSizeBytes:       options.maxSizeBytes,
+		lowWaterBytes:      percentageBytes(options.maxSizeBytes, options.lowWaterPercent),
+		admissionWindow:    options.admissionWindow,
+		cacheAfterRequests: options.cacheAfterRequests,
+		touchWindow:        options.touchWindow,
+		touchQueue:         make(chan cacheKey, cacheTouchQueueSize),
+		evict:              make(chan struct{}, 1),
+		stopCleanup:        make(chan struct{}),
+		refs:               1,
+	}
+	result.admissionBlooms = make([]*cacheBloom, int(options.cacheAfterRequests)-1)
+	for index := range result.admissionBlooms {
+		result.admissionBlooms[index] = &cacheBloom{seed: uint64(index + 1)}
 	}
 	var usageBytes int64
 	if err := writer.QueryRow("SELECT total_bytes FROM cache_usage WHERE id = 1").Scan(&usageBytes); err != nil {
@@ -737,6 +763,7 @@ func (store *sqliteResponseStore) Put(
 		return fmt.Errorf("commit SQLite cache write: %w", err)
 	}
 	store.usageBytes.Add(entrySize - formerSize)
+	store.touchBloom.markIfNew(entry.Key)
 	return nil
 }
 
@@ -764,10 +791,16 @@ func (store *sqliteResponseStore) operationContext(parent context.Context) (cont
 }
 
 func (database *sqliteDatabase) recordCacheHit(key cacheKey) {
-	if database.touchSequence.Add(1)%database.hitSampleRatio != 0 {
-		return
-	}
 	database.enqueueCacheTouch(key)
+}
+
+func (database *sqliteDatabase) admitCache(key cacheKey) bool {
+	for _, bloom := range database.admissionBlooms {
+		if bloom.markIfNew(key) {
+			return false
+		}
+	}
+	return true
 }
 
 func (database *sqliteDatabase) enqueueCacheTouch(key cacheKey) {
@@ -782,28 +815,35 @@ func (database *sqliteDatabase) enqueueCacheTouch(key cacheKey) {
 	}
 }
 
-func (bloom *cacheTouchBloom) markIfNew(key cacheKey) bool {
-	bloom.Lock()
-	defer bloom.Unlock()
-	hash1 := binary.LittleEndian.Uint64(key[:8])
-	hash2 := binary.LittleEndian.Uint64(key[8:]) | 1
+func (bloom *cacheBloom) markIfNew(key cacheKey) bool {
+	hash1 := binary.LittleEndian.Uint64(key[:8]) ^ bloom.seed*0x9e3779b97f4a7c15
+	hash2 := binary.LittleEndian.Uint64(key[8:]) ^ bloom.seed*0xbf58476d1ce4e5b9
+	hash2 |= 1
+	shardIndex := hash1 % cacheBloomShards
+	hash1 /= cacheBloomShards
+	shard := &bloom.shards[shardIndex]
+	shard.Lock()
+	defer shard.Unlock()
 	alreadyPresent := true
-	for index := uint64(0); index < cacheTouchBloomHashes; index++ {
-		bit := (hash1 + index*hash2) % (cacheTouchBloomWords * 64)
+	for index := uint64(0); index < cacheBloomHashes; index++ {
+		bit := (hash1 + index*hash2) % (cacheBloomWordsPerShard * 64)
 		word := bit / 64
 		mask := uint64(1) << (bit % 64)
-		if bloom.words[word]&mask == 0 {
+		if shard.words[word]&mask == 0 {
 			alreadyPresent = false
-			bloom.words[word] |= mask
+			shard.words[word] |= mask
 		}
 	}
 	return !alreadyPresent
 }
 
-func (bloom *cacheTouchBloom) reset() {
-	bloom.Lock()
-	clear(bloom.words[:])
-	bloom.Unlock()
+func (bloom *cacheBloom) reset() {
+	for index := range bloom.shards {
+		shard := &bloom.shards[index]
+		shard.Lock()
+		clear(shard.words[:])
+		shard.Unlock()
+	}
 }
 
 func (database *sqliteDatabase) cleanupLoop() {
@@ -812,8 +852,10 @@ func (database *sqliteDatabase) cleanupLoop() {
 	defer cleanupTicker.Stop()
 	touchTicker := time.NewTicker(cacheTouchFlushInterval)
 	defer touchTicker.Stop()
-	bloomTicker := time.NewTicker(database.accessInterval)
-	defer bloomTicker.Stop()
+	admissionTicker := time.NewTicker(database.admissionWindow)
+	defer admissionTicker.Stop()
+	touchBloomTicker := time.NewTicker(database.touchWindow)
+	defer touchBloomTicker.Stop()
 	for {
 		select {
 		case <-database.stopCleanup:
@@ -821,7 +863,11 @@ func (database *sqliteDatabase) cleanupLoop() {
 			return
 		case <-touchTicker.C:
 			database.flushCacheTouches()
-		case <-bloomTicker.C:
+		case <-admissionTicker.C:
+			for _, bloom := range database.admissionBlooms {
+				bloom.reset()
+			}
+		case <-touchBloomTicker.C:
 			database.touchBloom.reset()
 		case <-cleanupTicker.C:
 			database.flushCacheTouches()
@@ -884,7 +930,7 @@ func (database *sqliteDatabase) flushCacheTouches() bool {
 update:
 	now := time.Now().UnixMilli()
 	arguments := make([]any, 0, len(keys)+2)
-	arguments = append(arguments, now, now-database.accessInterval.Milliseconds())
+	arguments = append(arguments, now, now-database.touchWindow.Milliseconds())
 	for index := range keys {
 		arguments = append(arguments, keys[index][:])
 	}

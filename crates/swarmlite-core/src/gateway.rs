@@ -4,14 +4,14 @@ use serde_json::{Value, json};
 use swarmlite_stack::{PathRegexpMatcher, RequestMatcher, Route};
 
 use crate::model::{
-    ClusterGatewayConfig, ClusterState, DEFAULT_GATEWAY_CACHE_ACCESS_UPDATE_INTERVAL_SECONDS,
-    DEFAULT_GATEWAY_CACHE_HIT_SAMPLE_RATIO, DEFAULT_GATEWAY_CACHE_LOW_WATER_PERCENT,
+    ClusterGatewayConfig, ClusterState, DEFAULT_GATEWAY_CACHE_ADMISSION_WINDOW_SECONDS,
+    DEFAULT_GATEWAY_CACHE_AFTER_REQUESTS, DEFAULT_GATEWAY_CACHE_LOW_WATER_PERCENT,
     DEFAULT_GATEWAY_CACHE_MAX_SIZE_BYTES, DEFAULT_GATEWAY_CACHE_SQLITE_BUSY_TIMEOUT_SECONDS,
     DEFAULT_GATEWAY_CACHE_SQLITE_CLEANUP_INTERVAL_SECONDS,
     DEFAULT_GATEWAY_CACHE_SQLITE_JOURNAL_SIZE_LIMIT_BYTES,
     DEFAULT_GATEWAY_CACHE_SQLITE_MMAP_SIZE_BYTES, DEFAULT_GATEWAY_CACHE_SQLITE_READ_CONNECTIONS,
-    DesiredTaskState, GatewayCacheConfig, ObservedTaskState, RecoveredStackGateway, ServicePortKey,
-    ServiceRecord,
+    DEFAULT_GATEWAY_CACHE_SQLITE_TOUCH_WINDOW_SECONDS, DesiredTaskState, GatewayCacheConfig,
+    ObservedTaskState, RecoveredStackGateway, ServicePortKey, ServiceRecord,
 };
 
 pub use swarmlite_stack::{HttpServer, StorageConfig, routed_service_ports, storage};
@@ -139,19 +139,30 @@ fn apply_cache_runtime_config(value: &mut Value, cache: &GatewayCacheConfig) {
                     ),
                 );
                 object.insert(
-                    "hit_sample_ratio".to_owned(),
-                    json!(
+                    "admission_window".to_owned(),
+                    duration(
                         cache
-                            .hit_sample_ratio
-                            .unwrap_or(DEFAULT_GATEWAY_CACHE_HIT_SAMPLE_RATIO)
+                            .admission
+                            .window_seconds
+                            .unwrap_or(DEFAULT_GATEWAY_CACHE_ADMISSION_WINDOW_SECONDS),
                     ),
                 );
                 object.insert(
-                    "access_update_interval".to_owned(),
+                    "cache_after_requests".to_owned(),
+                    json!(
+                        cache
+                            .admission
+                            .cache_after_requests
+                            .unwrap_or(DEFAULT_GATEWAY_CACHE_AFTER_REQUESTS)
+                    ),
+                );
+                object.insert(
+                    "touch_window".to_owned(),
                     duration(
                         cache
-                            .access_update_interval_seconds
-                            .unwrap_or(DEFAULT_GATEWAY_CACHE_ACCESS_UPDATE_INTERVAL_SECONDS),
+                            .sqlite
+                            .touch_window_seconds
+                            .unwrap_or(DEFAULT_GATEWAY_CACHE_SQLITE_TOUCH_WINDOW_SECONDS),
                     ),
                 );
                 if let Some(value) = cache.sqlite.cache_size_kib {
@@ -528,8 +539,9 @@ x-swarmlite:
         let mut gateway = gateway_with_listen(&[":80"]);
         gateway.cache.max_size_bytes = Some(2_147_483_648);
         gateway.cache.low_water_percent = Some(80);
-        gateway.cache.hit_sample_ratio = Some(16);
-        gateway.cache.access_update_interval_seconds = Some(120);
+        gateway.cache.admission.window_seconds = Some(120);
+        gateway.cache.admission.cache_after_requests = Some(4);
+        gateway.cache.sqlite.touch_window_seconds = Some(180);
         gateway.cache.sqlite.cache_size_kib = Some(8_192);
         gateway.cache.sqlite.mmap_size_bytes = Some(0);
         gateway.cache.sqlite.read_connections = Some(6);
@@ -548,8 +560,9 @@ x-swarmlite:
         assert_eq!(cache["path"], "/cache/native-v1/cache.db");
         assert_eq!(cache["max_size_bytes"], 2_147_483_648_u64);
         assert_eq!(cache["low_water_percent"], 80);
-        assert_eq!(cache["hit_sample_ratio"], 16);
-        assert_eq!(cache["access_update_interval"], "120s");
+        assert_eq!(cache["admission_window"], "120s");
+        assert_eq!(cache["cache_after_requests"], 4);
+        assert_eq!(cache["touch_window"], "180s");
         assert_eq!(cache["cache_size_kib"], 8_192);
         assert_eq!(cache["mmap_size_bytes"], 0);
         assert_eq!(cache["read_connections"], 6);

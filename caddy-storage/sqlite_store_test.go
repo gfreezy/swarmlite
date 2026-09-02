@@ -326,6 +326,7 @@ func TestSQLiteResponseStoreKeepsAccessMetadataSeparateFromResponseBodies(t *tes
 	); err != nil {
 		t.Fatal(err)
 	}
+	store.touchBloom.reset()
 	store.enqueueCacheTouch(entry.Key)
 	if !store.flushCacheTouches() {
 		t.Fatal("cache touch flush failed")
@@ -342,7 +343,7 @@ func TestSQLiteResponseStoreKeepsAccessMetadataSeparateFromResponseBodies(t *tes
 }
 
 func TestCacheTouchBloomDeduplicatesAndResets(t *testing.T) {
-	var bloom cacheTouchBloom
+	var bloom cacheBloom
 	key := testCacheKey("touch")
 	if !bloom.markIfNew(key) {
 		t.Fatal("first Bloom insertion was treated as a duplicate")
@@ -353,6 +354,14 @@ func TestCacheTouchBloomDeduplicatesAndResets(t *testing.T) {
 	bloom.reset()
 	if !bloom.markIfNew(key) {
 		t.Fatal("Bloom reset did not make the cache key eligible again")
+	}
+
+	database := sqliteDatabase{admissionBlooms: []*cacheBloom{
+		{seed: 1},
+		{seed: 2},
+	}}
+	if database.admitCache(key) || database.admitCache(key) || !database.admitCache(key) {
+		t.Fatal("two admission Bloom filters did not admit the third request")
 	}
 }
 
@@ -657,12 +666,13 @@ func TestSQLiteResponseStoreAllowsDisablingReadMmap(t *testing.T) {
 
 func TestSQLiteResponseStoreHonorsCapacityAndAccessTuning(t *testing.T) {
 	store, err := newSQLiteResponseStore(sqliteOptions{
-		path:            filepath.Join(t.TempDir(), "cache.db"),
-		maxSizeBytes:    10_000,
-		lowWaterPercent: 80,
-		hitSampleRatio:  1,
-		accessInterval:  2 * time.Minute,
-		cleanupInterval: time.Hour,
+		path:               filepath.Join(t.TempDir(), "cache.db"),
+		maxSizeBytes:       10_000,
+		lowWaterPercent:    80,
+		admissionWindow:    3 * time.Minute,
+		cacheAfterRequests: 4,
+		touchWindow:        2 * time.Minute,
+		cleanupInterval:    time.Hour,
 	}, zap.NewNop())
 	if err != nil {
 		t.Fatal(err)
@@ -675,11 +685,16 @@ func TestSQLiteResponseStoreHonorsCapacityAndAccessTuning(t *testing.T) {
 			store.lowWaterBytes,
 		)
 	}
-	if store.hitSampleRatio != 1 || store.accessInterval != 2*time.Minute {
+	if store.admissionWindow != 3*time.Minute ||
+		store.cacheAfterRequests != 4 ||
+		len(store.admissionBlooms) != 3 ||
+		store.touchWindow != 2*time.Minute {
 		t.Fatalf(
-			"unexpected access tuning ratio=%d interval=%s",
-			store.hitSampleRatio,
-			store.accessInterval,
+			"unexpected activity tuning admission=%s requests=%d filters=%d touch=%s",
+			store.admissionWindow,
+			store.cacheAfterRequests,
+			len(store.admissionBlooms),
+			store.touchWindow,
 		)
 	}
 }
@@ -694,9 +709,13 @@ func TestSQLiteResponseStoreRejectsInvalidCapacityTuning(t *testing.T) {
 			path:            filepath.Join(t.TempDir(), "low.db"),
 			lowWaterPercent: 100,
 		},
-		"negative access interval": {
-			path:           filepath.Join(t.TempDir(), "interval.db"),
-			accessInterval: -time.Second,
+		"negative touch window": {
+			path:        filepath.Join(t.TempDir(), "interval.db"),
+			touchWindow: -time.Second,
+		},
+		"too many admission requests": {
+			path:               filepath.Join(t.TempDir(), "admission.db"),
+			cacheAfterRequests: maxCacheAfterRequests + 1,
 		},
 		"negative mmap size": {
 			path:          filepath.Join(t.TempDir(), "mmap.db"),

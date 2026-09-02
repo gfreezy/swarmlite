@@ -169,9 +169,10 @@ func TestCachedResponseCompressionRemainsClientSpecific(t *testing.T) {
 									"minimum_length": 512,
 								},
 								map[string]any{
-									"handler": "cache",
-									"path":    filepath.Join(t.TempDir(), "cache.db"),
-									"ttl":     "5m",
+									"handler":              "cache",
+									"path":                 filepath.Join(t.TempDir(), "cache.db"),
+									"ttl":                  "5m",
+									"cache_after_requests": 1,
 								},
 								map[string]any{
 									"handler":   "reverse_proxy",

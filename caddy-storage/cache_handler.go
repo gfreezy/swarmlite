@@ -42,16 +42,17 @@ type CacheHandler struct {
 	Key                   *CacheKey      `json:"key,omitempty"`
 	StatusCodes           []int          `json:"status_codes,omitempty"`
 
-	MaxSizeBytes         int64          `json:"max_size_bytes,omitempty"`
-	LowWaterPercent      int            `json:"low_water_percent,omitempty"`
-	HitSampleRatio       uint64         `json:"hit_sample_ratio,omitempty"`
-	AccessUpdateInterval caddy.Duration `json:"access_update_interval,omitempty"`
-	CacheSizeKiB         int64          `json:"cache_size_kib,omitempty"`
-	MmapSizeBytes        *int64         `json:"mmap_size_bytes,omitempty"`
-	ReadConnections      int            `json:"read_connections,omitempty"`
-	BusyTimeout          caddy.Duration `json:"busy_timeout,omitempty"`
-	CleanupInterval      caddy.Duration `json:"cleanup_interval,omitempty"`
-	JournalSizeLimit     int64          `json:"journal_size_limit,omitempty"`
+	MaxSizeBytes       int64          `json:"max_size_bytes,omitempty"`
+	LowWaterPercent    int            `json:"low_water_percent,omitempty"`
+	AdmissionWindow    caddy.Duration `json:"admission_window,omitempty"`
+	CacheAfterRequests uint8          `json:"cache_after_requests,omitempty"`
+	CacheSizeKiB       int64          `json:"cache_size_kib,omitempty"`
+	MmapSizeBytes      *int64         `json:"mmap_size_bytes,omitempty"`
+	ReadConnections    int            `json:"read_connections,omitempty"`
+	BusyTimeout        caddy.Duration `json:"busy_timeout,omitempty"`
+	CleanupInterval    caddy.Duration `json:"cleanup_interval,omitempty"`
+	JournalSizeLimit   int64          `json:"journal_size_limit,omitempty"`
+	TouchWindow        caddy.Duration `json:"touch_window,omitempty"`
 
 	store           *sqliteResponseStore
 	logger          *zap.Logger
@@ -199,17 +200,18 @@ func (handler *CacheHandler) Provision(ctx caddy.Context) error {
 
 	handler.namespace = handler.cacheNamespace()
 	store, err := newSQLiteResponseStore(sqliteOptions{
-		path:             handler.Path,
-		maxSizeBytes:     handler.MaxSizeBytes,
-		lowWaterPercent:  handler.LowWaterPercent,
-		hitSampleRatio:   handler.HitSampleRatio,
-		accessInterval:   time.Duration(handler.AccessUpdateInterval),
-		cacheSizeKiB:     handler.CacheSizeKiB,
-		mmapSizeBytes:    handler.MmapSizeBytes,
-		readConnections:  handler.ReadConnections,
-		busyTimeout:      time.Duration(handler.BusyTimeout),
-		cleanupInterval:  time.Duration(handler.CleanupInterval),
-		journalSizeLimit: handler.JournalSizeLimit,
+		path:               handler.Path,
+		maxSizeBytes:       handler.MaxSizeBytes,
+		lowWaterPercent:    handler.LowWaterPercent,
+		admissionWindow:    time.Duration(handler.AdmissionWindow),
+		cacheAfterRequests: handler.CacheAfterRequests,
+		cacheSizeKiB:       handler.CacheSizeKiB,
+		mmapSizeBytes:      handler.MmapSizeBytes,
+		readConnections:    handler.ReadConnections,
+		busyTimeout:        time.Duration(handler.BusyTimeout),
+		cleanupInterval:    time.Duration(handler.CleanupInterval),
+		journalSizeLimit:   handler.JournalSizeLimit,
+		touchWindow:        time.Duration(handler.TouchWindow),
 	}, handler.logger)
 	if err != nil {
 		return err
@@ -254,6 +256,10 @@ func (handler *CacheHandler) ServeHTTP(
 	// A HEAD miss is passed through but never stored because its body cannot
 	// populate a later GET. A cached GET can still satisfy HEAD requests.
 	if request.Method == http.MethodHead {
+		response.Header().Set("Cache-Status", cacheStatusName+"; fwd=uri-miss")
+		return next.ServeHTTP(response, request)
+	}
+	if decision.lookup && decision.store && !handler.store.admitCache(baseKey) {
 		response.Header().Set("Cache-Status", cacheStatusName+"; fwd=uri-miss")
 		return next.ServeHTTP(response, request)
 	}

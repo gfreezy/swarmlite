@@ -22,13 +22,13 @@ use crate::swarmlite::{
         ClusterGatewayConfig, ClusterSettings, ConfigBlobCheckRequest, ConfigBlobCheckResponse,
         DEFAULT_GATEWAY_IMAGE, DeploymentListResponse, GatewayAccessLogFormat,
         GatewayClusterStatusResponse, GatewayLogLevel, GatewayNodeStatusKind,
-        MAX_CADDY_DURATION_SECONDS, MAX_CONFIG_FILE_BYTES, MAX_GATEWAY_CACHE_SIGNED_SIZE,
-        MAX_GATEWAY_CACHE_SQLITE_READ_CONNECTIONS, MAX_STACK_CONFIG_BYTES, NodeGatewayResponse,
-        NodeGatewayUpdate, NodeLabelRemoveRequest, NodeLabelSetRequest, NodeLabelsResponse,
-        RegistryLoginRequest, RegistryLoginResponse, StackApplyRequest, StackConfigPayload,
-        StackDeploymentListResponse, StackDeploymentResponse, StackDeploymentStatus,
-        StackRollbackRequest, StackValidationResponse, StatusResponse, config_digest,
-        valid_gateway_image,
+        MAX_CADDY_DURATION_SECONDS, MAX_CONFIG_FILE_BYTES, MAX_GATEWAY_CACHE_AFTER_REQUESTS,
+        MAX_GATEWAY_CACHE_SIGNED_SIZE, MAX_GATEWAY_CACHE_SQLITE_READ_CONNECTIONS,
+        MAX_STACK_CONFIG_BYTES, NodeGatewayResponse, NodeGatewayUpdate, NodeLabelRemoveRequest,
+        NodeLabelSetRequest, NodeLabelsResponse, RegistryLoginRequest, RegistryLoginResponse,
+        StackApplyRequest, StackConfigPayload, StackDeploymentListResponse,
+        StackDeploymentResponse, StackDeploymentStatus, StackRollbackRequest,
+        StackValidationResponse, StatusResponse, config_digest, valid_gateway_image,
     },
     node, registry,
 };
@@ -603,24 +603,34 @@ define_config_keys! {
         description: "Target logical cache usage after capacity eviction.",
         apply: "hot reload"
     },
-    GatewayCacheHitSampleRatio => {
-        key: "gateway.cache.hit-sample-ratio",
-        field: ClusterConfigField::GatewayCacheHitSampleRatio,
-        type: "integer",
-        values: None,
-        constraints: "1..=4294967295; 1 samples every hit, N samples one in N hits",
-        default: "32",
-        description: "Sampling denominator used before queuing approximate-LRU access updates.",
-        apply: "hot reload"
-    },
-    GatewayCacheAccessUpdateIntervalSeconds => {
-        key: "gateway.cache.access-update-interval-seconds",
-        field: ClusterConfigField::GatewayCacheAccessUpdateIntervalSeconds,
+    GatewayCacheAdmissionWindowSeconds => {
+        key: "gateway.cache.admission.window-seconds",
+        field: ClusterConfigField::GatewayCacheAdmissionWindowSeconds,
         type: "integer",
         values: None,
         constraints: "1..=9223372036 seconds",
         default: "300 seconds",
-        description: "Minimum interval between persisted access timestamps for one cache entry.",
+        description: "Window in which uncached request frequency is tracked for cache admission.",
+        apply: "hot reload"
+    },
+    GatewayCacheAdmissionCacheAfterRequests => {
+        key: "gateway.cache.admission.cache-after-requests",
+        field: ClusterConfigField::GatewayCacheAdmissionCacheAfterRequests,
+        type: "integer",
+        values: None,
+        constraints: "1..=8 requests",
+        default: "3 requests",
+        description: "Cache a response on this request number within the admission window.",
+        apply: "hot reload"
+    },
+    GatewayCacheSqliteTouchWindowSeconds => {
+        key: "gateway.cache.sqlite.touch-window-seconds",
+        field: ClusterConfigField::GatewayCacheSqliteTouchWindowSeconds,
+        type: "integer",
+        values: None,
+        constraints: "1..=9223372036 seconds",
+        default: "300 seconds",
+        description: "Persist at most one approximate-LRU access update per cache entry in this window.",
         apply: "hot reload"
     },
     GatewayCacheSqliteCacheSizeKib => {
@@ -939,11 +949,23 @@ fn config_set_update(key: ConfigKey, value: String) -> Result<ClusterConfigUpdat
             }
             update.gateway_cache_low_water_percent = Some(percent as u8);
         }
-        ConfigKey::GatewayCacheHitSampleRatio => {
-            update.gateway_cache_hit_sample_ratio = Some(parse_config_u32(&value, key, 1)?);
+        ConfigKey::GatewayCacheAdmissionWindowSeconds => {
+            update.gateway_cache_admission_window_seconds = Some(parse_config_u64(
+                &value,
+                key,
+                1,
+                MAX_CADDY_DURATION_SECONDS,
+            )?);
         }
-        ConfigKey::GatewayCacheAccessUpdateIntervalSeconds => {
-            update.gateway_cache_access_update_interval_seconds = Some(parse_config_u64(
+        ConfigKey::GatewayCacheAdmissionCacheAfterRequests => {
+            let requests = parse_config_u32(&value, key, 1)?;
+            if requests > u32::from(MAX_GATEWAY_CACHE_AFTER_REQUESTS) {
+                return Err(invalid_config_value(key, &value));
+            }
+            update.gateway_cache_admission_cache_after_requests = Some(requests as u8);
+        }
+        ConfigKey::GatewayCacheSqliteTouchWindowSeconds => {
+            update.gateway_cache_sqlite_touch_window_seconds = Some(parse_config_u64(
                 &value,
                 key,
                 1,
@@ -1242,15 +1264,19 @@ impl ConfigKey {
                 .map_or(CurrentConfigValue::Unset, |value| {
                     CurrentConfigValue::Integer(u64::from(value))
                 }),
-            Self::GatewayCacheHitSampleRatio => config
+            Self::GatewayCacheAdmissionWindowSeconds => {
+                optional_u64(config.gateway.cache.admission.window_seconds)
+            }
+            Self::GatewayCacheAdmissionCacheAfterRequests => config
                 .gateway
                 .cache
-                .hit_sample_ratio
+                .admission
+                .cache_after_requests
                 .map_or(CurrentConfigValue::Unset, |value| {
                     CurrentConfigValue::Integer(u64::from(value))
                 }),
-            Self::GatewayCacheAccessUpdateIntervalSeconds => {
-                optional_u64(config.gateway.cache.access_update_interval_seconds)
+            Self::GatewayCacheSqliteTouchWindowSeconds => {
+                optional_u64(config.gateway.cache.sqlite.touch_window_seconds)
             }
             Self::GatewayCacheSqliteCacheSizeKib => {
                 optional_u64(config.gateway.cache.sqlite.cache_size_kib)
@@ -4798,6 +4824,7 @@ mod tests {
             Some("proxy"),
             Some("gateway"),
             Some("gateway.cache"),
+            Some("gateway.cache.admission"),
             Some("gateway.cache.sqlite"),
             Some("gateway.logging"),
             Some("gateway.http.timeouts"),
@@ -4823,8 +4850,9 @@ mod tests {
             ("gateway.metrics.per-host", "false"),
             ("gateway.cache.max-size-bytes", "1073741824"),
             ("gateway.cache.low-water-percent", "90"),
-            ("gateway.cache.hit-sample-ratio", "32"),
-            ("gateway.cache.access-update-interval-seconds", "300"),
+            ("gateway.cache.admission.window-seconds", "300"),
+            ("gateway.cache.admission.cache-after-requests", "3"),
+            ("gateway.cache.sqlite.touch-window-seconds", "300"),
             ("gateway.cache.sqlite.cache-size-kib", "8192"),
             ("gateway.cache.sqlite.mmap-size-bytes", "268435456"),
             ("gateway.cache.sqlite.read-connections", "4"),

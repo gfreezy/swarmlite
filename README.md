@@ -507,9 +507,11 @@ matching `GET` response. CONNECT, protocol upgrades, range and conditional reque
 does not affect cache eligibility or key identity, and response `Cache-Control` directives are
 ignored. Concurrent misses for one key share a single origin request. SQLite failures fail open to
 the origin. Each Gateway limits the logical cached response payload to 1 GiB by default; use the
-cluster-level `gateway.cache.max-size-bytes` setting to change it. It samples cache hits,
-deduplicates recent touches with a small Bloom filter, and asynchronously updates a separate SQLite
-access table so LRU tracking does not rewrite rows containing response bodies. Expired entries are
+cluster-level `gateway.cache.max-size-bytes` setting to change it. By default, an uncached key is
+stored on its third request within a five-minute admission window. The dynamic admission filter
+uses one 64 KiB Bloom-filter level per preceding request, up to eight requests. Cached hits are
+deduplicated with a separate Bloom filter and asynchronously update a SQLite access table so LRU
+tracking does not rewrite rows containing response bodies. Expired entries are
 removed first; capacity pressure then evicts approximately least-recently-used entries to a 90%
 low-water mark. Capacity-rejected writes use an in-memory logical-usage check before starting a
 SQLite transaction. Read connections map at most 256 MiB of pages by default to reduce random-read system calls.
@@ -706,6 +708,8 @@ Mutable cluster settings use dotted scopes. Optional settings are omitted until 
 explicit `0` or `false` remains distinct from an unset value. Clear a value with
 `swarmlite config unset KEY`; optional Proxy and Caddy settings become unset, while clearing
 `gateway.image`, `gateway.listen`, or a deployment setting restores the Swarmlite default.
+Unknown fields found while loading persisted cluster settings are ignored and disappear on the
+next save; CLI keys and supported values remain validated by both the CLI and Controller.
 
 Configuration discovery combines Docker-style command help with scoped, `kubectl explain`-style
 details:
@@ -722,6 +726,7 @@ swarmlite config explain
 swarmlite config explain proxy
 swarmlite config explain gateway.logging
 swarmlite config explain gateway.cache
+swarmlite config explain gateway.cache.admission
 swarmlite config explain gateway.cache.sqlite
 swarmlite config explain gateway.http.timeouts
 swarmlite config explain gateway.logging.access.format
@@ -747,8 +752,9 @@ one segment use `-`. Invalid values report the applicable enum candidates or num
 | `gateway.metrics.per-host` | `true`/`false` | Host-labelled metrics; high-cardinality hosts can consume more memory |
 | `gateway.cache.max-size-bytes` | positive integer | Logical response-cache capacity per Gateway; default 1 GiB |
 | `gateway.cache.low-water-percent` | `1`–`99` | Target usage after LRU eviction; default 90% |
-| `gateway.cache.hit-sample-ratio` | positive integer | Sample one in N hits for LRU metadata; default 32 |
-| `gateway.cache.access-update-interval-seconds` | positive integer | Minimum persisted access-update interval; default 300 seconds |
+| `gateway.cache.admission.window-seconds` | positive integer | Window for tracking uncached request frequency; default 300 seconds |
+| `gateway.cache.admission.cache-after-requests` | `1`–`8` | Cache on this request number within the admission window; default 3 |
+| `gateway.cache.sqlite.touch-window-seconds` | positive integer | Persist at most one LRU access update per cache entry in this window; default 300 seconds |
 | `gateway.cache.sqlite.cache-size-kib` | non-negative integer | SQLite page cache per connection; `0` uses SQLite default |
 | `gateway.cache.sqlite.mmap-size-bytes` | non-negative integer | SQLite mmap limit per read connection; default 256 MiB, `0` disables mmap |
 | `gateway.cache.sqlite.read-connections` | `1`–`16` | Query-only SQLite reader pool; default 4 |
@@ -777,6 +783,9 @@ swarmlite config set agent.image-prune.interval-seconds 86400
 swarmlite config set gateway.metrics.enabled true
 swarmlite config set gateway.cache.max-size-bytes 2147483648
 swarmlite config set gateway.cache.low-water-percent 85
+swarmlite config set gateway.cache.admission.window-seconds 300
+swarmlite config set gateway.cache.admission.cache-after-requests 3
+swarmlite config set gateway.cache.sqlite.touch-window-seconds 300
 swarmlite config set gateway.cache.sqlite.mmap-size-bytes 268435456
 swarmlite config set gateway.logging.access.enabled true
 swarmlite config set gateway.logging.access.format json
