@@ -153,5 +153,35 @@ fn unix_ms() -> i64 {
         .as_millis() as i64
 }
 
+fn image_proxy_config(
+    config: &crate::model::ClusterProxyConfig,
+) -> anyhow::Result<swarmlite_registry::OutboundProxyConfig> {
+    for value in [
+        config.http.as_deref(),
+        config.https.as_deref(),
+        config.all.as_deref(),
+        config.no_proxy.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if value.is_empty()
+            || value.len() > 16 * 1024
+            || value.trim() != value
+            || value.chars().any(char::is_control)
+        {
+            anyhow::bail!(
+                "proxy values must contain 1 to 16384 bytes without control characters or surrounding whitespace"
+            );
+        }
+    }
+    swarmlite_registry::OutboundProxyConfig::new(
+        config.http.clone(),
+        config.https.clone(),
+        config.all.clone(),
+        config.no_proxy.clone(),
+    )
+}
+
 #[cfg(test)]
 mod tests;

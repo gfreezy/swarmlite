@@ -1422,6 +1422,7 @@ mod tests {
             cluster_id: "test".into(),
             controller_id: "controller-a".into(),
             controller_port: crate::config::DEFAULT_CONTROLLER_PORT,
+            proxy: Default::default(),
             gateway: Default::default(),
             deployment: Default::default(),
         };
@@ -1508,6 +1509,7 @@ mod tests {
             cluster_id: "cluster-old".into(),
             controller_id: "controller-a".into(),
             controller_port: crate::config::DEFAULT_CONTROLLER_PORT,
+            proxy: Default::default(),
             gateway: Default::default(),
             deployment: Default::default(),
         };
@@ -1625,6 +1627,7 @@ mod tests {
             cluster_id: "test".into(),
             controller_id: "controller-a".into(),
             controller_port: 18080,
+            proxy: Default::default(),
             gateway: Default::default(),
             deployment: Default::default(),
         };
@@ -1675,6 +1678,7 @@ mod tests {
                 cluster_id: "other".into(),
                 controller_id: "controller-b".into(),
                 controller_port: 18080,
+                proxy: Default::default(),
                 gateway: Default::default(),
                 deployment: Default::default(),
             },
@@ -1707,6 +1711,7 @@ mod tests {
             cluster_id: "existing-controller".into(),
             controller_id: "controller-a".into(),
             controller_port: 18080,
+            proxy: Default::default(),
             gateway: Default::default(),
             deployment: Default::default(),
         };
@@ -1742,6 +1747,7 @@ mod tests {
             cluster_id: "recover-test".into(),
             controller_id: "controller-a".into(),
             controller_port: 18081,
+            proxy: Default::default(),
             gateway: Default::default(),
             deployment: Default::default(),
         };
@@ -1813,6 +1819,7 @@ mod tests {
             cluster_id: "joined-test".into(),
             controller_id: "controller-a".into(),
             controller_port: 18080,
+            proxy: Default::default(),
             gateway: Default::default(),
             deployment: Default::default(),
         };
@@ -1874,6 +1881,7 @@ mod tests {
             cluster_id: "rejoined-test".into(),
             controller_id: "controller-a".into(),
             controller_port: 18082,
+            proxy: Default::default(),
             gateway: Default::default(),
             deployment: Default::default(),
         };
@@ -1956,6 +1964,7 @@ mod tests {
                         cluster_id: "unsupported-test".into(),
                         controller_id: "controller-a".into(),
                         controller_port: crate::config::DEFAULT_CONTROLLER_PORT,
+                        proxy: Default::default(),
                         gateway: Default::default(),
                         deployment: Default::default(),
                     },

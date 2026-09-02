@@ -24,6 +24,7 @@ fn test_cluster(id: &str) -> ClusterSettings {
         cluster_id: id.into(),
         controller_id: "controller-a".into(),
         controller_port: DEFAULT_CONTROLLER_PORT,
+        proxy: Default::default(),
         gateway: ClusterGatewayConfig::default(),
         deployment: Default::default(),
     }
@@ -2373,6 +2374,62 @@ async fn deployment_policy_updates_are_validated_and_persisted() {
             .await,
         Err(ControllerError::Invalid(message)) if message.contains("greater than zero")
     ));
+}
+
+#[tokio::test]
+async fn proxy_configuration_is_validated_persisted_and_hot_reloaded() {
+    let (controller, repository, _directory) = test_controller("proxy-config-test").await;
+    assert_eq!(
+        controller.image_registry.ping().headers()["x-swarmlite-image-proxy"],
+        "disabled"
+    );
+
+    let updated = controller
+        .update_cluster_config(ClusterConfigUpdate {
+            proxy_all: Some("socks5h://127.0.0.1:1080".into()),
+            proxy_no_proxy: Some("localhost,.internal.example.com".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        updated.config.proxy.all.as_deref(),
+        Some("socks5h://127.0.0.1:1080")
+    );
+    assert_eq!(
+        repository.load().await.unwrap().cluster.proxy,
+        updated.config.proxy
+    );
+    assert_eq!(
+        controller.image_registry.ping().headers()["x-swarmlite-image-proxy"],
+        "enabled"
+    );
+
+    assert!(matches!(
+        controller
+            .update_cluster_config(ClusterConfigUpdate {
+                proxy_https: Some("ftp://proxy.example.com:21".into()),
+                ..Default::default()
+            })
+            .await,
+        Err(ControllerError::Invalid(message)) if message.contains("invalid proxy configuration")
+    ));
+
+    let cleared = controller
+        .update_cluster_config(ClusterConfigUpdate {
+            unset: BTreeSet::from([
+                ClusterConfigField::ProxyAll,
+                ClusterConfigField::ProxyNoProxy,
+            ]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(cleared.config.proxy.is_empty());
+    assert_eq!(
+        controller.image_registry.ping().headers()["x-swarmlite-image-proxy"],
+        "disabled"
+    );
 }
 
 #[tokio::test]

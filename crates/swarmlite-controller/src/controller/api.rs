@@ -934,6 +934,7 @@ configs:
                 cluster_id: "config-api-test".into(),
                 controller_id: "controller-test".into(),
                 controller_port: crate::config::DEFAULT_CONTROLLER_PORT,
+                proxy: Default::default(),
                 gateway: ClusterGatewayConfig::default(),
                 deployment: Default::default(),
             },

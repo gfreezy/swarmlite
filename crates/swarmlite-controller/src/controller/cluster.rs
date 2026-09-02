@@ -22,6 +22,13 @@ impl Controller {
             ));
         }
         let conflicts_with_unset = [
+            (update.proxy_http.is_some(), ClusterConfigField::ProxyHttp),
+            (update.proxy_https.is_some(), ClusterConfigField::ProxyHttps),
+            (update.proxy_all.is_some(), ClusterConfigField::ProxyAll),
+            (
+                update.proxy_no_proxy.is_some(),
+                ClusterConfigField::ProxyNoProxy,
+            ),
             (
                 update.gateway_image.is_some(),
                 ClusterConfigField::GatewayImage,
@@ -182,6 +189,10 @@ impl Controller {
 
         for field in &update.unset {
             match field {
+                ClusterConfigField::ProxyHttp => cluster.proxy.http = None,
+                ClusterConfigField::ProxyHttps => cluster.proxy.https = None,
+                ClusterConfigField::ProxyAll => cluster.proxy.all = None,
+                ClusterConfigField::ProxyNoProxy => cluster.proxy.no_proxy = None,
                 ClusterConfigField::GatewayImage => {
                     cluster.gateway.image.clone_from(&gateway_defaults.image);
                     cluster.gateway.managed_image = true;
@@ -285,6 +296,18 @@ impl Controller {
             }
         }
 
+        if let Some(value) = update.proxy_http {
+            cluster.proxy.http = Some(value);
+        }
+        if let Some(value) = update.proxy_https {
+            cluster.proxy.https = Some(value);
+        }
+        if let Some(value) = update.proxy_all {
+            cluster.proxy.all = Some(value);
+        }
+        if let Some(value) = update.proxy_no_proxy {
+            cluster.proxy.no_proxy = Some(value);
+        }
         if let Some(image) = update.gateway_image {
             cluster.gateway.image = image;
             cluster.gateway.managed_image = false;
@@ -526,6 +549,10 @@ impl Controller {
                 "deployment.image-pull.initial-backoff-seconds cannot exceed deployment.image-pull.max-backoff-seconds".into(),
             ));
         }
+        let proxy = image_proxy_config(&cluster.proxy).map_err(|error| {
+            ControllerError::Invalid(format!("invalid proxy configuration: {error:#}"))
+        })?;
+        let proxy_changed = cluster.proxy != previous_cluster.proxy;
         let changed = cluster != previous_cluster;
 
         if changed {
@@ -533,6 +560,9 @@ impl Controller {
             if let Err(error) = self.commit_locked(&mut inner).await {
                 inner.cluster = previous_cluster;
                 return Err(error.into());
+            }
+            if proxy_changed {
+                self.image_registry.set_proxy(proxy);
             }
             info!("updated cluster configuration");
         }

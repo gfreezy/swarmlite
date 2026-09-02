@@ -204,8 +204,17 @@ trap 'exit 1' HUP INT TERM
 download() {
     download_name="$1"
     log "downloading $download_name"
-    curl --fail --location --silent --show-error --retry 3 \
-        "$release_url/$download_name" --output "$install_tmp/$download_name"
+    if curl --fail --location --silent --show-error --retry 3 \
+        "$release_url/$download_name" --output "$install_tmp/$download_name"; then
+        return
+    fi
+    if [ -n "${http_proxy:-}${HTTP_PROXY:-}${https_proxy:-}${HTTPS_PROXY:-}${all_proxy:-}${ALL_PROXY:-}" ]; then
+        log "proxy download failed; retrying $download_name directly"
+        curl --fail --location --silent --show-error --retry 3 --proxy "" \
+            "$release_url/$download_name" --output "$install_tmp/$download_name"
+        return
+    fi
+    return 1
 }
 
 download "$archive"

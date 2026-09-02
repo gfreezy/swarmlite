@@ -6,19 +6,24 @@ impl Controller {
         token: String,
         repository: StateRepository,
     ) -> Result<Self, StorageError> {
+        let mut versioned = repository.initialize_with_cluster(&config.cluster).await?;
+        let proxy = image_proxy_config(&versioned.cluster.proxy).map_err(|error| {
+            StorageError::Backend(format!(
+                "failed to configure image registry proxy: {error:#}"
+            ))
+        })?;
         let registry_config =
-            swarmlite_registry::RegistryServiceConfig::new(config.image_cache_dir.clone())
+            swarmlite_registry::RegistryServiceConfig::new(config.image_cache_dir.clone(), proxy)
                 .map_err(|error| {
-                    StorageError::Backend(format!(
-                        "failed to configure image registry proxy: {error:#}"
-                    ))
-                })?;
+                StorageError::Backend(format!(
+                    "failed to configure image registry proxy: {error:#}"
+                ))
+            })?;
         let image_registry = swarmlite_registry::RegistryService::new(registry_config)
             .await
             .map_err(|error| {
                 StorageError::Backend(format!("failed to initialize image registry: {error:#}"))
             })?;
-        let mut versioned = repository.initialize_with_cluster(&config.cluster).await?;
         let kv_repository = repository.kv_repository();
         let controller_id = config.cluster.controller_id.clone();
         let live_nodes = versioned

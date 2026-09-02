@@ -1,4 +1,8 @@
-use std::{io::SeekFrom, path::PathBuf};
+use std::{
+    io::SeekFrom,
+    path::PathBuf,
+    sync::{Arc, RwLock},
+};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -44,10 +48,10 @@ pub struct RegistryServiceConfig {
 }
 
 impl RegistryServiceConfig {
-    pub fn new(cache_root: PathBuf) -> Result<Self> {
+    pub fn new(cache_root: PathBuf, proxy: OutboundProxyConfig) -> Result<Self> {
         Ok(Self {
             cache: RegistryCacheConfig::new(cache_root),
-            proxy: OutboundProxyConfig::from_env()?,
+            proxy,
         })
     }
 }
@@ -55,15 +59,19 @@ impl RegistryServiceConfig {
 #[derive(Clone)]
 pub struct RegistryService {
     cache: RegistryCache,
-    proxy: OutboundProxyConfig,
+    proxy: Arc<RwLock<OutboundProxyConfig>>,
 }
 
 impl RegistryService {
     pub async fn new(config: RegistryServiceConfig) -> Result<Self> {
         Ok(Self {
             cache: RegistryCache::open(config.cache).await?,
-            proxy: config.proxy,
+            proxy: Arc::new(RwLock::new(config.proxy)),
         })
+    }
+
+    pub fn set_proxy(&self, proxy: OutboundProxyConfig) {
+        *self.proxy.write().expect("image proxy lock poisoned") = proxy;
     }
 
     pub fn ping(&self) -> Response {
@@ -74,11 +82,18 @@ impl RegistryService {
         );
         response.headers_mut().insert(
             "x-swarmlite-image-proxy",
-            HeaderValue::from_static(if self.proxy.enabled() {
-                "enabled"
-            } else {
-                "disabled"
-            }),
+            HeaderValue::from_static(
+                if self
+                    .proxy
+                    .read()
+                    .expect("image proxy lock poisoned")
+                    .enabled()
+                {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+            ),
         );
         response
     }
@@ -156,10 +171,15 @@ impl RegistryService {
     }
 
     fn client(&self) -> Result<Client> {
+        let proxy = self
+            .proxy
+            .read()
+            .expect("image proxy lock poisoned")
+            .clone();
         Client::try_from(ClientConfig {
-            http_proxy: self.proxy.http_proxy_url().map(ToOwned::to_owned),
-            https_proxy: self.proxy.https_proxy_url().map(ToOwned::to_owned),
-            no_proxy: self.proxy.no_proxy().map(ToOwned::to_owned),
+            http_proxy: proxy.http_proxy_url().map(ToOwned::to_owned),
+            https_proxy: proxy.https_proxy_url().map(ToOwned::to_owned),
+            no_proxy: proxy.no_proxy().map(ToOwned::to_owned),
             ..Default::default()
         })
         .context("invalid Controller image proxy configuration")

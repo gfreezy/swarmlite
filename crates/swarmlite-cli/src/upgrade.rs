@@ -1,13 +1,21 @@
+use std::path::PathBuf;
+
 use anyhow::{Context, Result, bail};
 use swarmlite_registry::OutboundProxyConfig;
 use tokio::io::AsyncWriteExt;
 
-use super::{ansi, stderr_color};
+use super::{ansi, connection, stderr_color};
+use crate::swarmlite::{
+    config::{InstalledNodeConfig, SYSTEM_CONFIG_PATH},
+    model::ClusterConfigResponse,
+    node,
+};
 
 const RELEASES_URL: &str = "https://github.com/gfreezy/swarmlite/releases";
 const MAX_INSTALLER_BYTES: u64 = 1024 * 1024;
 
-pub(super) async fn run(version: &str) -> Result<()> {
+pub(super) async fn run(version: &str, requested_data_dir: Option<PathBuf>) -> Result<()> {
+    let proxy = upgrade_proxy(requested_data_dir).await?;
     let installer_url = installer_url(version)?;
     eprintln!(
         "{}",
@@ -18,7 +26,7 @@ pub(super) async fn run(version: &str) -> Result<()> {
         )
     );
 
-    let response = download(&installer_url).await?;
+    let response = download(&installer_url, &proxy).await?;
 
     if response
         .content_length()
@@ -35,9 +43,26 @@ pub(super) async fn run(version: &str) -> Result<()> {
         bail!("refusing to run an installer larger than {MAX_INSTALLER_BYTES} bytes");
     }
 
-    let mut child = tokio::process::Command::new("sh")
+    let mut command = tokio::process::Command::new("sh");
+    command
         .args(["-s", "--", "--version", version])
-        .stdin(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::piped());
+    for name in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ] {
+        command.env_remove(name);
+    }
+    for (name, value) in proxy.environment_variables() {
+        command.env(name, value);
+    }
+    let mut child = command
         .spawn()
         .context("failed to start the Swarmlite installer with sh")?;
     let mut stdin = child
@@ -60,22 +85,49 @@ pub(super) async fn run(version: &str) -> Result<()> {
     Ok(())
 }
 
-async fn download(url: &str) -> Result<reqwest::Response> {
-    let proxy = match OutboundProxyConfig::from_env() {
-        Ok(proxy) => proxy,
-        Err(error) => {
-            eprintln!(
-                "Swarmlite proxy configuration is invalid ({error}); retrying the upgrade download directly"
-            );
-            return direct_download(url).await;
-        }
+async fn upgrade_proxy(requested_data_dir: Option<PathBuf>) -> Result<OutboundProxyConfig> {
+    let environment = OutboundProxyConfig::from_env()
+        .context("invalid HTTP_PROXY/HTTPS_PROXY/ALL_PROXY environment")?;
+    if environment.enabled() {
+        eprintln!("using proxy settings from the process environment");
+        return Ok(environment);
+    }
+
+    let Some(controller) = controller_proxy(requested_data_dir).await else {
+        return Ok(environment);
     };
+    if controller.enabled() {
+        eprintln!("using proxy settings from the Swarmlite Controller");
+        Ok(controller)
+    } else {
+        Ok(environment)
+    }
+}
+
+async fn controller_proxy(requested_data_dir: Option<PathBuf>) -> Option<OutboundProxyConfig> {
+    let installed = InstalledNodeConfig::load_if_exists(SYSTEM_CONFIG_PATH).ok()?;
+    let data_dir = node::resolve_data_dir(requested_data_dir.or(installed.data_dir)).ok()?;
+    let controller = connection::resolve(&data_dir, None, None).await.ok()?;
+    let response = controller
+        .get_json::<ClusterConfigResponse>("/v1/config")
+        .await
+        .ok()?;
+    OutboundProxyConfig::new(
+        response.config.proxy.http,
+        response.config.proxy.https,
+        response.config.proxy.all,
+        response.config.proxy.no_proxy,
+    )
+    .ok()
+}
+
+async fn download(url: &str, proxy: &OutboundProxyConfig) -> Result<reqwest::Response> {
     if proxy.enabled() {
-        let response = match proxy_client(&proxy) {
+        let response = match proxy_client(proxy) {
             Ok(client) => client.get(url).send().await,
             Err(error) => {
                 eprintln!(
-                    "Swarmlite proxy configuration is invalid ({error}); retrying the upgrade download directly"
+                    "proxy configuration is invalid ({error}); retrying the upgrade download directly"
                 );
                 return direct_download(url).await;
             }
@@ -84,7 +136,7 @@ async fn download(url: &str) -> Result<reqwest::Response> {
             Ok(response) if response.status().is_success() => return Ok(response),
             Ok(response) if proxy_failure_status(response.status()) => {
                 eprintln!(
-                    "Swarmlite proxy returned HTTP {}; retrying the upgrade download directly",
+                    "proxy returned HTTP {}; retrying the upgrade download directly",
                     response.status()
                 );
             }
@@ -94,9 +146,7 @@ async fn download(url: &str) -> Result<reqwest::Response> {
                     .with_context(|| format!("failed to download installer from {url}"));
             }
             Err(error) => {
-                eprintln!(
-                    "Swarmlite proxy could not download the upgrade ({error}); retrying directly"
-                );
+                eprintln!("proxy could not download the upgrade ({error}); retrying directly");
             }
         }
     }

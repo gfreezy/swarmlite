@@ -1925,6 +1925,7 @@ mod tests {
             cluster_id: "cluster-test".into(),
             controller_id: "controller-a".into(),
             controller_port: crate::config::DEFAULT_CONTROLLER_PORT,
+            proxy: Default::default(),
             gateway: ClusterGatewayConfig::default(),
             deployment: Default::default(),
         }

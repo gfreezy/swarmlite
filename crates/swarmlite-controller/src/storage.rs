@@ -777,6 +777,7 @@ mod tests {
             cluster_id: "storage-test".into(),
             controller_id: "controller-node".into(),
             controller_port: 19090,
+            proxy: Default::default(),
             gateway: ClusterGatewayConfig::default(),
             deployment: Default::default(),
         }

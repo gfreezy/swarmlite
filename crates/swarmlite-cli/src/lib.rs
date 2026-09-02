@@ -483,6 +483,46 @@ macro_rules! define_config_keys {
 }
 
 define_config_keys! {
+    ProxyHttp => {
+        key: "proxy.http",
+        field: ClusterConfigField::ProxyHttp,
+        type: "string",
+        values: None,
+        constraints: "absolute http, https, socks5, or socks5h proxy URL without surrounding whitespace",
+        default: "unset; direct HTTP connections unless proxy.all is set",
+        description: "Proxy used by the Controller for HTTP destinations.",
+        apply: "Controller hot reload"
+    },
+    ProxyHttps => {
+        key: "proxy.https",
+        field: ClusterConfigField::ProxyHttps,
+        type: "string",
+        values: None,
+        constraints: "absolute http, https, socks5, or socks5h proxy URL without surrounding whitespace",
+        default: "unset; direct HTTPS connections unless proxy.all is set",
+        description: "Proxy used by the Controller for HTTPS destinations.",
+        apply: "Controller hot reload"
+    },
+    ProxyAll => {
+        key: "proxy.all",
+        field: ClusterConfigField::ProxyAll,
+        type: "string",
+        values: None,
+        constraints: "absolute http, https, socks5, or socks5h proxy URL without surrounding whitespace",
+        default: "unset",
+        description: "Fallback proxy used when the destination protocol has no specific proxy.",
+        apply: "Controller hot reload"
+    },
+    ProxyNoProxy => {
+        key: "proxy.no-proxy",
+        field: ClusterConfigField::ProxyNoProxy,
+        type: "string",
+        values: None,
+        constraints: "non-empty comma-separated bypass list without control characters or surrounding whitespace; at most 16384 bytes",
+        default: "unset",
+        description: "Hosts and address ranges that bypass the configured proxies.",
+        apply: "Controller hot reload"
+    },
     GatewayImage => {
         key: "gateway.image",
         field: ClusterConfigField::GatewayImage,
@@ -808,6 +848,22 @@ define_config_keys! {
 fn config_set_update(key: ConfigKey, value: String) -> Result<ClusterConfigUpdate> {
     let mut update = ClusterConfigUpdate::default();
     match key {
+        ConfigKey::ProxyHttp => {
+            validate_proxy_config_value(key, &value, Some(ProxyKind::Http))?;
+            update.proxy_http = Some(value);
+        }
+        ConfigKey::ProxyHttps => {
+            validate_proxy_config_value(key, &value, Some(ProxyKind::Https))?;
+            update.proxy_https = Some(value);
+        }
+        ConfigKey::ProxyAll => {
+            validate_proxy_config_value(key, &value, Some(ProxyKind::All))?;
+            update.proxy_all = Some(value);
+        }
+        ConfigKey::ProxyNoProxy => {
+            validate_proxy_config_value(key, &value, None)?;
+            update.proxy_no_proxy = Some(value);
+        }
         ConfigKey::GatewayImage => {
             if !valid_gateway_image(&value) {
                 return Err(invalid_config_value(key, &value));
@@ -1010,6 +1066,38 @@ fn config_set_update(key: ConfigKey, value: String) -> Result<ClusterConfigUpdat
     Ok(update)
 }
 
+#[derive(Clone, Copy)]
+enum ProxyKind {
+    Http,
+    Https,
+    All,
+}
+
+fn validate_proxy_config_value(key: ConfigKey, value: &str, kind: Option<ProxyKind>) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 16 * 1024
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return Err(invalid_config_value(key, value));
+    }
+    let result = match kind {
+        Some(ProxyKind::Http) => {
+            swarmlite_registry::OutboundProxyConfig::new(Some(value.to_owned()), None, None, None)
+        }
+        Some(ProxyKind::Https) => {
+            swarmlite_registry::OutboundProxyConfig::new(None, Some(value.to_owned()), None, None)
+        }
+        Some(ProxyKind::All) => {
+            swarmlite_registry::OutboundProxyConfig::new(None, None, Some(value.to_owned()), None)
+        }
+        None => return Ok(()),
+    };
+    result
+        .map(|_| ())
+        .map_err(|_| invalid_config_value(key, value))
+}
+
 fn invalid_config_value(key: ConfigKey, value: &str) -> anyhow::Error {
     let metadata = key.metadata();
     anyhow::anyhow!(
@@ -1089,6 +1177,26 @@ impl ConfigKey {
             value.map_or(CurrentConfigValue::Unset, CurrentConfigValue::Integer)
         };
         match self {
+            Self::ProxyHttp => config
+                .proxy
+                .http
+                .clone()
+                .map_or(CurrentConfigValue::Unset, CurrentConfigValue::String),
+            Self::ProxyHttps => config
+                .proxy
+                .https
+                .clone()
+                .map_or(CurrentConfigValue::Unset, CurrentConfigValue::String),
+            Self::ProxyAll => config
+                .proxy
+                .all
+                .clone()
+                .map_or(CurrentConfigValue::Unset, CurrentConfigValue::String),
+            Self::ProxyNoProxy => config
+                .proxy
+                .no_proxy
+                .clone()
+                .map_or(CurrentConfigValue::Unset, CurrentConfigValue::String),
             Self::GatewayImage => CurrentConfigValue::String(config.gateway.image.clone()),
             Self::GatewayListen => CurrentConfigValue::List(config.gateway.listen.clone()),
             Self::GatewayMetricsEnabled => optional_bool(config.gateway.metrics.enabled),
@@ -1396,7 +1504,7 @@ async fn run() -> Result<()> {
         .init();
 
     if let Command::Upgrade { version } = &cli.command {
-        return upgrade::run(version).await;
+        return upgrade::run(version, cli.data_dir.clone()).await;
     }
     let installed = InstalledNodeConfig::load_if_exists(SYSTEM_CONFIG_PATH)?;
     let data_dir = node::resolve_data_dir(cli.data_dir.or_else(|| installed.data_dir.clone()))?;
@@ -1410,6 +1518,7 @@ async fn run() -> Result<()> {
                 cluster_id: node::new_cluster_id(),
                 controller_id: String::new(),
                 controller_port: options.controller_port,
+                proxy: Default::default(),
                 gateway: ClusterGatewayConfig {
                     listen: options.gateway_listen.clone(),
                     image: options
@@ -4652,6 +4761,7 @@ mod tests {
         assert!(Cli::try_parse_from(["swarmlite", "config", "get", "gateway-image"]).is_err());
         for target in [
             None,
+            Some("proxy"),
             Some("gateway"),
             Some("gateway.cache"),
             Some("gateway.cache.sqlite"),
@@ -4669,6 +4779,10 @@ mod tests {
     fn config_set_accepts_key_value_arguments() {
         assert!(Cli::try_parse_from(["swarmlite", "config", "set", "mode", "ha"]).is_err());
         for (key, value) in [
+            ("proxy.http", "http://proxy.example.com:3128"),
+            ("proxy.https", "https://proxy.example.com:3129"),
+            ("proxy.all", "socks5h://proxy.example.com:1080"),
+            ("proxy.no-proxy", "localhost,.internal.example.com"),
             ("gateway.image", "ghcr.io/example/caddy:v1"),
             ("gateway.listen", ":80,:443"),
             ("gateway.metrics.enabled", "true"),
@@ -4759,6 +4873,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(paths.len(), ConfigKey::ALL.len());
         assert!(ConfigKey::from_path("gateway.metrics.enabled").is_some());
+        assert!(ConfigKey::from_path("proxy.all").is_some());
         assert!(ConfigKey::from_path("gateway.cache.max-size-bytes").is_some());
         assert!(ConfigKey::from_path("gateway.cache.sqlite.mmap-size-bytes").is_some());
         assert!(ConfigKey::from_path("gateway-metrics-enabled").is_none());
@@ -4770,6 +4885,10 @@ mod tests {
         gateway.metrics.enabled = Some(false);
         gateway.cache.max_size_bytes = Some(2_147_483_648);
         gateway.http.timeouts.read_header_seconds = Some(0);
+        let proxy = crate::swarmlite::model::ClusterProxyConfig {
+            all: Some("socks5h://proxy.example.com:1080".into()),
+            ..Default::default()
+        };
         let response = ClusterConfigResponse {
             generation: 9,
             config: ClusterSettings {
@@ -4777,6 +4896,7 @@ mod tests {
                 cluster_id: "cluster-a".into(),
                 controller_id: "node-a".into(),
                 controller_port: 17080,
+                proxy,
                 gateway,
                 deployment: Default::default(),
             },
@@ -4800,6 +4920,10 @@ mod tests {
             values.values["gateway.metrics.per-host"],
             serde_json::Value::Null
         );
+        assert_eq!(
+            values.values["proxy.all"],
+            serde_json::json!("socks5h://proxy.example.com:1080")
+        );
         assert_eq!(values.values.len(), ConfigKey::ALL.len());
     }
 
@@ -4813,6 +4937,7 @@ mod tests {
             cluster_id: "cluster-a".into(),
             controller_id: "node-a".into(),
             controller_port: 17080,
+            proxy: Default::default(),
             gateway,
             deployment: Default::default(),
         };
@@ -4872,6 +4997,12 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(low_water_error.contains("1..=99 percent"));
+
+        let proxy_error =
+            config_set_update(ConfigKey::ProxyAll, "ftp://proxy.example.com:21".into())
+                .unwrap_err()
+                .to_string();
+        assert!(proxy_error.contains("http, https, socks5, or socks5h"));
     }
 
     #[test]

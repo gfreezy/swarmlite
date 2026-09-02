@@ -439,12 +439,33 @@ pub struct KvLockMutationRequest {
     pub lease_millis: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClusterProxyConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub https: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub all: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_proxy: Option<String>,
+}
+
+impl ClusterProxyConfig {
+    pub fn is_empty(&self) -> bool {
+        self.http.is_none() && self.https.is_none() && self.all.is_none() && self.no_proxy.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClusterSettings {
     pub schema_version: u32,
     pub cluster_id: String,
     pub controller_id: String,
     pub controller_port: u16,
+    #[serde(default, skip_serializing_if = "ClusterProxyConfig::is_empty")]
+    pub proxy: ClusterProxyConfig,
     pub gateway: ClusterGatewayConfig,
     pub deployment: DeploymentPolicy,
 }
@@ -479,6 +500,14 @@ pub struct ClusterConfigResponse {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClusterConfigUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_http: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_https: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_all: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_no_proxy: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway_image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -549,6 +578,14 @@ pub struct ClusterConfigUpdate {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ClusterConfigField {
+    #[serde(rename = "proxy.http")]
+    ProxyHttp,
+    #[serde(rename = "proxy.https")]
+    ProxyHttps,
+    #[serde(rename = "proxy.all")]
+    ProxyAll,
+    #[serde(rename = "proxy.no-proxy")]
+    ProxyNoProxy,
     #[serde(rename = "gateway.image")]
     GatewayImage,
     #[serde(rename = "gateway.listen")]
@@ -1828,6 +1865,25 @@ mod tests {
         };
         assert!(!refresh_managed_gateway_image(&mut custom));
         assert_eq!(custom.image, "registry.example.com/caddy:latest");
+    }
+
+    #[test]
+    fn cluster_settings_without_proxy_remain_compatible() {
+        let expected = ClusterSettings {
+            schema_version: CLUSTER_SCHEMA_VERSION,
+            cluster_id: "cluster-a".into(),
+            controller_id: "controller-a".into(),
+            controller_port: 17_080,
+            proxy: ClusterProxyConfig::default(),
+            gateway: ClusterGatewayConfig::default(),
+            deployment: DeploymentPolicy::default(),
+        };
+        let mut value = serde_json::to_value(&expected).unwrap();
+        value.as_object_mut().unwrap().remove("proxy");
+        assert_eq!(
+            serde_json::from_value::<ClusterSettings>(value).unwrap(),
+            expected
+        );
     }
 
     #[test]

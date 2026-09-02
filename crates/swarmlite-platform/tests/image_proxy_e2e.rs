@@ -144,7 +144,7 @@ async fn run_e2e(docker: &Docker) -> Result<()> {
     let mut proxy = spawn_connect_proxy().await?;
     let registry_config = RegistryServiceConfig {
         cache: RegistryCacheConfig::new(cache_root.clone()),
-        proxy: OutboundProxyConfig::new(Some(proxy.url()), None, None, None)?,
+        proxy: OutboundProxyConfig::new(None, None, Some(proxy.url()), None)?,
     };
     let registry = Arc::new(RegistryService::new(registry_config).await?);
     let controller = spawn_controller(registry.clone()).await?;

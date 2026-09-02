@@ -289,6 +289,8 @@ Stack file. Keep that file private and never commit real credentials. Registry c
 stored in protected Controller and Agent state; they are omitted from status and Service
 specifications.
 
+### Image proxy
+
 When an image proxy is configured and can reach the target Registry, image pulls are relayed
 through the Controller without changing Docker or Podman service settings. Before each pull, the
 Agent probes the target manifest through its ephemeral loopback-only Registry relay. A successful
@@ -306,28 +308,34 @@ downloads expire after one hour. There is no size or LRU policy. A cache write f
 to an uncached upstream pull. Node image storage is owned by Docker or Podman; use the runtime's
 normal `image prune` policy when node disk reclamation is required.
 
-Only the Controller needs outbound proxy settings. HTTP and HTTPS destinations can use separate
-HTTP-style proxies; when only `SWARMLITE_HTTP_PROXY` is set, it is also used for HTTPS destinations:
+Only the Controller needs persistent outbound proxy settings. Configure protocol-specific proxies
+independently, or set `proxy.all` as their fallback:
 
 ```bash
-export SWARMLITE_HTTP_PROXY=http://proxy.example.com:3128
-export SWARMLITE_HTTPS_PROXY=http://proxy.example.com:3128
-export SWARMLITE_NO_PROXY=registry.internal.example.com
+sudo swarmlite config set proxy.http http://proxy.example.com:3128
+sudo swarmlite config set proxy.https http://proxy.example.com:3128
+sudo swarmlite config set proxy.no-proxy registry.internal.example.com
 ```
 
-Alternatively, configure one SOCKS5 proxy for both HTTP and HTTPS destinations. `socks5h` is
-recommended so DNS resolution also happens through the proxy:
+HTTP, HTTPS, SOCKS5, and SOCKS5-with-proxy-DNS URLs are accepted. To use one SOCKS proxy for every
+destination, set `proxy.all`; `socks5h` is recommended so DNS resolution also happens through the
+proxy:
 
 ```bash
-export SWARMLITE_SOCKS5_PROXY=socks5h://proxy.example.com:1080
-export SWARMLITE_NO_PROXY=registry.internal.example.com
+sudo swarmlite config set proxy.all socks5h://proxy.example.com:1080
 ```
 
-`SWARMLITE_SOCKS5_PROXY` cannot be combined with `SWARMLITE_HTTP_PROXY` or
-`SWARMLITE_HTTPS_PROXY`. Setting any proxy variable enables probing; `SWARMLITE_NO_PROXY` alone
-does not. `swarmlite upgrade` uses the same settings for its GitHub Release download and retries
-directly when the configured proxy is unavailable. These variables do not modify or restart
-`docker.service` or `podman.service`. A manual
+Changes apply to the Controller image proxy without restarting it. `proxy.http` and `proxy.https`
+override `proxy.all` for their respective destination protocols; `proxy.no-proxy` alone does not
+enable proxying. Clear a value with `swarmlite config unset KEY`.
+
+`swarmlite upgrade` first reads the conventional `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and
+`NO_PROXY` process environment, accepting both uppercase and lowercase names and preferring the
+lowercase value when both cases are set. If no process proxy is configured and the Controller is
+available, the command reads the cluster proxy configuration. It exports the selected values in
+both cases to the installer, so the initial download and the installer's `curl` downloads follow
+the same route. If neither source supplies a proxy, or a selected proxy is unavailable, the
+download retries directly. A manual
 `docker pull ghcr.io/example/api:latest` still contacts the original Registry directly; a later
 `docker run` can reuse the original tag restored by Swarmlite.
 
@@ -651,10 +659,10 @@ After that one-time migration, replacements use the overlapping blue/green path.
 listeners are described in
 [`caddy-storage/README.md`](caddy-storage/README.md).
 
-Gateway and Caddy settings use dotted scopes. Optional settings are omitted until explicitly set;
-an explicit `0` or `false` remains distinct from an unset value. Clear a value with
-`swarmlite config unset KEY` to inherit the Caddy default again. Clearing `gateway.image`,
-`gateway.listen`, or a deployment setting restores the Swarmlite default.
+Mutable cluster settings use dotted scopes. Optional settings are omitted until explicitly set; an
+explicit `0` or `false` remains distinct from an unset value. Clear a value with
+`swarmlite config unset KEY`; optional Proxy and Caddy settings become unset, while clearing
+`gateway.image`, `gateway.listen`, or a deployment setting restores the Swarmlite default.
 
 Configuration discovery combines Docker-style command help with scoped, `kubectl explain`-style
 details:
@@ -668,6 +676,7 @@ swarmlite config get gateway.metrics.enabled
 
 # All keys, a dotted scope, or one key with its current/default/apply details.
 swarmlite config explain
+swarmlite config explain proxy
 swarmlite config explain gateway.logging
 swarmlite config explain gateway.cache
 swarmlite config explain gateway.cache.sqlite
@@ -683,6 +692,10 @@ one segment use `-`. Invalid values report the applicable enum candidates or num
 
 | Key | Value | Effect |
 | --- | --- | --- |
+| `proxy.http` | absolute proxy URL | Controller proxy for HTTP destinations; supports HTTP, HTTPS, SOCKS5, and SOCKS5H URLs |
+| `proxy.https` | absolute proxy URL | Controller proxy for HTTPS destinations; supports HTTP, HTTPS, SOCKS5, and SOCKS5H URLs |
+| `proxy.all` | absolute proxy URL | Fallback Controller proxy for protocols without a specific proxy |
+| `proxy.no-proxy` | comma-separated host/address list | Destinations that bypass configured proxies |
 | `gateway.image` | OCI image reference | Gateway image; replaces the container only when the resolved image digest changes |
 | `gateway.listen` | comma-separated addresses | Published Gateway listeners; loaded through Caddy's Admin API |
 | `gateway.metrics.enabled` | `true`/`false` | HTTP request metrics on the online Gateway's fixed local admin endpoint (`127.0.0.1:2019`) |
