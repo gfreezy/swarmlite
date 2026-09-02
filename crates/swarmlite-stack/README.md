@@ -58,7 +58,7 @@ rejected instead of being silently ignored. The complete supported surface is:
 | `image` | Non-empty image reference; required |
 | `pull_policy` | `always`, `missing` (default), or `never` |
 | `command`, `entrypoint` | String with shell-style word splitting, or string array |
-| `environment` | Scalar map or string array |
+| `environment` | Scalar map or string array; values support the SwarmKit template context |
 | `labels` | Scalar map or string array; attached to task containers |
 | `expose` | Internal target number or `target[/tcp|udp]`; port ranges are not supported |
 | `ports` | Target number, `target[/tcp|udp]`, or long syntax with `target` and optional `protocol`; the container runtime assigns the host port |
@@ -72,6 +72,15 @@ rejected instead of being silently ignored. The complete supported surface is:
 | `deploy.placement.constraints` | Hard `node.id` or `node.labels.*` comparisons using `==` or `!=` |
 | `deploy.placement.max_replicas_per_node` | Non-negative steady-state per-node limit; unset or `0` means unlimited; `start-first` replacements may temporarily exceed it |
 | `deploy.update_config` | `parallelism` and `order: start-first|stop-first` |
+
+Environment templates use SwarmKit's `.Service`, `.Node`, and `.Task` context names and are
+expanded by the Agent immediately before container creation. Only the value after the first `=` is
+expanded, so Stack authors choose literal environment variable names. Supported fields are
+`.Service.ID`, `.Service.Name`, `.Service.Labels`, `.Node.ID`, `.Node.Hostname`,
+`.Node.Platform.Architecture`, `.Node.Platform.OS`, `.Task.ID`, `.Task.Name`, and `.Task.Slot`.
+The `join` function and Go-template features such as `index`, `if`, comparisons, and `printf` are
+available. Service labels come from
+`deploy.labels`, and replica slots are one-based to match SwarmKit.
 
 An internal route may omit `backend.port` when its Service declares exactly one distinct TCP
 target across `expose` and `ports`. A Service with zero or multiple TCP targets requires an

@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 pub use swarmlite_stack::{
     GatewayHttpMode, GatewayTlsMode, HealthcheckSpec, HttpBackend, HttpBackendProtocol,
     HttpPathMatch, HttpPathMatchType, HttpPathRewrite, HttpRouteRule, HttpRouteSpec, PullPolicy,
-    ServiceConfigMount, ServicePort, ServiceSpec, StackGatewaySpec, config_digest,
-    service_spec_hash,
+    ServiceConfigMount, ServicePort, ServiceSpec, StackGatewaySpec, TemplateContext, TemplateNode,
+    config_digest, service_spec_hash,
 };
 
 pub const CLUSTER_SCHEMA_VERSION: u32 = 9;

@@ -10,6 +10,10 @@ services:
       DEBUG: false
       WORKERS: 4
       INHERIT_FROM_HOST:
+      SERVICE_NAME: "{{.Service.Name}}"
+      TASK_INSTANCE: '{{join "-" .Service.Name .Task.Slot}}'
+      NODE_HOSTNAME: "{{.Node.Hostname}}"
+      SERVICE_OWNER: '{{index .Service.Labels "com.example.owner"}}'
     labels:
       com.example.component: api
       com.example.public: true

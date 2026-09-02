@@ -10,11 +10,13 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 mod compose;
+mod template;
 
 pub use compose::{
     ParsedStack, ParsedStackDocument, StackConfigSource, StackRegistryCredential, parse_stack,
     parse_stack_document, resolve_config_digests,
 };
+pub use template::{TemplateContext, TemplateNode};
 
 pub fn validate_stack_name(name: &str) -> Result<()> {
     if name.is_empty()

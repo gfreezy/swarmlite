@@ -322,6 +322,9 @@ pub async fn run(options: ServeOptions) -> Result<()> {
     let agent_config = AgentConfig {
         cluster_id: settings.cluster.cluster_id.clone(),
         node_id: settings.node_id.clone(),
+        hostname: system_hostname(),
+        platform_architecture: std::env::consts::ARCH.to_owned(),
+        platform_os: std::env::consts::OS.to_owned(),
         advertise_address: advertise_address.clone(),
         controller: agent_controller,
         labels: settings.labels.clone(),
@@ -1255,7 +1258,16 @@ fn usable_address(address: IpAddr) -> bool {
 }
 
 fn default_node_id() -> String {
-    let hostname = nonempty_env("HOSTNAME")
+    let hostname = system_hostname();
+    format!(
+        "{}-{}",
+        sanitize_node_id(&hostname),
+        &Uuid::new_v4().simple().to_string()[..8]
+    )
+}
+
+fn system_hostname() -> String {
+    nonempty_env("HOSTNAME")
         .or_else(|| nonempty_env("COMPUTERNAME"))
         .or_else(|| {
             std::fs::read_to_string("/etc/hostname")
@@ -1263,12 +1275,7 @@ fn default_node_id() -> String {
                 .map(|value| value.trim().to_owned())
                 .filter(|value| !value.is_empty())
         })
-        .unwrap_or_else(|| "node".to_owned());
-    format!(
-        "{}-{}",
-        sanitize_node_id(&hostname),
-        &Uuid::new_v4().simple().to_string()[..8]
-    )
+        .unwrap_or_else(|| "node".to_owned())
 }
 
 fn sanitize_node_id(value: &str) -> String {

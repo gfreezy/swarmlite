@@ -44,7 +44,7 @@
         },
         "environment": {
           "$ref": "#/$defs/stringMapOrList",
-          "description": "Environment as a scalar map or a list containing KEY and KEY=value entries. A null map value emits only KEY."
+          "description": "Environment as a scalar map or a list containing KEY and KEY=value entries. Values support the Docker Swarm Go-template context; variable names are literal. A null map value emits only KEY."
         },
         "labels": {
           "$ref": "#/$defs/stringMapOrList",

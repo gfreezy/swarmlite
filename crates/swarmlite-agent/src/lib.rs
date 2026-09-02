@@ -27,8 +27,8 @@ use crate::{
         AgentCommandResult, AgentDataStream, AgentDataStreamOperation,
         CONFIG_GC_GRACE_PERIOD_SECONDS, GatewayReport, HeartbeatResponse, ImageResolutionProgress,
         ImageResolutionReport, ImageResolutionServiceReport, MAX_CONFIG_FILE_BYTES, NodeControl,
-        NodeHeartbeat, NodeRecord, ObservedTaskState, TaskReconcilePhase, TaskReconcileProgress,
-        TaskReconcileReport, TaskReport,
+        NodeHeartbeat, NodeRecord, ObservedTaskState, TaskAssignment, TaskReconcilePhase,
+        TaskReconcileProgress, TaskReconcileReport, TaskReport, TemplateContext, TemplateNode,
     },
     registry::RegistryCredentialStore,
     runtime::{
@@ -153,6 +153,12 @@ async fn run_with_runtime<R: ContainerRuntime>(
     let runtime = Arc::new(runtime);
     let reconcile_runtime = Arc::clone(&runtime);
     let reconcile_cluster_id = config.cluster_id.clone();
+    let reconcile_template_node = TemplateNode {
+        id: config.node_id.clone(),
+        hostname: config.hostname.clone(),
+        platform_architecture: config.platform_architecture.clone(),
+        platform_os: config.platform_os.clone(),
+    };
     let reconcile_client = client.clone();
     let config_cache = ConfigCache::new(config.config_dir.clone());
     tokio::spawn(async move {
@@ -162,6 +168,7 @@ async fn run_with_runtime<R: ContainerRuntime>(
             config_cache,
             assignments_rx,
             reconcile_cluster_id,
+            reconcile_template_node,
             reconciliation_state,
         )
         .await;
@@ -666,6 +673,7 @@ async fn reconciliation_loop<R: ContainerRuntime>(
     config_cache: ConfigCache,
     mut assignments: tokio::sync::watch::Receiver<Option<HeartbeatResponse>>,
     cluster_id: String,
+    template_node: TemplateNode,
     state: ReconciliationState,
 ) {
     let progress = ReconcileProgressPublisher {
@@ -681,6 +689,7 @@ async fn reconciliation_loop<R: ContainerRuntime>(
         client: &client,
         config_cache: &config_cache,
         cluster_id: &cluster_id,
+        template_node: &template_node,
         state: &state,
         progress: &progress,
         image_progress: &image_progress,
@@ -729,6 +738,7 @@ struct ReconcileContext<'a, R> {
     client: &'a ControllerClient,
     config_cache: &'a ConfigCache,
     cluster_id: &'a str,
+    template_node: &'a TemplateNode,
     state: &'a ReconciliationState,
     progress: &'a ReconcileProgressPublisher,
     image_progress: &'a ImageProgressPublisher,
@@ -833,6 +843,7 @@ async fn commit_reconcile_response<R: ContainerRuntime>(
         response,
         Some(context.progress),
         &prepared.config_errors,
+        context.template_node,
     )
     .await;
     publish_reconcile_results(
@@ -1146,13 +1157,52 @@ async fn send_heartbeat(
         .await?)
 }
 
+fn expand_assignment_templates(
+    assignment: &TaskAssignment,
+    node: &TemplateNode,
+) -> Result<TaskAssignment> {
+    let task_slot = (u64::from(assignment.slot) + 1).to_string();
+    let task_name = format!("{}.{}.{}", assignment.service, task_slot, assignment.id);
+    let context = TemplateContext {
+        service_id: &assignment.service_id,
+        service_name: &assignment.service,
+        service_labels: &assignment.spec.service_labels,
+        node,
+        task_id: &assignment.id,
+        task_name: &task_name,
+        task_slot: &task_slot,
+    };
+    let mut expanded = assignment.clone();
+    expanded.spec.environment = context.expand_environment(&assignment.spec.environment)?;
+    Ok(expanded)
+}
+
+#[cfg(test)]
+fn test_template_node() -> TemplateNode {
+    TemplateNode {
+        id: "node-a".into(),
+        hostname: "node-a".into(),
+        platform_architecture: std::env::consts::ARCH.into(),
+        platform_os: std::env::consts::OS.into(),
+    }
+}
+
 #[cfg(test)]
 async fn reconcile_containers<R: ContainerRuntime>(
     runtime: &R,
     existing: &HashMap<String, ManagedContainer>,
     response: &HeartbeatResponse,
 ) -> Vec<TaskReconcileReport> {
-    reconcile_containers_with_progress(runtime, existing, response, None, &HashMap::new()).await
+    let template_node = test_template_node();
+    reconcile_containers_with_progress(
+        runtime,
+        existing,
+        response,
+        None,
+        &HashMap::new(),
+        &template_node,
+    )
+    .await
 }
 
 async fn reconcile_containers_with_progress<R: ContainerRuntime>(
@@ -1161,6 +1211,7 @@ async fn reconcile_containers_with_progress<R: ContainerRuntime>(
     response: &HeartbeatResponse,
     progress: Option<&ReconcileProgressPublisher>,
     config_errors: &HashMap<String, String>,
+    template_node: &TemplateNode,
 ) -> Vec<TaskReconcileReport> {
     let mut reports = Vec::new();
     for removal in &response.remove_tasks {
@@ -1182,31 +1233,49 @@ async fn reconcile_containers_with_progress<R: ContainerRuntime>(
         ));
     }
 
-    for assignment in &response.assignments {
+    for unexpanded_assignment in &response.assignments {
         let reporter = progress.map_or_else(RuntimeTaskProgress::default, |progress| {
-            progress.reporter(&assignment.id, assignment.deployment_generation)
+            progress.reporter(
+                &unexpanded_assignment.id,
+                unexpanded_assignment.deployment_generation,
+            )
         });
-        if assignment.desired == crate::model::DesiredTaskState::Draining {
+        if unexpanded_assignment.desired == crate::model::DesiredTaskState::Draining {
             reporter.report(TaskReconcilePhase::Verify);
             reports.push(reconcile_report(
-                &assignment.id,
-                assignment.deployment_generation,
+                &unexpanded_assignment.id,
+                unexpanded_assignment.deployment_generation,
                 TaskReconcilePhase::Verify,
                 Ok(()),
             ));
             continue;
         }
-        if let Some(message) = config_errors.get(&assignment.id) {
+        if let Some(message) = config_errors.get(&unexpanded_assignment.id) {
             reporter.report(TaskReconcilePhase::Config);
             reports.push(TaskReconcileReport {
-                task_id: assignment.id.clone(),
-                desired_generation: assignment.deployment_generation,
+                task_id: unexpanded_assignment.id.clone(),
+                desired_generation: unexpanded_assignment.deployment_generation,
                 applied_generation: None,
                 phase: TaskReconcilePhase::Config,
                 error: Some(message.clone()),
             });
             continue;
         }
+        let assignment = match expand_assignment_templates(unexpanded_assignment, template_node) {
+            Ok(assignment) => assignment,
+            Err(error) => {
+                reporter.report(TaskReconcilePhase::Config);
+                reports.push(TaskReconcileReport {
+                    task_id: unexpanded_assignment.id.clone(),
+                    desired_generation: unexpanded_assignment.deployment_generation,
+                    applied_generation: None,
+                    phase: TaskReconcilePhase::Config,
+                    error: Some(format!("{error:#}")),
+                });
+                continue;
+            }
+        };
+        let assignment = &assignment;
         let (phase, result) = match existing.get(&assignment.id) {
             Some(container)
                 if container.revision.map_or_else(
@@ -1642,6 +1711,49 @@ mod tests {
     }
 
     #[test]
+    fn expands_stack_environment_templates_with_agent_node_context() {
+        let mut response = task_test_response("task-id");
+        let assignment = &mut response.assignments[0];
+        assignment.slot = 1;
+        assignment
+            .spec
+            .service_labels
+            .insert("tier".into(), "backend".into());
+        assignment.spec.environment = vec![
+            "CUSTOM_SERVICE={{.Service.Name}}".into(),
+            "CUSTOM_SERVICE_ID={{.Service.ID}}".into(),
+            "CUSTOM_TASK={{.Task.ID}}/{{.Task.Name}}/{{.Task.Slot}}".into(),
+            "CUSTOM_NODE={{.Node.ID}}/{{.Node.Hostname}}".into(),
+            "CUSTOM_PLATFORM={{.Node.Platform.OS}}/{{.Node.Platform.Architecture}}".into(),
+            "CUSTOM_LABEL={{index .Service.Labels \"tier\"}}".into(),
+        ];
+        let node = TemplateNode {
+            id: "node-id".into(),
+            hostname: "worker-01".into(),
+            platform_architecture: "aarch64".into(),
+            platform_os: "linux".into(),
+        };
+
+        let expanded = expand_assignment_templates(assignment, &node).unwrap();
+
+        assert_eq!(
+            expanded.spec.environment,
+            [
+                "CUSTOM_SERVICE=web",
+                "CUSTOM_SERVICE_ID=demo.web",
+                "CUSTOM_TASK=task-id/web.2.task-id/2",
+                "CUSTOM_NODE=node-id/worker-01",
+                "CUSTOM_PLATFORM=linux/aarch64",
+                "CUSTOM_LABEL=backend",
+            ]
+        );
+        assert_eq!(
+            assignment.spec.environment[0],
+            "CUSTOM_SERVICE={{.Service.Name}}"
+        );
+    }
+
+    #[test]
     fn gateway_retries_transient_errors_with_backoff_and_port_conflicts_once_per_minute() {
         let now = std::time::Instant::now();
         let transient = GatewayReport {
@@ -1746,6 +1858,7 @@ mod tests {
             ConfigCache::new(directory.path().join("configs")),
             assignments_rx,
             "cluster-test".into(),
+            test_template_node(),
             state,
         ));
 
@@ -2034,6 +2147,7 @@ mod tests {
             &response,
             None,
             &config_errors,
+            &test_template_node(),
         )
         .await;
 

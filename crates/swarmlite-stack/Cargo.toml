@@ -7,6 +7,7 @@ description = "Swarmlite Stack parser, routing validation, and Caddy JSON render
 
 [dependencies]
 anyhow = "1.0"
+gtmpl.workspace = true
 humantime = "2.3"
 regex = "1.12"
 serde = { version = "1.0", features = ["derive"] }

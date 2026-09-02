@@ -201,6 +201,47 @@ changing cluster state. Editor completion is available through
 See [`examples/services-all.yaml`](examples/services-all.yaml) for Service fields and
 [`examples/routing-all.yaml`](examples/routing-all.yaml) for routing fields.
 
+### Task environment templates
+
+Environment values support the same Go-template context names as Docker Swarm. The Agent expands
+them after the task is assigned to a node and immediately before creating the container. The
+environment variable name is literal and chosen by the Stack author; only the value after `=` is
+expanded:
+
+```yaml
+services:
+  api:
+    image: example/api:1.0
+    environment:
+      SERVICE_NAME: "{{.Service.Name}}"
+      TASK_INSTANCE: '{{join "-" .Service.Name .Task.Slot}}'
+      TASK_ID: "{{.Task.ID}}"
+      NODE_HOSTNAME: "{{.Node.Hostname}}"
+      SERVICE_OWNER: '{{index .Service.Labels "com.example.owner"}}'
+    deploy:
+      labels:
+        com.example.owner: platform
+```
+
+The available context matches SwarmKit:
+
+| Template | Swarmlite value |
+| --- | --- |
+| `.Service.ID` | Stack-qualified Service ID, such as `production.api` |
+| `.Service.Name` | Service name from the Stack file, such as `api` |
+| `.Service.Labels` | Service metadata from `deploy.labels` |
+| `.Node.ID` | Swarmlite node ID |
+| `.Node.Hostname` | Hostname detected by the Agent |
+| `.Node.Platform.Architecture` | Agent host architecture |
+| `.Node.Platform.OS` | Agent host operating system |
+| `.Task.ID` | Unique task ID |
+| `.Task.Name` | `<service>.<slot>.<task-id>` |
+| `.Task.Slot` | Stable one-based replica slot |
+
+SwarmKit's `join` function and Go-template features such as `index`, `if`, comparisons, and
+`printf` are available. A bare environment entry without `=` is left unchanged. Template syntax and field
+names are case-sensitive; invalid templates are rejected while parsing the Stack.
+
 ### Deployment lifecycle
 
 `deploy`, `scale`, `restart`, and `rm` submit desired state to the Controller and wait for

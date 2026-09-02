@@ -102,6 +102,9 @@ pub struct ControllerConfig {
 pub struct AgentConfig {
     pub cluster_id: String,
     pub node_id: String,
+    pub hostname: String,
+    pub platform_architecture: String,
+    pub platform_os: String,
     pub advertise_address: String,
     pub controller: String,
     pub labels: BTreeMap<String, String>,

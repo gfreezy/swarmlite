@@ -407,6 +407,11 @@ fn normalize_service(name: &str, raw: RawService) -> Result<ServiceSpec> {
         .with_context(|| format!("service {name}: invalid stop_grace_period"))?
         .unwrap_or(Duration::from_secs(10))
         .as_secs();
+    let environment = raw.environment.into_environment()?;
+    let container_labels = raw.labels.into_map()?;
+    let service_labels = raw.deploy.labels.into_map()?;
+    crate::template::validate_environment_templates(&environment, &service_labels)
+        .with_context(|| format!("service {name}: invalid environment template"))?;
 
     let spec = ServiceSpec {
         image,
@@ -421,13 +426,13 @@ fn normalize_service(name: &str, raw: RawService) -> Result<ServiceSpec> {
             .map(|value| value.into_vec("entrypoint"))
             .transpose()?
             .unwrap_or_default(),
-        environment: raw.environment.into_environment()?,
+        environment,
         expose,
         ports,
         volumes,
         configs,
-        container_labels: raw.labels.into_map()?,
-        service_labels: raw.deploy.labels.into_map()?,
+        container_labels,
+        service_labels,
         healthcheck: raw
             .healthcheck
             .map(|healthcheck| normalize_healthcheck(name, healthcheck))
@@ -836,6 +841,44 @@ x-swarmlite:
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("invalid x-swarmlite.name"));
+    }
+
+    #[test]
+    fn validates_swarm_style_environment_templates() {
+        let parsed = parse_stack(
+            r#"
+services:
+  api:
+    image: example/api
+    environment:
+      CUSTOM_SERVICE: "{{.Service.Name}}"
+      CUSTOM_TASK: "{{.Task.Name}}"
+      CUSTOM_NODE: "{{.Node.Hostname}}"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.services["api"].environment,
+            [
+                "CUSTOM_NODE={{.Node.Hostname}}",
+                "CUSTOM_SERVICE={{.Service.Name}}",
+                "CUSTOM_TASK={{.Task.Name}}",
+            ]
+        );
+
+        let error = parse_stack(
+            r#"
+services:
+  api:
+    image: example/api
+    environment:
+      CUSTOM_VALUE: "{{.Swarmlite.Service}}"
+"#,
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("service api: invalid environment template"));
+        assert!(message.contains("CUSTOM_VALUE"));
     }
 
     #[test]
