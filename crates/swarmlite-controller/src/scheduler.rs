@@ -658,9 +658,7 @@ mod tests {
             state.tasks.insert(task.id.clone(), task);
         }
 
-        state
-            .services
-            .insert("demo.web".into(), service(2, 2));
+        state.services.insert("demo.web".into(), service(2, 2));
         assert!(reconcile(&mut state, &live));
         let replacement = state
             .tasks
@@ -686,10 +684,7 @@ mod tests {
             .filter(|task| task.revision == 2 && task.desired == DesiredTaskState::Running)
             .map(|task| task.node_id.as_str())
             .collect::<BTreeSet<_>>();
-        assert_eq!(
-            current_revision_nodes,
-            BTreeSet::from(["node-a", "node-b"])
-        );
+        assert_eq!(current_revision_nodes, BTreeSet::from(["node-a", "node-b"]));
     }
 
     #[test]
