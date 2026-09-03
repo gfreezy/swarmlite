@@ -243,6 +243,18 @@ fn schedule_task(
         .filter(|node| explicit_ports_available(state, node, &service.spec))
         .collect::<Vec<_>>();
     candidates.sort_by_key(|node| {
+        // During a rollout, spread the current revision before considering old
+        // tasks that are still running for start-first availability.
+        let same_revision = state
+            .tasks
+            .values()
+            .filter(|task| {
+                task.node_id == node.id
+                    && task.service_id == service.id
+                    && task.revision == service.revision
+                    && task.desired == DesiredTaskState::Running
+            })
+            .count();
         let same_service = state
             .tasks
             .values()
@@ -257,7 +269,7 @@ fn schedule_task(
             .values()
             .filter(|task| task.node_id == node.id && task.desired == DesiredTaskState::Running)
             .count();
-        (same_service, total, node.id.as_str())
+        (same_revision, same_service, total, node.id.as_str())
     });
     let node = candidates.first()?;
     let ports = allocate_ports(state, node, service)?;
@@ -624,6 +636,59 @@ mod tests {
                 .filter(|task| task.revision == 2)
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn start_first_rollout_spreads_current_revision_across_nodes() {
+        let (mut state, live) = state_with_nodes();
+        let original = service(1, 2);
+        state.services.insert(original.id.clone(), original);
+        assert!(reconcile(&mut state, &live));
+
+        let initial_tasks = std::mem::take(&mut state.tasks);
+        for (_, mut task) in initial_tasks {
+            task.id = if task.node_id == "node-a" {
+                "z-old-node-a".into()
+            } else {
+                "a-old-node-b".into()
+            };
+            task.observed = ObservedTaskState::Healthy;
+            task.ports[0].published = Some(20_000);
+            state.tasks.insert(task.id.clone(), task);
+        }
+
+        state
+            .services
+            .insert("demo.web".into(), service(2, 2));
+        assert!(reconcile(&mut state, &live));
+        let replacement = state
+            .tasks
+            .values_mut()
+            .find(|task| task.revision == 2)
+            .unwrap();
+        replacement.observed = ObservedTaskState::Healthy;
+        replacement.ports[0].published = Some(20_001);
+
+        assert!(reconcile(&mut state, &live));
+        assert_eq!(
+            state.tasks["z-old-node-a"].desired,
+            DesiredTaskState::Stopped
+        );
+        state
+            .tasks
+            .retain(|_, task| task.desired != DesiredTaskState::Stopped);
+
+        assert!(reconcile(&mut state, &live));
+        let current_revision_nodes = state
+            .tasks
+            .values()
+            .filter(|task| task.revision == 2 && task.desired == DesiredTaskState::Running)
+            .map(|task| task.node_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            current_revision_nodes,
+            BTreeSet::from(["node-a", "node-b"])
         );
     }
 
