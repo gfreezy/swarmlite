@@ -2280,7 +2280,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "swarmlite"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "swarmlite-cli",
  "tempfile",
@@ -2288,7 +2288,7 @@ dependencies = [
 
 [[package]]
 name = "swarmlite-agent"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "anyhow",
  "bollard",
@@ -2308,7 +2308,7 @@ dependencies = [
 
 [[package]]
 name = "swarmlite-cli"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "anyhow",
  "base64",
@@ -2333,7 +2333,7 @@ dependencies = [
 
 [[package]]
 name = "swarmlite-client"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "anyhow",
  "reqwest",
@@ -2347,7 +2347,7 @@ dependencies = [
 
 [[package]]
 name = "swarmlite-controller"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "anyhow",
  "axum",
@@ -2375,7 +2375,7 @@ dependencies = [
 
 [[package]]
 name = "swarmlite-core"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "anyhow",
  "serde",
@@ -2385,7 +2385,7 @@ dependencies = [
 
 [[package]]
 name = "swarmlite-node"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "anyhow",
  "axum",
@@ -2406,7 +2406,7 @@ dependencies = [
 
 [[package]]
 name = "swarmlite-platform"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "anyhow",
  "axum",
@@ -2435,7 +2435,7 @@ dependencies = [
 
 [[package]]
 name = "swarmlite-protocol"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "bytes",
  "swarmlite-core",
@@ -2443,7 +2443,7 @@ dependencies = [
 
 [[package]]
 name = "swarmlite-registry"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2462,7 +2462,7 @@ dependencies = [
 
 [[package]]
 name = "swarmlite-stack"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "anyhow",
  "chrono",
