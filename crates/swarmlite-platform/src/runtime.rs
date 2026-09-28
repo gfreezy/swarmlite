@@ -3708,7 +3708,7 @@ mod tests {
         let state = crate::local_state::LocalState::open(directory.path()).unwrap();
         let assignment = one_shot_assignment();
         let key = format!("{}:{}", assignment.cluster_id, assignment.id);
-        state.authorize_jobs(&[key.clone()]).unwrap();
+        state.authorize_jobs(std::slice::from_ref(&key)).unwrap();
         let mut runtime = runtime.with_job_state(state);
         assert!(
             runtime
@@ -3749,7 +3749,7 @@ mod tests {
         let state = crate::local_state::LocalState::open(directory.path()).unwrap();
         let mut assignment = one_shot_assignment();
         let key = format!("{}:{}", assignment.cluster_id, assignment.id);
-        state.authorize_jobs(&[key.clone()]).unwrap();
+        state.authorize_jobs(std::slice::from_ref(&key)).unwrap();
         state.authorize_jobs(&[]).unwrap();
         let runtime = runtime.with_job_state(state.clone());
         assert!(

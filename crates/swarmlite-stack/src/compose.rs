@@ -492,10 +492,10 @@ fn normalize_service(name: &str, raw: RawService) -> Result<ServiceSpec> {
     if stop_grace_period_seconds > i32::MAX as u64 {
         bail!("stop_grace_period is too large");
     }
-    if let Some(signal) = raw.stop_signal.as_deref() {
-        if signal.is_empty() || !signal.chars().all(|c| c.is_ascii_alphanumeric()) {
-            bail!("invalid stop_signal {signal:?}");
-        }
+    if let Some(signal) = raw.stop_signal.as_deref()
+        && (signal.is_empty() || !signal.chars().all(|c| c.is_ascii_alphanumeric()))
+    {
+        bail!("invalid stop_signal {signal:?}");
     }
     let environment = raw.environment.into_environment()?;
     let container_labels = raw.labels.into_map()?;

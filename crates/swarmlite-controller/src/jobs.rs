@@ -5,13 +5,12 @@ use std::collections::BTreeSet;
 pub(crate) fn skip_missed(state: &mut ClusterState, now: i64) -> bool {
     let mut changed = false;
     for service in state.services.values_mut() {
-        if let (Some(job), Some(cursor)) = (&service.spec.job, &mut service.job_cursor) {
-            if cursor.next_at_unix_ms <= now {
-                if let Ok(next) = job.next_after(now) {
-                    cursor.next_at_unix_ms = next;
-                    changed = true;
-                }
-            }
+        if let (Some(job), Some(cursor)) = (&service.spec.job, &mut service.job_cursor)
+            && cursor.next_at_unix_ms <= now
+            && let Ok(next) = job.next_after(now)
+        {
+            cursor.next_at_unix_ms = next;
+            changed = true;
         }
     }
     changed
