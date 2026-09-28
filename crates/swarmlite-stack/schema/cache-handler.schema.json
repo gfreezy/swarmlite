@@ -20,7 +20,7 @@
         "not": { "enum": ["CONNECT", "connect"] }
       },
       "default": ["GET", "HEAD"],
-      "description": "Souin-compatible method allowlist. When omitted, only GET responses are stored and HEAD may reuse a matching GET response; CONNECT and protocol upgrades always bypass the cache."
+      "description": "HTTP method allowlist. When omitted, only GET responses are stored and HEAD may reuse a matching GET response; CONNECT and protocol upgrades always bypass the cache."
     },
     "max_cacheable_body_bytes": {
       "type": "integer",
@@ -36,7 +36,7 @@
     },
     "key": {
       "$ref": "#/$defs/key",
-      "description": "Souin-compatible cache key settings. Native keys are always hashed, so hash is accepted without changing key identity."
+      "description": "Cache key settings. Native keys are always hashed."
     },
     "status_codes": {
       "type": "array",
@@ -71,7 +71,6 @@
           }
         },
         "disable_query": { "type": "boolean" },
-        "hash": { "type": "boolean" },
         "query_parameters": {
           "type": "array",
           "minItems": 1,

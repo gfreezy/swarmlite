@@ -14,28 +14,6 @@ use crate::{
 const MAX_KEY_BYTES: usize = 1_024;
 const MAX_OBJECT_BYTES: usize = 4 * 1024 * 1024;
 
-#[derive(Debug)]
-pub(crate) struct LegacyKvObject {
-    pub key: String,
-    pub value_base64: String,
-    pub modified_at_unix_ms: i64,
-}
-
-#[derive(Debug)]
-pub(crate) struct LegacyKvLock {
-    pub name: String,
-    pub owner_id: String,
-    pub fencing_token: u64,
-    pub lease_until_unix_ms: i64,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct LegacyKvImport {
-    pub objects: Vec<LegacyKvObject>,
-    pub locks: Vec<LegacyKvLock>,
-    pub next_fencing_token: u64,
-}
-
 #[derive(Clone)]
 pub(crate) struct KvRepository {
     database: Database,
@@ -329,47 +307,6 @@ impl KvRepository {
         }
         transaction.commit().map_err(backend)?;
         Ok(matched)
-    }
-
-    pub(crate) fn import_legacy(&self, import: LegacyKvImport) -> StorageResult<()> {
-        if import.objects.is_empty() && import.locks.is_empty() && import.next_fencing_token == 0 {
-            return Ok(());
-        }
-        let mut connection = self.database.connect().map_err(backend)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(backend)?;
-        for object in import.objects {
-            let value = STANDARD.decode(&object.value_base64).map_err(invalid)?;
-            transaction
-                .execute(
-                    "INSERT OR IGNORE INTO kv_objects(key, value, modified_at_unix_ms)
-                     VALUES (?1, ?2, ?3)",
-                    params![object.key, value, object.modified_at_unix_ms],
-                )
-                .map_err(backend)?;
-        }
-        for lock in import.locks {
-            let token = i64::try_from(lock.fencing_token)
-                .map_err(|_| invalid("legacy KV fencing token exceeds SQLite integer range"))?;
-            transaction
-                .execute(
-                    "INSERT OR IGNORE INTO kv_locks(name, owner_id, fencing_token, lease_until_unix_ms)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![lock.name, lock.owner_id, token, lock.lease_until_unix_ms],
-                )
-                .map_err(backend)?;
-        }
-        let next = i64::try_from(import.next_fencing_token)
-            .map_err(|_| invalid("legacy KV fencing token exceeds SQLite integer range"))?;
-        transaction
-            .execute(
-                "UPDATE kv_meta SET next_fencing_token = MAX(next_fencing_token, ?1)
-                 WHERE singleton = 1",
-                [next],
-            )
-            .map_err(backend)?;
-        transaction.commit().map_err(backend)
     }
 
     fn keys_at(&self, path: &str) -> StorageResult<Vec<String>> {

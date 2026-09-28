@@ -101,6 +101,7 @@ pub async fn run_with_token_and_updates(
     local_state: LocalState,
     runtime: DockerCompatibleRuntime,
 ) -> Result<()> {
+    let runtime = runtime.with_job_state(local_state.clone());
     run_with_runtime(config, token, updates, gateway_report, local_state, runtime).await
 }
 
@@ -112,6 +113,7 @@ async fn run_with_runtime<R: ContainerRuntime>(
     local_state: LocalState,
     runtime: R,
 ) -> Result<()> {
+    local_state.authorize_jobs(&[])?;
     runtime.ping().await?;
     let system = runtime.system_info().await?;
     let mut fence = local_state
@@ -119,6 +121,7 @@ async fn run_with_runtime<R: ContainerRuntime>(
         .unwrap_or_default();
     let registry_credentials = RegistryCredentialStore::new(local_state.clone());
     let mut node = NodeRecord {
+        supports_jobs: true,
         id: config.node_id.clone(),
         address: config.advertise_address.clone(),
         swarmlite_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
@@ -151,6 +154,11 @@ async fn run_with_runtime<R: ContainerRuntime>(
         events: reconcile_events_tx,
     };
     let runtime = Arc::new(runtime);
+    let job_runtime = Arc::clone(&runtime);
+    let job_cluster = config.cluster_id.clone();
+    tokio::spawn(async move {
+        job_deadline_loop(job_runtime, job_cluster).await;
+    });
     let initial_image_prune = updates.borrow().cluster.agent.image_prune.clone();
     let (image_prune_tx, image_prune_rx) = tokio::sync::watch::channel(initial_image_prune);
     let image_prune_runtime = Arc::clone(&runtime);
@@ -222,6 +230,7 @@ async fn run_with_runtime<R: ContainerRuntime>(
             tasks: containers
                 .values()
                 .map(|container| TaskReport {
+                    job: container.job.clone(),
                     id: container.task_id.clone(),
                     observed: container.observed.clone(),
                     container_id: Some(container.id.clone()),
@@ -285,6 +294,16 @@ async fn run_with_runtime<R: ContainerRuntime>(
         }
         if let Err(error) = registry_credentials.replace(&response.registry_credentials) {
             error!(%error, "failed to persist registry credentials; refusing to change containers");
+            continue;
+        }
+        let job_ids = response
+            .assignments
+            .iter()
+            .filter(|a| a.job.is_some())
+            .map(|a| format!("{}:{}", a.cluster_id, a.id))
+            .collect::<Vec<_>>();
+        if let Err(error) = local_state.authorize_jobs(&job_ids) {
+            error!(%error, "failed to persist job authorizations; refusing reconciliation");
             continue;
         }
         let next_control = NodeControl {
@@ -1267,24 +1286,44 @@ async fn reconcile_containers_with_progress<R: ContainerRuntime>(
     template_node: &TemplateNode,
 ) -> Vec<TaskReconcileReport> {
     let mut reports = Vec::new();
-    for removal in &response.remove_tasks {
+    let removals = response.remove_tasks.iter().map(|removal| async {
         let reporter = progress.map_or_else(RuntimeTaskProgress::default, |progress| {
             progress.reporter(&removal.id, removal.deployment_generation)
         });
         let result = match existing.get(&removal.id) {
-            Some(container) => runtime.remove_task(container, &reporter).await,
-            None => {
-                reporter.report(TaskReconcilePhase::Remove);
-                Ok(())
+            Some(container) if container.job.is_some() => {
+                let operation = async {
+                    if container.running {
+                        runtime.stop_job(container, "cancelled").await
+                    } else if !removal.retain_job_container {
+                        tokio::time::timeout(
+                            Duration::from_secs(5),
+                            runtime.remove_task(container, &reporter),
+                        )
+                        .await
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("job cleanup timed out")))
+                    } else {
+                        Ok(())
+                    }
+                };
+                tokio::time::timeout(
+                    Duration::from_secs(container.stop_grace_seconds.max(0) as u64 + 10),
+                    operation,
+                )
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("job stop attempt timed out")))
             }
+            Some(container) => runtime.remove_task(container, &reporter).await,
+            None => Ok(()),
         };
-        reports.push(reconcile_report(
+        reconcile_report(
             &removal.id,
             removal.deployment_generation,
             TaskReconcilePhase::Remove,
             result,
-        ));
-    }
+        )
+    });
+    reports.extend(futures_util::future::join_all(removals).await);
 
     for unexpanded_assignment in &response.assignments {
         let reporter = progress.map_or_else(RuntimeTaskProgress::default, |progress| {
@@ -1329,13 +1368,32 @@ async fn reconcile_containers_with_progress<R: ContainerRuntime>(
             }
         };
         let assignment = &assignment;
+        if let Some(job) = &assignment.job {
+            let result = if existing.contains_key(&assignment.id) {
+                Ok(()) // Existing one-shot containers are evidence, never restart candidates.
+            } else {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                let budget = job.start_deadline_unix_ms.saturating_sub(now).max(0) as u64;
+                tokio::time::timeout(
+                    Duration::from_millis(budget),
+                    runtime.create_task(assignment, &reporter),
+                )
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("job start window expired")))
+            };
+            reports.push(reconcile_report(
+                &assignment.id,
+                assignment.deployment_generation,
+                TaskReconcilePhase::Verify,
+                result,
+            ));
+            continue;
+        }
         let (phase, result) = match existing.get(&assignment.id) {
-            Some(container)
-                if container.revision.map_or_else(
-                    || container.spec_hash.as_deref() != Some(&assignment.spec_hash),
-                    |revision| revision != assignment.revision,
-                ) =>
-            {
+            Some(container) if container.revision != Some(assignment.revision) => {
                 let result = async {
                     runtime.remove_task(container, &reporter).await?;
                     runtime.create_task(assignment, &reporter).await
@@ -1465,10 +1523,7 @@ fn assignment_requires_runtime_change(
         Some(container) => {
             !container.running
                 || container.observed == ObservedTaskState::Failed
-                || container.revision.map_or_else(
-                    || container.spec_hash.as_deref() != Some(&assignment.spec_hash),
-                    |revision| revision != assignment.revision,
-                )
+                || container.revision != Some(assignment.revision)
         }
     }
 }
@@ -1539,6 +1594,7 @@ mod tests {
         resolved_image_id: Option<String>,
         fail_resolve: bool,
         list_delay: Option<Duration>,
+        inventory: HashMap<String, ManagedContainer>,
     }
 
     impl ContainerRuntime for FakeRuntime {
@@ -1573,7 +1629,7 @@ mod tests {
             if let Some(delay) = self.list_delay {
                 tokio::time::sleep(delay).await;
             }
-            Ok(HashMap::new())
+            Ok(self.inventory.clone())
         }
 
         async fn resolve_image(
@@ -1674,6 +1730,7 @@ mod tests {
 
     fn managed(task_id: &str) -> ManagedContainer {
         ManagedContainer {
+            job: None,
             id: format!("container-{task_id}"),
             image_id: Some("sha256:current".into()),
             task_id: task_id.to_owned(),
@@ -1725,6 +1782,7 @@ mod tests {
             generation: 1,
             cluster: test_cluster(),
             assignments: vec![crate::model::TaskAssignment {
+                job: None,
                 id: task_id.into(),
                 cluster_id: "cluster-test".into(),
                 stack: "demo".into(),
@@ -1751,6 +1809,8 @@ mod tests {
                     max_replicas_per_node: None,
                     max_surge: 1,
                     stop_grace_period_seconds: 10,
+                    stop_signal: None,
+                    job: None,
                 },
                 ports: Vec::new(),
                 generation: 1,
@@ -1767,6 +1827,61 @@ mod tests {
             registry_credentials: Default::default(),
             registry_credentials_hash: String::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn job_reconciliation_never_restarts_an_exited_container() {
+        let runtime = FakeRuntime::default();
+        let mut response = task_test_response("task-job");
+        let assignment = &mut response.assignments[0];
+        assignment.job = Some(crate::model::JobExecution {
+            runtime: None,
+            job_id: "demo.backup".into(),
+            scheduled_at_unix_ms: 0,
+            not_before_unix_ms: 0,
+            start_deadline_unix_ms: i64::MAX,
+            spec: Box::new(assignment.spec.clone()),
+        });
+        let mut container = managed("task-job");
+        container.running = false;
+        container.observed = ObservedTaskState::Succeeded;
+        let existing = HashMap::from([("task-job".into(), container)]);
+        let reports = reconcile_containers(&runtime, &existing, &response).await;
+        assert!(reports.iter().all(|r| r.error.is_none()));
+        assert!(runtime.started.lock().unwrap().is_empty());
+        assert!(runtime.created.lock().unwrap().is_empty());
+        assert!(runtime.removed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn job_deadline_is_enforced_without_a_controller_connection() {
+        let mut container = managed("overdue");
+        container.job = Some(crate::model::JobRuntimeState {
+            stop_reason: None,
+            job_id: "demo.backup".into(),
+            scheduled_at_unix_ms: 1,
+            start_deadline_unix_ms: 2,
+            timeout_seconds: Some(1),
+            started_at_unix_ms: Some(1),
+            exit_code: None,
+        });
+        let runtime = Arc::new(FakeRuntime {
+            inventory: HashMap::from([("overdue".into(), container)]),
+            ..Default::default()
+        });
+        let worker = tokio::spawn(job_deadline_loop(
+            Arc::clone(&runtime),
+            "cluster-test".into(),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runtime.removed.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        worker.abort();
+        assert_eq!(*runtime.removed.lock().unwrap(), vec!["overdue"]);
     }
 
     #[test]
@@ -2155,6 +2270,7 @@ mod tests {
         response
             .remove_tasks
             .push(crate::model::TaskRemovalAssignment {
+                retain_job_container: false,
                 id: "old-task".into(),
                 deployment_generation: 1,
             });
@@ -2177,6 +2293,7 @@ mod tests {
             generation: 2,
             cluster: test_cluster(),
             assignments: vec![crate::model::TaskAssignment {
+                job: None,
                 id: "task-1".into(),
                 cluster_id: "cluster-test".into(),
                 stack: "demo".into(),
@@ -2210,6 +2327,8 @@ mod tests {
                     max_replicas_per_node: None,
                     max_surge: 1,
                     stop_grace_period_seconds: 10,
+                    stop_signal: None,
+                    job: None,
                 },
                 ports: Vec::new(),
                 generation: 2,
@@ -2264,6 +2383,7 @@ mod tests {
             generation: 1,
             cluster: test_cluster(),
             assignments: vec![crate::model::TaskAssignment {
+                job: None,
                 id: "task-1".into(),
                 cluster_id: "cluster-test".into(),
                 stack: "demo".into(),
@@ -2294,6 +2414,8 @@ mod tests {
                     max_replicas_per_node: None,
                     max_surge: 1,
                     stop_grace_period_seconds: 10,
+                    stop_signal: None,
+                    job: None,
                 },
                 ports: vec![crate::model::PortBinding {
                     target: 80,
@@ -2339,6 +2461,7 @@ mod tests {
             generation: 2,
             cluster: test_cluster(),
             assignments: vec![crate::model::TaskAssignment {
+                job: None,
                 id: "task-1".into(),
                 cluster_id: "cluster-test".into(),
                 stack: "demo".into(),
@@ -2365,6 +2488,8 @@ mod tests {
                     max_replicas_per_node: None,
                     max_surge: 1,
                     stop_grace_period_seconds: 10,
+                    stop_signal: None,
+                    job: None,
                 },
                 ports: Vec::new(),
                 generation: 2,
@@ -2398,6 +2523,7 @@ mod tests {
             generation: 7,
             cluster: test_cluster(),
             assignments: vec![crate::model::TaskAssignment {
+                job: None,
                 id: "task-failed".into(),
                 cluster_id: "cluster-test".into(),
                 stack: "demo".into(),
@@ -2424,6 +2550,8 @@ mod tests {
                     max_replicas_per_node: None,
                     max_surge: 1,
                     stop_grace_period_seconds: 10,
+                    stop_signal: None,
+                    job: None,
                 },
                 ports: Vec::new(),
                 generation: 7,
@@ -2453,5 +2581,57 @@ mod tests {
                 .unwrap()
                 .contains("image pull denied")
         );
+    }
+}
+
+async fn job_deadline_loop<R: ContainerRuntime>(runtime: Arc<R>, cluster: String) {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tick.tick().await;
+        let Ok(Ok(containers)) =
+            tokio::time::timeout(Duration::from_secs(5), runtime.list_managed(&cluster)).await
+        else {
+            continue;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let stops = containers
+            .values()
+            .filter(|c| {
+                c.running
+                    && c.job.as_ref().is_some_and(|j| {
+                        j.stop_reason.is_some()
+                            || j.started_at_unix_ms.zip(j.timeout_seconds).is_some_and(
+                                |(start, timeout)| {
+                                    now >= start.saturating_add(timeout.saturating_mul(1000) as i64)
+                                },
+                            )
+                    })
+            })
+            .map(|c| async {
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    runtime.stop_job(
+                        c,
+                        c.job
+                            .as_ref()
+                            .and_then(|j| j.stop_reason.as_deref())
+                            .unwrap_or("timeout"),
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        warn!(task_id = %c.task_id, %error, "job deadline stop failed")
+                    }
+                    Err(error) => {
+                        warn!(task_id = %c.task_id, %error, "job deadline stop timed out")
+                    }
+                }
+            });
+        futures_util::future::join_all(stops).await;
     }
 }

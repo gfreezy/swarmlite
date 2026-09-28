@@ -660,6 +660,7 @@ x-swarmlite:
 
     fn service() -> ServiceRecord {
         ServiceRecord {
+            job_cursor: None,
             id: "demo.web".into(),
             stack: "demo".into(),
             name: "web".into(),
@@ -686,6 +687,8 @@ x-swarmlite:
                 max_replicas_per_node: None,
                 max_surge: 1,
                 stop_grace_period_seconds: 10,
+                stop_signal: None,
+                job: None,
             },
             deleted: false,
         }
@@ -693,6 +696,7 @@ x-swarmlite:
 
     fn node(id: &str, address: &str) -> NodeRecord {
         NodeRecord {
+            supports_jobs: true,
             id: id.into(),
             address: address.into(),
             swarmlite_version: None,
@@ -713,6 +717,7 @@ x-swarmlite:
         published: u16,
     ) -> TaskRecord {
         TaskRecord {
+            job: None,
             id: id.into(),
             service_id: "demo.web".into(),
             revision: 1,

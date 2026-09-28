@@ -731,9 +731,16 @@ fn desired_state_color(state: &DesiredTaskState) -> &'static str {
 
 fn observed_state_color(state: &ObservedTaskState) -> &'static str {
     match state {
-        ObservedTaskState::Healthy | ObservedTaskState::Running => "32",
-        ObservedTaskState::Pending | ObservedTaskState::Starting => "33",
-        ObservedTaskState::Failed | ObservedTaskState::Lost => "31",
+        ObservedTaskState::Succeeded | ObservedTaskState::Healthy | ObservedTaskState::Running => {
+            "32"
+        }
+        ObservedTaskState::Unknown | ObservedTaskState::Pending | ObservedTaskState::Starting => {
+            "33"
+        }
+        ObservedTaskState::Failed
+        | ObservedTaskState::Lost
+        | ObservedTaskState::TimedOut
+        | ObservedTaskState::Cancelled => "31",
     }
 }
 

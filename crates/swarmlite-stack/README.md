@@ -97,3 +97,9 @@ before the normalized Service specifications are persisted. External configs are
 See [../../examples/services-all.yaml](../../examples/services-all.yaml) for every accepted shape in
 one Stack file. Fields such as `build`, `depends_on`, `networks`, `restart`, `resources`, and
 `secrets` are not currently implemented.
+
+Scheduled one-shot workloads are defined under `x-swarmlite-jobs`; see
+[`examples/jobs.yaml`](../../examples/jobs.yaml) and the root README for execution and
+recovery semantics. The parser normalizes them into the shared workload map with a
+`ServiceSpec.job` policy and zero desired service replicas. Both services and jobs accept
+Compose-style `stop_signal` and `stop_grace_period`.

@@ -14,7 +14,6 @@ pub use swarmlite_stack::{
 
 pub const CLUSTER_SCHEMA_VERSION: u32 = 9;
 pub const GATEWAY_RECOVERY_FORMAT_VERSION: u32 = 1;
-pub const LEGACY_DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/gfreezy/swarmlite-caddy:latest";
 pub const DEFAULT_GATEWAY_IMAGE: &str = concat!(
     "ghcr.io/gfreezy/swarmlite-caddy:v",
     env!("CARGO_PKG_VERSION")
@@ -114,6 +113,7 @@ impl Default for ClusterGatewayConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct GatewayCacheConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_size_bytes: Option<u64>,
@@ -365,11 +365,6 @@ impl GatewayHttpTimeoutsConfig {
 }
 
 pub fn refresh_managed_gateway_image(config: &mut ClusterGatewayConfig) -> bool {
-    if config.image == LEGACY_DEFAULT_GATEWAY_IMAGE {
-        config.image = DEFAULT_GATEWAY_IMAGE.to_owned();
-        config.managed_image = true;
-        return true;
-    }
     if config.managed_image && config.image != DEFAULT_GATEWAY_IMAGE {
         config.image = DEFAULT_GATEWAY_IMAGE.to_owned();
         return true;
@@ -721,6 +716,8 @@ pub struct NodeMember {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_cursor: Option<JobCursor>,
     pub id: String,
     pub stack: String,
     pub name: String,
@@ -1034,6 +1031,7 @@ pub struct StackDeploymentError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeRecord {
+    pub supports_jobs: bool,
     pub id: String,
     pub address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1057,6 +1055,10 @@ pub enum DesiredTaskState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservedTaskState {
+    Succeeded,
+    Unknown,
+    Cancelled,
+    TimedOut,
     Pending,
     Starting,
     Running,
@@ -1075,6 +1077,8 @@ pub struct PortBinding {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobExecution>,
     pub id: String,
     pub service_id: String,
     pub revision: u64,
@@ -1232,6 +1236,8 @@ pub struct TaskReconcileError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobRuntimeState>,
     pub id: String,
     pub observed: ObservedTaskState,
     pub container_id: Option<String>,
@@ -1268,6 +1274,8 @@ pub struct HeartbeatResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskRemovalAssignment {
+    #[serde(default)]
+    pub retain_job_container: bool,
     pub id: String,
     pub deployment_generation: u64,
 }
@@ -1548,6 +1556,8 @@ pub struct NodeLabelRemoveRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskAssignment {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobExecution>,
     pub id: String,
     pub cluster_id: String,
     pub stack: String,
@@ -1900,16 +1910,7 @@ mod tests {
     }
 
     #[test]
-    fn refreshes_only_managed_and_legacy_gateway_images() {
-        let mut legacy = ClusterGatewayConfig {
-            image: LEGACY_DEFAULT_GATEWAY_IMAGE.into(),
-            managed_image: false,
-            ..Default::default()
-        };
-        assert!(refresh_managed_gateway_image(&mut legacy));
-        assert_eq!(legacy.image, DEFAULT_GATEWAY_IMAGE);
-        assert!(legacy.managed_image);
-
+    fn refreshes_only_managed_gateway_images() {
         let mut managed = ClusterGatewayConfig {
             image: "ghcr.io/gfreezy/swarmlite-caddy:v0.0.1".into(),
             managed_image: true,
@@ -1928,7 +1929,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_settings_without_optional_sections_remain_compatible() {
+    fn cluster_settings_optional_sections_use_defaults() {
         let expected = ClusterSettings {
             schema_version: CLUSTER_SCHEMA_VERSION,
             cluster_id: "cluster-a".into(),
@@ -1942,10 +1943,6 @@ mod tests {
         let mut value = serde_json::to_value(&expected).unwrap();
         value.as_object_mut().unwrap().remove("proxy");
         value.as_object_mut().unwrap().remove("agent");
-        value["gateway"]["cache"] = serde_json::json!({
-            "hit_sample_ratio": 32,
-            "access_update_interval_seconds": 300
-        });
         assert_eq!(
             serde_json::from_value::<ClusterSettings>(value).unwrap(),
             expected
@@ -1953,7 +1950,17 @@ mod tests {
     }
 
     #[test]
-    fn old_gateway_config_without_management_flag_remains_custom() {
+    fn rejects_removed_gateway_cache_settings() {
+        for field in ["hit_sample_ratio", "access_update_interval_seconds"] {
+            assert!(
+                serde_json::from_value::<GatewayCacheConfig>(serde_json::json!({field: 1}))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_config_without_management_flag_is_custom() {
         let mut decoded: ClusterGatewayConfig = serde_json::from_str(
             r#"{"listen":[":80",":443"],"image":"registry.example.com/caddy:v1"}"#,
         )
@@ -2038,5 +2045,46 @@ x-swarmlite:
         let decoded: GatewayRecoverySnapshot = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, snapshot);
         decoded.validate_for_cluster("cluster-a").unwrap();
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobCursor {
+    #[serde(default)]
+    pub last_scheduled_at_unix_ms: Option<i64>,
+    pub schedule: String,
+    pub time_zone: String,
+    pub next_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobExecution {
+    #[serde(default)]
+    pub runtime: Option<JobRuntimeState>,
+    pub job_id: String,
+    pub scheduled_at_unix_ms: i64,
+    pub not_before_unix_ms: i64,
+    pub start_deadline_unix_ms: i64,
+    pub spec: Box<ServiceSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobRuntimeState {
+    #[serde(default)]
+    pub stop_reason: Option<String>,
+    pub job_id: String,
+    pub scheduled_at_unix_ms: i64,
+    pub start_deadline_unix_ms: i64,
+    pub timeout_seconds: Option<u64>,
+    pub started_at_unix_ms: Option<i64>,
+    pub exit_code: Option<i64>,
+}
+
+impl ObservedTaskState {
+    pub fn is_job_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::TimedOut
+        )
     }
 }

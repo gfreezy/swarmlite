@@ -1,3 +1,4 @@
+use std::time::Duration;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
@@ -67,6 +68,11 @@ const GATEWAY_SYNC_ADMIN_PORT: u16 = 2021;
 const GATEWAY_RECOVERY_PATH: &str = "/config/swarmlite-recovery.json";
 const GATEWAY_RECOVERY_TEMP_NAME: &str = ".swarmlite-recovery.json.tmp";
 const MAX_GATEWAY_RECOVERY_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+const TASK_KIND_LABEL: &str = "io.swarmlite.task_kind";
+const JOB_ID_LABEL: &str = "io.swarmlite.job_id";
+const JOB_SCHEDULED_LABEL: &str = "io.swarmlite.scheduled_at_unix_ms";
+const JOB_START_DEADLINE_LABEL: &str = "io.swarmlite.start_deadline_unix_ms";
+const JOB_TIMEOUT_LABEL: &str = "io.swarmlite.timeout_seconds";
 const TASK_LABEL: &str = "io.swarmlite.task_id";
 const SERVICE_LABEL: &str = "io.swarmlite.service_id";
 const STACK_LABEL: &str = "io.swarmlite.stack";
@@ -92,6 +98,7 @@ pub struct RuntimeImagePrune {
 
 #[derive(Debug, Clone)]
 pub struct ManagedContainer {
+    pub job: Option<crate::model::JobRuntimeState>,
     pub id: String,
     pub image_id: Option<String>,
     pub task_id: String,
@@ -150,7 +157,7 @@ struct ExistingGatewayContainer {
     cluster_id: Option<String>,
     image: Option<String>,
     grace_period_seconds: Option<String>,
-    slot: Option<GatewaySlot>,
+    slot: GatewaySlot,
     runtime_spec_hash: Option<String>,
     running: bool,
 }
@@ -327,6 +334,17 @@ pub trait ContainerRuntime: Send + Sync + 'static {
         progress: &RuntimeTaskProgress,
     ) -> impl Future<Output = Result<()>> + Send;
 
+    fn stop_job(
+        &self,
+        container: &ManagedContainer,
+        _reason: &str,
+    ) -> impl Future<Output = Result<()>> + Send {
+        async move {
+            self.remove_task(container, &RuntimeTaskProgress::default())
+                .await
+        }
+    }
+
     fn stream_task_logs(
         &self,
         container: &ManagedContainer,
@@ -338,6 +356,8 @@ pub trait ContainerRuntime: Send + Sync + 'static {
 
 #[derive(Clone)]
 pub struct DockerCompatibleRuntime {
+    job_state: Option<crate::local_state::LocalState>,
+    job_stops: Arc<std::sync::Mutex<BTreeSet<String>>>,
     client: Docker,
     kind: RuntimeKind,
     socket: String,
@@ -358,6 +378,30 @@ enum TaskNameConflictResolution {
 }
 
 impl DockerCompatibleRuntime {
+    pub fn with_job_state(mut self, state: crate::local_state::LocalState) -> Self {
+        self.job_state = Some(state);
+        self
+    }
+
+    fn check_job_authorization(&self, assignment: &TaskAssignment, claim: bool) -> Result<()> {
+        let Some(job) = &assignment.job else {
+            return Ok(());
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        if now < job.not_before_unix_ms || now >= job.start_deadline_unix_ms {
+            bail!("job start window expired or has not opened");
+        }
+        let state = self
+            .job_state
+            .as_ref()
+            .context("job execution requires a durable attempt ledger")?;
+        let key = format!("{}:{}", assignment.cluster_id, assignment.id);
+        if !state.job_authorized(&key)? || (claim && !state.claim_job(&key)?) {
+            bail!("job attempt already consumed or authorization revoked; refusing to start again");
+        }
+        Ok(())
+    }
+
     pub fn connect(config: &ResolvedRuntimeConfig) -> Result<Self> {
         Self::connect_inner(config, None, None, DeploymentPolicy::default(), None)
     }
@@ -421,6 +465,8 @@ impl DockerCompatibleRuntime {
             .transpose()
             .context("failed to construct local image relay client")?;
         Ok(Self {
+            job_state: None,
+            job_stops: Default::default(),
             client,
             kind: config.kind,
             socket: config.socket.clone(),
@@ -556,7 +602,6 @@ impl DockerCompatibleRuntime {
         if let Some(index) = gateways.iter().position(|gateway| {
             gateway.image_id.as_deref() == Some(desired_image_id.as_str())
                 && gateway.runtime_spec_hash.as_deref() == Some(runtime_spec_hash.as_str())
-                && gateway.slot.is_some()
         }) {
             let desired = gateways.remove(index);
             let desired_is_staged = gateways
@@ -583,30 +628,6 @@ impl DockerCompatibleRuntime {
                 self.wait_gateway_admin_any().await?
             };
             let has_public_config = self.gateway_has_public_config(desired_admin_port).await?;
-            if let Some(legacy_index) = gateways.iter().position(|gateway| gateway.slot.is_none())
-                && !has_public_config
-            {
-                let mut legacy = gateways.remove(legacy_index);
-                if !legacy.running {
-                    self.client
-                        .start_container(&legacy.id, None)
-                        .await
-                        .context("failed to restart the legacy Gateway during upgrade recovery")?;
-                    legacy.running = true;
-                }
-                self.remove_gateway(&desired).await?;
-                self.remove_gateway_slot_volumes(&spec.cluster_id, desired.slot)
-                    .await?;
-                return self
-                    .replace_gateway(
-                        spec,
-                        assignment,
-                        Some(&legacy),
-                        &gateway_image,
-                        &runtime_spec_hash,
-                    )
-                    .await;
-            }
             if !has_public_config {
                 self.restore_gateway_certificates(
                     &reqwest::Client::new(),
@@ -1014,29 +1035,36 @@ impl DockerCompatibleRuntime {
 
     async fn gateway_containers(&self) -> Result<Vec<ExistingGatewayContainer>> {
         let summaries = self.list_managed_summaries().await?;
-        Ok(summaries
-            .into_iter()
-            .filter_map(|summary| {
-                let created = summary.created.unwrap_or_default();
-                let labels = summary.labels.unwrap_or_default();
-                if !is_gateway_system_container(&labels) {
-                    return None;
-                }
-                Some(ExistingGatewayContainer {
-                    id: summary.id?,
-                    created,
-                    image_id: summary.image_id,
-                    cluster_id: labels.get(CLUSTER_LABEL).cloned(),
-                    image: labels.get(GATEWAY_IMAGE_LABEL).cloned(),
-                    grace_period_seconds: labels.get(GATEWAY_GRACE_PERIOD_LABEL).cloned(),
-                    slot: labels
-                        .get(GATEWAY_SLOT_LABEL)
-                        .and_then(|value| value.parse().ok()),
-                    runtime_spec_hash: labels.get(GATEWAY_RUNTIME_SPEC_LABEL).cloned(),
-                    running: summary.state == Some(ContainerSummaryStateEnum::RUNNING),
-                })
-            })
-            .collect())
+        let mut gateways = Vec::new();
+        for summary in summaries {
+            let labels = summary.labels.unwrap_or_default();
+            if !is_gateway_system_container(&labels) {
+                continue;
+            }
+            let Some(id) = summary.id else {
+                continue;
+            };
+            let slot = labels
+                .get(GATEWAY_SLOT_LABEL)
+                .and_then(|value| value.parse().ok())
+                .with_context(|| {
+                    format!(
+                        "Gateway {id} has no valid blue/green slot; unsupported container layout"
+                    )
+                })?;
+            gateways.push(ExistingGatewayContainer {
+                id,
+                created: summary.created.unwrap_or_default(),
+                image_id: summary.image_id,
+                cluster_id: labels.get(CLUSTER_LABEL).cloned(),
+                image: labels.get(GATEWAY_IMAGE_LABEL).cloned(),
+                grace_period_seconds: labels.get(GATEWAY_GRACE_PERIOD_LABEL).cloned(),
+                slot,
+                runtime_spec_hash: labels.get(GATEWAY_RUNTIME_SPEC_LABEL).cloned(),
+                running: summary.state == Some(ContainerSummaryStateEnum::RUNNING),
+            });
+        }
+        Ok(gateways)
     }
 
     async fn replace_gateway(
@@ -1047,17 +1075,8 @@ impl DockerCompatibleRuntime {
         gateway_image: &str,
         runtime_spec_hash: &str,
     ) -> Result<()> {
-        let target_slot = existing.and_then(|gateway| gateway.slot).map_or_else(
-            || {
-                if existing.is_some() {
-                    GatewaySlot::Green
-                } else {
-                    GatewaySlot::Blue
-                }
-            },
-            GatewaySlot::opposite,
-        );
-        self.remove_gateway_slot_volumes(&spec.cluster_id, Some(target_slot))
+        let target_slot = existing.map_or(GatewaySlot::Blue, |gateway| gateway.slot.opposite());
+        self.remove_gateway_slot_volumes(&spec.cluster_id, target_slot)
             .await?;
 
         let client = reqwest::Client::new();
@@ -1075,36 +1094,15 @@ impl DockerCompatibleRuntime {
                 existing_admin_port = GATEWAY_ACTIVE_ADMIN_PORT;
             }
         }
-        let mut helper_id = None;
         let mut candidate = None;
         let mut candidate_public = false;
-        let mut legacy_stopped = false;
         let mut active_quiesced = false;
         let mut retired_removed = existing.is_none();
         let result: Result<()> = async {
-            if let Some(active) = existing {
-                if active.slot.is_some() {
-                    self.post_gateway_action(
-                        &client,
-                        existing_admin_port,
-                        "/swarmlite/storage/push",
-                    )
-                    .await
-                    .context("failed to commit the active Gateway certificate snapshot")?;
-                    active_quiesced = true;
-                } else {
-                    let id = self
-                        .create_gateway_sync_helper(spec, gateway_image, None)
-                        .await?;
-                    helper_id = Some(id);
-                    self.post_gateway_action(
-                        &client,
-                        GATEWAY_SYNC_ADMIN_PORT,
-                        "/swarmlite/storage/push",
-                    )
-                    .await
-                    .context("failed to commit the legacy Gateway certificate snapshot")?;
-                }
+            if existing.is_some() {
+                self.post_gateway_action(&client, existing_admin_port, "/swarmlite/storage/push")
+                    .await.context("failed to commit the active Gateway certificate snapshot")?;
+                active_quiesced = true;
             }
 
             let green = self
@@ -1121,25 +1119,6 @@ impl DockerCompatibleRuntime {
             .context("failed to restore the staged Gateway certificate snapshot")?;
             self.persist_gateway_recovery_snapshot_to(&green.id, &assignment.recovery_snapshot)
                 .await?;
-
-            if let Some(active) = existing.filter(|gateway| gateway.slot.is_none()) {
-                self.stop_gateway(active).await?;
-                legacy_stopped = true;
-                self.post_gateway_action(
-                    &client,
-                    GATEWAY_SYNC_ADMIN_PORT,
-                    "/swarmlite/storage/push",
-                )
-                    .await
-                    .context("failed to finalize the stopped legacy Gateway certificate snapshot")?;
-                self.post_gateway_action(
-                    &client,
-                    GATEWAY_STAGED_ADMIN_PORT,
-                    "/swarmlite/storage/restore",
-                )
-                .await
-                .context("failed to restore the final legacy Gateway certificate snapshot")?;
-            }
 
             let config =
                 gateway_config_for_admin(&assignment.config, GATEWAY_STAGED_ADMIN_PORT);
@@ -1173,12 +1152,6 @@ impl DockerCompatibleRuntime {
         }
         .await;
 
-        if let Some(id) = helper_id.as_deref()
-            && let Err(error) = self.remove_gateway_sync_helper(id, &spec.cluster_id).await
-        {
-            warn!(%error, "failed to clean up the Gateway certificate sync helper");
-        }
-
         if let Err(error) = result {
             if active_quiesced
                 && !retired_removed
@@ -1208,18 +1181,10 @@ impl DockerCompatibleRuntime {
                 warn!(%cleanup_error, "failed to remove the staged Gateway after upgrade failure");
             }
             if let Err(cleanup_error) = self
-                .remove_gateway_slot_volumes(&spec.cluster_id, Some(target_slot))
+                .remove_gateway_slot_volumes(&spec.cluster_id, target_slot)
                 .await
             {
                 warn!(%cleanup_error, "failed to remove staged Gateway volumes after upgrade failure");
-            }
-            if legacy_stopped
-                && let Some(active) = existing
-                && let Err(start_error) = self.client.start_container(&active.id, None).await
-            {
-                return Err(error.context(format!(
-                    "the legacy Gateway was stopped and rollback also failed: {start_error}"
-                )));
             }
             return Err(error);
         }
@@ -1248,7 +1213,6 @@ impl DockerCompatibleRuntime {
     ) -> Result<()> {
         let client = reqwest::Client::new();
         if active.running
-            && active.slot.is_some()
             && let Some(active_admin_port) = active_admin_port
         {
             return self
@@ -1300,7 +1264,7 @@ impl DockerCompatibleRuntime {
         &self,
         spec: &GatewayContainerSpec,
         gateway_image: &str,
-        data_slot: Option<GatewaySlot>,
+        data_slot: GatewaySlot,
     ) -> Result<String> {
         let name = gateway_sync_container_name(&spec.cluster_id);
         let remove = RemoveContainerOptionsBuilder::default().force(true).build();
@@ -1392,7 +1356,7 @@ impl DockerCompatibleRuntime {
     ) -> Result<ExistingGatewayContainer> {
         let bootstrap = gateway_bootstrap(spec, GATEWAY_STAGED_ADMIN_PORT, false)?;
         let [data_volume, config_volume, cache_volume] =
-            gateway_volume_names(&spec.cluster_id, Some(slot));
+            gateway_volume_names(&spec.cluster_id, slot);
         let host_config = HostConfig {
             binds: Some(vec![
                 format!("{data_volume}:/data"),
@@ -1479,7 +1443,7 @@ impl DockerCompatibleRuntime {
             cluster_id: Some(spec.cluster_id.clone()),
             image: Some(spec.gateway.image.clone()),
             grace_period_seconds: Some(optional_label(spec.gateway.shutdown.grace_period_seconds)),
-            slot: Some(slot),
+            slot,
             runtime_spec_hash: Some(runtime_spec_hash.to_owned()),
             running: true,
         })
@@ -1689,7 +1653,7 @@ impl DockerCompatibleRuntime {
     }
 
     async fn remove_gateway_volumes(&self, cluster_id: &str) -> Result<()> {
-        for slot in [None, Some(GatewaySlot::Blue), Some(GatewaySlot::Green)] {
+        for slot in [GatewaySlot::Blue, GatewaySlot::Green] {
             self.remove_gateway_slot_volumes(cluster_id, slot).await?;
         }
         self.remove_gateway_sync_volumes(cluster_id).await?;
@@ -1697,11 +1661,7 @@ impl DockerCompatibleRuntime {
         Ok(())
     }
 
-    async fn remove_gateway_slot_volumes(
-        &self,
-        cluster_id: &str,
-        slot: Option<GatewaySlot>,
-    ) -> Result<()> {
+    async fn remove_gateway_slot_volumes(&self, cluster_id: &str, slot: GatewaySlot) -> Result<()> {
         self.remove_named_gateway_volumes(gateway_volume_names(cluster_id, slot))
             .await
     }
@@ -2200,11 +2160,8 @@ fn gateway_sync_container_name(cluster_id: &str) -> String {
     format!("swarmlite-gateway-{cluster_id}-storage-sync")
 }
 
-fn gateway_volume_names(cluster_id: &str, slot: Option<GatewaySlot>) -> [String; 3] {
-    let prefix = slot.map_or_else(
-        || format!("swarmlite-gateway-{cluster_id}"),
-        |slot| format!("swarmlite-gateway-{cluster_id}-{}", slot.label()),
-    );
+fn gateway_volume_names(cluster_id: &str, slot: GatewaySlot) -> [String; 3] {
+    let prefix = format!("swarmlite-gateway-{cluster_id}-{}", slot.label());
     [
         format!("{prefix}-data"),
         format!("{prefix}-config"),
@@ -2468,11 +2425,72 @@ impl ContainerRuntime for DockerCompatibleRuntime {
                 .state
                 .as_ref()
                 .is_some_and(|state| state.running == Some(true));
-            let observed = inspect
+            let mut observed = inspect
                 .state
                 .clone()
                 .map(observed_state)
                 .unwrap_or(ObservedTaskState::Failed);
+            let is_job = match labels.get(TASK_KIND_LABEL).map(String::as_str) {
+                Some("job") => true,
+                Some("service") => false,
+                None => {
+                    // COMPAT(11 -> 12): schema 11 Service containers lack task_kind.
+                    // Remove this missing-label fallback in the next release.
+                    false
+                }
+                Some(kind) => bail!("unsupported task_kind {kind:?} on container {id}"),
+            };
+            let job = if is_job {
+                let state = inspect.state.as_ref();
+                let started = state
+                    .and_then(|s| s.started_at.as_deref())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|t| t.timestamp_millis())
+                    .filter(|t| *t > 0);
+                let exit_code = state.and_then(|s| s.exit_code);
+                observed = if running {
+                    ObservedTaskState::Running
+                } else if started.is_none() {
+                    ObservedTaskState::Unknown
+                } else if exit_code == Some(0) {
+                    ObservedTaskState::Succeeded
+                } else {
+                    ObservedTaskState::Failed
+                };
+                let stop_reason = self
+                    .job_state
+                    .as_ref()
+                    .map(|store| {
+                        store.get::<JobStopIntent>(&format!("job-stop:{cluster_id}:{task_id}"))
+                    })
+                    .transpose()?
+                    .flatten()
+                    .map(|intent| intent.reason);
+                if !running {
+                    match stop_reason.as_deref() {
+                        Some("timeout") => observed = ObservedTaskState::TimedOut,
+                        Some(_) => observed = ObservedTaskState::Cancelled,
+                        None => {}
+                    }
+                }
+                Some(crate::model::JobRuntimeState {
+                    stop_reason,
+                    job_id: labels.get(JOB_ID_LABEL).cloned().unwrap_or_default(),
+                    scheduled_at_unix_ms: labels
+                        .get(JOB_SCHEDULED_LABEL)
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0),
+                    start_deadline_unix_ms: labels
+                        .get(JOB_START_DEADLINE_LABEL)
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0),
+                    timeout_seconds: labels.get(JOB_TIMEOUT_LABEL).and_then(|v| v.parse().ok()),
+                    started_at_unix_ms: started,
+                    exit_code,
+                })
+            } else {
+                None
+            };
             let revision = labels
                 .get(REVISION_LABEL)
                 .and_then(|value| value.parse().ok());
@@ -2520,6 +2538,7 @@ impl ContainerRuntime for DockerCompatibleRuntime {
             result.insert(
                 task_id.clone(),
                 ManagedContainer {
+                    job,
                     id,
                     image_id: inspect.image.clone(),
                     task_id,
@@ -2559,6 +2578,7 @@ impl ContainerRuntime for DockerCompatibleRuntime {
         assignment: &TaskAssignment,
         progress: &RuntimeTaskProgress,
     ) -> Result<()> {
+        self.check_job_authorization(assignment, false)?;
         let _image_operation = self.image_operations.lock().await;
         info!(
             task_id = %assignment.id,
@@ -2586,6 +2606,7 @@ impl ContainerRuntime for DockerCompatibleRuntime {
             .await?
         };
 
+        self.check_job_authorization(assignment, true)?;
         let port_bindings = task_port_bindings(assignment);
         let exposed_ports = assignment
             .spec
@@ -2607,7 +2628,11 @@ impl ContainerRuntime for DockerCompatibleRuntime {
             binds: (!binds.is_empty()).then_some(binds),
             port_bindings: (!port_bindings.is_empty()).then_some(port_bindings),
             restart_policy: Some(RestartPolicy {
-                name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
+                name: Some(if assignment.job.is_some() {
+                    RestartPolicyNameEnum::NO
+                } else {
+                    RestartPolicyNameEnum::UNLESS_STOPPED
+                }),
                 maximum_retry_count: None,
             }),
             ..Default::default()
@@ -2634,6 +2659,7 @@ impl ContainerRuntime for DockerCompatibleRuntime {
                     start_interval: healthcheck.start_interval_nanos,
                 }),
             stop_timeout: Some(assignment.spec.stop_grace_period_seconds as i64),
+            stop_signal: assignment.spec.stop_signal.clone(),
             host_config: Some(host_config),
             ..Default::default()
         };
@@ -2644,6 +2670,16 @@ impl ContainerRuntime for DockerCompatibleRuntime {
             assignment.slot
         );
         let create_options = CreateContainerOptionsBuilder::default().name(&name).build();
+        if assignment.job.is_some() {
+            let created = self
+                .client
+                .create_container(Some(create_options), body)
+                .await?;
+            self.check_job_authorization(assignment, false)?;
+            progress.report(TaskReconcilePhase::Start);
+            self.client.start_container(&created.id, None).await?;
+            return Ok(());
+        }
         for attempt in 0..3 {
             progress.report(TaskReconcilePhase::Create);
             let created = match self
@@ -2738,11 +2774,89 @@ impl ContainerRuntime for DockerCompatibleRuntime {
         Ok(())
     }
 
+    async fn stop_job(&self, container: &ManagedContainer, reason: &str) -> Result<()> {
+        if !container.running {
+            return Ok(());
+        }
+        let state = self
+            .job_state
+            .as_ref()
+            .context("job stop requires durable local state")?;
+        let key = format!(
+            "job-stop:{}:{}",
+            container.cluster_id.as_deref().unwrap_or_default(),
+            container.task_id
+        );
+        let intent = state
+            .get::<JobStopIntent>(&key)?
+            .unwrap_or_else(|| JobStopIntent {
+                reason: reason.to_owned(),
+                requested_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+            });
+        state.put(&key, &intent)?;
+        let mut stopping = self
+            .job_stops
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !stopping.insert(container.task_id.clone()) {
+            return Ok(());
+        }
+        drop(stopping);
+        let elapsed = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_sub(intent.requested_at_unix_ms)
+            .max(0)
+            / 1000;
+        let remaining = (i64::from(container.stop_grace_seconds) - elapsed).max(0) as u64;
+        let options = StopContainerOptionsBuilder::default()
+            .t(remaining as i32)
+            .build();
+        let client = self.client.clone();
+        let id = container.id.clone();
+        let task_id = container.task_id.clone();
+        let stops = Arc::clone(&self.job_stops);
+        // The Docker daemon performs signal -> grace -> kill. Waiting for an old
+        // container must never occupy the Agent's reconciliation loop.
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                Duration::from_secs(remaining + 5),
+                client.stop_container(&id, Some(options)),
+            )
+            .await;
+            if !matches!(&result, Ok(Ok(())))
+                && !matches!(&result, Ok(Err(e)) if docker_not_found(e))
+            {
+                let kill = client.kill_container(
+                    &id,
+                    Some(
+                        bollard::query_parameters::KillContainerOptionsBuilder::default()
+                            .signal("SIGKILL")
+                            .build(),
+                    ),
+                );
+                if !matches!(
+                    tokio::time::timeout(Duration::from_secs(5), kill).await,
+                    Ok(Ok(()))
+                ) {
+                    warn!(%task_id, "could not stop job; will retry from durable stop intent");
+                }
+            }
+            stops
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&task_id);
+        });
+        Ok(())
+    }
+
     async fn start_task(
         &self,
         container: &ManagedContainer,
         progress: &RuntimeTaskProgress,
     ) -> Result<()> {
+        if container.job.is_some() {
+            bail!("cannot restart a one-shot job");
+        }
         info!(
             task_id = %container.task_id,
             runtime = %self.kind,
@@ -2946,6 +3060,14 @@ fn task_labels(assignment: &TaskAssignment) -> Result<HashMap<String, String>> {
         .clone()
         .into_iter()
         .collect::<HashMap<_, _>>();
+    for key in [
+        JOB_ID_LABEL,
+        JOB_SCHEDULED_LABEL,
+        JOB_START_DEADLINE_LABEL,
+        JOB_TIMEOUT_LABEL,
+    ] {
+        labels.remove(key);
+    }
     labels.extend([
         (MANAGED_LABEL.to_owned(), "true".to_owned()),
         (CLUSTER_LABEL.to_owned(), assignment.cluster_id.clone()),
@@ -2965,6 +3087,31 @@ fn task_labels(assignment: &TaskAssignment) -> Result<HashMap<String, String>> {
             assignment.spec.stop_grace_period_seconds.to_string(),
         ),
     ]);
+    labels.insert(
+        TASK_KIND_LABEL.into(),
+        if assignment.job.is_some() {
+            "job"
+        } else {
+            "service"
+        }
+        .into(),
+    );
+    if let Some(job) = &assignment.job {
+        labels.remove(SERVICE_LABEL);
+        labels.remove(SERVICE_NAME_LABEL);
+        labels.insert(JOB_ID_LABEL.into(), job.job_id.clone());
+        labels.insert(
+            JOB_SCHEDULED_LABEL.into(),
+            job.scheduled_at_unix_ms.to_string(),
+        );
+        labels.insert(
+            JOB_START_DEADLINE_LABEL.into(),
+            job.start_deadline_unix_ms.to_string(),
+        );
+        if let Some(timeout) = assignment.spec.job.as_ref().and_then(|j| j.timeout_seconds) {
+            labels.insert(JOB_TIMEOUT_LABEL.into(), timeout.to_string());
+        }
+    }
     if !assignment.spec.configs.is_empty() {
         labels.insert(
             CONFIG_REFS_LABEL.to_owned(),
@@ -3440,6 +3587,8 @@ mod tests {
         let client = Docker::connect_with_http(&endpoint, 5, API_DEFAULT_VERSION).unwrap();
         (
             DockerCompatibleRuntime {
+                job_state: None,
+                job_stops: Default::default(),
                 client,
                 kind: RuntimeKind::Docker,
                 socket: endpoint,
@@ -3472,6 +3621,8 @@ mod tests {
         let client = Docker::connect_with_http(&endpoint, 5, API_DEFAULT_VERSION).unwrap();
         (
             DockerCompatibleRuntime {
+                job_state: None,
+                job_stops: Default::default(),
                 client,
                 kind: RuntimeKind::Docker,
                 socket: endpoint,
@@ -3491,6 +3642,7 @@ mod tests {
 
     fn start_failure_assignment() -> TaskAssignment {
         TaskAssignment {
+            job: None,
             id: "task-start-failure".into(),
             cluster_id: "cluster-old".into(),
             stack: "demo".into(),
@@ -3517,6 +3669,8 @@ mod tests {
                 max_replicas_per_node: None,
                 max_surge: 1,
                 stop_grace_period_seconds: 10,
+                stop_signal: None,
+                job: None,
             },
             ports: Vec::new(),
             generation: 1,
@@ -3525,6 +3679,248 @@ mod tests {
             spec_hash: "hash".into(),
             image_resolved: true,
         }
+    }
+
+    fn one_shot_assignment() -> TaskAssignment {
+        let mut assignment = start_failure_assignment();
+        let now = chrono::Utc::now().timestamp_millis();
+        assignment.spec.job = Some(swarmlite_stack::JobSpec {
+            schedule: Some("* * * * *".into()),
+            time_zone: "UTC".into(),
+            suspend: false,
+            timeout_seconds: Some(60),
+        });
+        assignment.job = Some(crate::model::JobExecution {
+            runtime: None,
+            job_id: "demo.backup".into(),
+            scheduled_at_unix_ms: now,
+            not_before_unix_ms: now - 1000,
+            start_deadline_unix_ms: now + 60_000,
+            spec: Box::new(assignment.spec.clone()),
+        });
+        assignment
+    }
+
+    #[tokio::test]
+    async fn job_start_error_is_never_retried_or_cleaned_up_even_after_ledger_reopen() {
+        let (runtime, calls, server) = runtime_with_start_failure_api().await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = crate::local_state::LocalState::open(directory.path()).unwrap();
+        let assignment = one_shot_assignment();
+        let key = format!("{}:{}", assignment.cluster_id, assignment.id);
+        state.authorize_jobs(&[key.clone()]).unwrap();
+        let mut runtime = runtime.with_job_state(state);
+        assert!(
+            runtime
+                .create_task(&assignment, &RuntimeTaskProgress::default())
+                .await
+                .is_err()
+        );
+        runtime.job_state = Some(crate::local_state::LocalState::open(directory.path()).unwrap());
+        runtime
+            .job_state
+            .as_ref()
+            .unwrap()
+            .authorize_jobs(&[key])
+            .unwrap();
+        assert!(
+            runtime
+                .create_task(&assignment, &RuntimeTaskProgress::default())
+                .await
+                .is_err()
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c.ends_with("/containers/create"))
+                .count(),
+            1
+        );
+        assert_eq!(calls.iter().filter(|c| c.ends_with("/start")).count(), 1);
+        assert!(!calls.iter().any(|c| c.starts_with("DELETE")));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn job_revoked_or_expired_assignment_never_creates_a_container() {
+        let (runtime, calls, server) = runtime_with_start_failure_api().await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = crate::local_state::LocalState::open(directory.path()).unwrap();
+        let mut assignment = one_shot_assignment();
+        let key = format!("{}:{}", assignment.cluster_id, assignment.id);
+        state.authorize_jobs(&[key.clone()]).unwrap();
+        state.authorize_jobs(&[]).unwrap();
+        let runtime = runtime.with_job_state(state.clone());
+        assert!(
+            runtime
+                .create_task(&assignment, &RuntimeTaskProgress::default())
+                .await
+                .is_err()
+        );
+        state.authorize_jobs(&[key]).unwrap();
+        assignment.job.as_mut().unwrap().start_deadline_unix_ms = 1;
+        assert!(
+            runtime
+                .create_task(&assignment, &RuntimeTaskProgress::default())
+                .await
+                .is_err()
+        );
+        assert!(calls.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[test]
+    fn job_labels_distinguish_definition_and_execution_without_service_identity() {
+        let assignment = one_shot_assignment();
+        let labels = task_labels(&assignment).unwrap();
+        assert_eq!(labels[TASK_LABEL], assignment.id);
+        assert_eq!(labels[JOB_ID_LABEL], "demo.backup");
+        assert_eq!(labels[TASK_KIND_LABEL], "job");
+        assert_eq!(labels[JOB_TIMEOUT_LABEL], "60");
+        assert!(!labels.contains_key(SERVICE_LABEL));
+    }
+
+    #[derive(Clone, Default)]
+    struct JobApi {
+        body: Arc<Mutex<serde_json::Value>>,
+        stop_uri: Arc<Mutex<String>>,
+        stop_started: Arc<tokio::sync::Notify>,
+        allow_stop: Arc<tokio::sync::Notify>,
+        running: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    async fn job_api(
+        State(state): State<JobApi>,
+        method: Method,
+        uri: Uri,
+        body: Bytes,
+    ) -> axum::response::Response {
+        let path = uri.path();
+        let (status, body) = if method == Method::GET && path.contains("/images/") {
+            (
+                StatusCode::OK,
+                serde_json::json!({"Id":"sha256:test-image"}),
+            )
+        } else if path.ends_with("/containers/create") {
+            *state.body.lock().unwrap() = serde_json::from_slice(&body).unwrap();
+            (
+                StatusCode::CREATED,
+                serde_json::json!({"Id":"job-container","Warnings":[]}),
+            )
+        } else if path.ends_with("/start") {
+            state.running.store(true, Ordering::SeqCst);
+            (StatusCode::NO_CONTENT, serde_json::Value::Null)
+        } else if path.ends_with("/stop") {
+            *state.stop_uri.lock().unwrap() = uri.to_string();
+            state.stop_started.notify_one();
+            state.allow_stop.notified().await;
+            state.running.store(false, Ordering::SeqCst);
+            (StatusCode::NO_CONTENT, serde_json::Value::Null)
+        } else if path.ends_with("/containers/json") {
+            (
+                StatusCode::OK,
+                serde_json::json!([{
+                    "Id":"job-container", "Names":["/job"], "Image":"busybox", "ImageID":"sha256:test-image",
+                    "Command":"true", "Created":1, "Ports":[], "Labels":state.body.lock().unwrap()["Labels"].clone(),
+                    "State":"running", "Status":"Up"
+                }]),
+            )
+        } else if path.ends_with("/containers/job-container/json") {
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "Id":"job-container", "Image":"sha256:test-image", "Config":state.body.lock().unwrap().clone(),
+                    "State":{"Running":state.running.load(Ordering::SeqCst), "StartedAt":"2026-01-01T00:00:00Z", "ExitCode":0}
+                }),
+            )
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                serde_json::json!({"message":"unexpected request"}),
+            )
+        };
+        axum::response::Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(if status == StatusCode::NO_CONTENT {
+                Body::empty()
+            } else {
+                Body::from(body.to_string())
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn job_engine_settings_and_nonblocking_stop_preserve_timeout_intent_on_recovery() {
+        let state = JobApi::default();
+        let app = Router::new()
+            .fallback(any(job_api))
+            .with_state(state.clone());
+        let (runtime, server) = runtime_for_pull_api(app, DeploymentPolicy::default()).await;
+        let directory = tempfile::tempdir().unwrap();
+        let ledger = crate::local_state::LocalState::open(directory.path()).unwrap();
+        let mut assignment = one_shot_assignment();
+        assignment.spec.stop_signal = Some("SIGINT".into());
+        ledger
+            .authorize_jobs(&[format!("{}:{}", assignment.cluster_id, assignment.id)])
+            .unwrap();
+        let mut runtime = runtime.with_job_state(ledger.clone());
+        runtime
+            .create_task(&assignment, &RuntimeTaskProgress::default())
+            .await
+            .unwrap();
+        {
+            let body = state.body.lock().unwrap();
+            assert_eq!(body["HostConfig"]["RestartPolicy"]["Name"], "no");
+            assert_eq!(body["StopSignal"], "SIGINT");
+            assert_eq!(body["StopTimeout"], 10);
+        }
+        let containers = runtime.list_managed(&assignment.cluster_id).await.unwrap();
+        let container = &containers[&assignment.id];
+        assert_eq!(container.observed, ObservedTaskState::Running);
+        // A previous Agent persisted the stop intent and then crashed. Its elapsed
+        // grace time must be preserved, even when a different reason requests stop.
+        ledger
+            .put(
+                &format!("job-stop:{}:{}", assignment.cluster_id, assignment.id),
+                &JobStopIntent {
+                    reason: "timeout".into(),
+                    requested_at_unix_ms: chrono::Utc::now().timestamp_millis() - 100_000,
+                },
+            )
+            .unwrap();
+        runtime.job_state = Some(crate::local_state::LocalState::open(directory.path()).unwrap());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.stop_job(container, "replaced"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), state.stop_started.notified())
+            .await
+            .unwrap();
+        assert!(state.stop_uri.lock().unwrap().contains("t=0"));
+        assert!(state.running.load(Ordering::SeqCst)); // Engine still waiting; Agent already returned.
+        state.allow_stop.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !runtime.job_stops.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let containers = runtime.list_managed(&assignment.cluster_id).await.unwrap();
+        assert_eq!(
+            containers[&assignment.id].observed,
+            ObservedTaskState::TimedOut
+        ); // even with exit code 0
+        assert_eq!(
+            containers[&assignment.id].job.as_ref().unwrap().exit_code,
+            Some(0)
+        );
+        server.abort();
     }
 
     #[test]
@@ -4009,16 +4405,12 @@ mod tests {
     #[test]
     fn scopes_gateway_volumes_to_the_cluster() {
         assert_eq!(
-            gateway_volume_names("cluster-old", Some(GatewaySlot::Blue)),
+            gateway_volume_names("cluster-old", GatewaySlot::Blue),
             [
                 "swarmlite-gateway-cluster-old-blue-data".to_owned(),
                 "swarmlite-gateway-cluster-old-blue-config".to_owned(),
                 "swarmlite-gateway-cluster-old-blue-cache".to_owned(),
             ]
-        );
-        assert_eq!(
-            gateway_volume_names("cluster-old", None)[0],
-            "swarmlite-gateway-cluster-old-data"
         );
     }
 
@@ -4082,6 +4474,7 @@ mod tests {
     #[test]
     fn adds_cluster_and_recovery_identity_labels() {
         let assignment = TaskAssignment {
+            job: None,
             id: "task-1".into(),
             cluster_id: "cluster-old".into(),
             stack: "demo".into(),
@@ -4108,6 +4501,8 @@ mod tests {
                 max_replicas_per_node: None,
                 max_surge: 1,
                 stop_grace_period_seconds: 10,
+                stop_signal: None,
+                job: None,
             },
             ports: Vec::new(),
             generation: 4,
@@ -4118,7 +4513,8 @@ mod tests {
         };
 
         let labels = task_labels(&assignment).unwrap();
-        assert_eq!(labels.len(), 11);
+        assert_eq!(labels.len(), 12);
+        assert_eq!(labels[TASK_KIND_LABEL], "service");
         assert_eq!(labels[MANAGED_LABEL], "true");
         assert_eq!(labels[CLUSTER_LABEL], "cluster-old");
         assert_eq!(labels[STACK_LABEL], "demo");
@@ -4140,6 +4536,7 @@ mod tests {
     fn mounts_cached_stack_configs_read_only_alongside_volumes() {
         let digest = "a".repeat(64);
         let assignment = TaskAssignment {
+            job: None,
             id: "task-1".into(),
             cluster_id: "cluster-old".into(),
             stack: "demo".into(),
@@ -4173,6 +4570,8 @@ mod tests {
                 max_replicas_per_node: None,
                 max_surge: 1,
                 stop_grace_period_seconds: 10,
+                stop_signal: None,
+                job: None,
             },
             ports: Vec::new(),
             generation: 1,
@@ -4215,6 +4614,7 @@ mod tests {
     #[test]
     fn lets_docker_allocate_and_then_reads_the_published_port() {
         let assignment = TaskAssignment {
+            job: None,
             id: "task-1".into(),
             cluster_id: "cluster-old".into(),
             stack: "demo".into(),
@@ -4245,6 +4645,8 @@ mod tests {
                 max_replicas_per_node: None,
                 max_surge: 1,
                 stop_grace_period_seconds: 10,
+                stop_signal: None,
+                job: None,
             },
             ports: vec![PortBinding {
                 target: 80,
@@ -4279,4 +4681,10 @@ mod tests {
         let resolved = resolved_container_ports(&inspect, assignment.ports);
         assert_eq!(resolved[0].published, Some(49_152));
     }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct JobStopIntent {
+    reason: String,
+    requested_at_unix_ms: i64,
 }

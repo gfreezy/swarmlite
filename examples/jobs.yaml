@@ -1,0 +1,14 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/gfreezy/swarmlite/main/crates/swarmlite-stack/schema/stack.schema.json
+x-swarmlite:
+  name: maintenance
+
+x-swarmlite-jobs:
+  cleanup:
+    image: alpine:3.22
+    command: ["sh", "-c", "date; echo cleanup complete"]
+    schedule: "*/5 * * * *"
+    timezone: Asia/Shanghai
+    timeout: 4m
+    stop_signal: SIGTERM
+    stop_grace_period: 10s
+    suspend: false

@@ -201,6 +201,108 @@ changing cluster state. Editor completion is available through
 See [`examples/services-all.yaml`](examples/services-all.yaml) for Service fields and
 [`examples/routing-all.yaml`](examples/routing-all.yaml) for routing fields.
 
+### Scheduled jobs
+
+Define one-shot workloads under `x-swarmlite-jobs`. A Stack can contain only jobs, or
+both services and jobs with distinct names. See [`examples/jobs.yaml`](examples/jobs.yaml).
+
+```yaml
+x-swarmlite:
+  name: maintenance
+
+x-swarmlite-jobs:
+  cleanup:
+    image: example/app:1.0
+    command: ["/app/cleanup"]
+    schedule: "0 2 * * *"
+    timezone: Asia/Shanghai
+    timeout: 30m
+    stop_signal: SIGTERM
+    stop_grace_period: 10s
+    suspend: false
+```
+
+`schedule` is a five-field cron expression (minute, hour, day, month, weekday), evaluated
+in the IANA `timezone` (default `UTC`). Omit `schedule` for a manual-only job. Each occurrence has its own `task_id`; `job_id`
+identifies the Stack-qualified definition, such as `maintenance.cleanup`. Job container
+labels use `io.swarmlite.task_kind=job`, `io.swarmlite.job_id`, the existing
+`io.swarmlite.task_id`, and immutable schedule/start-deadline/timeout metadata. They do
+not reuse Service identity labels.
+
+Jobs reuse the existing image, command, entrypoint, environment, labels, configs,
+volumes, pull policy, stop settings, and `deploy.placement` fields. Service inheritance,
+ports, health checks, replicas, and rolling-update settings are not supported for jobs.
+`stop_signal` is also supported on services; omitting it preserves the image's
+`STOPSIGNAL`, falling back to the runtime's `SIGTERM` default.
+
+Each scheduled occurrence makes **at most one container start attempt**. The Controller
+persists the trigger cursor and fixed node assignment before dispatch, and the Agent
+atomically claims the task in its local SQLite ledger before creating its container.
+Ambiguous create/start results consume that attempt. Failed or lost executions are not
+restarted or moved to another node. Containers use restart policy `no`, including after
+host reboot. An attempt may therefore never start; this is deliberate.
+
+At every new occurrence, the Controller revokes all unfinished earlier occurrences and
+requests their termination. It allows up to the largest old `stop_grace_period` plus
+five seconds before releasing the new assignment, capped at 30 seconds and half the
+remaining interval before the next occurrence. Agents perform stops independently of reconciliation: send the
+configured stop signal, wait the remaining grace period, then force termination if
+necessary. An unreachable node never blocks the new occurrence. Old and new executions
+can overlap during a partition; there is no strict singleton guarantee. Startup work
+also expires at the next occurrence, so a slow image pull cannot start an obsolete run.
+
+`timeout` defaults to `30m` and measures running time from the container's actual start,
+excluding image pulls. It must be a positive whole-second duration. The Agent enforces
+it even while disconnected from the Controller; graceful shutdown time is additional.
+If the Agent itself is unavailable, enforcement resumes after it restarts. Stop intent
+and its original timestamp are durable, so restarts do not reset the grace period.
+`suspend: true` skips future occurrences without terminating a running execution;
+resuming does not replay skipped occurrences.
+
+Controller startup skips missed schedule times and resumes at a future occurrence.
+Ordinary scheduling tolerates tick latency within the scheduled minute; older missed
+occurrences are skipped. With no compatible live node, that occurrence is skipped too.
+Only Agents advertising job support receive jobs. Keep node clocks synchronized.
+Controller startup migrates schema 11 to 12 in one transaction; normal reads and writes
+only accept schema 12. This is the only supported historical storage format, and the
+11-to-12 migration is scheduled for removal in the next release. Older Controller binaries
+cannot read the upgraded database. Upgrade Controllers, Agents, and CLI together.
+Older storage layouts, embedded KV documents, slotless Gateways, `pull_policy: if_not_present`,
+and removed cache fields are no longer supported. Use `pull_policy: missing`; cache keys
+are always hashed and no longer accept `key.hash`. Schema 11 snapshots have that no-op
+option removed during migration.
+On lost-database recovery, redeploy the Stack files: historical jobs are never replayed,
+and surviving unclaimed job containers are stopped rather than adopted as services.
+The at-most-once guarantee depends on retaining the Agent attempt ledger and on there
+being only one authoritative Controller. Do not restore an old Agent database while
+retaining live assignments; use the documented full-cluster recovery procedure instead.
+
+Deploy and manage jobs:
+
+```bash
+swarmlite deploy -c examples/jobs.yaml
+swarmlite inspect maintenance.cleanup
+swarmlite job ls
+swarmlite job run maintenance.cleanup
+swarmlite job history maintenance.cleanup --json
+swarmlite job logs maintenance.cleanup
+swarmlite job cancel <task-id>
+```
+
+Manual invocations are allowed while suspended, but reject unfinished earlier executions.
+They receive a startup window of at most five minutes (or until the next cron occurrence).
+Every `job run` request creates a new execution; do not blindly retry a request with an
+unknown result. `job cancel` requests termination; use history to confirm it finished.
+An automatic occurrence also replaces a still-running manual invocation.
+
+Deployment completion means the schedule was registered; it does not wait for a job
+execution. `inspect` includes the next trigger, execution timestamps, exit codes, and
+stop reasons. The last 20 confirmed finished executions are retained for inspection and
+logs; unresolved executions remain visible until reconciled. The Agent's compact start
+claims are retained to reject stale assignments. `scale` and `restart` reject jobs;
+edit and redeploy their definitions instead. Configuration changes affect future
+occurrences, while existing executions keep their original container settings.
+
 ### Task environment templates
 
 Environment values support the same Go-template context names as Docker Swarm. The Agent expands
@@ -490,7 +592,6 @@ cache:
   max_cacheable_body_bytes: 10485760
   max_request_body_bytes: 1048576
   key:
-    hash: true
     query_parameters: [embedded]
     headers: [Accept-Language]
   status_codes: [200]
@@ -698,11 +799,8 @@ snapshot keeps its existing recovery-format validation.
 | Native response cache | Not transferred; Green starts with a fresh cache database, whose SQLite schema remains internal to the cache module |
 | Caddy instance ID, storage-clean timestamps, and lock files | Not transferred; they are instance-local and regenerated |
 
-The first replacement of a legacy bridge-network Gateway has one short stop/bind transition,
-because Docker's old host-port proxy cannot share `80`/`443` with the new host-network listener.
-After that one-time migration, replacements use the overlapping blue/green path. Custom images and
-listeners are described in
-[`caddy-storage/README.md`](caddy-storage/README.md).
+Gateway replacement requires the current blue/green container layout. Custom images and
+listeners are described in [`caddy-storage/README.md`](caddy-storage/README.md).
 
 Mutable cluster settings use dotted scopes. Optional settings are omitted until explicitly set; an
 explicit `0` or `false` remains distinct from an unset value. Clear a value with
@@ -1011,7 +1109,7 @@ service VIPs, cross-node DNS, autoscaling, global services, or the broader Kuber
 
 ### Command reference
 
-The CLI exposes 20 top-level commands and 16 actionable subcommands in the grouped command trees.
+The CLI exposes 21 top-level commands and 21 actionable subcommands in the grouped command trees.
 Run `swarmlite COMMAND --help` for complete arguments.
 
 ```text
@@ -1027,6 +1125,8 @@ gateway status|enable|disable
 node label get|set|remove
                      read or update one node's placement labels
 registry login       store private registry credentials
+job ls|run|history|logs|cancel
+                     manage one-shot and scheduled jobs
 deploy               deploy or update a Stack
 deployment status [STACK]
 deployment history [STACK]
@@ -1074,7 +1174,7 @@ output (`--json`, `ps --quiet`, and `logs --raw`) never adds styling.
 | Gateway HTTPS | TCP `443` | HTTPS serving |
 | Caddy admin API | `127.0.0.1:2019` | Local atomic configuration |
 | Staged Caddy admin API | `127.0.0.1:2020` | Temporary endpoint during Gateway replacement |
-| Certificate sync admin API | `127.0.0.1:2021` | Temporary legacy-migration helper endpoint |
+| Certificate sync admin API | `127.0.0.1:2021` | Temporary certificate snapshot helper endpoint |
 | CLI and node process | `/usr/local/bin/swarmlite` | System installation binary |
 | Node data | `/var/lib/swarmlite` | Identity, SQLite state, and Agent config cache |
 | Installed runtime settings | `/etc/swarmlite/runtime.env` | Data directory, runtime, and socket |

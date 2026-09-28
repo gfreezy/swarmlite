@@ -8,6 +8,7 @@ pub use swarmlite_client as client;
 pub use swarmlite_platform::local_state;
 
 mod controller;
+mod jobs;
 mod kv;
 mod scheduler;
 pub mod storage;

@@ -373,7 +373,10 @@ fn summarize_tasks(
                 node_id: task.node_id.clone(),
                 desired: task.desired.clone(),
                 observed: task.observed.clone(),
-                image: service.spec.image.clone(),
+                image: task
+                    .job
+                    .as_ref()
+                    .map_or_else(|| service.spec.image.clone(), |j| j.spec.image.clone()),
                 ports: task.ports.clone(),
                 error: task
                     .reconcile_error
@@ -478,6 +481,7 @@ mod tests {
         state.services.insert(
             "demo.web".into(),
             ServiceRecord {
+                job_cursor: None,
                 id: "demo.web".into(),
                 stack: "demo".into(),
                 name: "web".into(),
@@ -500,6 +504,8 @@ mod tests {
                     max_replicas_per_node: None,
                     max_surge: 0,
                     stop_grace_period_seconds: 10,
+                    stop_signal: None,
+                    job: None,
                 },
                 deleted: false,
             },
@@ -507,6 +513,7 @@ mod tests {
         state.tasks.insert(
             "task-123".into(),
             TaskRecord {
+                job: None,
                 id: "task-123".into(),
                 service_id: "demo.web".into(),
                 revision: 1,
@@ -539,6 +546,7 @@ mod tests {
         state.services.insert(
             "demo.web".into(),
             ServiceRecord {
+                job_cursor: None,
                 id: "demo.web".into(),
                 stack: "demo".into(),
                 name: "web".into(),
@@ -561,6 +569,8 @@ mod tests {
                     max_replicas_per_node: None,
                     max_surge: 1,
                     stop_grace_period_seconds: 10,
+                    stop_signal: None,
+                    job: None,
                 },
                 deleted: false,
             },
@@ -572,6 +582,7 @@ mod tests {
             state.tasks.insert(
                 id.into(),
                 TaskRecord {
+                    job: None,
                     id: id.into(),
                     service_id: "demo.web".into(),
                     revision,

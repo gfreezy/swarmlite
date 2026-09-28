@@ -11,9 +11,12 @@ use crate::{
 };
 
 pub fn reconcile(state: &mut ClusterState, live_nodes: &BTreeSet<String>) -> bool {
-    let mut changed = false;
+    let mut changed = crate::jobs::reconcile(state, live_nodes, crate::controller::unix_ms());
 
     for task in state.tasks.values_mut() {
+        if task.job.is_some() {
+            continue;
+        }
         if matches!(
             task.desired,
             DesiredTaskState::Running | DesiredTaskState::Draining
@@ -34,6 +37,9 @@ pub fn reconcile(state: &mut ClusterState, live_nodes: &BTreeSet<String>) -> boo
     let service_ids: Vec<String> = state.services.keys().cloned().collect();
     for service_id in service_ids {
         let service = state.services[&service_id].clone();
+        if service.spec.job.is_some() {
+            continue;
+        }
         if service.deleted || service.spec.replicas == 0 {
             changed |= stop_all_service_tasks(state, &service);
             continue;
@@ -229,7 +235,7 @@ pub fn finish_drains(state: &mut ClusterState, now_unix_ms: i64) -> bool {
     changed
 }
 
-fn schedule_task(
+pub(crate) fn schedule_task(
     state: &ClusterState,
     service: &ServiceRecord,
     live_nodes: &BTreeSet<String>,
@@ -253,6 +259,7 @@ fn schedule_task(
                     && task.service_id == service.id
                     && task.revision == service.revision
                     && task.desired == DesiredTaskState::Running
+                    && !(task.job.is_some() && task.observed.is_job_terminal())
             })
             .count();
         let same_service = state
@@ -262,12 +269,17 @@ fn schedule_task(
                 task.node_id == node.id
                     && task.service_id == service.id
                     && task.desired == DesiredTaskState::Running
+                    && !(task.job.is_some() && task.observed.is_job_terminal())
             })
             .count();
         let total = state
             .tasks
             .values()
-            .filter(|task| task.node_id == node.id && task.desired == DesiredTaskState::Running)
+            .filter(|task| {
+                task.node_id == node.id
+                    && task.desired == DesiredTaskState::Running
+                    && !(task.job.is_some() && task.observed.is_job_terminal())
+            })
             .count();
         (same_revision, same_service, total, node.id.as_str())
     });
@@ -280,11 +292,13 @@ fn schedule_task(
             task.service_id == service.id
                 && task.revision == service.revision
                 && task.desired == DesiredTaskState::Running
+                && !(task.job.is_some() && task.observed.is_job_terminal())
         })
         .map(|task| task.slot)
         .collect();
     let slot = (0..service.spec.replicas).find(|slot| !used_slots.contains(slot))?;
     Some(TaskRecord {
+        job: None,
         id: Uuid::new_v4().to_string(),
         service_id: service.id.clone(),
         revision: service.revision,
@@ -463,6 +477,7 @@ mod tests {
 
     fn service(revision: u64, replicas: u32) -> ServiceRecord {
         ServiceRecord {
+            job_cursor: None,
             id: "demo.web".into(),
             stack: "demo".into(),
             name: "web".into(),
@@ -490,6 +505,8 @@ mod tests {
                 max_replicas_per_node: None,
                 max_surge: 1,
                 stop_grace_period_seconds: 10,
+                stop_signal: None,
+                job: None,
             },
         }
     }
@@ -500,6 +517,7 @@ mod tests {
             state.nodes.insert(
                 id.into(),
                 NodeRecord {
+                    supports_jobs: true,
                     id: id.into(),
                     address: "127.0.0.1".into(),
                     swarmlite_version: None,

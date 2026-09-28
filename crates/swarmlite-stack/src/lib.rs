@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 mod compose;
+mod jobs;
+pub use jobs::JobSpec;
 mod template;
 
 pub use compose::{
@@ -52,6 +54,10 @@ pub struct ServiceSpec {
     pub max_replicas_per_node: Option<u32>,
     pub max_surge: u32,
     pub stop_grace_period_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_signal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -73,7 +79,6 @@ pub struct ServiceConfigMount {
 pub enum PullPolicy {
     Always,
     #[default]
-    #[serde(alias = "if_not_present")]
     Missing,
     Never,
 }
@@ -227,7 +232,7 @@ pub struct HttpRouteRule {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(try_from = "HttpCacheSpecInput")]
+#[serde(deny_unknown_fields)]
 pub struct HttpCacheSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<String>,
@@ -241,89 +246,17 @@ pub struct HttpCacheSpec {
     pub key: Option<HttpCacheKeySpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_codes: Option<Vec<u16>>,
-    // Persisted Stack snapshots may contain cache-handler fields removed when
-    // the native response cache replaced Souin. Retain their names long enough
-    // for normal Stack validation to reject them, but omit them when trusted
-    // historical state is serialized again.
-    #[serde(default, flatten, skip_serializing)]
-    ignored_legacy_fields: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct HttpCacheKeySpec {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disable_query: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub hash: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_parameters: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct HttpCacheSpecInput {
-    #[serde(default)]
-    ttl: Option<String>,
-    #[serde(default)]
-    allowed_http_verbs: Option<Vec<String>>,
-    #[serde(default)]
-    max_cacheable_body_bytes: Option<u64>,
-    #[serde(default)]
-    max_request_body_bytes: Option<u64>,
-    #[serde(default)]
-    status_codes: Option<Vec<u16>>,
-    #[serde(default)]
-    key: Option<HttpCacheKeySpecInput>,
-    #[serde(default, flatten)]
-    ignored_legacy_fields: BTreeMap<String, Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct HttpCacheKeySpecInput {
-    #[serde(default)]
-    headers: Vec<String>,
-    #[serde(default)]
-    disable_query: bool,
-    // The native cache always hashes its complete key. This setting is
-    // accepted only so pre-native Stack files and snapshots remain readable.
-    #[serde(default)]
-    hash: bool,
-    #[serde(default)]
-    query_parameters: Option<Vec<String>>,
-    #[serde(default, flatten)]
-    ignored_fields: BTreeMap<String, Value>,
-}
-
-impl TryFrom<HttpCacheSpecInput> for HttpCacheSpec {
-    type Error = String;
-
-    fn try_from(mut input: HttpCacheSpecInput) -> std::result::Result<Self, Self::Error> {
-        let key = if let Some(key) = input.key {
-            input.ignored_legacy_fields.extend(
-                key.ignored_fields
-                    .into_iter()
-                    .map(|(field, value)| (format!("key.{field}"), value)),
-            );
-            Some(HttpCacheKeySpec {
-                disable_query: key.disable_query,
-                hash: key.hash,
-                headers: key.headers,
-                query_parameters: key.query_parameters,
-            })
-        } else {
-            None
-        };
-        Ok(Self {
-            ttl: input.ttl,
-            allowed_http_verbs: input.allowed_http_verbs,
-            max_cacheable_body_bytes: input.max_cacheable_body_bytes,
-            max_request_body_bytes: input.max_request_body_bytes,
-            key,
-            status_codes: input.status_codes,
-            ignored_legacy_fields: input.ignored_legacy_fields,
-        })
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -812,10 +745,6 @@ fn validate_cache(cache: Option<&HttpCacheSpec>) -> Result<()> {
         return Ok(());
     };
 
-    if let Some(field) = cache.ignored_legacy_fields.keys().next() {
-        bail!("unknown field `{field}`");
-    }
-
     if let Some(ttl) = cache.ttl.as_deref() {
         let duration = humantime::parse_duration(ttl)
             .with_context(|| format!("cache ttl {ttl:?} is invalid"))?;
@@ -1267,6 +1196,8 @@ mod tests {
             max_replicas_per_node: None,
             max_surge: 1,
             stop_grace_period_seconds: 10,
+            stop_signal: None,
+            job: None,
         }
     }
 
@@ -1606,13 +1537,19 @@ x-swarmlite:
     }
 
     #[test]
-    fn preserves_souin_cache_settings_when_serializing() {
+    fn rejects_removed_cache_options_in_current_documents() {
+        for cache in [json!({"key": {"hash": true}}), json!({"stale": "1h"})] {
+            assert!(serde_json::from_value::<HttpCacheSpec>(cache).is_err());
+        }
+    }
+
+    #[test]
+    fn preserves_cache_settings_when_serializing() {
         let cache: HttpCacheSpec = serde_json::from_value(json!({
             "ttl": "24h",
             "allowed_http_verbs": ["GET", "HEAD"],
             "key": {
                 "disable_query": true,
-                "hash": true,
                 "headers": ["accept-encoding"]
             }
         }))
@@ -1629,15 +1566,14 @@ x-swarmlite:
                 "allowed_http_verbs": ["GET", "HEAD"],
                 "key": {
                     "disable_query": true,
-                    "hash": true,
-                    "headers": ["accept-encoding"]
+                        "headers": ["accept-encoding"]
                 }
             })
         );
     }
 
     #[test]
-    fn accepts_souin_cache_key_settings_in_stack_configuration() {
+    fn accepts_cache_key_settings_in_stack_configuration() {
         let parsed = parse_stack(
             r#"
 services:
@@ -1651,7 +1587,6 @@ x-swarmlite:
         - cache:
             allowed_http_verbs: [GET, HEAD]
             key:
-              hash: true
               disable_query: true
               headers: [x-preferred-languages, x-app-language]
           backend:
@@ -1673,7 +1608,6 @@ x-swarmlite:
             ["x-preferred-languages", "x-app-language"]
         );
         assert!(cache.key.as_ref().unwrap().disable_query);
-        assert!(cache.key.as_ref().unwrap().hash);
     }
 
     #[test]

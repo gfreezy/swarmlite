@@ -60,7 +60,7 @@ does not restart Caddy. A different digest starts a blank blue/green candidate w
 `/config`, and `/cache` volumes; Controller-owned state is restored before it binds public ports.
 The online process always uses `127.0.0.1:2019` for Caddy administration. A replacement candidate
 uses `127.0.0.1:2020` during overlap and moves the admin listener to `2019` after the retired
-process exits; the legacy certificate sync helper temporarily uses `127.0.0.1:2021`.
+process exits; the certificate sync helper for a stopped Gateway temporarily uses `127.0.0.1:2021`.
 
 ## Automatic configuration
 

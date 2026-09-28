@@ -50,7 +50,10 @@ impl fmt::Debug for StackRegistryCredential {
 
 #[derive(Debug, Deserialize)]
 struct RawStack {
+    #[serde(default)]
     services: BTreeMap<String, RawService>,
+    #[serde(rename = "x-swarmlite-jobs", default)]
+    jobs: BTreeMap<String, RawJob>,
     #[serde(default)]
     configs: BTreeMap<String, RawConfigSource>,
     #[serde(rename = "x-swarmlite", default)]
@@ -121,6 +124,78 @@ struct RawService {
     deploy: RawDeploy,
     healthcheck: Option<RawHealthcheck>,
     stop_grace_period: Option<String>,
+    stop_signal: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawJob {
+    schedule: Option<String>,
+    #[serde(default = "default_time_zone", rename = "timezone")]
+    time_zone: String,
+    #[serde(default)]
+    suspend: bool,
+    timeout: Option<String>,
+    #[serde(flatten)]
+    container: BTreeMap<String, Value>,
+}
+
+fn default_time_zone() -> String {
+    "UTC".into()
+}
+
+fn normalize_job(name: &str, raw: RawJob) -> Result<ServiceSpec> {
+    for field in ["ports", "expose", "healthcheck"] {
+        if raw.container.contains_key(field) {
+            bail!("job {name}: {field} is not supported");
+        }
+    }
+    if let Some(deploy) = raw.container.get("deploy").and_then(Value::as_mapping) {
+        for field in ["replicas", "mode", "update_config"] {
+            if deploy.contains_key(Value::String(field.into())) {
+                bail!("job {name}: deploy.{field} is not supported");
+            }
+        }
+    }
+    if raw
+        .container
+        .get("deploy")
+        .and_then(|d| d.get("placement"))
+        .and_then(|p| p.get("max_replicas_per_node"))
+        .is_some()
+    {
+        bail!("job {name}: deploy.placement.max_replicas_per_node is not supported");
+    }
+    let container: RawService = serde_yaml::from_value(serde_yaml::to_value(raw.container)?)
+        .with_context(|| format!("job {name}: invalid container configuration"))?;
+    let mut spec = normalize_service(name, container)?;
+    let timeout_seconds = raw
+        .timeout
+        .as_deref()
+        .map(|value| -> Result<u64> {
+            let duration = humantime::parse_duration(value)?;
+            if duration.is_zero()
+                || duration.subsec_nanos() != 0
+                || duration.as_secs() > i32::MAX as u64
+            {
+                bail!(
+                    "timeout must be a positive whole number of seconds, at most {}",
+                    i32::MAX
+                );
+            }
+            Ok(duration.as_secs())
+        })
+        .transpose()?
+        .or(Some(1800));
+    let job = crate::JobSpec {
+        schedule: raw.schedule,
+        time_zone: raw.time_zone,
+        suspend: raw.suspend,
+        timeout_seconds,
+    };
+    job.validate().with_context(|| format!("job {name}"))?;
+    spec.replicas = 0; // Scheduled workloads never enter replica reconciliation.
+    spec.job = Some(job);
+    Ok(spec)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -285,8 +360,8 @@ pub fn parse_stack(yaml: &str) -> Result<ParsedStack> {
 
 pub fn parse_stack_document(yaml: &str) -> Result<ParsedStackDocument> {
     let mut raw: RawStack = serde_yaml::from_str(yaml).context("invalid stack YAML")?;
-    if raw.services.is_empty() {
-        bail!("stack must contain at least one service");
+    if raw.services.is_empty() && raw.jobs.is_empty() {
+        bail!("stack must contain at least one service or job");
     }
 
     if let Some(name) = raw.swarmlite.name.as_deref() {
@@ -298,11 +373,18 @@ pub fn parse_stack_document(yaml: &str) -> Result<ParsedStackDocument> {
         .into_iter()
         .map(|(name, source)| normalize_config_source(&name, source).map(|source| (name, source)))
         .collect::<Result<BTreeMap<_, _>>>()?;
-    let services: BTreeMap<String, ServiceSpec> = raw
+    let mut services: BTreeMap<String, ServiceSpec> = raw
         .services
         .into_iter()
         .map(|(name, service)| normalize_service(&name, service).map(|spec| (name, spec)))
         .collect::<Result<_>>()?;
+    for (name, job) in raw.jobs {
+        crate::validate_stack_name(&name)?;
+        if services.contains_key(&name) {
+            bail!("service and job names must be distinct: {name}");
+        }
+        services.insert(name.clone(), normalize_job(&name, job)?);
+    }
     validate_service_configs(&services, &configs)?;
     let name = raw.swarmlite.name.take();
     let registries = std::mem::take(&mut raw.swarmlite.registries)
@@ -407,6 +489,14 @@ fn normalize_service(name: &str, raw: RawService) -> Result<ServiceSpec> {
         .with_context(|| format!("service {name}: invalid stop_grace_period"))?
         .unwrap_or(Duration::from_secs(10))
         .as_secs();
+    if stop_grace_period_seconds > i32::MAX as u64 {
+        bail!("stop_grace_period is too large");
+    }
+    if let Some(signal) = raw.stop_signal.as_deref() {
+        if signal.is_empty() || !signal.chars().all(|c| c.is_ascii_alphanumeric()) {
+            bail!("invalid stop_signal {signal:?}");
+        }
+    }
     let environment = raw.environment.into_environment()?;
     let container_labels = raw.labels.into_map()?;
     let service_labels = raw.deploy.labels.into_map()?;
@@ -442,6 +532,8 @@ fn normalize_service(name: &str, raw: RawService) -> Result<ServiceSpec> {
         max_replicas_per_node,
         max_surge,
         stop_grace_period_seconds,
+        stop_signal: raw.stop_signal,
+        job: None,
     };
     Ok(spec)
 }
@@ -809,6 +901,7 @@ mod tests {
             include_str!("../../../examples/routing-all.yaml"),
             include_str!("../../../examples/services-all.yaml"),
             include_str!("../../../examples/configs.yaml"),
+            include_str!("../../../examples/jobs.yaml"),
         ] {
             assert!(!yaml.lines().any(|line| line.starts_with("version:")));
             parse_stack(yaml).unwrap();
@@ -1249,7 +1342,7 @@ x-swarmlite:
     }
 
     #[test]
-    fn defaults_pull_policy_to_missing_and_accepts_compatibility_alias() {
+    fn defaults_pull_policy_to_missing_and_rejects_removed_alias() {
         let default = parse_stack(
             r#"
 services:
@@ -1268,8 +1361,8 @@ services:
     pull_policy: if_not_present
 "#,
         )
-        .unwrap();
-        assert_eq!(alias.services["web"].pull_policy, PullPolicy::Missing);
+        .unwrap_err();
+        assert!(format!("{alias:#}").contains("if_not_present"));
     }
 
     #[test]

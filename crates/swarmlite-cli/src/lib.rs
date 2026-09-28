@@ -42,6 +42,7 @@ use tokio::io::AsyncReadExt;
 
 mod cluster_cli;
 mod connection;
+mod job_cli;
 mod upgrade;
 
 const fn cli_styles() -> Styles {
@@ -121,6 +122,11 @@ impl From<RuntimeKindArg> for RuntimeKind {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Manage one-shot and scheduled jobs.
+    Job {
+        #[command(subcommand)]
+        action: job_cli::JobCommand,
+    },
     /// Initialize a new single-controller cluster on this node.
     Init {
         #[command(flatten)]
@@ -1825,6 +1831,7 @@ async fn run() -> Result<()> {
         Command::Deploy { options } => cluster_cli::run_deploy(&data_dir, options).await,
         Command::Deployment { action } => run_deployment_command(&data_dir, action).await,
         Command::Ls { options } => cluster_cli::run_list(&data_dir, options).await,
+        Command::Job { action } => job_cli::run(&data_dir, action).await,
         Command::Ps { options } => cluster_cli::run_ps(&data_dir, options).await,
         Command::Inspect { options } => cluster_cli::run_inspect(&data_dir, options).await,
         Command::Logs { options } => cluster_cli::run_logs(&data_dir, options).await,
@@ -3825,6 +3832,10 @@ fn format_task_summary(response: &StatusResponse) -> String {
         (ObservedTaskState::Pending, "pending"),
         (ObservedTaskState::Failed, "failed"),
         (ObservedTaskState::Lost, "lost"),
+        (ObservedTaskState::Succeeded, "succeeded"),
+        (ObservedTaskState::Unknown, "unknown"),
+        (ObservedTaskState::Cancelled, "cancelled"),
+        (ObservedTaskState::TimedOut, "timed_out"),
     ];
     let details = states
         .iter()
@@ -4060,6 +4071,7 @@ mod tests {
         assert_eq!(
             top_level,
             [
+                "job",
                 "init",
                 "serve",
                 "join",
@@ -4082,7 +4094,7 @@ mod tests {
                 "status",
             ]
         );
-        let grouped_actions = ["config", "gateway", "node", "registry", "deployment"]
+        let grouped_actions = ["config", "gateway", "node", "registry", "deployment", "job"]
             .into_iter()
             .map(|name| {
                 leaf_commands(
@@ -4093,7 +4105,7 @@ mod tests {
                 )
             })
             .sum::<usize>();
-        assert_eq!(grouped_actions, 16);
+        assert_eq!(grouped_actions, 21);
     }
 
     #[test]
@@ -4672,6 +4684,7 @@ mod tests {
         state.tasks.insert(
             "1234567890abcdef".into(),
             TaskRecord {
+                job: None,
                 id: "1234567890abcdef".into(),
                 service_id: "demo.web".into(),
                 revision: 1,

@@ -3,7 +3,7 @@
   "$id": "https://raw.githubusercontent.com/gfreezy/swarmlite/main/crates/swarmlite-stack/schema/stack.schema.json",
   "title": "Swarmlite Stack",
   "type": "object",
-  "required": ["services"],
+  "anyOf": [{ "required": ["services"] }, { "required": ["x-swarmlite-jobs"] }],
   "properties": {
     "services": {
       "type": "object",
@@ -15,10 +15,81 @@
       "additionalProperties": { "$ref": "#/$defs/configSource" },
       "description": "Compose config objects backed by files uploaded with the Stack."
     },
+    "x-swarmlite-jobs": { "type": "object", "minProperties": 1, "additionalProperties": { "$ref": "#/$defs/job" } },
     "x-swarmlite": { "$ref": "#/$defs/swarmlite" }
   },
   "additionalProperties": false,
   "$defs": {
+    "job": {
+      "type": "object",
+      "required": ["image"],
+      "properties": {
+        "image": {
+          "$ref": "#/$defs/service/properties/image"
+        },
+        "pull_policy": {
+          "$ref": "#/$defs/service/properties/pull_policy"
+        },
+        "command": {
+          "$ref": "#/$defs/service/properties/command"
+        },
+        "entrypoint": {
+          "$ref": "#/$defs/service/properties/entrypoint"
+        },
+        "environment": {
+          "$ref": "#/$defs/service/properties/environment"
+        },
+        "labels": {
+          "$ref": "#/$defs/service/properties/labels"
+        },
+        "volumes": {
+          "$ref": "#/$defs/service/properties/volumes"
+        },
+        "configs": {
+          "$ref": "#/$defs/service/properties/configs"
+        },
+        "stop_grace_period": {
+          "$ref": "#/$defs/service/properties/stop_grace_period"
+        },
+        "stop_signal": {
+          "$ref": "#/$defs/service/properties/stop_signal"
+        },
+        "schedule": {
+          "type": "string",
+          "description": "Five-field cron expression: minute hour day month weekday."
+        },
+        "timezone": {
+          "type": "string",
+          "default": "UTC",
+          "description": "IANA time zone, e.g. Asia/Shanghai."
+        },
+        "suspend": {
+          "type": "boolean",
+          "default": false,
+          "description": "Skip future triggers; leave already running executions alone."
+        },
+        "timeout": {
+          "$ref": "#/$defs/duration",
+          "default": "30m",
+          "description": "Positive whole-second runtime limit, measured from container start."
+        },
+        "deploy": {
+          "type": "object",
+          "properties": {
+            "labels": {
+              "$ref": "#/$defs/deploy/properties/labels"
+            },
+            "placement": {
+              "type": "object",
+              "properties": { "constraints": { "$ref": "#/$defs/placement/properties/constraints" } },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
     "service": {
       "type": "object",
       "required": ["image"],
@@ -77,6 +148,7 @@
         "healthcheck": {
           "$ref": "#/$defs/healthcheck"
         },
+        "stop_signal": { "type": "string", "minLength": 1 },
         "stop_grace_period": {
           "$ref": "#/$defs/duration",
           "default": "10s",

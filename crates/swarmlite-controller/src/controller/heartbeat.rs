@@ -88,6 +88,10 @@ impl Controller {
             }
         }
         for report in reports.values() {
+            // Unknown cron containers are only ever stopped, never adopted/restarted.
+            if report.job.is_some() && !inner.state.tasks.contains_key(&report.id) {
+                continue;
+            }
             if inner.state.tasks.contains_key(&report.id) {
                 changed |= inner.state.unclaimed_tasks.remove(&report.id).is_some();
                 continue;
@@ -132,6 +136,31 @@ impl Controller {
         let mut observed_failures = Vec::new();
         for id in assigned_ids {
             let task = inner.state.tasks.get_mut(&id).unwrap();
+            if task.job.is_some() {
+                if let Some(report) = reports.get(&id) {
+                    if task.reconcile_error.take().is_some() {
+                        changed = true;
+                    }
+                    if task.job.as_ref().unwrap().runtime != report.job {
+                        task.job.as_mut().unwrap().runtime = report.job.clone();
+                        changed = true;
+                    }
+                    if task.observed != report.observed || task.container_id != report.container_id
+                    {
+                        task.observed = report.observed.clone();
+                        task.container_id = report.container_id.clone();
+                        changed = true;
+                    }
+                } else if task_inventory_error.is_none()
+                    && task.container_id.is_some()
+                    && !task.observed.is_job_terminal()
+                    && task.observed != ObservedTaskState::Unknown
+                {
+                    task.observed = ObservedTaskState::Unknown;
+                    changed = true;
+                }
+                continue;
+            }
             match reports.get(&id) {
                 Some(report) => {
                     if task.observed != report.observed || task.container_id != report.container_id
@@ -181,6 +210,28 @@ impl Controller {
             }
         }
         for report in &task_results {
+            if let Some(task) = inner
+                .state
+                .tasks
+                .get_mut(&report.task_id)
+                .filter(|t| t.node_id == node_id && t.job.is_some())
+            {
+                if let Some(error) = report
+                    .error
+                    .as_ref()
+                    .filter(|_| !reports.contains_key(&report.task_id))
+                {
+                    if !task.observed.is_job_terminal() {
+                        task.observed = ObservedTaskState::Unknown;
+                        task.reconcile_error = Some(crate::model::TaskReconcileError {
+                            phase: report.phase,
+                            message: error.clone(),
+                        });
+                        changed = true;
+                    }
+                }
+                continue;
+            }
             let phase = if report.error.is_none() {
                 crate::model::TaskReconcilePhase::Verify
             } else {
@@ -227,6 +278,14 @@ impl Controller {
             }
         }
         for progress in &task_progress {
+            if inner
+                .state
+                .tasks
+                .get(&progress.task_id)
+                .is_some_and(|t| t.job.is_some())
+            {
+                continue;
+            }
             let (progress_changed, deployment_progressed) =
                 apply_task_progress(&mut inner, node_id, progress);
             soft_changed |= progress_changed;
@@ -293,6 +352,20 @@ impl Controller {
             })
             .filter_map(|task| {
                 let service = inner.state.services.get(&task.service_id)?;
+                if let Some(job) = &task.job {
+                    if !inner
+                        .state
+                        .nodes
+                        .get(node_id)
+                        .is_some_and(|node| node.supports_jobs)
+                    {
+                        return None;
+                    }
+                    if unix_ms() < job.not_before_unix_ms || unix_ms() >= job.start_deadline_unix_ms
+                    {
+                        return None;
+                    }
+                }
                 let deployment_generation = inner
                     .state
                     .stacks
@@ -306,6 +379,7 @@ impl Controller {
                     .and_then(|stack| stack.deployment.as_ref())
                     .map_or(0, |deployment| deployment.retry_revision);
                 Some(TaskAssignment {
+                    job: task.job.clone(),
                     id: task.id.clone(),
                     cluster_id: self.config.cluster.cluster_id.clone(),
                     stack: service.stack.clone(),
@@ -314,12 +388,19 @@ impl Controller {
                     revision: task.revision,
                     slot: task.slot,
                     desired: task.desired.clone(),
-                    spec: service.spec.clone(),
+                    spec: task
+                        .job
+                        .as_ref()
+                        .map_or_else(|| service.spec.clone(), |job| (*job.spec).clone()),
                     ports: task.ports.clone(),
                     generation,
                     deployment_generation,
                     deployment_retry_revision,
-                    spec_hash: service_spec_hash(&service.spec),
+                    spec_hash: service_spec_hash(
+                        task.job
+                            .as_ref()
+                            .map_or(&service.spec, |job| job.spec.as_ref()),
+                    ),
                     image_resolved: image_was_resolved_on_node(&inner.state, service, task),
                 })
             })
@@ -339,6 +420,7 @@ impl Controller {
                     .and_then(|stack| stack.deployment.as_ref())
                     .map_or(0, |deployment| deployment.generation);
                 Some(TaskRemovalAssignment {
+                    retain_job_container: task.job.is_some() && !service.deleted,
                     id: task.id.clone(),
                     deployment_generation,
                 })
@@ -357,10 +439,23 @@ impl Controller {
                 gateway_ready,
             )
             .then(|| TaskRemovalAssignment {
+                retain_job_container: false,
                 id: task.id.clone(),
                 deployment_generation: deployment.generation,
             })
         }));
+        remove_tasks.extend(
+            reports
+                .values()
+                .filter(|report| {
+                    report.job.is_some() && !inner.state.tasks.contains_key(&report.id)
+                })
+                .map(|report| TaskRemovalAssignment {
+                    retain_job_container: false,
+                    id: report.id.clone(),
+                    deployment_generation: 0,
+                }),
+        );
         let gateway_config = self.gateway_assignment(&inner, gateway_enabled);
         let registry_credentials = inner.state.registry_credentials.clone();
         let registry_credentials_hash = crate::registry::credentials_hash(&registry_credentials);

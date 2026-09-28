@@ -56,6 +56,7 @@ mod commands;
 mod deployment;
 mod gateway_control;
 mod heartbeat;
+mod job_commands;
 mod kv_store;
 mod lifecycle;
 mod membership;
@@ -146,7 +147,7 @@ impl From<StorageError> for ControllerError {
     }
 }
 
-fn unix_ms() -> i64 {
+pub(crate) fn unix_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

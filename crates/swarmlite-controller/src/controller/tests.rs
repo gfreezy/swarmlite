@@ -626,6 +626,7 @@ fn recovered_task_report(
     published_port: u16,
 ) -> TaskReport {
     TaskReport {
+        job: None,
         id: id.into(),
         observed: ObservedTaskState::Healthy,
         container_id: Some(format!("container-{id}")),
@@ -669,6 +670,7 @@ fn image_test_heartbeat_on(
     NodeHeartbeat {
         node,
         tasks: vec![TaskReport {
+            job: None,
             id: task.id.clone(),
             observed: ObservedTaskState::Healthy,
             container_id: Some("container-web".into()),
@@ -1353,6 +1355,7 @@ async fn deployment_waits_for_agent_application_and_health() {
             NodeHeartbeat {
                 node: test_node(),
                 tasks: vec![TaskReport {
+                    job: None,
                     id: task.id.clone(),
                     observed: ObservedTaskState::Healthy,
                     container_id: Some("container-new".into()),
@@ -1467,6 +1470,7 @@ x-swarmlite:
         })
         .collect::<Vec<_>>();
     let task_report = TaskReport {
+        job: None,
         id: task.id.clone(),
         observed: ObservedTaskState::Healthy,
         container_id: Some("container-routed".into()),
@@ -2023,6 +2027,7 @@ async fn failed_container_inventory_does_not_fail_stack_removal() {
             NodeHeartbeat {
                 node: test_node(),
                 tasks: vec![TaskReport {
+                    job: None,
                     id: task.id.clone(),
                     observed: ObservedTaskState::Failed,
                     container_id: Some("container-failed".into()),
@@ -2140,6 +2145,7 @@ fn test_join_request(node_id: &str, address: &str) -> JoinRequest {
 
 fn test_node() -> NodeRecord {
     NodeRecord {
+        supports_jobs: true,
         id: "node-a".into(),
         address: "127.0.0.1".into(),
         swarmlite_version: Some("0.1.25".into()),
@@ -2290,10 +2296,10 @@ async fn gateway_is_the_only_mutable_component_setting() {
 }
 
 #[tokio::test]
-async fn migrates_the_legacy_gateway_image_and_preserves_explicit_pins() {
-    let mut cluster = test_cluster("gateway-image-migration-test");
-    cluster.gateway.image = crate::model::LEGACY_DEFAULT_GATEWAY_IMAGE.into();
-    cluster.gateway.managed_image = false;
+async fn refreshes_managed_gateway_image_and_preserves_explicit_pins() {
+    let mut cluster = test_cluster("gateway-image-refresh-test");
+    cluster.gateway.image = "ghcr.io/gfreezy/swarmlite-caddy:v0.0.1".into();
+    cluster.gateway.managed_image = true;
     let directory = tempfile::tempdir().unwrap();
     let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
     let mut before = repository.initialize_with_cluster(&cluster).await.unwrap();
@@ -2714,6 +2720,7 @@ async fn caddy_acknowledgement_starts_drain_deadline() {
     }
 
     let report = TaskReport {
+        job: None,
         id: "old-task".into(),
         observed: ObservedTaskState::Healthy,
         container_id: Some("container-old".into()),
@@ -2888,6 +2895,7 @@ async fn gateway_generation_tracks_rendered_config_only() {
 
 fn test_service() -> ServiceRecord {
     ServiceRecord {
+        job_cursor: None,
         id: "demo.web".into(),
         stack: "demo".into(),
         name: "web".into(),
@@ -2914,6 +2922,8 @@ fn test_service() -> ServiceRecord {
             max_replicas_per_node: None,
             max_surge: 1,
             stop_grace_period_seconds: 10,
+            stop_signal: None,
+            job: None,
         },
         deleted: false,
     }
@@ -2935,6 +2945,7 @@ async fn heartbeat_then_deploy_adopts_the_existing_container() {
             NodeHeartbeat {
                 node: test_node(),
                 tasks: vec![TaskReport {
+                    job: None,
                     id: "existing-task".into(),
                     observed: ObservedTaskState::Healthy,
                     container_id: Some("container-existing".into()),
@@ -3138,6 +3149,7 @@ async fn recovery_restores_the_latest_service_revision_and_leaves_old_tasks_uncl
     service.spec.service_labels.clear();
     let spec_hash = service_spec_hash(&service.spec);
     let report = |id: &str, slot: u32, revision: u64, observed: ObservedTaskState| TaskReport {
+        job: None,
         id: id.into(),
         observed,
         container_id: Some(format!("container-{id}")),
@@ -3232,6 +3244,7 @@ async fn recovery_ignores_invalid_service_revisions() {
                 tasks: [("revision-zero", 0_u64), ("revision-max", u64::MAX)]
                     .into_iter()
                     .map(|(id, revision)| TaskReport {
+                        job: None,
                         id: id.into(),
                         observed: ObservedTaskState::Healthy,
                         container_id: Some(format!("container-{id}")),
@@ -3281,6 +3294,7 @@ async fn recovery_ignores_invalid_service_revisions() {
 
 fn draining_task() -> TaskRecord {
     TaskRecord {
+        job: None,
         id: "old-task".into(),
         service_id: "demo.web".into(),
         revision: 1,
@@ -3299,4 +3313,121 @@ fn draining_task() -> TaskRecord {
         applied_generation: None,
         reconcile_error: None,
     }
+}
+
+#[tokio::test]
+async fn job_deployment_registers_immediately_and_execution_evidence_survives_sqlite_reload() {
+    let (controller, repository, directory) = test_controller("job-persistence").await;
+    let parsed = parse_stack(
+        "x-swarmlite-jobs:\n  backup:\n    image: busybox:1.37\n    schedule: '* * * * *'\n",
+    )
+    .unwrap();
+    let response = controller.apply("demo", parsed).await.unwrap();
+    assert_eq!(response.status, StackDeploymentStatus::Healthy);
+    assert!(controller.status().await.state.tasks.is_empty());
+    controller
+        .join_node("node-a", test_join_request("node-a", "127.0.0.1"))
+        .await
+        .unwrap();
+    let mut inner = controller.inner.lock().await;
+    inner.state.nodes.insert("node-a".into(), test_node());
+    inner.live_nodes.insert("node-a".into(), Instant::now());
+    let now = unix_ms();
+    inner
+        .state
+        .services
+        .get_mut("demo.backup")
+        .unwrap()
+        .job_cursor
+        .as_mut()
+        .unwrap()
+        .next_at_unix_ms = now;
+    crate::jobs::reconcile(&mut inner.state, &BTreeSet::from(["node-a".into()]), now);
+    let task_id = inner.state.tasks.keys().next().unwrap().clone();
+    inner.state.tasks.get_mut(&task_id).unwrap().observed = ObservedTaskState::Succeeded;
+    controller.commit_locked(&mut inner).await.unwrap();
+    let cluster = inner.cluster.clone();
+    drop(inner);
+    let persisted = repository.load().await.unwrap();
+    assert_eq!(
+        persisted.state.tasks[&task_id].observed,
+        ObservedTaskState::Succeeded
+    );
+    assert_eq!(
+        persisted.state.tasks[&task_id]
+            .job
+            .as_ref()
+            .unwrap()
+            .scheduled_at_unix_ms,
+        now
+    );
+    let reopened = Controller::new(
+        test_controller_config(&cluster, directory.path()),
+        "0123456789abcdef".into(),
+        repository,
+    )
+    .await
+    .unwrap();
+    reopened.tick().await.unwrap();
+    assert!(reopened.status().await.state.tasks.contains_key(&task_id));
+    assert_eq!(reopened.status().await.state.tasks.len(), 1);
+}
+
+#[tokio::test]
+async fn manual_job_run_cancel_and_history_survive_persistence() {
+    let (controller, repository, _directory) = test_controller("manual-job").await;
+    let parsed =
+        parse_stack("x-swarmlite-jobs:\n  backup:\n    image: busybox\n    suspend: true\n")
+            .unwrap();
+    controller.apply("demo", parsed).await.unwrap();
+    controller
+        .join_node("node-a", test_join_request("node-a", "127.0.0.1"))
+        .await
+        .unwrap();
+    {
+        let mut inner = controller.inner.lock().await;
+        inner.state.nodes.insert("node-a".into(), test_node());
+        inner.live_nodes.insert("node-a".into(), Instant::now());
+    }
+    let first = controller.run_job("demo.backup").await.unwrap();
+    assert!(first.job.is_some());
+    assert!(controller.run_job("demo.backup").await.is_err());
+    assert_eq!(
+        controller.cancel_job_task(&first.id).await.unwrap().desired,
+        DesiredTaskState::Stopped
+    );
+    assert_eq!(
+        repository.load().await.unwrap().state.tasks[&first.id].desired,
+        DesiredTaskState::Stopped
+    );
+    assert!(controller.run_job("demo.backup").await.is_err()); // cancellation is not proof of exit
+    controller
+        .inner
+        .lock()
+        .await
+        .state
+        .tasks
+        .get_mut(&first.id)
+        .unwrap()
+        .observed = ObservedTaskState::Cancelled;
+    let second = controller.run_job("demo.backup").await.unwrap();
+    // A naturally finished execution must not occupy the shared scheduler slot.
+    controller
+        .inner
+        .lock()
+        .await
+        .state
+        .tasks
+        .get_mut(&second.id)
+        .unwrap()
+        .observed = ObservedTaskState::Succeeded;
+    let third = controller.run_job("demo.backup").await.unwrap();
+    assert_ne!(second.id, third.id);
+    assert_eq!(
+        controller.job_history("demo.backup").await.unwrap().len(),
+        3
+    );
+    assert_eq!(controller.list_jobs().await.len(), 1);
+    controller.tick().await.unwrap();
+    assert_eq!(controller.status().await.state.tasks.len(), 3); // manual-only never triggers itself
 }

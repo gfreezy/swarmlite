@@ -69,6 +69,10 @@ pub(super) fn router(controller: Arc<Controller>) -> Router {
             "/v1/services/{target}/force-update",
             post(force_update_service),
         )
+        .route("/v1/jobs", get(list_jobs))
+        .route("/v1/jobs/{target}/history", get(job_history))
+        .route("/v1/jobs/{target}/run", post(run_job))
+        .route("/v1/job-tasks/{id}/cancel", post(cancel_job_task))
         .route("/v1/tasks", get(target_tasks))
         .route("/v1/data-sessions", post(create_data_session))
         .route(
@@ -1093,4 +1097,36 @@ x-swarmlite:
             Err(ControllerError::Invalid(message)) if message.contains("missing from the Controller")
         ));
     }
+}
+
+async fn list_jobs(
+    State(controller): State<Arc<Controller>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<crate::model::ServiceRecord>>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    Ok(Json(controller.list_jobs().await))
+}
+async fn job_history(
+    State(controller): State<Arc<Controller>>,
+    Path(target): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<crate::model::TaskRecord>>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.job_history(&target).await.map(Json)
+}
+async fn run_job(
+    State(controller): State<Arc<Controller>>,
+    Path(target): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<crate::model::TaskRecord>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.run_job(&target).await.map(Json)
+}
+async fn cancel_job_task(
+    State(controller): State<Arc<Controller>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<crate::model::TaskRecord>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller.cancel_job_task(&id).await.map(Json)
 }

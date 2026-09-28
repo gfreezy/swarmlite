@@ -45,7 +45,10 @@ fn service_update_plan(
             bump_revision: !revision_policy.preserves(&previous.name),
         };
     }
-    if revision_policy.refreshes_images() && next.pull_policy.refreshes_cached_image(&next.image) {
+    if next.job.is_none()
+        && revision_policy.refreshes_images()
+        && next.pull_policy.refreshes_cached_image(&next.image)
+    {
         ServiceUpdatePlan::ResolveImage
     } else {
         ServiceUpdatePlan::VerifyOnly
@@ -125,7 +128,14 @@ impl Controller {
     ) -> Result<StackDeploymentResponse, ControllerError> {
         let service = {
             let inner = self.inner.lock().await;
-            resolve_service(&inner.state, target, "scale")?
+            let service = resolve_service(&inner.state, target, "scale")?;
+            if service.spec.job.is_some() {
+                return Err(ControllerError::Invalid(
+                    "scheduled jobs cannot be scaled or restarted; edit and deploy the schedule"
+                        .into(),
+                ));
+            }
+            service
         };
         let stack_name = service.stack.clone();
         let _deployment = self.begin_stack_deployment(&stack_name)?;
@@ -154,7 +164,14 @@ impl Controller {
     ) -> Result<StackDeploymentResponse, ControllerError> {
         let service = {
             let inner = self.inner.lock().await;
-            resolve_service(&inner.state, target, "restart")?
+            let service = resolve_service(&inner.state, target, "restart")?;
+            if service.spec.job.is_some() {
+                return Err(ControllerError::Invalid(
+                    "scheduled jobs cannot be scaled or restarted; edit and deploy the schedule"
+                        .into(),
+                ));
+            }
+            service
         };
         let _deployment = self.begin_stack_deployment(&service.stack)?;
         let parsed = {
@@ -212,6 +229,18 @@ impl Controller {
         };
         let mut inner = self.inner.lock().await;
         validate_apply_locked(&inner, stack_name, &stack_gateway, replace)?;
+        for (name, spec) in &services {
+            if inner
+                .state
+                .services
+                .get(&service_id(stack_name, name))
+                .is_some_and(|s| s.spec.job.is_some() != spec.job.is_some())
+            {
+                return Err(ControllerError::Invalid(format!(
+                    "{name}: cannot change between service and job; use a different name"
+                )));
+            }
+        }
         let previous = inner.state.clone();
         inner
             .state
@@ -347,6 +376,7 @@ impl Controller {
                     inner.state.services.insert(
                         id.clone(),
                         ServiceRecord {
+                            job_cursor: None,
                             id,
                             stack: stack_name.to_owned(),
                             name,
@@ -1178,6 +1208,9 @@ fn deployment_is_healthy(
 ) -> bool {
     deployment_replacement_ready(state, stack_name, generation, gateway_ready)
         && state.tasks.values().all(|task| {
+            if task.job.is_some() {
+                return true;
+            }
             let Some(service) = state.services.get(&task.service_id) else {
                 return true;
             };
@@ -1226,6 +1259,9 @@ pub(super) fn deployment_replacement_ready(
         else {
             return false;
         };
+        if service.spec.job.is_some() {
+            return true;
+        }
         state
             .tasks
             .values()
@@ -1368,6 +1404,9 @@ fn deployment_response(
         .collect();
     let pending_removals = if current {
         let assigned = inner.state.tasks.values().filter(|task| {
+            if task.job.is_some() {
+                return false;
+            }
             let Some(service) = inner.state.services.get(&task.service_id) else {
                 return false;
             };

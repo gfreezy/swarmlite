@@ -6,6 +6,9 @@ license.workspace = true
 description = "Swarmlite Stack parser, routing validation, and Caddy JSON renderer"
 
 [dependencies]
+chrono = "0.4"
+chrono-tz = "0.10"
+croner = "3.0"
 anyhow = "1.0"
 gtmpl.workspace = true
 humantime = "2.3"

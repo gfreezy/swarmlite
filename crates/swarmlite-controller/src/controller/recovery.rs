@@ -15,7 +15,12 @@ pub(super) fn restore_unclaimed_service_revisions(
     new_service_ids: &BTreeSet<String>,
 ) {
     for service_id in new_service_ids {
-        let Some(service) = state.services.get(service_id).cloned() else {
+        let Some(service) = state
+            .services
+            .get(service_id)
+            .filter(|s| s.spec.job.is_none())
+            .cloned()
+        else {
             continue;
         };
         let spec_hash = service_spec_hash(&service.spec);
@@ -47,7 +52,9 @@ pub(super) fn adopt_unclaimed_tasks(state: &mut ClusterState, stack_name: &str) 
     let services = state
         .services
         .values()
-        .filter(|service| service.stack == stack_name && !service.deleted)
+        .filter(|service| {
+            service.stack == stack_name && !service.deleted && service.spec.job.is_none()
+        })
         .cloned()
         .collect::<Vec<_>>();
     let mut adopted = 0_usize;
@@ -89,6 +96,7 @@ pub(super) fn adopt_unclaimed_tasks(state: &mut ClusterState, stack_name: &str) 
             state.tasks.insert(
                 candidate.id.clone(),
                 TaskRecord {
+                    job: None,
                     id: candidate.id.clone(),
                     service_id: service.id.clone(),
                     revision: service.revision,
@@ -153,6 +161,10 @@ fn recovery_task_priority(state: &ObservedTaskState) -> u8 {
         ObservedTaskState::Starting => 3,
         ObservedTaskState::Pending => 2,
         ObservedTaskState::Failed => 1,
-        ObservedTaskState::Lost => 0,
+        ObservedTaskState::Lost
+        | ObservedTaskState::Unknown
+        | ObservedTaskState::Succeeded
+        | ObservedTaskState::TimedOut
+        | ObservedTaskState::Cancelled => 0,
     }
 }

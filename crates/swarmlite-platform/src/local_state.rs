@@ -22,6 +22,57 @@ pub struct LocalState {
 }
 
 impl LocalState {
+    /// Durable attempt ledger. The claim precedes any container creation/start;
+    /// uncertainty consumes the attempt. Never garbage-collect claims while stale
+    /// assignments or an old controller database could still refer to them.
+    fn with_jobs<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        self.with_connection(|connection| {
+            connection.execute_batch("CREATE TABLE IF NOT EXISTS job_attempts (
+                id TEXT PRIMARY KEY, authorized INTEGER NOT NULL, claimed INTEGER NOT NULL
+            ) STRICT;
+            CREATE INDEX IF NOT EXISTS active_job_authorizations ON job_attempts(authorized) WHERE authorized = 1;")?;
+            f(connection)
+        })
+    }
+
+    pub fn authorize_jobs(&self, ids: &[String]) -> Result<()> {
+        self.with_jobs(|connection| {
+            let tx = connection.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE job_attempts SET authorized = 0 WHERE authorized = 1",
+                [],
+            )?;
+            for id in ids {
+                tx.execute(
+                    "INSERT INTO job_attempts VALUES (?1, 1, 0)
+                    ON CONFLICT(id) DO UPDATE SET authorized = 1",
+                    [id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn claim_job(&self, id: &str) -> Result<bool> {
+        self.with_jobs(|connection| Ok(connection.execute(
+            "UPDATE job_attempts SET claimed = 1 WHERE id = ?1 AND authorized = 1 AND claimed = 0", [id]
+        )? == 1))
+    }
+
+    pub fn job_authorized(&self, id: &str) -> Result<bool> {
+        self.with_jobs(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT authorized FROM job_attempts WHERE id = ?1",
+                    [id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()?
+                .unwrap_or(false))
+        })
+    }
+
     pub fn open(data_dir: &Path) -> Result<Self> {
         let state = Self {
             database: Database::open(data_dir)?,
@@ -133,6 +184,31 @@ mod tests {
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     struct Fence {
         generation: u64,
+    }
+
+    #[test]
+    fn job_claim_is_atomic_durable_and_revocation_does_not_reset_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = LocalState::open(directory.path()).unwrap();
+        state.authorize_jobs(&["cluster:task".into()]).unwrap();
+        let handles = (0..8)
+            .map(|_| {
+                let state = state.clone();
+                std::thread::spawn(move || state.claim_job("cluster:task").unwrap())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            handles
+                .into_iter()
+                .map(|h| u32::from(h.join().unwrap()))
+                .sum::<u32>(),
+            1
+        );
+        let reopened = LocalState::open(directory.path()).unwrap();
+        reopened.authorize_jobs(&[]).unwrap();
+        assert!(!reopened.job_authorized("cluster:task").unwrap());
+        reopened.authorize_jobs(&["cluster:task".into()]).unwrap();
+        assert!(!reopened.claim_job("cluster:task").unwrap());
     }
 
     #[test]

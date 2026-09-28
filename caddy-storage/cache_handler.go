@@ -66,12 +66,9 @@ type CacheHandler struct {
 	flights         cacheFlightGroup
 }
 
-// CacheKey keeps the compatible subset of Souin's cache key configuration and
-// adds a structured query-parameter allowlist. Native cache keys are always
-// hashed, so Hash is accepted without changing key identity.
+// CacheKey configures query and header selection. Native keys are always hashed.
 type CacheKey struct {
 	DisableQuery    bool     `json:"disable_query,omitempty"`
-	Hash            bool     `json:"hash,omitempty"`
 	Headers         []string `json:"headers,omitempty"`
 	QueryParameters []string `json:"query_parameters,omitempty"`
 }

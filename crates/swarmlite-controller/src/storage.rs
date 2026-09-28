@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::{
     database::{DATABASE_FILE, Database},
-    kv::{KvRepository, LegacyKvImport, LegacyKvLock, LegacyKvObject},
+    kv::KvRepository,
     model::{
         ClusterSettings, ClusterState, DesiredTaskState, GatewayRecoverySnapshot, NodeMember,
         ObservedTaskState, PortBinding, RecoveredStackGateway, RegistryCredential, ServiceRecord,
@@ -19,9 +19,9 @@ use crate::{
 };
 use swarmlite_stack::config_digest;
 
-const PERSISTED_SCHEMA_VERSION: u32 = 11;
-#[cfg(test)]
-const LEGACY_PERSISTED_SCHEMA_VERSION: u32 = 7;
+const PERSISTED_SCHEMA_VERSION: u32 = 12;
+// COMPAT(11 -> 12): remove this module and its startup call in the next release.
+mod migrations;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -42,49 +42,13 @@ pub struct VersionedState {
     pub state: ClusterState,
 }
 
-struct LoadedState {
-    versioned: VersionedState,
-    legacy_kv: Option<LegacyKvState>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PersistedControlPlane {
     schema_version: u32,
     cluster_id: String,
     cluster: ClusterSettings,
     state: PersistedClusterState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    kv: Option<LegacyKvState>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct LegacyKvState {
-    objects: BTreeMap<String, LegacyKvObjectRecord>,
-    prefix_tombstones: BTreeMap<String, LegacyKvVersion>,
-    locks: BTreeMap<String, LegacyKvLockRecord>,
-    next_fencing_token: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LegacyKvObjectRecord {
-    value_base64: String,
-    version: LegacyKvVersion,
-    modified_at_unix_ms: i64,
-    tombstone: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-struct LegacyKvVersion {
-    physical_unix_ms: i64,
-    logical: u64,
-    replica_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LegacyKvLockRecord {
-    owner_id: String,
-    fencing_token: u64,
-    lease_until_unix_ms: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -101,6 +65,10 @@ struct PersistedClusterState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedTaskRecord {
+    #[serde(default)]
+    job: Option<crate::model::JobExecution>,
+    #[serde(default)]
+    job_observed: Option<ObservedTaskState>,
     id: String,
     service_id: String,
     revision: u64,
@@ -122,7 +90,8 @@ pub struct ConfigBlobGcStats {
 }
 
 /// SQLite-backed desired-state repository. Runtime heartbeat observations are
-/// intentionally excluded and rebuilt after a controller restart.
+/// intentionally excluded and rebuilt after a controller restart, except for
+/// one-shot job execution evidence, which must survive to prevent replay.
 #[derive(Clone)]
 pub struct StateRepository {
     database: Database,
@@ -158,27 +127,6 @@ impl StateRepository {
                      ) STRICT;",
                 )
                 .map_err(backend)?;
-            let has_gc_timestamp = {
-                let mut statement = connection
-                    .prepare("PRAGMA table_info(stack_config_blobs)")
-                    .map_err(backend)?;
-                statement
-                    .query_map([], |row| row.get::<_, String>(1))
-                    .map_err(backend)?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(backend)?
-                    .iter()
-                    .any(|column| column == "unreferenced_since_unix_ms")
-            };
-            if !has_gc_timestamp {
-                connection
-                    .execute(
-                        "ALTER TABLE stack_config_blobs
-                         ADD COLUMN unreferenced_since_unix_ms INTEGER",
-                        [],
-                    )
-                    .map_err(backend)?;
-            }
             Ok(())
         })?;
         Ok(repository)
@@ -197,24 +145,16 @@ impl StateRepository {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(backend)?;
+            // COMPAT(11 -> 12): remove startup migration in the next release.
+            migrations::upgrade_11_to_12(&transaction, &self.cluster)?;
             if let Some(versioned) = read_versioned(&transaction, &self.cluster)? {
                 transaction.commit().map_err(backend)?;
                 return Ok(Some(versioned));
             }
             Ok(None)
         })?;
-        if let Some(mut loaded) = loaded {
-            if let Some(legacy_kv) = loaded.legacy_kv.take() {
-                self.kv_repository.import_legacy(legacy_kv.into_import())?;
-                loaded.versioned.generation = self
-                    .replace(
-                        loaded.versioned.generation,
-                        &loaded.versioned.cluster,
-                        &loaded.versioned.state,
-                    )
-                    .await?;
-            }
-            return Ok(loaded.versioned);
+        if let Some(loaded) = loaded {
+            return Ok(loaded);
         }
 
         self.with_connection(|connection| {
@@ -283,11 +223,9 @@ impl StateRepository {
 
     pub async fn load(&self) -> StorageResult<VersionedState> {
         self.with_connection(|connection| {
-            read_versioned(connection, &self.cluster)?
-                .map(|loaded| loaded.versioned)
-                .ok_or_else(|| {
-                    StorageError::InvalidData("control-plane state is not initialized".to_owned())
-                })
+            read_versioned(connection, &self.cluster)?.ok_or_else(|| {
+                StorageError::InvalidData("control-plane state is not initialized".to_owned())
+            })
         })
     }
 
@@ -576,7 +514,7 @@ pub fn control_plane_state_exists(data_dir: &Path) -> StorageResult<bool> {
 fn read_versioned(
     connection: &Connection,
     expected_cluster: &ClusterSettings,
-) -> StorageResult<Option<LoadedState>> {
+) -> StorageResult<Option<VersionedState>> {
     let row = connection
         .query_row(
             "SELECT generation, schema_version, cluster_id, document
@@ -604,7 +542,7 @@ fn read_versioned(
         ));
     }
     let value: PersistedControlPlane = serde_json::from_slice(&document).map_err(invalid)?;
-    if value.schema_version != PERSISTED_SCHEMA_VERSION
+    if value.schema_version != schema_version
         || value.cluster_id != expected_cluster.cluster_id
         || !same_cluster_identity(&value.cluster, expected_cluster)
     {
@@ -612,13 +550,10 @@ fn read_versioned(
             "persisted SQLite document belongs to a different or unsupported cluster".to_owned(),
         ));
     }
-    Ok(Some(LoadedState {
-        versioned: VersionedState {
-            generation,
-            cluster: value.cluster,
-            state: value.state.into_runtime(),
-        },
-        legacy_kv: value.kv,
+    Ok(Some(VersionedState {
+        generation,
+        cluster: value.cluster,
+        state: value.state.into_runtime(),
     }))
 }
 
@@ -636,46 +571,6 @@ impl PersistedControlPlane {
             cluster_id: cluster.cluster_id.clone(),
             cluster,
             state: PersistedClusterState::from_runtime(&state),
-            kv: None,
-        }
-    }
-}
-
-impl LegacyKvState {
-    fn into_import(self) -> LegacyKvImport {
-        let objects = self
-            .objects
-            .into_iter()
-            .filter(|(key, object)| {
-                !object.tombstone
-                    && !self.prefix_tombstones.iter().any(|(prefix, tombstone)| {
-                        (key == prefix
-                            || key
-                                .strip_prefix(prefix)
-                                .is_some_and(|suffix| suffix.starts_with('/')))
-                            && tombstone >= &object.version
-                    })
-            })
-            .map(|(key, object)| LegacyKvObject {
-                key,
-                value_base64: object.value_base64,
-                modified_at_unix_ms: object.modified_at_unix_ms,
-            })
-            .collect();
-        let locks = self
-            .locks
-            .into_iter()
-            .map(|(name, lock)| LegacyKvLock {
-                name,
-                owner_id: lock.owner_id,
-                fencing_token: lock.fencing_token,
-                lease_until_unix_ms: lock.lease_until_unix_ms,
-            })
-            .collect();
-        LegacyKvImport {
-            objects,
-            locks,
-            next_fencing_token: self.next_fencing_token,
         }
     }
 }
@@ -719,6 +614,8 @@ impl PersistedClusterState {
 impl PersistedTaskRecord {
     fn from_runtime(task: &TaskRecord) -> Self {
         Self {
+            job: task.job.clone(),
+            job_observed: task.job.as_ref().map(|_| task.observed.clone()),
             id: task.id.clone(),
             service_id: task.service_id.clone(),
             revision: task.revision,
@@ -733,13 +630,14 @@ impl PersistedTaskRecord {
 
     fn into_runtime(self) -> TaskRecord {
         TaskRecord {
+            job: self.job,
             id: self.id,
             service_id: self.service_id,
             revision: self.revision,
             slot: self.slot,
             node_id: self.node_id,
             desired: self.desired,
-            observed: ObservedTaskState::Pending,
+            observed: self.job_observed.unwrap_or(ObservedTaskState::Pending),
             ports: self.ports,
             config_digests: self.config_digests,
             container_id: None,
@@ -767,7 +665,6 @@ mod tests {
         RecoveredStackGateway, RegistryCredential, ServicePortKey, ServiceSpec,
         StackDeploymentRecord, StackDeploymentStatus,
     };
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
 
     use super::*;
 
@@ -834,100 +731,6 @@ x-swarmlite:
             reopened
                 .initialize_from_gateway_recovery(&snapshot)
                 .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn loads_legacy_cache_fields_from_persisted_gateway_routes() {
-        let directory = tempfile::tempdir().unwrap();
-        let cluster = cluster();
-        let gateway = swarmlite_stack::parse_stack(
-            r#"
-services:
-  web:
-    image: nginx
-    expose: [80]
-x-swarmlite:
-  http_routes:
-    - hostnames: [legacy-cache.example.com]
-      rules:
-        - cache:
-            ttl: 24h
-            allowed_http_verbs: [GET, HEAD]
-          backend: { service: web, port: 80 }
-"#,
-        )
-        .unwrap()
-        .gateway;
-        let snapshot = GatewayRecoverySnapshot::new(
-            cluster.cluster_id.clone(),
-            12,
-            BTreeMap::from([(
-                "demo".into(),
-                RecoveredStackGateway {
-                    gateway,
-                    upstreams: BTreeMap::from([(
-                        ServicePortKey::new("web", 80, HttpBackendProtocol::Http),
-                        vec!["10.0.0.8:32080".into()],
-                    )]),
-                },
-            )]),
-        );
-        let repository = StateRepository::open(directory.path(), cluster).unwrap();
-        repository
-            .initialize_from_gateway_recovery(&snapshot)
-            .unwrap();
-
-        repository
-            .with_connection(|connection| {
-                let document = connection
-                    .query_row(
-                        "SELECT document FROM control_plane WHERE singleton = 1",
-                        [],
-                        |row| row.get::<_, Vec<u8>>(0),
-                    )
-                    .map_err(backend)?;
-                let mut document: serde_json::Value =
-                    serde_json::from_slice(&document).map_err(invalid)?;
-                let cache = document
-                    .pointer_mut("/state/gateway_routes/demo/gateway/http_routes/0/rules/0/cache")
-                    .and_then(serde_json::Value::as_object_mut)
-                    .unwrap();
-                cache.insert(
-                    "key".into(),
-                    serde_json::json!({
-                        "disable_query": true,
-                        "hash": true,
-                        "headers": ["accept-encoding"]
-                    }),
-                );
-                let document = serde_json::to_vec(&document).map_err(invalid)?;
-                connection
-                    .execute(
-                        "UPDATE control_plane SET document = ?1 WHERE singleton = 1",
-                        params![document],
-                    )
-                    .map_err(backend)?;
-                Ok(())
-            })
-            .unwrap();
-
-        let loaded = repository.load().await.unwrap();
-        let cache = loaded.state.gateway_routes["demo"].gateway.http_routes[0].rules[0]
-            .cache
-            .as_ref()
-            .unwrap();
-        assert_eq!(
-            serde_json::to_value(cache).unwrap(),
-            serde_json::json!({
-                "ttl": "24h",
-                "allowed_http_verbs": ["GET", "HEAD"],
-                "key": {
-                    "disable_query": true,
-                    "hash": true,
-                    "headers": ["accept-encoding"]
-                }
-            })
         );
     }
 
@@ -1030,39 +833,6 @@ x-swarmlite:
     }
 
     #[test]
-    fn adds_config_blob_gc_timestamp_to_existing_databases() {
-        let directory = tempfile::tempdir().unwrap();
-        let connection = Connection::open(directory.path().join(DATABASE_FILE)).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE stack_config_blobs (
-                     cluster_id TEXT NOT NULL,
-                     digest TEXT NOT NULL CHECK (length(digest) = 64),
-                     content BLOB NOT NULL,
-                     created_at_unix_ms INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
-                     PRIMARY KEY (cluster_id, digest)
-                 ) STRICT;",
-            )
-            .unwrap();
-        drop(connection);
-
-        let repository = StateRepository::open(directory.path(), cluster()).unwrap();
-        let contents = b"legacy-config".to_vec();
-        let digest = crate::model::config_digest(&contents);
-        repository
-            .put_config_blobs(&BTreeMap::from([(digest.clone(), contents)]))
-            .unwrap();
-        assert_eq!(
-            repository
-                .gc_config_blobs(&BTreeSet::new(), 1_000, 100)
-                .unwrap()
-                .marked,
-            1
-        );
-        assert!(repository.get_config_blob(&digest).unwrap().is_some());
-    }
-
-    #[test]
     fn pinning_a_blob_cancels_an_expired_gc_candidate_before_apply() {
         let directory = tempfile::tempdir().unwrap();
         let repository = StateRepository::open(directory.path(), cluster()).unwrap();
@@ -1099,6 +869,7 @@ x-swarmlite:
         state.nodes.insert(
             "soft-node".into(),
             NodeRecord {
+                supports_jobs: true,
                 id: "soft-node".into(),
                 address: "10.0.0.2".into(),
                 swarmlite_version: None,
@@ -1160,6 +931,7 @@ x-swarmlite:
         state.services.insert(
             "demo.web".into(),
             ServiceRecord {
+                job_cursor: None,
                 id: "demo.web".into(),
                 stack: "demo".into(),
                 name: "web".into(),
@@ -1182,6 +954,8 @@ x-swarmlite:
                     max_replicas_per_node: None,
                     max_surge: 0,
                     stop_grace_period_seconds: 10,
+                    stop_signal: None,
+                    job: None,
                 },
                 deleted: false,
             },
@@ -1189,6 +963,7 @@ x-swarmlite:
         state.tasks.insert(
             "task-1".into(),
             TaskRecord {
+                job: None,
                 id: "task-1".into(),
                 service_id: "demo.web".into(),
                 revision: 1,
@@ -1256,82 +1031,149 @@ x-swarmlite:
     }
 
     #[tokio::test]
-    async fn rejects_unsupported_control_plane_schema() {
+    async fn migrates_schema_11_once_during_initialization() {
         let directory = tempfile::tempdir().unwrap();
         let cluster = cluster();
         let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
-        let version = LegacyKvVersion {
-            physical_unix_ms: 10,
-            logical: 0,
-            replica_id: "legacy-gateway".into(),
-        };
-        let legacy = LegacyKvState {
-            objects: BTreeMap::from([
-                (
-                    "caddy/live".into(),
-                    LegacyKvObjectRecord {
-                        value_base64: STANDARD.encode("certificate"),
-                        version: version.clone(),
-                        modified_at_unix_ms: 10,
-                        tombstone: false,
-                    },
-                ),
-                (
-                    "caddy/removed/item".into(),
-                    LegacyKvObjectRecord {
-                        value_base64: STANDARD.encode("obsolete"),
-                        version: version.clone(),
-                        modified_at_unix_ms: 10,
-                        tombstone: false,
-                    },
-                ),
-            ]),
-            prefix_tombstones: BTreeMap::from([(
-                "caddy/removed".into(),
-                LegacyKvVersion {
-                    physical_unix_ms: 20,
-                    logical: 0,
-                    replica_id: "legacy-gateway".into(),
-                },
-            )]),
-            locks: BTreeMap::from([(
-                "caddy/locks/issue".into(),
-                LegacyKvLockRecord {
-                    owner_id: "legacy-gateway".into(),
-                    fencing_token: 7,
-                    lease_until_unix_ms: i64::MAX,
-                },
-            )]),
-            next_fencing_token: 7,
-        };
-        let document = serde_json::to_vec(&PersistedControlPlane {
-            schema_version: LEGACY_PERSISTED_SCHEMA_VERSION,
+        let mut document = serde_json::to_value(PersistedControlPlane {
+            schema_version: 11,
             cluster_id: cluster.cluster_id.clone(),
             cluster: cluster.clone(),
             state: PersistedClusterState::default(),
-            kv: Some(legacy),
         })
         .unwrap();
+        let spec = swarmlite_stack::parse_stack("services:\n  web:\n    image: nginx\n")
+            .unwrap()
+            .services
+            .remove("web")
+            .unwrap();
+        let mut legacy_spec = serde_json::to_value(spec).unwrap();
+        legacy_spec.as_object_mut().unwrap().remove("job");
+        legacy_spec.as_object_mut().unwrap().remove("stop_signal");
+        document["state"]["services"] = serde_json::json!({
+            "demo.web": {"id": "demo.web", "stack": "demo", "name": "web", "revision": 1, "spec": legacy_spec, "deleted": false}
+        });
+        document["state"]["tasks"] = serde_json::json!({
+            "task-11": {"id": "task-11", "service_id": "demo.web", "revision": 1,
+                "slot": 0, "node_id": "node-a", "desired": "running", "ports": [],
+                "config_digests": [], "drain_until_unix_ms": null}
+        });
+        let gateway = swarmlite_stack::parse_stack("services:\n  web:\n    image: nginx\n    expose: [80]\nx-swarmlite:\n  http_routes:\n    - rules:\n        - cache: {key: {headers: [accept-language]}}\n          backend: {service: web, port: 80}\n      hostnames: [example.com]\n").unwrap().gateway;
+        document["state"]["gateway_routes"] = serde_json::json!({"demo": RecoveredStackGateway {gateway, upstreams: Default::default()}});
+        document["state"]["gateway_routes"]["demo"]["gateway"]["http_routes"][0]["rules"][0]["cache"]
+            ["key"]["hash"] = serde_json::json!(true);
+        repository.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO control_plane(singleton, generation, schema_version, cluster_id, document) VALUES (1, 5, 11, ?1, ?2)",
+                params![cluster.cluster_id, serde_json::to_vec(&document).unwrap()],
+            ).map_err(backend)?;
+            Ok(())
+        }).unwrap();
+        assert!(repository.load().await.is_err()); // ordinary reads accept only schema 12
+        let loaded = repository.initialize_with_cluster(&cluster).await.unwrap();
+        assert_eq!(loaded.generation, 6);
+        assert!(loaded.state.tasks["task-11"].job.is_none());
+        let cache = loaded.state.gateway_routes["demo"].gateway.http_routes[0].rules[0]
+            .cache
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(cache).unwrap(),
+            serde_json::json!({"key": {"headers": ["accept-language"]}})
+        );
+        assert!(loaded.state.services["demo.web"].spec.job.is_none());
+        assert!(loaded.state.services["demo.web"].job_cursor.is_none());
+        let second = repository.initialize_with_cluster(&cluster).await.unwrap();
+        assert_eq!(second.generation, loaded.generation);
+        let version: u32 = repository
+            .with_connection(|connection| {
+                connection
+                    .query_row("SELECT schema_version FROM control_plane", [], |row| {
+                        row.get(0)
+                    })
+                    .map_err(backend)
+            })
+            .unwrap();
+        assert_eq!(version, PERSISTED_SCHEMA_VERSION);
+        assert_eq!(
+            repository.load().await.unwrap().state.services["demo.web"]
+                .spec
+                .image,
+            "nginx"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_schema_11_migration_preserves_original_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let cluster = cluster();
+        let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
+        let mut document = serde_json::to_value(PersistedControlPlane::new(
+            cluster.clone(),
+            ClusterState::default(),
+        ))
+        .unwrap();
+        document["schema_version"] = serde_json::json!(11);
+        document["kv"] = serde_json::json!({"objects": {}}); // removed historical format
+        let bytes = serde_json::to_vec(&document).unwrap();
         repository
             .with_connection(|connection| {
                 connection
                     .execute(
-                        "INSERT INTO control_plane(singleton, generation, schema_version, cluster_id, document)
-                         VALUES (1, 5, ?1, ?2, ?3)",
-                        params![
-                            LEGACY_PERSISTED_SCHEMA_VERSION,
-                            cluster.cluster_id,
-                            document
-                        ],
+                        "INSERT INTO control_plane VALUES (1, 5, 11, ?1, ?2)",
+                        params![cluster.cluster_id, bytes],
                     )
                     .map_err(backend)?;
                 Ok(())
             })
             .unwrap();
+        assert!(repository.initialize_with_cluster(&cluster).await.is_err());
+        let stored = repository
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT schema_version, generation, document FROM control_plane",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, u32>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, Vec<u8>>(2)?,
+                            ))
+                        },
+                    )
+                    .map_err(backend)
+            })
+            .unwrap();
+        assert_eq!(stored, (11, 5, bytes));
+    }
 
-        assert!(matches!(
-            repository.initialize_with_cluster(&cluster).await,
-            Err(StorageError::InvalidData(message)) if message.contains("unsupported cluster")
-        ));
+    #[tokio::test]
+    async fn rejects_unsupported_control_plane_schema() {
+        for version in [7, 8, 9, 10, 13] {
+            let directory = tempfile::tempdir().unwrap();
+            let cluster = cluster();
+            let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
+            let document =
+                serde_json::to_vec(&serde_json::json!({"schema_version": version})).unwrap();
+            repository
+                .with_connection(|connection| {
+                    connection
+                        .execute(
+                            "INSERT INTO control_plane VALUES (1, 5, ?1, ?2, ?3)",
+                            params![version, cluster.cluster_id, document],
+                        )
+                        .map_err(backend)?;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(
+                matches!(
+                    repository.initialize_with_cluster(&cluster).await,
+                    Err(StorageError::InvalidData(_))
+                ),
+                "version {version}"
+            );
+        }
     }
 }

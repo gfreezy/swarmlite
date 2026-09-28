@@ -56,6 +56,7 @@ impl Controller {
             }
         }
         let now = unix_ms();
+        changed |= crate::jobs::skip_missed(&mut versioned.state, now);
         let address = reqwest::Url::parse(&config.advertise_url)
             .ok()
             .and_then(|url| url.host_str().map(ToOwned::to_owned))
