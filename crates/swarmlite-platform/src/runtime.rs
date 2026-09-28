@@ -2433,11 +2433,11 @@ impl ContainerRuntime for DockerCompatibleRuntime {
             let is_job = match labels.get(TASK_KIND_LABEL).map(String::as_str) {
                 Some("job") => true,
                 Some("service") => false,
-                None => {
-                    // COMPAT(11 -> 12): schema 11 Service containers lack task_kind.
-                    // Remove this missing-label fallback in the next release.
-                    false
-                }
+                // Compatibility: Service containers created before task_kind survive
+                // upgrades without gaining labels. Keep this fallback until those
+                // containers are replaced; a database migration or version bump
+                // alone does not make it safe to remove.
+                None => false,
                 Some(kind) => bail!("unsupported task_kind {kind:?} on container {id}"),
             };
             let job = if is_job {
@@ -3255,9 +3255,20 @@ mod tests {
     }
 
     async fn disappearing_inventory_docker_api(
+        State(task_kind): State<Option<String>>,
         method: Method,
         uri: Uri,
     ) -> axum::response::Response {
+        let mut live_labels = serde_json::json!({
+            MANAGED_LABEL: "true",
+            CLUSTER_LABEL: "cluster-old",
+            TASK_LABEL: "task-live",
+            REVISION_LABEL: "1",
+            SPEC_HASH_LABEL: "hash"
+        });
+        if let Some(kind) = task_kind {
+            live_labels[TASK_KIND_LABEL] = serde_json::Value::String(kind);
+        }
         let path = uri.path();
         let (status, body) = if method == Method::GET && path.ends_with("/containers/json") {
             (
@@ -3287,13 +3298,7 @@ mod tests {
                         "Command": "nginx",
                         "Created": 1,
                         "Ports": [],
-                        "Labels": {
-                            MANAGED_LABEL: "true",
-                            CLUSTER_LABEL: "cluster-old",
-                            TASK_LABEL: "task-live",
-                            REVISION_LABEL: "1",
-                            SPEC_HASH_LABEL: "hash"
-                        },
+                        "Labels": live_labels,
                         "State": "running",
                         "Status": "Up"
                     }
@@ -4013,16 +4018,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skips_a_container_that_disappears_during_managed_inventory() {
-        let app = Router::new().fallback(any(disappearing_inventory_docker_api));
+    async fn rejects_unknown_task_kind_in_managed_inventory() {
+        let app = Router::new()
+            .fallback(any(disappearing_inventory_docker_api))
+            .with_state(Some("unsupported".to_owned()));
         let (runtime, server) = runtime_for_pull_api(app, DeploymentPolicy::default()).await;
-
-        let inventory = runtime.list_managed("cluster-old").await.unwrap();
+        let error = runtime.list_managed("cluster-old").await.unwrap_err();
         server.abort();
+        let message = format!("{error:#}");
+        assert!(message.contains("task_kind"), "{message}");
+        assert!(message.contains("live-container"), "{message}");
+    }
 
-        assert_eq!(inventory.len(), 1);
-        assert!(inventory.contains_key("task-live"));
-        assert!(!inventory.contains_key("task-gone"));
+    #[tokio::test]
+    async fn managed_inventory_accepts_legacy_and_current_services_and_skips_disappeared_containers() {
+        for kind in [None, Some("service".to_owned())] {
+            let app = Router::new()
+                .fallback(any(disappearing_inventory_docker_api))
+                .with_state(kind);
+            let (runtime, server) = runtime_for_pull_api(app, DeploymentPolicy::default()).await;
+
+            let inventory = runtime.list_managed("cluster-old").await.unwrap();
+            server.abort();
+
+            assert_eq!(inventory.len(), 1);
+            assert!(inventory["task-live"].job.is_none());
+            assert!(!inventory.contains_key("task-gone"));
+        }
     }
 
     #[tokio::test]

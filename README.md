@@ -263,14 +263,17 @@ Controller startup skips missed schedule times and resumes at a future occurrenc
 Ordinary scheduling tolerates tick latency within the scheduled minute; older missed
 occurrences are skipped. With no compatible live node, that occurrence is skipped too.
 Only Agents advertising job support receive jobs. Keep node clocks synchronized.
-Controller startup migrates schema 11 to 12 in one transaction; normal reads and writes
-only accept schema 12. This is the only supported historical storage format, and the
-11-to-12 migration is scheduled for removal in the next release. Older Controller binaries
-cannot read the upgraded database. Upgrade Controllers, Agents, and CLI together.
+Controller storage requires schema 12; older database formats are rejected without
+modifying their contents. Automatic schema 11 migration has been removed. Upgrade an
+existing schema-11 database through v0.1.41 before using this version. Upgrade Controllers,
+Agents, and CLI together. New managed workload containers have `io.swarmlite.task_kind`
+set to `service` or `job`. Older containers without this label are still recognized as
+Services: upgrading the software or database does not rewrite existing container labels.
+This compatibility remains necessary until those containers are replaced.
+Older Controller binaries cannot read a schema-12 database.
 Older storage layouts, embedded KV documents, slotless Gateways, `pull_policy: if_not_present`,
-and removed cache fields are no longer supported. Use `pull_policy: missing`; cache keys
-are always hashed and no longer accept `key.hash`. Schema 11 snapshots have that no-op
-option removed during migration.
+and removed cache fields are not supported. Use `pull_policy: missing`; cache keys
+are always hashed and do not accept `key.hash`.
 On lost-database recovery, redeploy the Stack files: historical jobs are never replayed,
 and surviving unclaimed job containers are stopped rather than adopted as services.
 The at-most-once guarantee depends on retaining the Agent attempt ledger and on there

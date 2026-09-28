@@ -20,8 +20,6 @@ use crate::{
 use swarmlite_stack::config_digest;
 
 const PERSISTED_SCHEMA_VERSION: u32 = 12;
-// COMPAT(11 -> 12): remove this module and its startup call in the next release.
-mod migrations;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -145,8 +143,6 @@ impl StateRepository {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(backend)?;
-            // COMPAT(11 -> 12): remove startup migration in the next release.
-            migrations::upgrade_11_to_12(&transaction, &self.cluster)?;
             if let Some(versioned) = read_versioned(&transaction, &self.cluster)? {
                 transaction.commit().map_err(backend)?;
                 return Ok(Some(versioned));
@@ -1031,131 +1027,14 @@ x-swarmlite:
     }
 
     #[tokio::test]
-    async fn migrates_schema_11_once_during_initialization() {
-        let directory = tempfile::tempdir().unwrap();
-        let cluster = cluster();
-        let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
-        let mut document = serde_json::to_value(PersistedControlPlane {
-            schema_version: 11,
-            cluster_id: cluster.cluster_id.clone(),
-            cluster: cluster.clone(),
-            state: PersistedClusterState::default(),
-        })
-        .unwrap();
-        let spec = swarmlite_stack::parse_stack("services:\n  web:\n    image: nginx\n")
-            .unwrap()
-            .services
-            .remove("web")
-            .unwrap();
-        let mut legacy_spec = serde_json::to_value(spec).unwrap();
-        legacy_spec.as_object_mut().unwrap().remove("job");
-        legacy_spec.as_object_mut().unwrap().remove("stop_signal");
-        document["state"]["services"] = serde_json::json!({
-            "demo.web": {"id": "demo.web", "stack": "demo", "name": "web", "revision": 1, "spec": legacy_spec, "deleted": false}
-        });
-        document["state"]["tasks"] = serde_json::json!({
-            "task-11": {"id": "task-11", "service_id": "demo.web", "revision": 1,
-                "slot": 0, "node_id": "node-a", "desired": "running", "ports": [],
-                "config_digests": [], "drain_until_unix_ms": null}
-        });
-        let gateway = swarmlite_stack::parse_stack("services:\n  web:\n    image: nginx\n    expose: [80]\nx-swarmlite:\n  http_routes:\n    - rules:\n        - cache: {key: {headers: [accept-language]}}\n          backend: {service: web, port: 80}\n      hostnames: [example.com]\n").unwrap().gateway;
-        document["state"]["gateway_routes"] = serde_json::json!({"demo": RecoveredStackGateway {gateway, upstreams: Default::default()}});
-        document["state"]["gateway_routes"]["demo"]["gateway"]["http_routes"][0]["rules"][0]["cache"]
-            ["key"]["hash"] = serde_json::json!(true);
-        repository.with_connection(|connection| {
-            connection.execute(
-                "INSERT INTO control_plane(singleton, generation, schema_version, cluster_id, document) VALUES (1, 5, 11, ?1, ?2)",
-                params![cluster.cluster_id, serde_json::to_vec(&document).unwrap()],
-            ).map_err(backend)?;
-            Ok(())
-        }).unwrap();
-        assert!(repository.load().await.is_err()); // ordinary reads accept only schema 12
-        let loaded = repository.initialize_with_cluster(&cluster).await.unwrap();
-        assert_eq!(loaded.generation, 6);
-        assert!(loaded.state.tasks["task-11"].job.is_none());
-        let cache = loaded.state.gateway_routes["demo"].gateway.http_routes[0].rules[0]
-            .cache
-            .as_ref()
-            .unwrap();
-        assert_eq!(
-            serde_json::to_value(cache).unwrap(),
-            serde_json::json!({"key": {"headers": ["accept-language"]}})
-        );
-        assert!(loaded.state.services["demo.web"].spec.job.is_none());
-        assert!(loaded.state.services["demo.web"].job_cursor.is_none());
-        let second = repository.initialize_with_cluster(&cluster).await.unwrap();
-        assert_eq!(second.generation, loaded.generation);
-        let version: u32 = repository
-            .with_connection(|connection| {
-                connection
-                    .query_row("SELECT schema_version FROM control_plane", [], |row| {
-                        row.get(0)
-                    })
-                    .map_err(backend)
-            })
-            .unwrap();
-        assert_eq!(version, PERSISTED_SCHEMA_VERSION);
-        assert_eq!(
-            repository.load().await.unwrap().state.services["demo.web"]
-                .spec
-                .image,
-            "nginx"
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_schema_11_migration_preserves_original_data() {
-        let directory = tempfile::tempdir().unwrap();
-        let cluster = cluster();
-        let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
-        let mut document = serde_json::to_value(PersistedControlPlane::new(
-            cluster.clone(),
-            ClusterState::default(),
-        ))
-        .unwrap();
-        document["schema_version"] = serde_json::json!(11);
-        document["kv"] = serde_json::json!({"objects": {}}); // removed historical format
-        let bytes = serde_json::to_vec(&document).unwrap();
-        repository
-            .with_connection(|connection| {
-                connection
-                    .execute(
-                        "INSERT INTO control_plane VALUES (1, 5, 11, ?1, ?2)",
-                        params![cluster.cluster_id, bytes],
-                    )
-                    .map_err(backend)?;
-                Ok(())
-            })
-            .unwrap();
-        assert!(repository.initialize_with_cluster(&cluster).await.is_err());
-        let stored = repository
-            .with_connection(|connection| {
-                connection
-                    .query_row(
-                        "SELECT schema_version, generation, document FROM control_plane",
-                        [],
-                        |row| {
-                            Ok((
-                                row.get::<_, u32>(0)?,
-                                row.get::<_, i64>(1)?,
-                                row.get::<_, Vec<u8>>(2)?,
-                            ))
-                        },
-                    )
-                    .map_err(backend)
-            })
-            .unwrap();
-        assert_eq!(stored, (11, 5, bytes));
-    }
-
-    #[tokio::test]
     async fn rejects_unsupported_control_plane_schema() {
-        for version in [7, 8, 9, 10, 13] {
+        for version in [7, 8, 9, 10, 11, 13] {
             let directory = tempfile::tempdir().unwrap();
             let cluster = cluster();
             let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
-            let document =
-                serde_json::to_vec(&serde_json::json!({"schema_version": version})).unwrap();
+            let mut value = PersistedControlPlane::new(cluster.clone(), ClusterState::default());
+            value.schema_version = version;
+            let document = serde_json::to_vec(&value).unwrap();
             repository
                 .with_connection(|connection| {
                     connection
@@ -1174,6 +1053,24 @@ x-swarmlite:
                 ),
                 "version {version}"
             );
+            let stored = repository
+                .with_connection(|connection| {
+                    connection
+                        .query_row(
+                            "SELECT schema_version, generation, document FROM control_plane",
+                            [],
+                            |row| {
+                                Ok((
+                                    row.get::<_, u32>(0)?,
+                                    row.get::<_, i64>(1)?,
+                                    row.get::<_, Vec<u8>>(2)?,
+                                ))
+                            },
+                        )
+                        .map_err(backend)
+                })
+                .unwrap();
+            assert_eq!(stored, (version, 5, document));
         }
     }
 }
