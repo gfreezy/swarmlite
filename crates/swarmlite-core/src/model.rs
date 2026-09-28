@@ -1894,6 +1894,47 @@ pub struct GatewayStatus {
     pub endpoint_errors: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobCursor {
+    #[serde(default)]
+    pub last_scheduled_at_unix_ms: Option<i64>,
+    pub schedule: String,
+    pub time_zone: String,
+    pub next_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobExecution {
+    #[serde(default)]
+    pub runtime: Option<JobRuntimeState>,
+    pub job_id: String,
+    pub scheduled_at_unix_ms: i64,
+    pub not_before_unix_ms: i64,
+    pub start_deadline_unix_ms: i64,
+    pub spec: Box<ServiceSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobRuntimeState {
+    #[serde(default)]
+    pub stop_reason: Option<String>,
+    pub job_id: String,
+    pub scheduled_at_unix_ms: i64,
+    pub start_deadline_unix_ms: i64,
+    pub timeout_seconds: Option<u64>,
+    pub started_at_unix_ms: Option<i64>,
+    pub exit_code: Option<i64>,
+}
+
+impl ObservedTaskState {
+    pub fn is_job_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::TimedOut
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2045,46 +2086,5 @@ x-swarmlite:
         let decoded: GatewayRecoverySnapshot = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, snapshot);
         decoded.validate_for_cluster("cluster-a").unwrap();
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct JobCursor {
-    #[serde(default)]
-    pub last_scheduled_at_unix_ms: Option<i64>,
-    pub schedule: String,
-    pub time_zone: String,
-    pub next_at_unix_ms: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct JobExecution {
-    #[serde(default)]
-    pub runtime: Option<JobRuntimeState>,
-    pub job_id: String,
-    pub scheduled_at_unix_ms: i64,
-    pub not_before_unix_ms: i64,
-    pub start_deadline_unix_ms: i64,
-    pub spec: Box<ServiceSpec>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct JobRuntimeState {
-    #[serde(default)]
-    pub stop_reason: Option<String>,
-    pub job_id: String,
-    pub scheduled_at_unix_ms: i64,
-    pub start_deadline_unix_ms: i64,
-    pub timeout_seconds: Option<u64>,
-    pub started_at_unix_ms: Option<i64>,
-    pub exit_code: Option<i64>,
-}
-
-impl ObservedTaskState {
-    pub fn is_job_terminal(&self) -> bool {
-        matches!(
-            self,
-            Self::Succeeded | Self::Failed | Self::Cancelled | Self::TimedOut
-        )
     }
 }

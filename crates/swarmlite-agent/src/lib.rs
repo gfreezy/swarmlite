@@ -1564,6 +1564,58 @@ fn assignment_uses_only_dynamic_ports(assignment: &crate::model::TaskAssignment)
         })
 }
 
+async fn job_deadline_loop<R: ContainerRuntime>(runtime: Arc<R>, cluster: String) {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tick.tick().await;
+        let Ok(Ok(containers)) =
+            tokio::time::timeout(Duration::from_secs(5), runtime.list_managed(&cluster)).await
+        else {
+            continue;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let stops = containers
+            .values()
+            .filter(|c| {
+                c.running
+                    && c.job.as_ref().is_some_and(|j| {
+                        j.stop_reason.is_some()
+                            || j.started_at_unix_ms.zip(j.timeout_seconds).is_some_and(
+                                |(start, timeout)| {
+                                    now >= start.saturating_add(timeout.saturating_mul(1000) as i64)
+                                },
+                            )
+                    })
+            })
+            .map(|c| async {
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    runtime.stop_job(
+                        c,
+                        c.job
+                            .as_ref()
+                            .and_then(|j| j.stop_reason.as_deref())
+                            .unwrap_or("timeout"),
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        warn!(task_id = %c.task_id, %error, "job deadline stop failed")
+                    }
+                    Err(error) => {
+                        warn!(task_id = %c.task_id, %error, "job deadline stop timed out")
+                    }
+                }
+            });
+        futures_util::future::join_all(stops).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -2581,57 +2633,5 @@ mod tests {
                 .unwrap()
                 .contains("image pull denied")
         );
-    }
-}
-
-async fn job_deadline_loop<R: ContainerRuntime>(runtime: Arc<R>, cluster: String) {
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
-    loop {
-        tick.tick().await;
-        let Ok(Ok(containers)) =
-            tokio::time::timeout(Duration::from_secs(5), runtime.list_managed(&cluster)).await
-        else {
-            continue;
-        };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-        let stops = containers
-            .values()
-            .filter(|c| {
-                c.running
-                    && c.job.as_ref().is_some_and(|j| {
-                        j.stop_reason.is_some()
-                            || j.started_at_unix_ms.zip(j.timeout_seconds).is_some_and(
-                                |(start, timeout)| {
-                                    now >= start.saturating_add(timeout.saturating_mul(1000) as i64)
-                                },
-                            )
-                    })
-            })
-            .map(|c| async {
-                match tokio::time::timeout(
-                    Duration::from_secs(5),
-                    runtime.stop_job(
-                        c,
-                        c.job
-                            .as_ref()
-                            .and_then(|j| j.stop_reason.as_deref())
-                            .unwrap_or("timeout"),
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        warn!(task_id = %c.task_id, %error, "job deadline stop failed")
-                    }
-                    Err(error) => {
-                        warn!(task_id = %c.task_id, %error, "job deadline stop timed out")
-                    }
-                }
-            });
-        futures_util::future::join_all(stops).await;
     }
 }

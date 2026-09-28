@@ -136,13 +136,13 @@ impl Controller {
         let mut observed_failures = Vec::new();
         for id in assigned_ids {
             let task = inner.state.tasks.get_mut(&id).unwrap();
-            if task.job.is_some() {
+            if let Some(job) = &mut task.job {
                 if let Some(report) = reports.get(&id) {
                     if task.reconcile_error.take().is_some() {
                         changed = true;
                     }
-                    if task.job.as_ref().unwrap().runtime != report.job {
-                        task.job.as_mut().unwrap().runtime = report.job.clone();
+                    if job.runtime != report.job {
+                        job.runtime = report.job.clone();
                         changed = true;
                     }
                     if task.observed != report.observed || task.container_id != report.container_id
@@ -220,15 +220,14 @@ impl Controller {
                     .error
                     .as_ref()
                     .filter(|_| !reports.contains_key(&report.task_id))
+                    && !task.observed.is_job_terminal()
                 {
-                    if !task.observed.is_job_terminal() {
-                        task.observed = ObservedTaskState::Unknown;
-                        task.reconcile_error = Some(crate::model::TaskReconcileError {
-                            phase: report.phase,
-                            message: error.clone(),
-                        });
-                        changed = true;
-                    }
+                    task.observed = ObservedTaskState::Unknown;
+                    task.reconcile_error = Some(crate::model::TaskReconcileError {
+                        phase: report.phase,
+                        message: error.clone(),
+                    });
+                    changed = true;
                 }
                 continue;
             }
