@@ -4031,7 +4031,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn managed_inventory_accepts_legacy_and_current_services_and_skips_disappeared_containers() {
+    async fn managed_inventory_accepts_legacy_and_current_services_and_skips_disappeared_containers()
+     {
         for kind in [None, Some("service".to_owned())] {
             let app = Router::new()
                 .fallback(any(disappearing_inventory_docker_api))
