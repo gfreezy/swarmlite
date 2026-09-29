@@ -5,3 +5,7 @@
 !crates/**
 !src/
 !src/**
+!ui/
+!ui/**
+ui/node_modules
+ui/dist

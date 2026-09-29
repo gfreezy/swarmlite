@@ -24,6 +24,13 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
 
+      - name: Install Node.js for embedded UI
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
@@ -32,6 +39,12 @@ jobs:
 
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Check UI behavior
+        run: |
+          npm ci --prefix ui --no-audit --no-fund
+          npm run lint --prefix ui
+          npm test --prefix ui
 
       - name: Run Rust tests
         run: cargo test --workspace --all-features --locked
@@ -66,6 +79,13 @@ jobs:
 
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
+
+      - name: Install Node.js for embedded UI
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
 
       - name: Install musl build tools
         if: runner.os == 'Linux'

@@ -1915,6 +1915,7 @@ mod tests {
             start_deadline_unix_ms: 2,
             timeout_seconds: Some(1),
             started_at_unix_ms: Some(1),
+            finished_at_unix_ms: None,
             exit_code: None,
         });
         let runtime = Arc::new(FakeRuntime {

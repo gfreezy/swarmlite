@@ -43,6 +43,7 @@ use tokio::io::AsyncReadExt;
 mod cluster_cli;
 mod connection;
 mod job_cli;
+mod ui;
 mod upgrade;
 
 const fn cli_styles() -> Styles {
@@ -122,6 +123,11 @@ impl From<RuntimeKindArg> for RuntimeKind {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Open a local web dashboard for the cluster.
+    Ui {
+        #[command(flatten)]
+        options: ui::UiArgs,
+    },
     /// Manage long-running services.
     Service {
         #[command(subcommand)]
@@ -1583,6 +1589,7 @@ async fn run() -> Result<()> {
     let installed = InstalledNodeConfig::load_if_exists(SYSTEM_CONFIG_PATH)?;
     let data_dir = node::resolve_data_dir(cli.data_dir.or_else(|| installed.data_dir.clone()))?;
     match cli.command {
+        Command::Ui { options } => ui::run(&data_dir, options).await,
         Command::Init { options } => {
             let (runtime, runtime_socket) =
                 installed.runtime_options(options.runtime.map(Into::into), options.runtime_socket);
@@ -4084,6 +4091,7 @@ mod tests {
         assert_eq!(
             top_level,
             [
+                "ui",
                 "service",
                 "job",
                 "init",

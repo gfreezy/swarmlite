@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-stream.workspace = true
+axum.workspace = true
 base64.workspace = true
 clap.workspace = true
 futures-util.workspace = true
@@ -23,6 +25,12 @@ tokio.workspace = true
 tokio-tungstenite.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
+uuid.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -2486,6 +2486,12 @@ impl ContainerRuntime for DockerCompatibleRuntime {
                         .unwrap_or(0),
                     timeout_seconds: labels.get(JOB_TIMEOUT_LABEL).and_then(|v| v.parse().ok()),
                     started_at_unix_ms: started,
+                    finished_at_unix_ms: state
+                        .filter(|_| !running)
+                        .and_then(|s| s.finished_at.as_deref())
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .map(|t| t.timestamp_millis())
+                        .filter(|t| started.is_some_and(|start| *t >= start)),
                     exit_code,
                 })
             } else {
@@ -3836,7 +3842,7 @@ mod tests {
                 StatusCode::OK,
                 serde_json::json!({
                     "Id":"job-container", "Image":"sha256:test-image", "Config":state.body.lock().unwrap().clone(),
-                    "State":{"Running":state.running.load(Ordering::SeqCst), "StartedAt":"2026-01-01T00:00:00Z", "ExitCode":0}
+                    "State":{"Running":state.running.load(Ordering::SeqCst), "StartedAt":"2026-01-01T00:00:00Z", "FinishedAt":"2026-01-01T00:00:30Z", "ExitCode":0}
                 }),
             )
         } else {
@@ -3884,6 +3890,14 @@ mod tests {
         let containers = runtime.list_managed(&assignment.cluster_id).await.unwrap();
         let container = &containers[&assignment.id];
         assert_eq!(container.observed, ObservedTaskState::Running);
+        assert!(
+            container
+                .job
+                .as_ref()
+                .unwrap()
+                .finished_at_unix_ms
+                .is_none()
+        );
         // A previous Agent persisted the stop intent and then crashed. Its elapsed
         // grace time must be preserved, even when a different reason requests stop.
         ledger
@@ -3924,6 +3938,11 @@ mod tests {
         assert_eq!(
             containers[&assignment.id].job.as_ref().unwrap().exit_code,
             Some(0)
+        );
+        let job = containers[&assignment.id].job.as_ref().unwrap();
+        assert_eq!(
+            job.finished_at_unix_ms.unwrap() - job.started_at_unix_ms.unwrap(),
+            30_000
         );
         server.abort();
     }

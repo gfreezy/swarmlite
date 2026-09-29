@@ -146,6 +146,26 @@ swarmlite logs --controller ssh://root@server.example.com --follow demo.web
 Swarmlite opens a temporary SSH tunnel and reads the protected Controller connection settings on
 the server. Application traffic and node-to-Controller traffic do not use this tunnel.
 
+### Open the local web console
+
+```bash
+swarmlite ui --controller ssh://root@server.example.com
+# Or use this machine's stored Controller connection:
+swarmlite ui
+```
+
+`ui` opens a local console for workloads, rich inspect details, all tasks, deployment history,
+job executions, routing paths, Gateway state, node metadata, cluster configuration and logs.
+Actions live in their respective resource pages and refresh them after completion, including service
+scale/restart, job run/cancel, deployment retry/rollback, Stack removal, configuration changes,
+Gateway enable/disable, node labels and Registry login. It excludes `deploy` and all YAML input,
+as well as `init`, `join`, `serve`, and `upgrade`. Queries also have structured views.
+It listens only on `127.0.0.1` at an available port and keeps the SSH connection alive when used.
+Use `--port 17081` to choose a port and `--no-open` to print the browser URL without launching it.
+Open the complete printed URL; its temporary browser credential expires when the command exits.
+The released binary includes all web assets and needs no Node.js installation at runtime.
+See [`ui/README.md`](ui/README.md) for frontend development and build details.
+
 ### 6. Clean up or expand
 
 Remove the example Stack:
@@ -1124,10 +1144,11 @@ service VIPs, cross-node DNS, autoscaling, global services, or the broader Kuber
 
 ### Command reference
 
-The CLI exposes 20 top-level commands and 21 actionable subcommands in the grouped command trees.
+The CLI exposes 21 top-level commands and 21 actionable subcommands in the grouped command trees.
 Run `swarmlite COMMAND --help` for complete arguments.
 
 ```text
+ui                   open a local web console with inspection and CLI operations
 init                 initialize a single-controller cluster
 join                 configure another node from cluster settings
 join-token           print the generated join command
@@ -1248,6 +1269,9 @@ dependency boundaries:
 - `swarmlite-stack` parses and validates Stack documents and renders routing structures.
 
 Only `swarmlite-node` composes Agent and Controller. Those role crates do not depend on each other.
+
+Building the CLI also requires Node.js 24 LTS and npm. Cargo automatically builds and embeds
+the React UI; CI and Docker builds include it in the same release binary.
 
 Build the Rust binary with:
 

@@ -1925,6 +1925,8 @@ pub struct JobRuntimeState {
     pub start_deadline_unix_ms: i64,
     pub timeout_seconds: Option<u64>,
     pub started_at_unix_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at_unix_ms: Option<i64>,
     pub exit_code: Option<i64>,
 }
 
