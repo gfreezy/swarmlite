@@ -4,7 +4,7 @@ go 1.26.1
 
 require (
 	github.com/caddyserver/caddy/v2 v2.11.4
-	github.com/caddyserver/certmagic v0.25.3
+	github.com/caddyserver/certmagic v0.25.4
 	github.com/klauspost/compress v1.18.6
 	go.uber.org/zap v1.28.0
 	modernc.org/sqlite v1.57.0
