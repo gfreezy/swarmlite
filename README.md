@@ -126,8 +126,8 @@ sudo swarmlite ps demo
 sudo swarmlite inspect demo.web
 sudo swarmlite logs --tail 200 demo.web
 sudo swarmlite logs --follow demo.api
-sudo swarmlite scale demo.web=2
-sudo swarmlite restart demo.api
+sudo swarmlite service scale demo.web=2
+sudo swarmlite service restart demo.api
 sudo swarmlite deployment status demo
 sudo swarmlite deployment attach demo
 ```
@@ -285,10 +285,10 @@ Deploy and manage jobs:
 ```bash
 swarmlite deploy -c examples/jobs.yaml
 swarmlite inspect maintenance.cleanup
-swarmlite job ls
+swarmlite ls maintenance
 swarmlite job run maintenance.cleanup
 swarmlite job history maintenance.cleanup --json
-swarmlite job logs maintenance.cleanup
+swarmlite logs maintenance.cleanup
 swarmlite job cancel <task-id>
 ```
 
@@ -302,7 +302,7 @@ Deployment completion means the schedule was registered; it does not wait for a 
 execution. `inspect` includes the next trigger, execution timestamps, exit codes, and
 stop reasons. The last 20 confirmed finished executions are retained for inspection and
 logs; unresolved executions remain visible until reconciled. The Agent's compact start
-claims are retained to reject stale assignments. `scale` and `restart` reject jobs;
+claims are retained to reject stale assignments. `service scale` and `service restart` reject jobs;
 edit and redeploy their definitions instead. Configuration changes affect future
 occurrences, while existing executions keep their original container settings.
 
@@ -349,7 +349,7 @@ names are case-sensitive; invalid templates are rejected while parsing the Stack
 
 ### Deployment lifecycle
 
-`deploy`, `scale`, `restart`, and `rm` submit desired state to the Controller and wait for
+`deploy`, `service scale`, `service restart`, and `rm` submit desired state to the Controller and wait for
 convergence by default. They support `--detach`. Deployments are durable and can be observed from a
 new CLI process:
 
@@ -381,25 +381,37 @@ A deployment becomes:
 - `superseded` when another generation intentionally replaces it.
 
 The default progress deadline is 300 seconds of inactivity, not a maximum total deployment time.
-`restart` always increments the Service revision and performs its configured rolling replacement.
+`service restart` always increments the Service revision and performs its configured rolling replacement.
 Old healthy tasks remain routable until their replacements are healthy and Gateways accept the new
 upstreams.
 
-### Inspect services, tasks, and logs
+### Inspect services, jobs, tasks, and logs
 
-`deploy`, `ls`, and `rm` target Stacks. `inspect`, `scale`, and `restart` target a Service in
-`STACK.SERVICE` form. `ps` accepts a Stack or Service. `logs` accepts a Service, task name, or task
-ID:
+Shared queries live at the top level: `ls` lists Service and Job definitions (optionally
+filtered by Stack), `inspect` reads either definition with its tasks, `ps` lists tasks for a
+Stack, Service, or Job, and `logs` reads output for either workload or an individual Task.
+`ls --json` includes Job scheduling settings; the table distinguishes `service` and `job`
+and shows `-` for Job replica counts.
+
+Type-specific operations are grouped: `service scale/restart` manage long-running Services;
+`job run/history/cancel` manage Job executions. `deploy` and `rm` apply to entire Stacks.
+
+This CLI layout replaces top-level `scale/restart` with `service scale/restart` and removes
+`job ls/logs` in favor of top-level `ls/logs`. Update scripts to use the new paths.
+
+Examples (optional arguments are shown in brackets):
 
 ```bash
 swarmlite ls [STACK]
-swarmlite ps [STACK|SERVICE]
+swarmlite ps [STACK|STACK.SERVICE|STACK.JOB]
 swarmlite inspect STACK.SERVICE
+swarmlite inspect STACK.JOB
 swarmlite logs --tail 200 STACK.SERVICE
+swarmlite logs --tail 200 STACK.JOB
 swarmlite logs --follow STACK.SERVICE
 swarmlite logs --follow STACK.SERVICE.SLOT
-swarmlite scale STACK.SERVICE=3
-swarmlite restart STACK.SERVICE
+swarmlite service scale STACK.SERVICE=3
+swarmlite service restart STACK.SERVICE
 swarmlite rm STACK
 ```
 
@@ -1112,7 +1124,7 @@ service VIPs, cross-node DNS, autoscaling, global services, or the broader Kuber
 
 ### Command reference
 
-The CLI exposes 21 top-level commands and 21 actionable subcommands in the grouped command trees.
+The CLI exposes 20 top-level commands and 21 actionable subcommands in the grouped command trees.
 Run `swarmlite COMMAND --help` for complete arguments.
 
 ```text
@@ -1128,20 +1140,20 @@ gateway status|enable|disable
 node label get|set|remove
                      read or update one node's placement labels
 registry login       store private registry credentials
-job ls|run|history|logs|cancel
+service scale|restart
+                     scale or roll long-running Services
+job run|history|cancel
                      manage one-shot and scheduled jobs
 deploy               deploy or update a Stack
 deployment status [STACK]
 deployment history [STACK]
 deployment attach|retry|rollback STACK
                      inspect, follow, or recover Stack deployments
-ls [STACK]           list Services
-ps [TARGET]          list tasks, optionally for one Stack or Service
-inspect SERVICE      inspect a Service
-logs SERVICE|TASK_NAME|TASK_ID
+ls [STACK] [--json]  list Service and Job definitions
+ps [TARGET]          list tasks, optionally for one Stack, Service, or Job
+inspect TARGET       inspect a Service or Job definition and its tasks
+logs SERVICE|JOB|TASK_NAME|TASK_ID
                      stream container logs
-scale SERVICE=N      scale replicated Services
-restart SERVICE      roll a Service
 rm STACK             remove Stacks
 status [--json]      inspect cluster state
 ```

@@ -1757,6 +1757,8 @@ pub struct ServiceSummary {
     pub stack: String,
     pub name: String,
     pub image: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job: Option<swarmlite_stack::JobSpec>,
     pub replicas: u32,
     pub running_replicas: u32,
 }

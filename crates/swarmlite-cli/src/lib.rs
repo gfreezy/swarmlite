@@ -122,6 +122,11 @@ impl From<RuntimeKindArg> for RuntimeKind {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Manage long-running services.
+    Service {
+        #[command(subcommand)]
+        action: ServiceCommand,
+    },
     /// Manage one-shot and scheduled jobs.
     Job {
         #[command(subcommand)]
@@ -203,35 +208,25 @@ enum Command {
         #[command(subcommand)]
         action: DeploymentCommand,
     },
-    /// List cluster services, optionally limited to one Stack.
+    /// List Service and Job definitions, optionally limited to one Stack.
     Ls {
         #[command(flatten)]
         options: cluster_cli::ListArgs,
     },
-    /// List tasks, optionally limited to a Stack or Service.
+    /// List tasks, optionally limited to a Stack, Service, or Job.
     Ps {
         #[command(flatten)]
         options: cluster_cli::PsArgs,
     },
-    /// Display detailed information about a Service.
+    /// Display a Service or Job definition and its tasks.
     Inspect {
         #[command(flatten)]
         options: cluster_cli::InspectArgs,
     },
-    /// Fetch logs from a Service, Task name, or Task ID.
+    /// Fetch logs from a Service, Job, Task name, or Task ID.
     Logs {
         #[command(flatten)]
         options: cluster_cli::LogsArgs,
-    },
-    /// Scale one or more Services.
-    Scale {
-        #[command(flatten)]
-        options: cluster_cli::ScaleArgs,
-    },
-    /// Perform a rolling restart of a Service.
-    Restart {
-        #[command(flatten)]
-        options: cluster_cli::RestartArgs,
     },
     /// Remove one or more Stacks.
     Rm {
@@ -248,6 +243,20 @@ enum Command {
         controller: Option<String>,
         #[arg(long, env = "SWARMLITE_TOKEN")]
         token: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    /// Scale one or more Services.
+    Scale {
+        #[command(flatten)]
+        options: cluster_cli::ScaleArgs,
+    },
+    /// Perform a rolling restart of a Service.
+    Restart {
+        #[command(flatten)]
+        options: cluster_cli::RestartArgs,
     },
 }
 
@@ -1835,8 +1844,12 @@ async fn run() -> Result<()> {
         Command::Ps { options } => cluster_cli::run_ps(&data_dir, options).await,
         Command::Inspect { options } => cluster_cli::run_inspect(&data_dir, options).await,
         Command::Logs { options } => cluster_cli::run_logs(&data_dir, options).await,
-        Command::Scale { options } => cluster_cli::run_scale(&data_dir, options).await,
-        Command::Restart { options } => cluster_cli::run_restart(&data_dir, options).await,
+        Command::Service { action } => match action {
+            ServiceCommand::Scale { options } => cluster_cli::run_scale(&data_dir, options).await,
+            ServiceCommand::Restart { options } => {
+                cluster_cli::run_restart(&data_dir, options).await
+            }
+        },
         Command::Rm { options } => cluster_cli::run_remove(&data_dir, options).await,
         Command::Status {
             json,
@@ -4071,6 +4084,7 @@ mod tests {
         assert_eq!(
             top_level,
             [
+                "service",
                 "job",
                 "init",
                 "serve",
@@ -4088,23 +4102,29 @@ mod tests {
                 "ps",
                 "inspect",
                 "logs",
-                "scale",
-                "restart",
                 "rm",
                 "status",
             ]
         );
-        let grouped_actions = ["config", "gateway", "node", "registry", "deployment", "job"]
-            .into_iter()
-            .map(|name| {
-                leaf_commands(
-                    command
-                        .get_subcommands()
-                        .find(|subcommand| subcommand.get_name() == name)
-                        .unwrap(),
-                )
-            })
-            .sum::<usize>();
+        let grouped_actions = [
+            "config",
+            "gateway",
+            "node",
+            "registry",
+            "deployment",
+            "service",
+            "job",
+        ]
+        .into_iter()
+        .map(|name| {
+            leaf_commands(
+                command
+                    .get_subcommands()
+                    .find(|subcommand| subcommand.get_name() == name)
+                    .unwrap(),
+            )
+        })
+        .sum::<usize>();
         assert_eq!(grouped_actions, 21);
     }
 
@@ -4547,7 +4567,7 @@ mod tests {
     }
 
     #[test]
-    fn exposes_flat_cluster_commands() {
+    fn exposes_shared_queries_and_resource_specific_commands() {
         assert!(Cli::try_parse_from(["swarmlite", "ls"]).is_ok());
         assert!(Cli::try_parse_from(["swarmlite", "ls", "demo"]).is_ok());
         assert!(Cli::try_parse_from(["swarmlite", "ps"]).is_ok());
@@ -4557,8 +4577,11 @@ mod tests {
         assert!(Cli::try_parse_from(["swarmlite", "logs", "--tail", "20", "demo.web",]).is_ok());
         assert!(Cli::try_parse_from(["swarmlite", "logs", "--follow", "demo.web",]).is_ok());
         assert!(Cli::try_parse_from(["swarmlite", "logs", "--raw", "task-id",]).is_ok());
-        assert!(Cli::try_parse_from(["swarmlite", "scale", "--detach", "demo.web=3",]).is_ok());
-        assert!(Cli::try_parse_from(["swarmlite", "restart", "demo.web",]).is_ok());
+        assert!(
+            Cli::try_parse_from(["swarmlite", "service", "scale", "--detach", "demo.web=3",])
+                .is_ok()
+        );
+        assert!(Cli::try_parse_from(["swarmlite", "service", "restart", "demo.web",]).is_ok());
         assert!(Cli::try_parse_from(["swarmlite", "rm", "demo", "other",]).is_ok());
         assert!(Cli::try_parse_from(["swarmlite", "rm", "--json", "demo",]).is_ok());
         assert!(Cli::try_parse_from(["swarmlite", "deployment", "status", "demo"]).is_ok());
@@ -4594,6 +4617,19 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["swarmlite", "stack", "ls"]).is_err());
         assert!(Cli::try_parse_from(["swarmlite", "service", "ls"]).is_err());
+        assert!(Cli::try_parse_from(["swarmlite", "scale", "demo.web=3"]).is_err());
+        assert!(Cli::try_parse_from(["swarmlite", "restart", "demo.web"]).is_err());
+        assert!(Cli::try_parse_from(["swarmlite", "job", "ls"]).is_err());
+        assert!(Cli::try_parse_from(["swarmlite", "job", "logs", "demo.cleanup"]).is_err());
+        assert!(Cli::try_parse_from(["swarmlite", "ls", "demo", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "ps", "demo.cleanup"]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "inspect", "demo.cleanup"]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "logs", "demo.cleanup"]).is_ok());
+        assert!(Cli::try_parse_from(["swarmlite", "job", "run", "demo.cleanup"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["swarmlite", "job", "history", "demo.cleanup", "--json"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["swarmlite", "job", "cancel", "task-id"]).is_ok());
     }
 
     #[test]
@@ -4619,14 +4655,13 @@ mod tests {
             "ps",
             "inspect",
             "logs",
-            "scale",
-            "restart",
+            "service",
+            "job",
             "rm",
         ] {
             assert!(names.contains(&name));
         }
         assert!(!names.contains(&"stack"));
-        assert!(!names.contains(&"service"));
         assert!(!names.contains(&"role"));
         assert!(!names.contains(&"controller"));
         assert!(!names.contains(&"agent"));

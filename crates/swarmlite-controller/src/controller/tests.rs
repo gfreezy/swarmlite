@@ -3391,6 +3391,41 @@ async fn manual_job_run_cancel_and_history_survive_persistence() {
     }
     let first = controller.run_job("demo.backup").await.unwrap();
     assert!(first.job.is_some());
+    let listed = controller.list_services(Some("demo")).await.unwrap();
+    assert_eq!(listed.services.len(), 1);
+    let summary = &listed.services[0];
+    assert_eq!(summary.id, "demo.backup");
+    let job = summary.job.as_ref().unwrap();
+    assert!(job.schedule.is_none());
+    assert!(job.suspend);
+    assert_eq!(job.time_zone, "UTC");
+    let inspected = controller.inspect_service("demo.backup").await.unwrap();
+    assert!(inspected.service.spec.job.is_some());
+    assert_eq!(inspected.tasks.len(), 1);
+    assert_eq!(inspected.tasks[0].id, first.id);
+    let tasks = controller.target_tasks("demo.backup").await.unwrap();
+    assert_eq!(tasks.tasks.len(), 1);
+    assert_eq!(tasks.tasks[0].id, first.id);
+    for target in ["demo.backup", first.id.as_str()] {
+        let logs = controller
+            .create_data_session(crate::model::DataSessionOperation::Logs {
+                target: target.into(),
+                tail: 10,
+                follow: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(logs.streams.len(), 1);
+        assert_eq!(logs.streams[0].task_id, first.id);
+    }
+    assert!(matches!(
+        controller.scale_service("demo.backup", 2).await,
+        Err(ControllerError::Invalid(_))
+    ));
+    assert!(matches!(
+        controller.force_update_service("demo.backup").await,
+        Err(ControllerError::Invalid(_))
+    ));
     assert!(controller.run_job("demo.backup").await.is_err());
     assert_eq!(
         controller.cancel_job_task(&first.id).await.unwrap().desired,

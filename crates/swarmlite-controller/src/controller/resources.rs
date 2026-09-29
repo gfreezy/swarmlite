@@ -102,6 +102,7 @@ impl Controller {
                     stack: service.stack.clone(),
                     name: service.name.clone(),
                     image: service.spec.image.clone(),
+                    job: service.spec.job.clone(),
                     replicas: service.spec.replicas,
                     running_replicas,
                 }

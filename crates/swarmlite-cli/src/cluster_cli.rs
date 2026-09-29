@@ -58,7 +58,10 @@ pub(super) struct DeployArgs {
 
 #[derive(Debug, Args)]
 pub(super) struct ListArgs {
-    /// Limit the service list to one Stack.
+    /// Emit Service and Job definitions as JSON.
+    #[arg(long)]
+    json: bool,
+    /// Limit Service and Job definitions to one Stack.
     #[arg(value_name = "STACK")]
     stack: Option<String>,
     #[command(flatten)]
@@ -67,8 +70,8 @@ pub(super) struct ListArgs {
 
 #[derive(Debug, Args)]
 pub(super) struct PsArgs {
-    /// Limit the task list to one Stack or Service.
-    #[arg(value_name = "STACK|STACK.SERVICE")]
+    /// Limit the task list to one Stack, Service, or Job.
+    #[arg(value_name = "STACK|STACK.SERVICE|STACK.JOB")]
     target: Option<String>,
     #[arg(short = 'q', long)]
     quiet: bool,
@@ -80,16 +83,16 @@ pub(super) struct PsArgs {
 
 #[derive(Debug, Args)]
 pub(super) struct InspectArgs {
-    #[arg(value_name = "STACK.SERVICE")]
-    service: String,
+    #[arg(value_name = "STACK.SERVICE|STACK.JOB")]
+    target: String,
     #[command(flatten)]
     connection: ConnectionArgs,
 }
 
 #[derive(Debug, Args)]
 pub(super) struct LogsArgs {
-    /// Service, Task name from `ps`, or Task ID/prefix.
-    #[arg(value_name = "STACK.SERVICE|STACK.SERVICE.SLOT|TASK_ID")]
+    /// Service, Job, Task name from `ps`, or Task ID/prefix.
+    #[arg(value_name = "STACK.SERVICE|STACK.JOB|TASK_NAME|TASK_ID")]
     target: String,
     #[arg(short = 'n', long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(0..=10_000))]
     tail: u32,
@@ -161,7 +164,11 @@ pub(super) async fn run_list(data_dir: &Path, args: ListArgs) -> Result<()> {
         |stack| format!("/v1/services?stack={}", encode(&stack)),
     );
     let response: ServiceListResponse = client.get_json(&path).await?;
-    print_service_table(&response);
+    if args.json {
+        print_pretty_json(&response, stdout_color())?;
+    } else {
+        print_service_table(&response);
+    }
     Ok(())
 }
 
@@ -185,7 +192,7 @@ pub(super) async fn run_ps(data_dir: &Path, args: PsArgs) -> Result<()> {
 pub(super) async fn run_inspect(data_dir: &Path, args: InspectArgs) -> Result<()> {
     let client = resolve_client(data_dir, args.connection).await?;
     let response: ServiceInspectResponse = client
-        .get_json(&format!("/v1/services/{}", encode(&args.service)))
+        .get_json(&format!("/v1/services/{}", encode(&args.target)))
         .await?;
     print_pretty_json(&response, stdout_color())?;
     Ok(())
@@ -330,21 +337,56 @@ fn print_service_table(response: &ServiceListResponse) {
             vec![
                 ansi(color, "2", &service.id),
                 ansi(color, "1;36", format!("{}.{}", service.stack, service.name)),
-                "replicated".into(),
-                ansi(
-                    color,
-                    if service.running_replicas == service.replicas {
-                        "32"
-                    } else {
-                        "33"
-                    },
-                    format!("{}/{}", service.running_replicas, service.replicas),
-                ),
+                if service.job.is_some() {
+                    "job"
+                } else {
+                    "service"
+                }
+                .into(),
+                if service.job.is_some() {
+                    "-".into()
+                } else {
+                    ansi(
+                        color,
+                        if service.running_replicas == service.replicas {
+                            "32"
+                        } else {
+                            "33"
+                        },
+                        format!("{}/{}", service.running_replicas, service.replicas),
+                    )
+                },
+                service
+                    .job
+                    .as_ref()
+                    .map_or("-", |job| job.schedule.as_deref().unwrap_or("manual"))
+                    .into(),
+                service
+                    .job
+                    .as_ref()
+                    .map_or("-", |job| job.time_zone.as_str())
+                    .into(),
+                service
+                    .job
+                    .as_ref()
+                    .map_or_else(|| "-".into(), |job| job.suspend.to_string()),
                 service.image.clone(),
             ]
         })
         .collect();
-    print_table(&["ID", "NAME", "MODE", "REPLICAS", "IMAGE"], rows);
+    print_table(
+        &[
+            "ID",
+            "NAME",
+            "KIND",
+            "REPLICAS",
+            "SCHEDULE",
+            "TIMEZONE",
+            "SUSPENDED",
+            "IMAGE",
+        ],
+        rows,
+    );
 }
 
 fn print_task_table(
