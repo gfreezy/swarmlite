@@ -4,6 +4,8 @@ A local cluster console built with npm, React, TypeScript, Vite, Tailwind CSS,
 and checked-in shadcn/ui components. Inspect workloads and tasks, troubleshoot routing,
 compare retained deployments, and submit CLI operations without a Stack YAML file.
 
+[← Project overview](../README.md) · [Web UI screenshots](../README.md#screenshots)
+
 ## Run the embedded console
 
 ```sh
@@ -59,7 +61,9 @@ also stops its local request processes.
 ## Inspection
 
 - **Routes** uses an interactive directed graph to connect hostnames and path rules to service targets, published upstreams,
-  task replicas and node ports. Select a node to trace its connections and open full rule details;
+  task replicas and node ports. Click a node to select it and highlight its connected paths; click
+  the same node again, click empty canvas, press Esc, or use **Clear selection** to deselect it.
+  Open full rule details using the separate selected-route actions;
   zoom, fit, search and a list view are available. Unpublished tasks stay in the details, and
   missing upstreams use dashed diagnostic edges. It reads the Controller's retained Gateway routing snapshot,
   including recovery state; each Gateway's desired/applied generation and errors are shown
