@@ -49,6 +49,9 @@ impl Controller {
         } else {
             soft_changed |= inner.gateway_reports.remove(node_id).is_some();
         }
+        if let Some(sample) = node.metrics.take() {
+            metrics::record(&mut inner, &self.metrics_store, node_id, sample);
+        }
         inner.live_nodes.insert(node_id.to_owned(), Instant::now());
         inner.state.nodes.insert(node_id.to_owned(), node);
         if gateway_report_changed && gateway_report_applied {

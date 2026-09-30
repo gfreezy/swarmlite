@@ -8,6 +8,7 @@ pub(super) fn routes() -> Router<Arc<UiState>> {
         .route("/api/tasks", get(all_tasks))
         .route("/api/tasks/{id}", get(task))
         .route("/api/nodes", get(nodes))
+        .route("/api/node-stats", get(node_stats))
         .route("/api/config", get(config))
         .route("/api/cli", get(cli_reference))
 }
@@ -120,7 +121,7 @@ fn command_destination(path: &str) -> Option<&'static str> {
         "job history" => Some("Jobs"),
         "deployment status" | "deployment history" | "deployment attach" => Some("Deployments"),
         "gateway status" => Some("Routes"),
-        "node label get" => Some("Nodes"),
+        "node label get" | "node stats" => Some("Nodes"),
         "config get" | "config explain" => Some("Configuration"),
         _ => None,
     }
@@ -219,4 +220,35 @@ mod tests {
             ));
         }
     }
+}
+
+#[derive(Deserialize)]
+struct MetricsQuery {
+    node: Option<String>,
+    #[serde(default)]
+    history: bool,
+    seconds: Option<u64>,
+    from: Option<i64>,
+    to: Option<i64>,
+}
+async fn node_stats(
+    State(state): State<Arc<UiState>>,
+    Query(query): Query<MetricsQuery>,
+) -> ApiResult<swarmlite_core::metrics::NodeStatsResponse> {
+    let path = {
+        let mut params = url::form_urlencoded::Serializer::new(String::new());
+        if let Some(node) = query.node {
+            params.append_pair("node", &node);
+        }
+        params.append_pair("history", if query.history { "true" } else { "false" });
+        params.append_pair("seconds", &query.seconds.unwrap_or(900).to_string());
+        if let Some(from) = query.from {
+            params.append_pair("from", &from.to_string());
+        }
+        if let Some(to) = query.to {
+            params.append_pair("to", &to.to_string());
+        }
+        format!("/v1/nodes/stats?{}", params.finish())
+    };
+    Ok(Json(bounded(state.connection.get_json(&path)).await?))
 }

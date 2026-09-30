@@ -933,6 +933,48 @@ interval after the Agent starts or after either image-prune setting changes.
 
 ### Configure labels and deployment policy
 
+Node monitoring is available without a Stack YAML file:
+
+```bash
+swarmlite node stats
+swarmlite node stats node-a --watch
+swarmlite node stats node-a --history 24h
+swarmlite node stats node-a --history 365d --json
+```
+
+Linux Agents sample host CPU, I/O wait, load, memory/Swap, local filesystem capacity/inodes,
+block-device I/O and network counters every five seconds. CPU is normalized across all cores;
+memory usage uses `MemAvailable`; filesystem percentages use `used / (used + available)`.
+Disk I/O totals exclude partitions and stacked devices; network totals exclude loopback and
+virtual interfaces. Per-device/interface details remain visible. The first rate sample is unavailable,
+not zero. These are host metrics, not container resource limits. CLI output uses green below 75%,
+yellow from 75%, and red from 90%; these are presentation thresholds, not alert rules. Stale readings
+are explicitly marked. `NO_COLOR`, `--color never`, JSON and redirected output omit ANSI colors;
+`--watch --json` emits NDJSON. An upgraded Linux Agent is required for live readings.
+
+The Controller retains only the latest full sample per node, a 64-point mailbox and a 256-point
+compact write batch in memory. An independent worker writes `metrics.sqlite` in the Controller
+state directory every 30 seconds (or when the batch fills), with WAL and a 512 KiB connection cache.
+History queries do not hold the cluster-state lock. A crash can lose the unflushed batch; storage
+failures are reported while live sampling continues. Historical points contain aggregate host values,
+not repeated device inventories. SQLite pages freed by retention are reused.
+
+| Stored resolution | Retention | Selected query ranges |
+| --- | --- | --- |
+| Original samples (~5 seconds) | 15 minutes | 5m, 15m |
+| 1 minute | 24 hours | 1h, 24h |
+| 1 hour | 30 days | 7d, 30d |
+| 1 day | 365 days | 365d |
+
+UTC buckets are updated incrementally from source samples in the same transaction as raw inserts.
+Per-metric sums, valid-sample counts and maxima preserve correct sample-weighted averages across
+batches and restarts; missing readings are not treated as zero. Duplicate source timestamps are
+ignored. Expired buckets are cleaned every flush, even without active nodes. CLI history and the
+Web Nodes page select resolution automatically. The Web time picker also supports custom start/end
+intervals; the oldest requested timestamp determines available resolution. Bucket averages may
+include values outside exact custom boundaries. History survives Controller restart; live freshness
+is rebuilt from new samples. There is no long-term store beyond 365 days.
+
 Set node labels while initializing or joining:
 
 ```bash
@@ -1158,6 +1200,7 @@ serve                run this node's fixed components
 config get|set|unset|explain read, update, clear, or describe cluster-wide settings
 gateway status|enable|disable
                      inspect all Gateways or update one node's Gateway switch
+node stats [NODE] [--watch] [--json] [--history 5m|15m|1h|24h|7d|30d|365d]
 node label get|set|remove
                      read or update one node's placement labels
 registry login       store private registry credentials

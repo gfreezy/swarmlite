@@ -1,5 +1,16 @@
+import {
+  NodeMonitoring,
+  MetricValue,
+  MetricState,
+} from "@/components/node-monitoring";
+import {
+  type NodeStatsResponse,
+  memoryPercent,
+  diskPercent,
+  freshness,
+} from "@/lib/metrics";
 import { Select } from "@/components/ui/select";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Plus, Tag, Power, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -263,7 +274,20 @@ export function NodesView({
     refreshToken,
   );
   const [selected, setSelected] = useState("");
-  const node = result.data?.nodes.find((n) => n.id === selected);
+  const stats = usePolling(
+    (signal) => get<NodeStatsResponse>("/node-stats", signal),
+    "node-stats",
+    refreshToken,
+  );
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  const elapsed = stats.updated ? Math.max(0, now - stats.updated) / 1000 : 0;
+  const staleAfter = stats.data?.stale_after_seconds ?? 30;
+  const node =
+    result.data?.nodes.find((n) => n.id === selected) || result.data?.nodes[0];
   return (
     <>
       <div className="resource-toolbar">
@@ -278,17 +302,21 @@ export function NodesView({
         </Button>
       </div>
       <p className="section-note">
-        Capacity and labels are reported metadata, not live CPU usage or
-        reachability probes.
+        Select a node for host monitoring, filesystem usage and I/O trends.
+        Metrics refresh every 5 seconds.
       </p>
       <ErrorNotice error={result.error} stale={Boolean(result.data)} />
+      <ErrorNotice error={stats.error} stale={Boolean(stats.data)} />
       <Card className="table-card">
         <Table>
           <TableHeader>
             <TableRow>
               <TableHead>Node</TableHead>
               <TableHead>Address</TableHead>
-              <TableHead>Capacity</TableHead>
+              <TableHead>CPU</TableHead>
+              <TableHead>Memory</TableHead>
+              <TableHead>Disk</TableHead>
+              <TableHead>Metrics</TableHead>
               <TableHead>Tasks / recovery</TableHead>
               <TableHead>Labels</TableHead>
             </TableRow>
@@ -297,7 +325,7 @@ export function NodesView({
             {result.data?.nodes.map((n) => (
               <TableRow
                 key={n.id}
-                data-state={selected === n.id ? "selected" : undefined}
+                data-state={node?.id === n.id ? "selected" : undefined}
               >
                 <TableCell>
                   <button
@@ -314,11 +342,38 @@ export function NodesView({
                   </small>
                 </TableCell>
                 <TableCell>{n.member?.address || n.report?.address}</TableCell>
-                <TableCell>
-                  {n.report
-                    ? `${n.report.cpu_millis / 1000} CPU · ${(n.report.memory_bytes / 1024 ** 3).toFixed(1)} GiB`
-                    : "—"}
-                </TableCell>
+                {(() => {
+                  const stat = stats.data?.nodes.find((s) => s.id === n.id);
+                  const m = stat?.latest?.metrics;
+                  return (
+                    <>
+                      <TableCell>
+                        <MetricValue value={m?.cpu_percent} />
+                        <small className="block muted">
+                          {n.report
+                            ? `${n.report.cpu_millis / 1000} cores`
+                            : "—"}
+                        </small>
+                      </TableCell>
+                      <TableCell>
+                        <MetricValue value={m && memoryPercent(m)} />
+                        <small className="block muted">
+                          {n.report
+                            ? `${(n.report.memory_bytes / 1024 ** 3).toFixed(1)} GiB`
+                            : "—"}
+                        </small>
+                      </TableCell>
+                      <TableCell>
+                        <MetricValue value={m && diskPercent(m)} />
+                      </TableCell>
+                      <TableCell>
+                        <MetricState
+                          state={freshness(stat, elapsed, staleAfter)}
+                        />
+                      </TableCell>
+                    </>
+                  );
+                })()}
                 <TableCell>
                   {n.tasks.length} / {n.unclaimed_tasks.length}
                 </TableCell>
@@ -395,6 +450,14 @@ export function NodesView({
             </div>
           </CardHeader>
           <CardContent>
+            <NodeMonitoring
+              key={node.id}
+              id={node.id}
+              node={stats.data?.nodes.find((s) => s.id === node.id)}
+              elapsed={elapsed}
+              staleAfter={staleAfter}
+              now={now}
+            />
             <Facts
               className="facts-summary"
               values={{

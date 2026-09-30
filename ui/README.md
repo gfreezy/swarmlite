@@ -41,6 +41,7 @@ are passed directly to the same executable without a shell; registry passwords u
 | `deployment retry/rollback`, `rm` | Stack detail actions |
 | `config get/explain/set/unset` | Configuration details, edit and reset dialogs |
 | `gateway status/enable/disable` | Routes and node details |
+| `node stats` | Nodes → monitoring, per-device metrics, automatic history aggregation through 365 days |
 | `node label get/set/remove` | Node details |
 | `registry login` | Registries |
 | `connection-info`, `join-token` | Nodes → local connection and join details |
@@ -126,3 +127,8 @@ npm test      # Inspection and operation behavior tests
 
 UI API failures preserve and label the last successful snapshot. Membership does not imply
 node connectivity. Logs stay in bounded browser memory and disconnect when leaving the log tab.
+
+Node monitoring offers quick time presets and a custom local-time start/end picker. Charts show
+average values, range peaks, time ticks, and pointer/keyboard sample inspection. For older custom
+ranges the Controller chooses the oldest available tier (up to daily buckets), even for short ranges.
+Aggregate buckets can extend beyond exact requested boundaries. The latest-value cards remain live.

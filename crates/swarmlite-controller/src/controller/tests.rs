@@ -2145,6 +2145,7 @@ fn test_join_request(node_id: &str, address: &str) -> JoinRequest {
 
 fn test_node() -> NodeRecord {
     NodeRecord {
+        metrics: None,
         supports_jobs: true,
         id: "node-a".into(),
         address: "127.0.0.1".into(),
@@ -3465,4 +3466,83 @@ async fn manual_job_run_cancel_and_history_survive_persistence() {
     assert_eq!(controller.list_jobs().await.len(), 1);
     controller.tick().await.unwrap();
     assert_eq!(controller.status().await.state.tasks.len(), 3); // manual-only never triggers itself
+}
+
+#[tokio::test]
+async fn node_monitoring_is_authenticated_and_does_not_mutate_cluster_generation() {
+    use swarmlite_core::metrics::{NodeMetrics, NodeStatsResponse};
+    let (controller, _, _directory) = test_controller("metrics-api-test").await;
+    let before = controller.status().await.generation;
+    {
+        let mut inner = controller.inner.lock().await;
+        let sample = NodeMetrics {
+            sampled_at_unix_ms: 123,
+            cpu_percent: Some(42.),
+            ..Default::default()
+        };
+        super::metrics::record(
+            &mut inner,
+            &controller.metrics_store,
+            "controller-a",
+            sample.clone(),
+        );
+        super::metrics::record(
+            &mut inner,
+            &controller.metrics_store,
+            "controller-a",
+            sample,
+        );
+    }
+    assert_eq!(controller.status().await.generation, before);
+    let stats = controller
+        .node_stats(Some("controller-a"), false, 900, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        stats.nodes[0].latest.as_ref().unwrap().metrics.cpu_percent,
+        Some(42.)
+    );
+    assert!(
+        controller
+            .node_stats(None, true, 900, None, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        controller
+            .node_stats(Some("missing"), true, 900, None, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        controller
+            .node_stats(None, false, 366 * 86400, None, None)
+            .await
+            .is_err()
+    );
+    let app = super::api::router(Arc::new(controller));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    assert_eq!(
+        client
+            .get(format!("http://{addr}/v1/nodes/stats"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let stats = client
+        .get(format!("http://{addr}/v1/nodes/stats"))
+        .bearer_auth("0123456789abcdef")
+        .send()
+        .await
+        .unwrap()
+        .json::<NodeStatsResponse>()
+        .await
+        .unwrap();
+    assert_eq!(stats.nodes.len(), 1);
+    server.abort();
 }

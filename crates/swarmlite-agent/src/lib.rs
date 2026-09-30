@@ -121,6 +121,7 @@ async fn run_with_runtime<R: ContainerRuntime>(
         .unwrap_or_default();
     let registry_credentials = RegistryCredentialStore::new(local_state.clone());
     let mut node = NodeRecord {
+        metrics: None,
         supports_jobs: true,
         id: config.node_id.clone(),
         address: config.advertise_address.clone(),
@@ -200,6 +201,7 @@ async fn run_with_runtime<R: ContainerRuntime>(
         )
         .await;
     });
+    let metrics = swarmlite_platform::metrics::start();
     let mut ticker = tokio::time::interval(Duration::from_secs(config.heartbeat_interval_seconds));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut gateway_retry = GatewayRetryState::default();
@@ -225,6 +227,7 @@ async fn run_with_runtime<R: ContainerRuntime>(
             CONTAINER_INVENTORY_TIMEOUT,
         )
         .await;
+        node.metrics = metrics.borrow().clone();
         let heartbeat = NodeHeartbeat {
             node: node.clone(),
             tasks: containers

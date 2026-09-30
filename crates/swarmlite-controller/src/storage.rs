@@ -92,15 +92,20 @@ pub struct ConfigBlobGcStats {
 /// one-shot job execution evidence, which must survive to prevent replay.
 #[derive(Clone)]
 pub struct StateRepository {
+    metrics_path: std::path::PathBuf,
     database: Database,
     kv_repository: KvRepository,
     cluster: ClusterSettings,
 }
 
 impl StateRepository {
+    pub(crate) fn metrics_path(&self) -> std::path::PathBuf {
+        self.metrics_path.clone()
+    }
     pub fn open(data_dir: &Path, cluster: ClusterSettings) -> StorageResult<Self> {
         let database = Database::open(data_dir).map_err(backend)?;
         let repository = Self {
+            metrics_path: data_dir.join("metrics.sqlite"),
             kv_repository: KvRepository::open(database.clone())?,
             database,
             cluster,
@@ -865,6 +870,7 @@ x-swarmlite:
         state.nodes.insert(
             "soft-node".into(),
             NodeRecord {
+                metrics: None,
                 supports_jobs: true,
                 id: "soft-node".into(),
                 address: "10.0.0.2".into(),

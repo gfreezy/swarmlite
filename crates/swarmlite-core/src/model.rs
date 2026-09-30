@@ -1031,6 +1031,8 @@ pub struct StackDeploymentError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<crate::metrics::NodeMetrics>,
     pub supports_jobs: bool,
     pub id: String,
     pub address: String,

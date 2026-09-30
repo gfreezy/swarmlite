@@ -43,6 +43,7 @@ use tokio::io::AsyncReadExt;
 mod cluster_cli;
 mod connection;
 mod job_cli;
+mod node_stats;
 mod ui;
 mod upgrade;
 
@@ -326,6 +327,11 @@ enum GatewayCommand {
 
 #[derive(Debug, Subcommand)]
 enum NodeCommand {
+    /// Show node CPU, memory, disk and network metrics.
+    Stats {
+        #[command(flatten)]
+        options: node_stats::StatsArgs,
+    },
     /// Read or change a node's authoritative placement labels.
     Label {
         #[command(subcommand)]
@@ -1778,6 +1784,7 @@ async fn run() -> Result<()> {
             }
         },
         Command::Node { action } => match action {
+            NodeCommand::Stats { options } => node_stats::run(&data_dir, options).await,
             NodeCommand::Label { action } => {
                 let (node_id, method, body, connection) = match action {
                     NodeLabelCommand::Get {
@@ -4133,7 +4140,7 @@ mod tests {
             )
         })
         .sum::<usize>();
-        assert_eq!(grouped_actions, 21);
+        assert_eq!(grouped_actions, 22);
     }
 
     #[test]

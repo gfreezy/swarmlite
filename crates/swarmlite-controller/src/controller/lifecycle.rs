@@ -111,10 +111,13 @@ impl Controller {
         let (status_changes, _) = tokio::sync::watch::channel(versioned.generation);
 
         info!(%controller_id, "single controller started");
+        let metrics_store =
+            metrics::Store::new(repository.metrics_path(), config.cluster.cluster_id.clone());
         Ok(Self {
             config,
             token,
             repository,
+            metrics_store,
             kv_repository,
             commands: commands::AgentCommandBroker::new(),
             sessions: sessions::DataSessionBroker::new(),
@@ -127,6 +130,7 @@ impl Controller {
                 cluster: versioned.cluster,
                 state: versioned.state,
                 live_nodes,
+                metrics: HashMap::new(),
                 gateway_generation,
                 gateway_config,
                 gateway_snapshot,

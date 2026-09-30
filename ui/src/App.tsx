@@ -75,7 +75,7 @@ const pageDescriptions: Record<string, string> = {
   Overview: "Cluster health, running workloads and recent changes.",
   Workloads: "Services and jobs across your stacks.",
   Deployments: "Track rollout progress and compare retained generations.",
-  Nodes: "Manage node placement, capacity and gateway availability.",
+  Nodes: "Monitor host resources, node placement and gateway availability.",
   Routes: "Trace traffic from hostnames and paths to running tasks.",
   Jobs: "Schedules, execution history and job controls.",
   Tasks: "Inspect task state, runtime details and logs.",

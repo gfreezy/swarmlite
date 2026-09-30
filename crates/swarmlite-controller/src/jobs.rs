@@ -194,6 +194,7 @@ mod tests {
             state.nodes.insert(
                 id.into(),
                 NodeRecord {
+                    metrics: None,
                     supports_jobs: true,
                     id: id.into(),
                     address: "127.0.0.1".into(),

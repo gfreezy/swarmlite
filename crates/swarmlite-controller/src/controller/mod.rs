@@ -60,6 +60,7 @@ mod job_commands;
 mod kv_store;
 mod lifecycle;
 mod membership;
+mod metrics;
 mod nodes;
 mod recovery;
 mod registries;
@@ -112,6 +113,7 @@ struct Inner {
     cluster: ClusterSettings,
     state: ClusterState,
     live_nodes: HashMap<String, Instant>,
+    metrics: HashMap<String, metrics::Latest>,
     gateway_generation: u64,
     gateway_config: serde_json::Value,
     gateway_snapshot: GatewayRecoverySnapshot,
@@ -120,6 +122,7 @@ struct Inner {
 }
 
 pub struct Controller {
+    metrics_store: metrics::Store,
     config: ControllerConfig,
     token: String,
     repository: StateRepository,

@@ -40,6 +40,7 @@ pub(super) fn router(controller: Arc<Controller>) -> Router {
         .route("/v2/", any(image_registry_ping))
         .route("/v2/{*path}", any(image_registry_request))
         .route("/v1/status", get(status))
+        .route("/v1/nodes/stats", get(node_stats))
         .route("/v1/cluster", get(bootstrap))
         .route(
             "/v1/config",
@@ -1129,4 +1130,35 @@ x-swarmlite:
             Err(ControllerError::Invalid(message)) if message.contains("missing from the Controller")
         ));
     }
+}
+
+#[derive(serde::Deserialize)]
+struct NodeStatsQuery {
+    node: Option<String>,
+    #[serde(default)]
+    history: bool,
+    #[serde(default = "default_metrics_range")]
+    seconds: u64,
+    from: Option<i64>,
+    to: Option<i64>,
+}
+fn default_metrics_range() -> u64 {
+    900
+}
+async fn node_stats(
+    State(controller): State<Arc<Controller>>,
+    headers: HeaderMap,
+    Query(query): Query<NodeStatsQuery>,
+) -> Result<Json<swarmlite_core::metrics::NodeStatsResponse>, ControllerError> {
+    require_auth(&controller, &headers)?;
+    controller
+        .node_stats(
+            query.node.as_deref(),
+            query.history,
+            query.seconds,
+            query.from,
+            query.to,
+        )
+        .await
+        .map(Json)
 }

@@ -696,6 +696,7 @@ x-swarmlite:
 
     fn node(id: &str, address: &str) -> NodeRecord {
         NodeRecord {
+            metrics: None,
             supports_jobs: true,
             id: id.into(),
             address: address.into(),
