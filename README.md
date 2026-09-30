@@ -7,7 +7,7 @@ roll out service updates, schedule jobs, publish HTTPS routes, and inspect your 
 one binary. It is designed for machines in a trusted LAN or region.
 
 [Quick start](#quick-start) · [Web UI](#web-ui) · [Node monitoring](#node-monitoring) ·
-[Documentation](#documentation) · [Releases](https://github.com/gfreezy/swarmlite/releases)
+[Performance](#performance) · [Documentation](#documentation) · [Releases](https://github.com/gfreezy/swarmlite/releases)
 
 > [!IMPORTANT]
 > Swarmlite is an MVP. It uses one fixed Controller, with no automatic failover or overlay network.
@@ -221,6 +221,23 @@ These are **host metrics**, not per-container statistics. Historical data surviv
 a crash can lose the unflushed batch. Query resolution follows the oldest requested timestamp,
 and aggregate buckets may extend beyond exact custom boundaries.
 [Metric definitions, storage and retention](docs/operations.md#node-monitoring).
+
+## Performance
+
+Approximate steady-state overhead for the Controller and its local Agent:
+
+| Cluster | Memory (RSS) | CPU (% of one core) | Disk read | Disk write |
+| --- | ---: | ---: | ---: | ---: |
+| 10 nodes / 100 Tasks | ~20 MiB | ~2% | ~45 KiB/s | ~30 KiB/s |
+| 100 nodes / 1,000 Tasks, optimized writer | ~40 MiB | ~12% | ~260 KiB/s | ~310 KiB/s |
+
+A Worker Agent managing ten nginx containers averaged roughly **10 MiB RSS** and **less than
+1% of one CPU core**. Retained monitoring databases use roughly **20 MiB for 10 nodes** and
+**200 MiB for 100 nodes**.
+
+Measured in a Linux ARM64 VM with simulated workers and prepopulated 365-day monitoring history.
+Figures exclude Docker, Caddy, application containers and the Web UI; disk writes include
+WAL/checkpoint activity, rather than database growth.
 
 ## How Swarmlite works
 

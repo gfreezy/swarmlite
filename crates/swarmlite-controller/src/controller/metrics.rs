@@ -2,6 +2,7 @@ use super::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{BTreeMap, btree_map::Entry},
     path::PathBuf,
     sync::{Arc as StdArc, Mutex as StdMutex, mpsc},
 };
@@ -13,7 +14,7 @@ const DAY: u64 = 86400;
 const RETENTION_SECONDS: u64 = 365 * DAY;
 const FLUSH_SECONDS: u64 = 30;
 const QUEUE_CAPACITY: usize = 64;
-const BATCH_POINTS: usize = 256;
+const BATCH_POINTS: usize = 1024;
 // Incremental rollups keep their own sums/counts; never average averages.
 const TIERS: [(u64, u64); 3] = [(60, DAY), (3600, 30 * DAY), (DAY, RETENTION_SECONDS)];
 
@@ -70,12 +71,19 @@ impl Aggregate {
 fn connect(path: &std::path::Path) -> Result<Connection, rusqlite::Error> {
     let c = Connection::open(path)?;
     c.busy_timeout(Duration::from_secs(2))?;
-    c.execute_batch("PRAGMA cache_size=-512; PRAGMA synchronous=NORMAL; PRAGMA wal_autocheckpoint=128; PRAGMA journal_size_limit=1048576;")?;
+    c.execute_batch(
+        "PRAGMA cache_size=-512;
+         PRAGMA synchronous=NORMAL;
+         PRAGMA wal_autocheckpoint=1024;
+         PRAGMA journal_size_limit=8388608;",
+    )?;
     Ok(c)
 }
 fn initialize(path: &std::path::Path) -> anyhow::Result<Connection> {
     let c = connect(path)?;
-    c.execute_batch("PRAGMA journal_mode=WAL;
+    // Only the persistent writer gets a larger cache; short-lived readers stay small.
+    c.execute_batch("PRAGMA cache_size=-2048;
+        PRAGMA journal_mode=WAL;
         CREATE TABLE IF NOT EXISTS metric_samples (
             cluster TEXT NOT NULL,node TEXT NOT NULL,source INTEGER NOT NULL,received INTEGER NOT NULL,point TEXT NOT NULL,
             PRIMARY KEY(cluster,node,source)
@@ -96,34 +104,70 @@ fn initialize(path: &std::path::Path) -> anyhow::Result<Connection> {
 }
 fn flush(c: &mut Connection, cluster: &str, batch: &[Pending], now: i64) -> anyhow::Result<()> {
     let tx = c.transaction()?;
-    for p in batch {
-        let inserted=tx.execute("INSERT OR IGNORE INTO metric_samples(cluster,node,source,received,point) VALUES (?1,?2,?3,?4,?5)",params![cluster,p.node,p.source,p.point.received_at_unix_ms,serde_json::to_string(&p.point)?])?;
-        if inserted == 0 {
-            continue;
+    // Bounded by the batch, with keys borrowed from it. Load and write each bucket once.
+    let mut aggregates = BTreeMap::new();
+    {
+        let mut insert = tx.prepare(
+            "INSERT OR IGNORE INTO metric_samples(cluster,node,source,received,point)
+             VALUES (?1,?2,?3,?4,?5)",
+        )?;
+        let mut select = tx.prepare(
+            "SELECT aggregate FROM metric_rollups
+             WHERE cluster=?1 AND node=?2 AND resolution=?3 AND bucket=?4",
+        )?;
+        for p in batch {
+            let inserted = insert.execute(params![
+                cluster,
+                p.node,
+                p.source,
+                p.point.received_at_unix_ms,
+                serde_json::to_string(&p.point)?
+            ])?;
+            if inserted == 0 {
+                continue;
+            }
+            for (resolution, _) in TIERS {
+                let bucket = p
+                    .point
+                    .received_at_unix_ms
+                    .div_euclid(resolution as i64 * 1000)
+                    * resolution as i64
+                    * 1000;
+                let aggregate = match aggregates.entry((p.node.as_str(), resolution, bucket)) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => {
+                        let old: Option<String> = select
+                            .query_row(params![cluster, p.node, resolution as i64, bucket], |r| {
+                                r.get(0)
+                            })
+                            .optional()?;
+                        entry.insert(
+                            old.map(|s| serde_json::from_str::<Aggregate>(&s))
+                                .transpose()?
+                                .unwrap_or_default(),
+                        )
+                    }
+                };
+                aggregate.add(&p.point);
+            }
         }
-        for (resolution, _) in TIERS {
-            let bucket = p
-                .point
-                .received_at_unix_ms
-                .div_euclid(resolution as i64 * 1000)
-                * resolution as i64
-                * 1000;
-            let old:Option<String>=tx.query_row("SELECT aggregate FROM metric_rollups WHERE cluster=?1 AND node=?2 AND resolution=?3 AND bucket=?4",params![cluster,p.node,resolution as i64,bucket],|r|r.get(0)).optional()?;
-            let mut aggregate = old
-                .map(|s| serde_json::from_str::<Aggregate>(&s))
-                .transpose()?
-                .unwrap_or_default();
-            aggregate.add(&p.point);
-            tx.execute(
-                "INSERT OR REPLACE INTO metric_rollups VALUES (?1,?2,?3,?4,?5)",
-                params![
-                    cluster,
-                    p.node,
-                    resolution as i64,
-                    bucket,
-                    serde_json::to_string(&aggregate)?
-                ],
-            )?;
+    }
+    {
+        let mut upsert = tx.prepare(
+            "INSERT INTO metric_rollups(cluster,node,resolution,bucket,aggregate)
+             VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(cluster,node,resolution,bucket)
+             DO UPDATE SET aggregate=excluded.aggregate",
+        )?;
+        // Primary-key order also keeps writes to nearby database pages together.
+        for ((node, resolution, bucket), aggregate) in aggregates {
+            upsert.execute(params![
+                cluster,
+                node,
+                resolution as i64,
+                bucket,
+                serde_json::to_string(&aggregate)?
+            ])?;
         }
     }
     tx.execute(
@@ -504,6 +548,98 @@ mod tests {
             )
             .unwrap()
             .is_empty()
+        );
+    }
+    #[test]
+    fn grouped_aggregation_preserves_nodes_tiers_and_deduplication_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metrics.sqlite");
+        let mut c = initialize(&path).unwrap();
+        // Cross a minute, hour and day boundary in the same batch.
+        let t = 2 * DAY as i64 * 1000 - 1000;
+        let sample = |node, time, cpu, memory| {
+            let mut p = pending(node, time, cpu);
+            p.point.memory_percent = memory;
+            p.point.peaks[1] = memory;
+            p
+        };
+        flush(
+            &mut c,
+            "cluster",
+            &[
+                sample("a", t - 1000, Some(10.), Some(20.)),
+                sample("b", t, Some(50.), None),
+                sample("a", t, Some(30.), None),
+                sample("a", t, Some(99.), Some(99.)),
+                sample("a", t + 1000, Some(70.), Some(40.)),
+                sample("a", t + 2000, None, Some(80.)),
+                sample("b", t + 2000, Some(90.), None),
+            ],
+            t + 2000,
+        )
+        .unwrap();
+        drop(c);
+        let mut c = initialize(&path).unwrap();
+        let mut duplicate = sample("a", t + 2000, Some(99.), Some(99.));
+        duplicate.source = t;
+        flush(
+            &mut c,
+            "cluster",
+            &[duplicate, sample("a", t + 3000, Some(110.), None)],
+            t + 3000,
+        )
+        .unwrap();
+        for seconds in [3600, 7 * DAY, 365 * DAY] {
+            let range = history_range(seconds, None, None, t + 4000).unwrap();
+            let a = query(&c, "cluster", "a", range).unwrap();
+            assert_eq!(a.len(), 2);
+            assert_eq!(a[0].cpu_percent, Some(20.));
+            assert_eq!(a[0].memory_percent, Some(20.));
+            assert_eq!(a[0].peaks[0], Some(30.));
+            assert_eq!(a[0].sample_count, 2);
+            assert_eq!(a[1].cpu_percent, Some(90.));
+            assert_eq!(a[1].memory_percent, Some(60.));
+            assert_eq!(a[1].peaks[0], Some(110.));
+            assert_eq!(a[1].peaks[1], Some(80.));
+            assert_eq!(a[1].sample_count, 3);
+            let b = query(&c, "cluster", "b", range).unwrap();
+            assert_eq!(b.len(), 2);
+            assert_eq!(b[0].cpu_percent, Some(50.));
+            assert_eq!(b[1].cpu_percent, Some(90.));
+            assert_eq!(b[0].sample_count, 1);
+            assert_eq!(b[1].sample_count, 1);
+        }
+    }
+    #[test]
+    fn failed_aggregation_rolls_back_raw_samples_and_other_buckets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = initialize(&dir.path().join("metrics.sqlite")).unwrap();
+        let t = 2 * DAY as i64 * 1000;
+        c.execute(
+            "INSERT INTO metric_rollups VALUES ('cluster','b',60,?1,'invalid-json')",
+            [t],
+        )
+        .unwrap();
+        assert!(
+            flush(
+                &mut c,
+                "cluster",
+                &[pending("a", t, Some(10.)), pending("b", t, Some(20.))],
+                t,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM metric_samples", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM metric_rollups", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
         );
     }
     #[test]

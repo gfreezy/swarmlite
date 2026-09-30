@@ -4,6 +4,7 @@
 
 - [Design goals and tradeoffs](#design-goals-and-tradeoffs)
 - [Components and data flow](#components-and-data-flow)
+- [Node monitoring history](#node-monitoring-history)
 - [Why there is one fixed Controller](#why-there-is-one-fixed-controller)
 - [Why tasks bind ports on the host](#why-tasks-bind-ports-on-the-host)
 - [Why Controller-Agent connections use HTTP](#why-controller-agent-connections-use-http)
@@ -40,6 +41,24 @@ are active:
 The Controller and Agents are the control plane. Containers, operating-system port mappings, and
 Caddy are the serving data plane. A control process tells the data plane what should run, but it is
 not in the request path after that state has been applied.
+
+## Node monitoring history
+
+The Controller stores node monitoring history separately in `metrics.sqlite`. Original five-second
+samples are retained for 15 minutes, minute aggregates for 24 hours, hour aggregates for 30 days,
+and day aggregates for 365 days. Aggregates preserve sums, counts and peaks, including missing
+values, rather than averaging averages.
+
+History writes use a bounded 64-sample queue and batches of at most 1,024 samples, flushed every
+30 seconds or when full. Within a transaction, each affected node/time bucket is loaded and
+updated once. The persistent writer has a 2 MiB SQLite page-cache budget; each short-lived history
+query has a 512 KiB budget. Historical data stays on disk.
+
+The history database uses WAL with `synchronous=NORMAL`, automatic checkpoints after 1,024 WAL
+pages (about 4 MiB with 4 KiB pages), and an 8 MiB WAL retention limit after recycling. This limit
+does not cap an active WAL file. Buffered samples can be lost if the process exits abruptly, and
+recent committed history can be lost after a power failure or hard reset. History is best-effort
+telemetry; the separate desired-state and Agent databases keep their existing durability settings.
 
 ## Why there is one fixed Controller
 
