@@ -26,17 +26,18 @@ export type { RouteRow } from "@/lib/route-graph";
 export function RouteGraph({
   routes,
   services,
-  selected,
-  onSelect,
+  onInspect,
   onService,
 }: {
   routes: RouteRow[];
   services: Service[];
-  selected: string[];
-  onSelect: (ids: string[]) => void;
+  onInspect: (id: string) => void;
   onService: (service: Service) => void;
 }) {
   const graph = buildRouteGraph(routes);
+  const [selectedNode, setSelectedNode] = useState<string>();
+  const selected =
+    graph.nodes.find((node) => node.id === selectedNode)?.routes ?? [];
   const marker = useId().replace(/:/g, "");
   const viewport = useRef<HTMLDivElement>(null);
   const [requestedZoom, setZoom] = useState<number>();
@@ -57,7 +58,16 @@ export function RouteGraph({
     !selected.length || ids.some((id) => selected.includes(id));
   const icons = [Globe2, Filter, Boxes, Server];
   return (
-    <section className="route-graph" aria-label="Directed routing graph">
+    <section
+      className="route-graph"
+      aria-label="Directed routing graph"
+      onKeyDown={(event) => {
+        if (event.key === "Escape" && selected.length) {
+          event.preventDefault();
+          setSelectedNode(undefined);
+        }
+      }}
+    >
       <div className="graph-toolbar">
         <div className="graph-legend">
           <span>
@@ -71,7 +81,11 @@ export function RouteGraph({
         </div>
         <div className="action-group">
           {selected.length > 0 && (
-            <Button variant="ghost" size="sm" onClick={() => onSelect([])}>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setSelectedNode(undefined)}
+            >
               Clear selection
             </Button>
           )}
@@ -118,6 +132,10 @@ export function RouteGraph({
       <div
         className="graph-viewport"
         ref={viewport}
+        onClick={(event) => {
+          if (!(event.target as Element).closest(".graph-node"))
+            setSelectedNode(undefined);
+        }}
         tabIndex={0}
         aria-label="Routing diagram canvas; scroll to explore"
       >
@@ -195,14 +213,16 @@ export function RouteGraph({
               return (
                 <div
                   key={n.id}
-                  className={`graph-node${n.tone ? ` ${n.tone}` : ""}${active(n.routes) ? "" : " dimmed"}${selected.length && active(n.routes) ? " highlighted" : ""}`}
+                  className={`graph-node${n.tone ? ` ${n.tone}` : ""}${active(n.routes) ? "" : " dimmed"}${selected.length && active(n.routes) ? " highlighted" : ""}${selectedNode === n.id ? " selected" : ""}`}
                   style={{ left: n.x, top: n.y, width: WIDTH, height: HEIGHT }}
                 >
                   <button
                     className="graph-node-select"
                     aria-label={`Trace ${stages[n.column].toLowerCase()}: ${n.title}`}
-                    aria-pressed={selected.length > 0 && active(n.routes)}
-                    onClick={() => onSelect(n.routes)}
+                    aria-pressed={selectedNode === n.id}
+                    onClick={() =>
+                      setSelectedNode(selectedNode === n.id ? undefined : n.id)
+                    }
                   >
                     <span className="graph-node-type">
                       <Icon size={14} />
@@ -230,9 +250,34 @@ export function RouteGraph({
           </div>
         </div>
       </div>
+      {selected.length > 0 && (
+        <div className="graph-selection" aria-label="Selected route actions">
+          <span>
+            {selected.length} matching{" "}
+            {selected.length === 1 ? "route" : "routes"}
+          </span>
+          <div>
+            {routes
+              .filter((route) => selected.includes(route.id))
+              .map((route) => (
+                <Button
+                  key={route.id}
+                  variant="outline"
+                  size="sm"
+                  onClick={() => onInspect(route.id)}
+                >
+                  {route.matches.map((match) => match.path).join(", ") ||
+                    "All paths"}{" "}
+                  → {route.service_id || route.backend.host}
+                  <ArrowUpRight size={14} />
+                </Button>
+              ))}
+          </div>
+        </div>
+      )}
       <div className="graph-hint">
-        Select a node to trace its connections and inspect matching rules.
-        Scroll to explore the diagram.
+        Click a node to select it; click it again, click empty space, or press
+        Esc to clear. Use the selected route actions to inspect details.
       </div>
     </section>
   );

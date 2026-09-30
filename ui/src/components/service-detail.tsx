@@ -1,3 +1,4 @@
+import { ResourcePanel } from "@/components/resource-panel";
 import { Select } from "@/components/ui/select";
 import { useState } from "react";
 import { Boxes, Terminal } from "lucide-react";
@@ -37,10 +38,7 @@ export function ServiceDetail({
   );
   const [logTarget, setLogTarget] = useState(service.id);
   const [tab, setTab] = useState("inspect");
-  const showLogs = (target: string) => {
-    setLogTarget(target);
-    setTab("logs");
-  };
+  const [record, setRecord] = useState("");
   return (
     <>
       <div className="resource-toolbar">
@@ -108,7 +106,7 @@ export function ServiceDetail({
                       <Button
                         size="sm"
                         variant="ghost"
-                        onClick={() => showLogs(task.id)}
+                        onClick={() => setRecord(task.id)}
                       >
                         <Terminal />
                         Logs
@@ -146,6 +144,20 @@ export function ServiceDetail({
           <Logs target={logTarget} />
         </TabsContent>
       </Tabs>
+      {record && (
+        <ResourcePanel
+          title="Task logs"
+          items={(result.data?.tasks || []).map((task) => ({
+            id: task.id,
+            label: `${task.id} · ${task.node_id}`,
+          }))}
+          selected={record}
+          onSelect={setRecord}
+          onClose={() => setRecord("")}
+        >
+          <Logs key={record} target={record} />
+        </ResourcePanel>
+      )}
     </>
   );
 }

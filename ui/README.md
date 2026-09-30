@@ -72,6 +72,18 @@ also stops its local request processes.
   Local YAML is not read or edited.
   Deleted or expired generation snapshots return an explicit error.
 
+## Resource navigation
+
+Nodes, tasks, routes, workloads, jobs, deployments and settings share a split explorer.
+The searchable resource list and detail pane scroll independently; previous/next controls
+stay visible. Narrow screens use a persistent resource selector. Returning to the overview
+preserves filters, graph view and scroll position. Links from routing to workloads retain
+the selected route when returning.
+
+Nested task runtime details and individual task/execution logs open in a record drawer with
+a selector and previous/next controls. Closing it (or pressing Escape) returns focus to the
+original list. Deployment generations remain accessible in a sticky toolbar.
+
 ## Build
 
 Use Node.js 24 LTS and npm to build from source:

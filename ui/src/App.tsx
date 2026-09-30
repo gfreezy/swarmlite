@@ -1,8 +1,8 @@
+import { ResourceExplorer } from "@/components/resource-explorer";
 import { Select } from "@/components/ui/select";
 import { useRef, useState, type ReactNode } from "react";
 import {
   Activity,
-  ArrowLeft,
   ArrowUpRight,
   Boxes,
   CircleAlert,
@@ -229,14 +229,8 @@ export default function App() {
           <div className="page-heading">
             <div>
               <div className="eyebrow">CLUSTER WORKSPACE</div>
-              <h1>{selectedService?.id || selectedStack || page}</h1>
-              <p>
-                {selectedService
-                  ? selectedService.image
-                  : selectedStack
-                    ? "Deployment progress and generation history."
-                    : pageDescriptions[page]}
-              </p>
+              <h1>{page}</h1>
+              <p>{pageDescriptions[page]}</p>
             </div>
             <Button
               variant="outline"
@@ -249,417 +243,442 @@ export default function App() {
           </div>
           <ErrorNotice error={snapshot.error} stale={Boolean(snapshot.data)} />
           {(selectedService || selectedStack) && (
-            <Button
-              variant="ghost"
-              className="back-button"
-              onClick={() => {
+            <ResourceExplorer
+              title={
+                selectedStack
+                  ? "Deployments"
+                  : page === "Jobs"
+                    ? "Jobs"
+                    : "Workloads"
+              }
+              backLabel={`Back to ${page.toLowerCase()}`}
+              items={
+                selectedStack
+                  ? stacks.map((stack) => ({
+                      id: stack.stack,
+                      title: stack.stack,
+                      description: `Generation #${stack.current?.generation ?? "—"}`,
+                      meta: (
+                        <Status value={stack.current?.status || "unknown"} />
+                      ),
+                    }))
+                  : services
+                      .filter((service) => page !== "Jobs" || service.job)
+                      .map((service) => ({
+                        id: service.id,
+                        title: service.name || service.id,
+                        description: service.stack,
+                        meta: service.job
+                          ? "Job"
+                          : `${service.running_replicas} / ${service.replicas} replicas`,
+                      }))
+              }
+              selected={selectedStack || selectedService!.id}
+              onSelect={(id) =>
+                selectedStack
+                  ? openStack(id)
+                  : openService(services.find((service) => service.id === id)!)
+              }
+              onClose={() => {
                 setSelectedService(undefined);
                 setSelectedStack(undefined);
               }}
             >
-              <ArrowLeft />
-              Back to {page.toLowerCase()}
-            </Button>
-          )}
-          {selectedService && (
-            <div className="resource-toolbar">
-              <Button
-                variant="outline"
-                onClick={() =>
-                  operate("inspect", { target: [selectedService.id] })
-                }
-              >
-                Full definition…
-              </Button>
-              {selectedService.job ? (
-                <Button
-                  variant="outline"
-                  onClick={() =>
-                    operate("job run", { target: [selectedService.id] })
-                  }
-                >
-                  Run job…
-                </Button>
-              ) : (
-                <>
+              {selectedService && (
+                <div className="resource-toolbar">
                   <Button
                     variant="outline"
                     onClick={() =>
-                      operate("service scale", {
-                        services: [
-                          `${selectedService.id}=${services.find((s) => s.id === selectedService.id)?.replicas ?? selectedService.replicas}`,
-                        ],
-                      })
+                      operate("inspect", { target: [selectedService.id] })
                     }
                   >
-                    Scale…
+                    Full definition…
                   </Button>
-                  <Button
-                    variant="outline"
-                    onClick={() =>
-                      operate("service restart", {
-                        service: [selectedService.id],
-                      })
-                    }
-                  >
-                    Rolling restart…
-                  </Button>
-                </>
+                  {selectedService.job ? (
+                    <Button
+                      variant="outline"
+                      onClick={() =>
+                        operate("job run", { target: [selectedService.id] })
+                      }
+                    >
+                      Run job…
+                    </Button>
+                  ) : (
+                    <>
+                      <Button
+                        variant="outline"
+                        onClick={() =>
+                          operate("service scale", {
+                            services: [
+                              `${selectedService.id}=${services.find((s) => s.id === selectedService.id)?.replicas ?? selectedService.replicas}`,
+                            ],
+                          })
+                        }
+                      >
+                        Scale…
+                      </Button>
+                      <Button
+                        variant="outline"
+                        onClick={() =>
+                          operate("service restart", {
+                            service: [selectedService.id],
+                          })
+                        }
+                      >
+                        Rolling restart…
+                      </Button>
+                    </>
+                  )}
+                </div>
               )}
-            </div>
+              {selectedStack && (
+                <div className="resource-toolbar">
+                  <Button
+                    variant="outline"
+                    onClick={() =>
+                      operate("deployment retry", { stack: [selectedStack] })
+                    }
+                  >
+                    Retry…
+                  </Button>
+                  <Button
+                    variant="outline"
+                    onClick={() =>
+                      operate(
+                        "deployment rollback",
+                        { stack: [selectedStack] },
+                        {
+                          generations: stacks
+                            .find((s) => s.stack === selectedStack)
+                            ?.history.map((d) => d.generation),
+                        },
+                      )
+                    }
+                  >
+                    Roll back…
+                  </Button>
+                  <Button
+                    variant="outline"
+                    onClick={() => operate("rm", { stacks: [selectedStack] })}
+                  >
+                    Remove Stack…
+                  </Button>
+                </div>
+              )}
+              {selectedService ? (
+                selectedService.job ? (
+                  <JobDetail
+                    key={selectedService.id}
+                    service={
+                      services.find(
+                        (service) => service.id === selectedService.id,
+                      ) || selectedService
+                    }
+                    refreshToken={refreshToken}
+                    onOperate={operate}
+                  />
+                ) : (
+                  <ServiceDetail
+                    key={selectedService.id}
+                    service={
+                      services.find(
+                        (service) => service.id === selectedService.id,
+                      ) || selectedService
+                    }
+                    refreshToken={refreshToken}
+                  />
+                )
+              ) : selectedStack ? (
+                <DeploymentDetail
+                  key={selectedStack}
+                  name={selectedStack}
+                  onOperate={operate}
+                  refreshToken={refreshToken}
+                />
+              ) : null}
+            </ResourceExplorer>
           )}
-          {selectedStack && (
-            <div className="resource-toolbar">
-              <Button
-                variant="outline"
-                onClick={() =>
-                  operate("deployment retry", { stack: [selectedStack] })
-                }
-              >
-                Retry…
-              </Button>
-              <Button
-                variant="outline"
-                onClick={() =>
-                  operate(
-                    "deployment rollback",
-                    { stack: [selectedStack] },
-                    {
-                      generations: stacks
-                        .find((s) => s.stack === selectedStack)
-                        ?.history.map((d) => d.generation),
-                    },
-                  )
-                }
-              >
-                Roll back…
-              </Button>
-              <Button
-                variant="outline"
-                onClick={() => operate("rm", { stacks: [selectedStack] })}
-              >
-                Remove Stack…
-              </Button>
-            </div>
-          )}
-          {selectedService ? (
-            selectedService.job ? (
-              <JobDetail
-                key={selectedService.id}
-                service={
-                  services.find(
-                    (service) => service.id === selectedService.id,
-                  ) || selectedService
-                }
+          <div hidden={Boolean(selectedService || selectedStack)}>
+            {page === "Overview" && (
+              <>
+                <div className="resource-toolbar">
+                  <Button
+                    variant="outline"
+                    onClick={() => operate("status", { json: ["true"] })}
+                  >
+                    Full cluster state…
+                  </Button>
+                </div>
+                <div className="metrics">
+                  <Metric
+                    label="Registered nodes"
+                    value={overview ? String(overview.nodes.length) : "—"}
+                    description="Cluster membership"
+                    icon={<Server />}
+                  />
+                  <Metric
+                    label="Workloads"
+                    value={overview ? String(services.length) : "—"}
+                    description={`${workloads.length} services · ${services.length - workloads.length} jobs`}
+                    icon={<Boxes />}
+                  />
+                  <Metric
+                    label="Running replicas"
+                    value={overview ? `${running} / ${desired}` : "—"}
+                    description="Reported / desired service replicas"
+                    icon={<Activity />}
+                  />
+                  <Metric
+                    label="Stack deployments"
+                    value={overview ? String(stacks.length) : "—"}
+                    description={`${issues.length} need attention`}
+                    icon={<GitBranch />}
+                  />
+                </div>
+                {(issues.length > 0 ||
+                  Object.keys(overview?.gateway.endpoint_errors || {}).length >
+                    0 ||
+                  (overview?.recovery.conflicting_slots || 0) > 0) && (
+                  <section className="attention">
+                    <div className="section-title">
+                      <CircleAlert size={18} />
+                      <h2>Needs attention</h2>
+                    </div>
+                    {issues.map((stack) => (
+                      <button
+                        key={stack.stack}
+                        onClick={() => openStack(stack.stack)}
+                      >
+                        <span>
+                          <strong>{stack.stack}</strong>
+                          <small>
+                            {stack.current?.errors?.[0]?.message ||
+                              "Inspect deployment progress for more details."}
+                          </small>
+                        </span>
+                        <Status value={stack.current!.status} />
+                        <ArrowUpRight size={16} />
+                      </button>
+                    ))}
+                    {Object.entries(
+                      overview?.gateway.endpoint_errors || {},
+                    ).map(([node, message]) => (
+                      <p key={node}>
+                        <strong>Gateway · {node}</strong> — {message}
+                      </p>
+                    ))}
+                    {Boolean(overview?.recovery.conflicting_slots) && (
+                      <p>
+                        {overview!.recovery.conflicting_slots} conflicting
+                        recovery slots need attention.
+                      </p>
+                    )}
+                  </section>
+                )}
+                <div className="section-heading">
+                  <div>
+                    <h2>Workloads</h2>
+                    <p>Services and jobs across your stacks</p>
+                  </div>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => go("Workloads")}
+                  >
+                    View all
+                    <ArrowUpRight />
+                  </Button>
+                </div>
+                <WorkloadTable
+                  services={services.slice(0, 8)}
+                  open={openService}
+                  loading={snapshot.loading && !snapshot.data}
+                />
+                <div className="overview-bottom">
+                  <Card>
+                    <CardHeader>
+                      <CardTitle className="flex items-center gap-2">
+                        <Radio size={17} />
+                        Gateway
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent>
+                      <div className="gateway-line">
+                        <span>Routing configuration</span>
+                        <Status
+                          value={
+                            !overview
+                              ? "unknown"
+                              : !overview.gateway.enabled
+                                ? "disabled"
+                                : Object.keys(overview.gateway.endpoint_errors)
+                                      .length
+                                  ? "error"
+                                  : overview.gateway.applied_generation ===
+                                      overview.gateway.desired_generation
+                                    ? "ready"
+                                    : "pending"
+                          }
+                        />
+                      </div>
+                      <p className="muted">
+                        Desired generation{" "}
+                        {overview?.gateway.desired_generation ?? "—"} · Applied{" "}
+                        {overview?.gateway.applied_generation ?? "—"}
+                      </p>
+                    </CardContent>
+                  </Card>
+                  <Card>
+                    <CardHeader>
+                      <CardTitle className="flex items-center gap-2">
+                        <Clock3 size={17} />
+                        Latest snapshot
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent>
+                      <p>{timestamp(snapshot.updated)}</p>
+                      <p className="muted">
+                        Refreshes every 5 seconds. Node records describe
+                        reported state, not a live traffic probe.
+                      </p>
+                    </CardContent>
+                  </Card>
+                </div>
+              </>
+            )}
+            {page === "Workloads" && (
+              <>
+                <div className="resource-toolbar">
+                  <Button
+                    variant="outline"
+                    onClick={() => operate("ls", { json: ["true"] })}
+                  >
+                    Full definitions…
+                  </Button>
+                </div>
+                <div className="search-bar">
+                  <Search size={17} />
+                  <Input
+                    aria-label="Search workloads"
+                    placeholder="Search by workload or image…"
+                    value={search}
+                    onChange={(event) => setSearch(event.target.value)}
+                  />
+                  <span>{filtered.length} workloads</span>
+                </div>
+                <WorkloadTable
+                  services={filtered}
+                  open={openService}
+                  loading={snapshot.loading && !snapshot.data}
+                />
+              </>
+            )}
+            {page === "Deployments" && (
+              <Card className="table-card">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Stack</TableHead>
+                      <TableHead>Generation</TableHead>
+                      <TableHead>Status</TableHead>
+                      <TableHead>Started</TableHead>
+                      <TableHead />
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {stacks.map((stack) => (
+                      <TableRow key={stack.stack}>
+                        <TableCell>
+                          <button
+                            className="resource-link"
+                            onClick={() => openStack(stack.stack)}
+                          >
+                            <Layers3 size={16} />
+                            {stack.stack}
+                          </button>
+                        </TableCell>
+                        <TableCell className="mono">
+                          {stack.current ? `#${stack.current.generation}` : "—"}
+                        </TableCell>
+                        <TableCell>
+                          <Status value={stack.current?.status || "unknown"} />
+                        </TableCell>
+                        <TableCell>
+                          {timestamp(stack.current?.started_at_unix_ms)}
+                        </TableCell>
+                        <TableCell>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => openStack(stack.stack)}
+                          >
+                            Inspect
+                            <ArrowUpRight />
+                          </Button>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+                {!stacks.length && (
+                  <Empty>
+                    {snapshot.loading
+                      ? "Loading deployments…"
+                      : "No deployments yet."}
+                  </Empty>
+                )}
+              </Card>
+            )}
+            {page === "Routes" && (
+              <RoutesView
+                refreshToken={refreshToken}
+                services={services}
+                onService={openService}
+              />
+            )}
+            {page === "Jobs" && (
+              <>
+                <p className="section-note">
+                  Inspect schedules and execution history. Open a job to run it
+                  or cancel an execution.
+                </p>
+                <WorkloadTable
+                  services={services.filter((service) => service.job)}
+                  open={openService}
+                  loading={snapshot.loading && !snapshot.data}
+                />
+              </>
+            )}
+            {page === "Nodes" && (
+              <NodesView refreshToken={refreshToken} onOperate={operate} />
+            )}
+            {page === "Tasks" && (
+              <TasksView refreshToken={refreshToken} onOperate={operate} />
+            )}
+            {page === "Configuration" && (
+              <ConfigurationView
                 refreshToken={refreshToken}
                 onOperate={operate}
               />
-            ) : (
-              <ServiceDetail
-                key={selectedService.id}
-                service={
-                  services.find(
-                    (service) => service.id === selectedService.id,
-                  ) || selectedService
-                }
-                refreshToken={refreshToken}
-              />
-            )
-          ) : selectedStack ? (
-            <DeploymentDetail
-              key={selectedStack}
-              name={selectedStack}
-              onOperate={operate}
-              refreshToken={refreshToken}
-            />
-          ) : (
-            <>
-              {page === "Overview" && (
-                <>
-                  <div className="resource-toolbar">
-                    <Button
-                      variant="outline"
-                      onClick={() => operate("status", { json: ["true"] })}
-                    >
-                      Full cluster state…
-                    </Button>
-                  </div>
-                  <div className="metrics">
-                    <Metric
-                      label="Registered nodes"
-                      value={overview ? String(overview.nodes.length) : "—"}
-                      description="Cluster membership"
-                      icon={<Server />}
-                    />
-                    <Metric
-                      label="Workloads"
-                      value={overview ? String(services.length) : "—"}
-                      description={`${workloads.length} services · ${services.length - workloads.length} jobs`}
-                      icon={<Boxes />}
-                    />
-                    <Metric
-                      label="Running replicas"
-                      value={overview ? `${running} / ${desired}` : "—"}
-                      description="Reported / desired service replicas"
-                      icon={<Activity />}
-                    />
-                    <Metric
-                      label="Stack deployments"
-                      value={overview ? String(stacks.length) : "—"}
-                      description={`${issues.length} need attention`}
-                      icon={<GitBranch />}
-                    />
-                  </div>
-                  {(issues.length > 0 ||
-                    Object.keys(overview?.gateway.endpoint_errors || {})
-                      .length > 0 ||
-                    (overview?.recovery.conflicting_slots || 0) > 0) && (
-                    <section className="attention">
-                      <div className="section-title">
-                        <CircleAlert size={18} />
-                        <h2>Needs attention</h2>
-                      </div>
-                      {issues.map((stack) => (
-                        <button
-                          key={stack.stack}
-                          onClick={() => openStack(stack.stack)}
-                        >
-                          <span>
-                            <strong>{stack.stack}</strong>
-                            <small>
-                              {stack.current?.errors?.[0]?.message ||
-                                "Inspect deployment progress for more details."}
-                            </small>
-                          </span>
-                          <Status value={stack.current!.status} />
-                          <ArrowUpRight size={16} />
-                        </button>
-                      ))}
-                      {Object.entries(
-                        overview?.gateway.endpoint_errors || {},
-                      ).map(([node, message]) => (
-                        <p key={node}>
-                          <strong>Gateway · {node}</strong> — {message}
-                        </p>
-                      ))}
-                      {Boolean(overview?.recovery.conflicting_slots) && (
-                        <p>
-                          {overview!.recovery.conflicting_slots} conflicting
-                          recovery slots need attention.
-                        </p>
-                      )}
-                    </section>
-                  )}
-                  <div className="section-heading">
-                    <div>
-                      <h2>Workloads</h2>
-                      <p>Services and jobs across your stacks</p>
-                    </div>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => go("Workloads")}
-                    >
-                      View all
-                      <ArrowUpRight />
-                    </Button>
-                  </div>
-                  <WorkloadTable
-                    services={services.slice(0, 8)}
-                    open={openService}
-                    loading={snapshot.loading && !snapshot.data}
-                  />
-                  <div className="overview-bottom">
-                    <Card>
-                      <CardHeader>
-                        <CardTitle className="flex items-center gap-2">
-                          <Radio size={17} />
-                          Gateway
-                        </CardTitle>
-                      </CardHeader>
-                      <CardContent>
-                        <div className="gateway-line">
-                          <span>Routing configuration</span>
-                          <Status
-                            value={
-                              !overview
-                                ? "unknown"
-                                : !overview.gateway.enabled
-                                  ? "disabled"
-                                  : Object.keys(
-                                        overview.gateway.endpoint_errors,
-                                      ).length
-                                    ? "error"
-                                    : overview.gateway.applied_generation ===
-                                        overview.gateway.desired_generation
-                                      ? "ready"
-                                      : "pending"
-                            }
-                          />
-                        </div>
-                        <p className="muted">
-                          Desired generation{" "}
-                          {overview?.gateway.desired_generation ?? "—"} ·
-                          Applied {overview?.gateway.applied_generation ?? "—"}
-                        </p>
-                      </CardContent>
-                    </Card>
-                    <Card>
-                      <CardHeader>
-                        <CardTitle className="flex items-center gap-2">
-                          <Clock3 size={17} />
-                          Latest snapshot
-                        </CardTitle>
-                      </CardHeader>
-                      <CardContent>
-                        <p>{timestamp(snapshot.updated)}</p>
-                        <p className="muted">
-                          Refreshes every 5 seconds. Node records describe
-                          reported state, not a live traffic probe.
-                        </p>
-                      </CardContent>
-                    </Card>
-                  </div>
-                </>
-              )}
-              {page === "Workloads" && (
-                <>
-                  <div className="resource-toolbar">
-                    <Button
-                      variant="outline"
-                      onClick={() => operate("ls", { json: ["true"] })}
-                    >
-                      Full definitions…
-                    </Button>
-                  </div>
-                  <div className="search-bar">
-                    <Search size={17} />
-                    <Input
-                      aria-label="Search workloads"
-                      placeholder="Search by workload or image…"
-                      value={search}
-                      onChange={(event) => setSearch(event.target.value)}
-                    />
-                    <span>{filtered.length} workloads</span>
-                  </div>
-                  <WorkloadTable
-                    services={filtered}
-                    open={openService}
-                    loading={snapshot.loading && !snapshot.data}
-                  />
-                </>
-              )}
-              {page === "Deployments" && (
-                <Card className="table-card">
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead>Stack</TableHead>
-                        <TableHead>Generation</TableHead>
-                        <TableHead>Status</TableHead>
-                        <TableHead>Started</TableHead>
-                        <TableHead />
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {stacks.map((stack) => (
-                        <TableRow key={stack.stack}>
-                          <TableCell>
-                            <button
-                              className="resource-link"
-                              onClick={() => openStack(stack.stack)}
-                            >
-                              <Layers3 size={16} />
-                              {stack.stack}
-                            </button>
-                          </TableCell>
-                          <TableCell className="mono">
-                            {stack.current
-                              ? `#${stack.current.generation}`
-                              : "—"}
-                          </TableCell>
-                          <TableCell>
-                            <Status
-                              value={stack.current?.status || "unknown"}
-                            />
-                          </TableCell>
-                          <TableCell>
-                            {timestamp(stack.current?.started_at_unix_ms)}
-                          </TableCell>
-                          <TableCell>
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              onClick={() => openStack(stack.stack)}
-                            >
-                              Inspect
-                              <ArrowUpRight />
-                            </Button>
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                  {!stacks.length && (
-                    <Empty>
-                      {snapshot.loading
-                        ? "Loading deployments…"
-                        : "No deployments yet."}
-                    </Empty>
-                  )}
-                </Card>
-              )}
-              {page === "Routes" && (
-                <RoutesView
-                  refreshToken={refreshToken}
-                  services={services}
-                  onService={openService}
-                />
-              )}
-              {page === "Jobs" && (
-                <>
+            )}
+            {page === "Logs" && <LogExplorer />}
+            {page === "Registries" && (
+              <Card>
+                <CardHeader>
+                  <CardTitle>Private image registries</CardTitle>
+                </CardHeader>
+                <CardContent>
                   <p className="section-note">
-                    Inspect schedules and execution history. Open a job to run
-                    it or cancel an execution.
+                    Save or update credentials used by all nodes when pulling
+                    private images.
                   </p>
-                  <WorkloadTable
-                    services={services.filter((service) => service.job)}
-                    open={openService}
-                    loading={snapshot.loading && !snapshot.data}
-                  />
-                </>
-              )}
-              {page === "Nodes" && (
-                <NodesView refreshToken={refreshToken} onOperate={operate} />
-              )}
-              {page === "Tasks" && (
-                <TasksView refreshToken={refreshToken} onOperate={operate} />
-              )}
-              {page === "Configuration" && (
-                <ConfigurationView
-                  refreshToken={refreshToken}
-                  onOperate={operate}
-                />
-              )}
-              {page === "Logs" && <LogExplorer />}
-              {page === "Registries" && (
-                <Card>
-                  <CardHeader>
-                    <CardTitle>Private image registries</CardTitle>
-                  </CardHeader>
-                  <CardContent>
-                    <p className="section-note">
-                      Save or update credentials used by all nodes when pulling
-                      private images.
-                    </p>
-                    <Button onClick={() => operate("registry login")}>
-                      Add or update credentials…
-                    </Button>
-                  </CardContent>
-                </Card>
-              )}
-            </>
-          )}
+                  <Button onClick={() => operate("registry login")}>
+                    Add or update credentials…
+                  </Button>
+                </CardContent>
+              </Card>
+            )}
+          </div>
           {recentActions.some((a) => a.scope === actionScope) && (
             <ResourceActivity
               actions={recentActions.filter((a) => a.scope === actionScope)}
@@ -805,6 +824,11 @@ function DeploymentDetail({
   onOperate: Operate;
 }) {
   const [generation, setGeneration] = useState<number>();
+  const generationToolbar = useRef<HTMLDivElement>(null);
+  const selectGeneration = (value: number | undefined) => {
+    setGeneration(value);
+    generationToolbar.current?.scrollIntoView({ block: "start" });
+  };
   const result = usePolling(
     async (signal) => {
       const [stack, selected] = await Promise.all([
@@ -830,7 +854,10 @@ function DeploymentDetail({
         : undefined;
   return (
     <>
-      <div className="resource-toolbar">
+      <div
+        className="resource-toolbar generation-toolbar"
+        ref={generationToolbar}
+      >
         <label className="generation-picker">
           Viewing
           <Select
@@ -838,7 +865,7 @@ function DeploymentDetail({
             aria-label="Deployment generation"
             value={generation ?? "current"}
             onValueChange={(value) =>
-              setGeneration(value === "current" ? undefined : Number(value))
+              selectGeneration(value === "current" ? undefined : Number(value))
             }
           >
             <option value="current">Current generation</option>
@@ -997,7 +1024,7 @@ function DeploymentDetail({
                 <TableCell className="mono">
                   <button
                     className="resource-link"
-                    onClick={() => setGeneration(item.generation)}
+                    onClick={() => selectGeneration(item.generation)}
                   >
                     #{item.generation}
                     <ArrowUpRight size={13} />

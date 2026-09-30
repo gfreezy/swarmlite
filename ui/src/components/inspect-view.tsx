@@ -1,3 +1,4 @@
+import { ResourcePanel } from "@/components/resource-panel";
 import { useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -270,15 +271,24 @@ export function InspectView({
         </Table>
         {!tasks.length && <Empty>No retained tasks.</Empty>}
       </Card>
-      {tasks
-        .filter((task) => task.id === selected)
-        .map((task) => (
-          <Card key={task.id}>
-            <CardContent>
-              <TaskFacts task={task} />
-            </CardContent>
-          </Card>
-        ))}
+      {selected && (
+        <ResourcePanel
+          title="Task runtime"
+          items={tasks.map((task) => ({
+            id: task.id,
+            label: `${task.id} · ${task.node_id}`,
+          }))}
+          selected={selected}
+          onSelect={setSelected}
+          onClose={() => setSelected(undefined)}
+        >
+          {tasks
+            .filter((task) => task.id === selected)
+            .map((task) => (
+              <TaskFacts key={task.id} task={task} />
+            ))}
+        </ResourcePanel>
+      )}
       <JsonDetails title="Full inspect JSON" value={result.data} />
     </>
   );

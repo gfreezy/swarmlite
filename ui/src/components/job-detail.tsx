@@ -1,3 +1,4 @@
+import { ResourcePanel } from "@/components/resource-panel";
 import { Select } from "@/components/ui/select";
 import { type Operate } from "@/components/resource-action";
 import { useState } from "react";
@@ -53,6 +54,7 @@ export function JobDetail({
   );
   const [tab, setTab] = useState("history");
   const [logTarget, setLogTarget] = useState(service.id);
+  const [record, setRecord] = useState("");
   const policy = info.data?.policy || service.job!;
   const executions = history.data || [];
   return (
@@ -212,8 +214,7 @@ export function JobDetail({
                           variant="ghost"
                           size="sm"
                           onClick={() => {
-                            setLogTarget(execution.id);
-                            setTab("logs");
+                            setRecord(execution.id);
                           }}
                         >
                           <Terminal />
@@ -261,6 +262,20 @@ export function JobDetail({
           <Logs target={logTarget} />
         </TabsContent>
       </Tabs>
+      {record && (
+        <ResourcePanel
+          title="Execution logs"
+          items={executions.map((execution) => ({
+            id: execution.id,
+            label: `${execution.id} · ${execution.observed}`,
+          }))}
+          selected={record}
+          onSelect={setRecord}
+          onClose={() => setRecord("")}
+        >
+          <Logs key={record} target={record} />
+        </ResourcePanel>
+      )}
     </>
   );
 }
