@@ -188,7 +188,8 @@ fn detail(out: &mut String, m: &NodeMetrics, color: bool) {
         "USE",
         "INODES"
     );
-    for f in &m.filesystems {
+    // Also handle samples from Agents that still report Snap package images.
+    for f in m.filesystems.iter().filter(|f| f.filesystem != "squashfs") {
         let _ = writeln!(
             out,
             "  {:<24} {:<16} {:>12} {:>12} {} {} ({})",
@@ -325,6 +326,7 @@ pub(crate) fn format_stats(response: &NodeStatsResponse, details: bool, color: b
         let disk = m.and_then(|m| {
             m.filesystems
                 .iter()
+                .filter(|f| f.filesystem != "squashfs")
                 .filter_map(|f| ratio(f.used_bytes, f.used_bytes.saturating_add(f.available_bytes)))
                 .reduce(f64::max)
         });
@@ -429,10 +431,9 @@ pub(crate) fn format_stats(response: &NodeStatsResponse, details: bool, color: b
 #[cfg(test)]
 mod tests {
     use super::*;
-    use swarmlite_core::metrics::{MetricSample, NodeStats};
-    #[test]
-    fn plain_output_missing_and_stale_are_unambiguous() {
-        let response = NodeStatsResponse {
+    use swarmlite_core::metrics::{FilesystemMetrics, MetricSample, NodeStats};
+    fn stats_response(metrics: NodeMetrics) -> NodeStatsResponse {
+        NodeStatsResponse {
             retention_seconds: 900,
             stale_after_seconds: 30,
             resolution_seconds: 5,
@@ -447,14 +448,18 @@ mod tests {
                 age_seconds: Some(60.),
                 latest: Some(MetricSample {
                     received_at_unix_ms: 0,
-                    metrics: NodeMetrics {
-                        cpu_percent: Some(95.),
-                        ..Default::default()
-                    },
+                    metrics,
                 }),
                 history: vec![],
             }],
-        };
+        }
+    }
+    #[test]
+    fn plain_output_missing_and_stale_are_unambiguous() {
+        let response = stats_response(NodeMetrics {
+            cpu_percent: Some(95.),
+            ..Default::default()
+        });
         let plain = format_stats(&response, true, false);
         assert!(!plain.contains('\x1b'));
         assert!(plain.contains("STALE"));
@@ -465,5 +470,55 @@ mod tests {
         assert_eq!(sum([Some(1.), None].into_iter()), None);
         assert_eq!(sum([].into_iter()), None);
         assert!(!clean("node\x1b[2J").contains('\x1b'));
+    }
+    #[test]
+    fn snap_images_do_not_hide_actual_filesystem_usage_or_full_disks() {
+        let snap = FilesystemMetrics {
+            device: "/dev/loop0".into(),
+            mount: "/snap/core22/2133".into(),
+            filesystem: "squashfs".into(),
+            total_bytes: 100,
+            used_bytes: 100,
+            available_bytes: 0,
+            inodes: 100,
+            free_inodes: 0,
+        };
+        let mut response = stats_response(NodeMetrics {
+            filesystems: vec![
+                snap.clone(),
+                FilesystemMetrics {
+                    device: "/dev/loop1".into(),
+                    mount: "/data".into(),
+                    filesystem: "ext4".into(),
+                    total_bytes: 100,
+                    used_bytes: 50,
+                    available_bytes: 50,
+                    inodes: 100,
+                    free_inodes: 50,
+                },
+            ],
+            ..Default::default()
+        });
+        let plain = format_stats(&response, true, false);
+        assert!(plain.contains("50.0%"));
+        assert!(plain.contains("/data"));
+        assert!(plain.contains("/dev/loop1"));
+        assert!(!plain.contains("100.0%"));
+        assert!(!plain.contains("/snap/"));
+
+        let metrics = &mut response.nodes[0].latest.as_mut().unwrap().metrics;
+        metrics.filesystems[1].used_bytes = 100;
+        metrics.filesystems[1].available_bytes = 0;
+        assert!(format_stats(&response, true, false).contains("100.0%"));
+
+        response.nodes[0]
+            .latest
+            .as_mut()
+            .unwrap()
+            .metrics
+            .filesystems = vec![snap];
+        let plain = format_stats(&response, true, false);
+        assert!(!plain.contains("100.0%"));
+        assert!(!plain.contains("/snap/"));
     }
 }

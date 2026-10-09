@@ -85,8 +85,11 @@ export const memoryPercent = (m: NodeMetrics) =>
         m.memory.total_bytes,
       )
     : null;
+// Older Agents can still include Snap's read-only package images in their samples.
+export const capacityFilesystems = (m: NodeMetrics) =>
+  m.filesystems.filter((f) => f.filesystem !== "squashfs");
 export const diskPercent = (m: NodeMetrics) => {
-  const values = m.filesystems
+  const values = capacityFilesystems(m)
     .map((f) => ratio(f.used_bytes, f.used_bytes + f.available_bytes))
     .filter((v): v is number => v !== null);
   return values.length ? Math.max(...values) : null;

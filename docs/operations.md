@@ -268,6 +268,8 @@ swarmlite node stats node-a --history 365d --json
 Linux Agents sample host CPU, I/O wait, load, memory/Swap, local filesystem capacity/inodes,
 block-device I/O and network counters every five seconds. CPU is normalized across all cores;
 memory usage uses `MemAvailable`; filesystem percentages use `used / (used + available)`.
+Read-only SquashFS package images (including Snap mounts) are excluded from filesystem monitoring;
+their backing files still count toward the host filesystem's usage.
 Disk I/O totals exclude partitions and stacked devices; network totals exclude loopback and
 virtual interfaces. Per-device/interface details remain visible. The first rate sample is unavailable,
 not zero. These are host metrics, not container resource limits. CLI output uses green below 75%,

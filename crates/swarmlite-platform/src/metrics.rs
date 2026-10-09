@@ -177,6 +177,11 @@ mod linux {
                 if l.len() < 6 || r.len() < 2 {
                     return None;
                 }
+                // Snap packages are read-only images that always report 100% usage.
+                // Their backing files are already accounted for by the host filesystem.
+                if r[0] == "squashfs" {
+                    return None;
+                }
                 // Local block filesystems only. Overlay root supports containerized agents;
                 // remote filesystems are excluded to avoid blocking on unavailable servers.
                 if !r[1].starts_with("/dev/") && !(r[0] == "overlay" && l[4] == "/") {
@@ -343,6 +348,18 @@ mod linux {
             assert_eq!(disks["sda"][6], 4);
             let net = network_counters("eth0: 100 1 2 3 0 0 0 0 200 1 4 5 0 0 0 0");
             assert_eq!(net["eth0"][8], 200);
+        }
+        #[test]
+        fn package_images_are_skipped_without_hiding_other_read_only_or_loop_mounts() {
+            let mounts = "40 36 7:0 / /nonexistent-snap-metrics-test ro - squashfs /dev/loop0 ro\n\
+                          41 36 8:1 / / ro - ext4 /dev/sda1 ro\n\
+                          42 36 7:1 / /tmp rw - ext4 /dev/loop1 rw";
+            let mut errors = Vec::new();
+            let mounts = filesystems(mounts, &mut errors);
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(mounts.len(), 2);
+            assert_eq!(mounts[0].device, "/dev/sda1");
+            assert_eq!(mounts[1].device, "/dev/loop1");
         }
         #[test]
         #[cfg(target_os = "linux")]

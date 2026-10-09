@@ -23,6 +23,7 @@ import {
   speed,
   ratio,
   memoryPercent,
+  capacityFilesystems,
   diskPercent,
   diskRead,
   diskWrite,
@@ -299,6 +300,7 @@ export function NodeMonitoring({
           errors: [],
         }
       : undefined);
+  const filesystems = m ? capacityFilesystems(m) : [];
   return (
     <section className="node-monitoring" aria-label="Node monitoring">
       <div className="section-heading monitoring-heading">
@@ -504,7 +506,7 @@ export function NodeMonitoring({
               </TableRow>
             </TableHeader>
             <TableBody>
-              {m.filesystems.map((f) => (
+              {filesystems.map((f) => (
                 <TableRow key={`${f.device}:${f.mount}`}>
                   <TableCell>
                     <strong>{f.mount}</strong>
@@ -533,7 +535,7 @@ export function NodeMonitoring({
               ))}
             </TableBody>
           </Table>
-          {!m.filesystems.length && (
+          {!filesystems.length && (
             <Empty>No local filesystem data available.</Empty>
           )}
           <h3 className="monitoring-table-title">
