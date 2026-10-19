@@ -2770,9 +2770,27 @@ impl ContainerRuntime for DockerCompatibleRuntime {
             .collect::<Vec<_>>();
         let labels = task_labels(assignment)?;
         let binds = task_binds(assignment, self.config_root.as_deref())?;
+        let container = &assignment.spec.container;
         let host_config = HostConfig {
             binds: (!binds.is_empty()).then_some(binds),
             port_bindings: (!port_bindings.is_empty()).then_some(port_bindings),
+            readonly_rootfs: container.read_only.then_some(true),
+            cap_add: (!container.cap_add.is_empty()).then_some(container.cap_add.clone()),
+            cap_drop: (!container.cap_drop.is_empty()).then_some(container.cap_drop.clone()),
+            security_opt: container
+                .no_new_privileges
+                .then(|| vec!["no-new-privileges".to_owned()]),
+            tmpfs: (!container.tmpfs.is_empty()).then(|| {
+                container
+                    .tmpfs
+                    .iter()
+                    .map(|(target, options)| (target.clone(), options.clone()))
+                    .collect()
+            }),
+            pids_limit: container.pids_limit,
+            nano_cpus: container.nano_cpus,
+            memory: container.memory_bytes,
+            memory_swap: container.memory_swap_bytes,
             restart_policy: Some(RestartPolicy {
                 name: Some(if assignment.job.is_some() {
                     RestartPolicyNameEnum::NO
@@ -2785,6 +2803,7 @@ impl ContainerRuntime for DockerCompatibleRuntime {
         };
         let body = ContainerCreateBody {
             image: Some(container_image),
+            user: container.user.clone(),
             cmd: (!assignment.spec.command.is_empty()).then_some(assignment.spec.command.clone()),
             entrypoint: (!assignment.spec.entrypoint.is_empty())
                 .then_some(assignment.spec.entrypoint.clone()),
@@ -3321,7 +3340,7 @@ mod tests {
         routing::any,
     };
 
-    use crate::model::{ServiceConfigMount, ServicePort, ServiceSpec};
+    use crate::model::{ContainerRuntimeSpec, ServiceConfigMount, ServicePort, ServiceSpec};
 
     use super::*;
 
@@ -3823,6 +3842,7 @@ mod tests {
                 max_surge: 1,
                 stop_grace_period_seconds: 10,
                 stop_signal: None,
+                container: Default::default(),
                 job: None,
             },
             ports: Vec::new(),
@@ -4129,6 +4149,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_container_settings_map_to_the_docker_compatible_create_body() {
+        let state = JobApi::default();
+        let app = Router::new()
+            .fallback(any(job_api))
+            .with_state(state.clone());
+        let (runtime, server) = runtime_for_pull_api(app, DeploymentPolicy::default()).await;
+        let directory = tempfile::tempdir().unwrap();
+        let ledger = crate::local_state::LocalState::open(directory.path()).unwrap();
+        let mut assignment = one_shot_assignment();
+        assignment.spec.container = ContainerRuntimeSpec {
+            user: Some("10001:10002".into()),
+            read_only: true,
+            cap_add: vec!["NET_BIND_SERVICE".into()],
+            cap_drop: vec!["ALL".into()],
+            no_new_privileges: true,
+            tmpfs: BTreeMap::from([
+                ("/run".into(), "".into()),
+                ("/tmp".into(), "size=33554432,noexec,nosuid,nodev".into()),
+            ]),
+            pids_limit: Some(256),
+            nano_cpus: Some(1_250_000_000),
+            memory_bytes: Some(512 * 1024 * 1024),
+            memory_swap_bytes: Some(1024 * 1024 * 1024),
+        };
+        ledger
+            .authorize_jobs(&[format!("{}:{}", assignment.cluster_id, assignment.id)])
+            .unwrap();
+        let runtime = runtime.with_job_state(ledger);
+
+        runtime
+            .create_task(&assignment, &RuntimeTaskProgress::default())
+            .await
+            .unwrap();
+
+        let body = state.body.lock().unwrap();
+        assert_eq!(body["User"], "10001:10002");
+        assert_eq!(body["HostConfig"]["ReadonlyRootfs"], true);
+        assert_eq!(
+            body["HostConfig"]["CapAdd"],
+            serde_json::json!(["NET_BIND_SERVICE"])
+        );
+        assert_eq!(body["HostConfig"]["CapDrop"], serde_json::json!(["ALL"]));
+        assert_eq!(
+            body["HostConfig"]["SecurityOpt"],
+            serde_json::json!(["no-new-privileges"])
+        );
+        assert_eq!(body["HostConfig"]["Tmpfs"]["/run"], "");
+        assert_eq!(
+            body["HostConfig"]["Tmpfs"]["/tmp"],
+            "size=33554432,noexec,nosuid,nodev"
+        );
+        assert_eq!(body["HostConfig"]["PidsLimit"], 256);
+        assert_eq!(body["HostConfig"]["NanoCpus"], 1_250_000_000_i64);
+        assert_eq!(body["HostConfig"]["Memory"], 512 * 1024 * 1024);
+        assert_eq!(body["HostConfig"]["MemorySwap"], 1024 * 1024 * 1024);
+        drop(body);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn job_engine_settings_and_nonblocking_stop_preserve_timeout_intent_on_recovery() {
         let state = JobApi::default();
         let app = Router::new()
@@ -4152,6 +4232,20 @@ mod tests {
             assert_eq!(body["HostConfig"]["RestartPolicy"]["Name"], "no");
             assert_eq!(body["StopSignal"], "SIGINT");
             assert_eq!(body["StopTimeout"], 10);
+            assert!(body.get("User").is_none());
+            for field in [
+                "ReadonlyRootfs",
+                "CapAdd",
+                "CapDrop",
+                "SecurityOpt",
+                "Tmpfs",
+                "PidsLimit",
+                "NanoCpus",
+                "Memory",
+                "MemorySwap",
+            ] {
+                assert!(body["HostConfig"].get(field).is_none(), "{field}");
+            }
         }
         let containers = runtime.list_managed(&assignment.cluster_id).await.unwrap();
         let container = &containers[&assignment.id];
@@ -4812,6 +4906,7 @@ mod tests {
                 max_surge: 1,
                 stop_grace_period_seconds: 10,
                 stop_signal: None,
+                container: Default::default(),
                 job: None,
             },
             ports: Vec::new(),
@@ -4883,6 +4978,7 @@ mod tests {
                 max_surge: 1,
                 stop_grace_period_seconds: 10,
                 stop_signal: None,
+                container: Default::default(),
                 job: None,
             },
             ports: Vec::new(),
@@ -4960,6 +5056,7 @@ mod tests {
                 max_surge: 1,
                 stop_grace_period_seconds: 10,
                 stop_signal: None,
+                container: Default::default(),
                 job: None,
             },
             ports: vec![PortBinding {

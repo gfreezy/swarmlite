@@ -56,8 +56,48 @@ pub struct ServiceSpec {
     pub stop_grace_period_seconds: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_signal: Option<String>,
+    #[serde(default, skip_serializing_if = "ContainerRuntimeSpec::is_empty")]
+    pub container: ContainerRuntimeSpec,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job: Option<JobSpec>,
+}
+
+/// Runtime-ready container settings normalized from their Compose-compatible syntax.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerRuntimeSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub read_only: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cap_add: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cap_drop: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_new_privileges: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tmpfs: BTreeMap<String, String>,
+    /// Docker-compatible PID limit. `-1` requests an unlimited runtime setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pids_limit: Option<i64>,
+    /// CPU quota expressed in billionths of one CPU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nano_cpus: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<i64>,
+    /// Combined memory and swap limit in bytes. `-1` requests unlimited swap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_swap_bytes: Option<i64>,
+}
+
+impl ContainerRuntimeSpec {
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1417,8 +1457,20 @@ mod tests {
             max_surge: 1,
             stop_grace_period_seconds: 10,
             stop_signal: None,
+            container: Default::default(),
             job: None,
         }
+    }
+
+    #[test]
+    fn default_container_runtime_settings_do_not_change_legacy_serialization() {
+        let original = service_with_tcp_ports(&[80]);
+        let serialized = serde_json::to_value(&original).unwrap();
+        assert!(serialized.get("container").is_none());
+
+        let mut restricted = original.clone();
+        restricted.container.read_only = true;
+        assert_ne!(service_spec_hash(&original), service_spec_hash(&restricted));
     }
 
     #[test]

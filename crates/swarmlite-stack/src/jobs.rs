@@ -45,10 +45,13 @@ mod tests {
     use super::*;
     #[test]
     fn job_parser_reuses_container_fields_and_requires_five_field_cron() {
-        let stack = crate::parse_stack("x-swarmlite-jobs:\n  backup:\n    image: busybox:1.37\n    schedule: '0 2 * * *'\n    timezone: Asia/Shanghai\n    timeout: 30m\n    stop_signal: SIGINT\n    stop_grace_period: 20s\n    environment: {MODE: backup}\n").unwrap();
+        let stack = crate::parse_stack("x-swarmlite-jobs:\n  backup:\n    image: busybox:1.37\n    schedule: '0 2 * * *'\n    timezone: Asia/Shanghai\n    timeout: 30m\n    stop_signal: SIGINT\n    stop_grace_period: 20s\n    user: '10001'\n    read_only: true\n    pids_limit: 64\n    environment: {MODE: backup}\n").unwrap();
         let spec = &stack.services["backup"];
         assert_eq!(spec.stop_signal.as_deref(), Some("SIGINT"));
         assert_eq!(spec.stop_grace_period_seconds, 20);
+        assert_eq!(spec.container.user.as_deref(), Some("10001"));
+        assert!(spec.container.read_only);
+        assert_eq!(spec.container.pids_limit, Some(64));
         let job = spec.job.as_ref().unwrap();
         assert_eq!(job.timeout_seconds, Some(1800));
         assert_eq!(job.next_after(0).unwrap(), 64_800_000); // Jan 2, 02:00 UTC+8

@@ -42,6 +42,36 @@
         "labels": {
           "$ref": "#/$defs/service/properties/labels"
         },
+        "user": {
+          "$ref": "#/$defs/service/properties/user"
+        },
+        "read_only": {
+          "$ref": "#/$defs/service/properties/read_only"
+        },
+        "cap_add": {
+          "$ref": "#/$defs/service/properties/cap_add"
+        },
+        "cap_drop": {
+          "$ref": "#/$defs/service/properties/cap_drop"
+        },
+        "security_opt": {
+          "$ref": "#/$defs/service/properties/security_opt"
+        },
+        "tmpfs": {
+          "$ref": "#/$defs/service/properties/tmpfs"
+        },
+        "pids_limit": {
+          "$ref": "#/$defs/service/properties/pids_limit"
+        },
+        "cpus": {
+          "$ref": "#/$defs/service/properties/cpus"
+        },
+        "mem_limit": {
+          "$ref": "#/$defs/service/properties/mem_limit"
+        },
+        "memswap_limit": {
+          "$ref": "#/$defs/service/properties/memswap_limit"
+        },
         "volumes": {
           "$ref": "#/$defs/service/properties/volumes"
         },
@@ -83,6 +113,9 @@
               "type": "object",
               "properties": { "constraints": { "$ref": "#/$defs/placement/properties/constraints" } },
               "additionalProperties": false
+            },
+            "resources": {
+              "$ref": "#/$defs/resources"
             }
           },
           "additionalProperties": false
@@ -120,6 +153,54 @@
         "labels": {
           "$ref": "#/$defs/stringMapOrList",
           "description": "Labels attached to each task container. deploy.labels are service metadata instead."
+        },
+        "user": {
+          "type": "string",
+          "minLength": 1,
+          "description": "User and optional group used to run the container process, for example 10001:10001."
+        },
+        "read_only": {
+          "type": "boolean",
+          "default": false,
+          "description": "Mount the container root filesystem read-only. Explicit volumes and tmpfs mounts remain separately writable when configured that way."
+        },
+        "cap_add": {
+          "$ref": "#/$defs/capabilities",
+          "description": "Linux capabilities added to the container. CAP_ prefixes are optional."
+        },
+        "cap_drop": {
+          "$ref": "#/$defs/capabilities",
+          "description": "Linux capabilities removed from the container; ALL is supported."
+        },
+        "security_opt": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["no-new-privileges", "no-new-privileges:true", "no-new-privileges=true"]
+          },
+          "default": [],
+          "description": "Container security options. Currently only no-new-privileges:true is supported."
+        },
+        "tmpfs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^/.+"
+          },
+          "default": [],
+          "description": "Tmpfs mounts in target[:options] form, for example /tmp:size=32m,mode=1777,noexec,nosuid,nodev."
+        },
+        "pids_limit": {
+          "$ref": "#/$defs/pidsLimit"
+        },
+        "cpus": {
+          "$ref": "#/$defs/cpuLimit"
+        },
+        "mem_limit": {
+          "$ref": "#/$defs/memoryLimit"
+        },
+        "memswap_limit": {
+          "$ref": "#/$defs/memorySwapLimit"
         },
         "expose": {
           "type": "array",
@@ -169,6 +250,44 @@
           "items": { "type": "string" }
         }
       ]
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^(?:CAP_)?[A-Za-z0-9_]+$"
+      },
+      "default": []
+    },
+    "pidsLimit": {
+      "type": "integer",
+      "anyOf": [
+        { "const": -1 },
+        { "minimum": 1 }
+      ],
+      "description": "Maximum process count; -1 requests an unlimited runtime setting."
+    },
+    "cpuLimit": {
+      "oneOf": [
+        { "type": "number", "minimum": 0 },
+        { "type": "string", "pattern": "^(?:[0-9]+(?:\\.[0-9]+)?|\\.[0-9]+)$" }
+      ],
+      "description": "CPU ceiling in CPU units. Zero leaves the runtime default unchanged."
+    },
+    "memoryLimit": {
+      "oneOf": [
+        { "type": "integer", "minimum": 1 },
+        { "type": "string", "pattern": "^(?:[0-9]+(?:\\.[0-9]+)?|\\.[0-9]+)(?:[bBkKmMgGtTpP]|[kKmMgGtTpP][iI]?[bB])?$" }
+      ],
+      "description": "Positive memory ceiling in bytes or with a binary size suffix such as 512m or 1GiB."
+    },
+    "memorySwapLimit": {
+      "oneOf": [
+        { "type": "integer", "minimum": 1 },
+        { "const": -1 },
+        { "type": "string", "pattern": "^(?:(?:[0-9]+(?:\\.[0-9]+)?|\\.[0-9]+)(?:[bBkKmMgGtTpP]|[kKmMgGtTpP][iI]?[bB])?|-1)$" }
+      ],
+      "description": "Total memory plus swap ceiling. Must be at least the memory limit; -1 requests unlimited swap."
     },
     "scalar": {
       "type": ["string", "number", "boolean", "null"]
@@ -375,6 +494,26 @@
         },
         "update_config": {
           "$ref": "#/$defs/updateConfig",
+          "default": {}
+        },
+        "resources": {
+          "$ref": "#/$defs/resources",
+          "default": {}
+        }
+      },
+      "additionalProperties": false
+    },
+    "resources": {
+      "type": "object",
+      "properties": {
+        "limits": {
+          "type": "object",
+          "properties": {
+            "cpus": { "$ref": "#/$defs/cpuLimit" },
+            "memory": { "$ref": "#/$defs/memoryLimit" },
+            "pids": { "$ref": "#/$defs/pidsLimit" }
+          },
+          "additionalProperties": false,
           "default": {}
         }
       },

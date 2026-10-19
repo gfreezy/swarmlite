@@ -17,6 +17,21 @@ services:
     labels:
       com.example.component: api
       com.example.public: true
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=32m,mode=1777,noexec,nosuid,nodev
+      - /run:size=4m,noexec,nosuid,nodev
+    pids_limit: 256
+    cpus: "1.0"
+    mem_limit: 512m
+    memswap_limit: 512m
     expose:
       - "8082"
       - "5354/udp"

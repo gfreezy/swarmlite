@@ -8,6 +8,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use serde_json::Value;
+
 const TEST_HOSTNAME: &str = "swarmlite-template-e2e-node";
 
 struct TestCluster {
@@ -163,6 +165,189 @@ fn stack_templates_reach_the_container_environment() {
     assert_success("swarmlite rm", &remove);
 }
 
+#[test]
+#[ignore = "requires a running Linux Docker daemon with cgroup v2 and busybox:1.36 available locally"]
+fn container_security_and_resource_settings_reach_docker_and_the_kernel() {
+    require_local_image("busybox:1.36");
+
+    let binary = env!("CARGO_BIN_EXE_swarmlite");
+    let directory = tempfile::tempdir().expect("create E2E data directory");
+    let data_dir = directory.path().join("data");
+    let port = available_port();
+    let stack = unique_stack_name();
+
+    let init = Command::new(binary)
+        .args([
+            "--data-dir",
+            path_text(&data_dir),
+            "init",
+            "--controller-port",
+            &port.to_string(),
+            "--advertise-address",
+            "127.0.0.1",
+            "--runtime",
+            "docker",
+            "--no-gateway",
+        ])
+        .env("HOSTNAME", TEST_HOSTNAME)
+        .output()
+        .expect("run swarmlite init");
+    assert_success("swarmlite init", &init);
+
+    let stdout_path = directory.path().join("serve.stdout.log");
+    let stderr_path = directory.path().join("serve.stderr.log");
+    let server = Command::new(binary)
+        .args([
+            "--data-dir",
+            path_text(&data_dir),
+            "serve",
+            "--advertise-address",
+            "127.0.0.1",
+            "--runtime",
+            "docker",
+        ])
+        .env("HOSTNAME", TEST_HOSTNAME)
+        .stdout(Stdio::from(
+            File::create(&stdout_path).expect("create serve stdout log"),
+        ))
+        .stderr(Stdio::from(
+            File::create(&stderr_path).expect("create serve stderr log"),
+        ))
+        .spawn()
+        .expect("start swarmlite serve");
+    let mut cluster = TestCluster { server, stack };
+    wait_for_controller(binary, &data_dir, &mut cluster.server, &stderr_path);
+
+    let stack_file = directory.path().join("stack.yaml");
+    fs::write(
+        &stack_file,
+        r#"services:
+  restricted:
+    image: busybox:1.36
+    pull_policy: never
+    entrypoint: ["sh", "-c"]
+    command: ["sleep 300"]
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:size=8m,mode=1777,noexec,nosuid,nodev
+      - /run:size=4m,noexec,nosuid,nodev
+    pids_limit: 64
+    cpus: "0.5"
+    mem_limit: 64m
+    memswap_limit: 64m
+"#,
+    )
+    .expect("write runtime settings E2E Stack file");
+
+    let deploy = Command::new(binary)
+        .args([
+            "--data-dir",
+            path_text(&data_dir),
+            "deploy",
+            "--compose-file",
+            path_text(&stack_file),
+            "--detach",
+            &cluster.stack,
+        ])
+        .output()
+        .expect("deploy runtime settings E2E Stack");
+    assert_success("swarmlite deploy", &deploy);
+
+    let container = wait_for_container(&cluster.stack, Duration::from_secs(30));
+    let inspect = inspect_container(&container);
+    assert_eq!(inspect["State"]["Running"], true);
+    assert_eq!(inspect["Config"]["User"], "10001:10001");
+    assert_eq!(inspect["HostConfig"]["ReadonlyRootfs"], true);
+    assert_eq!(
+        inspect["HostConfig"]["CapAdd"],
+        serde_json::json!(["NET_BIND_SERVICE"])
+    );
+    assert_eq!(inspect["HostConfig"]["CapDrop"], serde_json::json!(["ALL"]));
+    assert_eq!(
+        inspect["HostConfig"]["SecurityOpt"],
+        serde_json::json!(["no-new-privileges"])
+    );
+    assert_eq!(
+        inspect["HostConfig"]["Tmpfs"]["/tmp"],
+        "size=8m,mode=1777,noexec,nosuid,nodev"
+    );
+    assert_eq!(inspect["HostConfig"]["PidsLimit"], 64);
+    assert_eq!(inspect["HostConfig"]["NanoCpus"], 500_000_000);
+    assert_eq!(inspect["HostConfig"]["Memory"], 64 * 1024 * 1024);
+    assert_eq!(inspect["HostConfig"]["MemorySwap"], 64 * 1024 * 1024);
+
+    let observations = docker_exec(
+        &container,
+        r#"set -eu
+printf 'uid='; id -u
+printf 'gid='; id -g
+printf 'no_new_privs='; awk '/^NoNewPrivs:/ {print $2}' /proc/self/status
+printf 'cap_eff='; awk '/^CapEff:/ {print $2}' /proc/self/status
+printf 'cap_bnd='; awk '/^CapBnd:/ {print $2}' /proc/self/status
+printf 'root_options='; awk '$2 == "/" {print $4}' /proc/mounts
+printf 'tmpfs_mount='; awk '$2 == "/tmp" {print $3 ":" $4}' /proc/mounts
+touch /tmp/swarmlite-e2e-write
+printf 'tmpfs_write='; test -f /tmp/swarmlite-e2e-write && echo ok
+printf 'pids_max='; cat /sys/fs/cgroup/pids.max
+printf 'cpu_max='; cat /sys/fs/cgroup/cpu.max
+printf 'memory_max='; cat /sys/fs/cgroup/memory.max
+printf 'swap_max='; cat /sys/fs/cgroup/memory.swap.max
+"#,
+    );
+    let observations = observations
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(observations["uid"], "10001");
+    assert_eq!(observations["gid"], "10001");
+    assert_eq!(observations["no_new_privs"], "1");
+    assert_eq!(observations["cap_eff"], "0000000000000000");
+    assert_eq!(observations["cap_bnd"], "0000000000000400");
+    assert!(
+        observations["root_options"]
+            .split(',')
+            .any(|option| option == "ro")
+    );
+    let tmpfs_mount = observations["tmpfs_mount"];
+    assert!(tmpfs_mount.starts_with("tmpfs:"), "{tmpfs_mount}");
+    let tmpfs_options = tmpfs_mount
+        .strip_prefix("tmpfs:")
+        .expect("tmpfs mount should include its filesystem type");
+    for option in ["rw", "nosuid", "nodev", "noexec"] {
+        assert!(
+            tmpfs_options.split(',').any(|actual| actual == option),
+            "missing tmpfs option {option}: {tmpfs_mount}"
+        );
+    }
+    assert_eq!(observations["tmpfs_write"], "ok");
+    assert_eq!(observations["pids_max"], "64");
+    let (quota, period) = observations["cpu_max"]
+        .split_once(' ')
+        .expect("cpu.max should contain quota and period");
+    assert_eq!(
+        quota.parse::<u64>().unwrap() * 2,
+        period.parse::<u64>().unwrap()
+    );
+    assert_eq!(observations["memory_max"], (64 * 1024 * 1024).to_string());
+    assert_eq!(observations["swap_max"], "0");
+
+    let remove = Command::new(binary)
+        .args([
+            "--data-dir",
+            path_text(&data_dir),
+            "rm",
+            "--detach",
+            &cluster.stack,
+        ])
+        .output()
+        .expect("remove runtime settings E2E Stack");
+    assert_success("swarmlite rm", &remove);
+}
+
 fn require_local_image(image: &str) {
     let output = Command::new("docker")
         .args(["image", "inspect", image])
@@ -274,6 +459,28 @@ fn inspect_label(container: &str, label: &str) -> String {
         .expect("docker inspect emitted a non-UTF-8 label")
         .trim()
         .to_owned()
+}
+
+fn inspect_container(container: &str) -> Value {
+    let output = Command::new("docker")
+        .args(["inspect", container])
+        .output()
+        .expect("inspect task container");
+    assert_success("docker inspect", &output);
+    serde_json::from_slice::<Vec<Value>>(&output.stdout)
+        .expect("docker inspect emitted invalid JSON")
+        .into_iter()
+        .next()
+        .expect("docker inspect returned no container")
+}
+
+fn docker_exec(container: &str, script: &str) -> String {
+    let output = Command::new("docker")
+        .args(["exec", container, "sh", "-c", script])
+        .output()
+        .expect("execute runtime settings probe");
+    assert_success("docker exec runtime settings probe", &output);
+    String::from_utf8(output.stdout).expect("runtime settings probe emitted non-UTF-8 output")
 }
 
 fn assert_success(action: &str, output: &Output) {

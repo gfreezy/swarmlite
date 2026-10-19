@@ -534,6 +534,7 @@ mod tests {
                 max_surge: 1,
                 stop_grace_period_seconds: 10,
                 stop_signal: None,
+                container: Default::default(),
                 job: None,
             },
         }
