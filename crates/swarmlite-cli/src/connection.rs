@@ -39,6 +39,7 @@ pub(crate) async fn resolve(
 ) -> Result<ControllerConnection> {
     let Some(ssh_controller) = controller.as_deref().filter(|value| has_ssh_scheme(value)) else {
         let (controller, token) = node::resolve_connection(data_dir, controller, token).await?;
+        require_administrator_token(&token)?;
         return Ok(ControllerConnection {
             client: ControllerClient::new(controller, token),
             _ssh_tunnel: None,
@@ -49,6 +50,7 @@ pub(crate) async fn resolve(
     let remote_info = target.read_connection_info().await?;
     let remote_controller = RemoteController::parse(&remote_info.controller)?;
     let token = token.unwrap_or(remote_info.token);
+    require_administrator_token(&token)?;
     let tunnel = SshTunnel::start(&target, &remote_controller).await?;
     let local_controller = format!("http://{}", tunnel.local_address());
 
@@ -56,6 +58,13 @@ pub(crate) async fn resolve(
         client: ControllerClient::new(local_controller, token),
         _ssh_tunnel: Some(tunnel),
     })
+}
+
+fn require_administrator_token(token: &str) -> Result<()> {
+    if token.starts_with("sldt_") {
+        bail!("deployment tokens are HTTP-only; use an administrator credential with the CLI");
+    }
+    Ok(())
 }
 
 fn has_ssh_scheme(value: &str) -> bool {

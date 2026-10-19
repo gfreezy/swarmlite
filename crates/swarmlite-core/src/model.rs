@@ -1031,6 +1031,8 @@ pub struct StackDeploymentError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeRecord {
+    #[serde(default)]
+    pub supports_service_operations: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<crate::metrics::NodeMetrics>,
     pub supports_jobs: bool,
@@ -1080,6 +1082,8 @@ pub struct PortBinding {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job: Option<JobExecution>,
     pub id: String,
     pub service_id: String,
@@ -1101,6 +1105,8 @@ pub struct TaskRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClusterState {
+    #[serde(skip)]
+    pub service_operations: BTreeMap<String, crate::service_operations::ServiceOperationRecord>,
     pub stacks: BTreeMap<String, StackRecord>,
     pub services: BTreeMap<String, ServiceRecord>,
     pub nodes: BTreeMap<String, NodeRecord>,
@@ -1558,6 +1564,10 @@ pub struct NodeLabelRemoveRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskAssignment {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<crate::service_operations::RestartAssignment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_image_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job: Option<JobExecution>,
     pub id: String,

@@ -119,6 +119,9 @@ pub(super) struct ScaleArgs {
 
 #[derive(Debug, Args)]
 pub(super) struct RestartArgs {
+    /// Pull the configured image and roll out new containers instead of restarting in place.
+    #[arg(long)]
+    pull: bool,
     #[arg(value_name = "STACK.SERVICE")]
     service: String,
     /// Return after the Controller accepts the desired state.
@@ -257,23 +260,58 @@ pub(super) async fn run_scale(data_dir: &Path, args: ScaleArgs) -> Result<()> {
 }
 
 pub(super) async fn run_restart(data_dir: &Path, args: RestartArgs) -> Result<()> {
+    use swarmlite_core::service_operations::{
+        RedeployRequest, ServiceOperation, ServiceOperationStatus,
+    };
     let client = resolve_client(data_dir, args.connection).await?;
-    let deployment: StackDeploymentResponse = client
-        .send_json::<_, ()>(
-            reqwest::Method::POST,
-            &format!("/v1/services/{}/force-update", encode(&args.service)),
-            None,
-        )
+    let path = if args.pull {
+        format!("/v1/deploy/services/{}/redeploy", encode(&args.service))
+    } else {
+        format!("/v1/services/{}/restart", encode(&args.service))
+    };
+    let key = format!("manual:{}", uuid::Uuid::new_v4());
+    let mut operation: ServiceOperation = client
+        .submit_operation(&path, &key, &RedeployRequest::default())
         .await?;
-    finish_deployment(
-        &client,
-        deployment,
-        args.detach,
-        DeploymentOperation::Restart,
-    )
-    .await?;
-    println!("{}", ansi(stdout_color(), "1;36", args.service));
-    Ok(())
+    let color = stdout_color();
+    println!(
+        "{} {} {}",
+        ansi(color, "1;36", &operation.service),
+        ansi(color, "32", "accepted"),
+        ansi(color, "2", &operation.operation_id)
+    );
+    if args.detach {
+        return Ok(());
+    }
+    loop {
+        match operation.status {
+            ServiceOperationStatus::Succeeded => {
+                println!(
+                    "{} {}",
+                    ansi(color, "32", "restart complete"),
+                    ansi(color, "1;36", args.service)
+                );
+                return Ok(());
+            }
+            ServiceOperationStatus::Failed => anyhow::bail!(
+                "operation {} failed: {}",
+                operation.operation_id,
+                operation.error.as_deref().unwrap_or("unknown")
+            ),
+            _ if operation.stalled || operation.blocked => anyhow::bail!(
+                "operation {} is stalled or blocked; inspect the stack deployment before retrying",
+                operation.operation_id
+            ),
+            _ => {}
+        }
+        operation = client
+            .get_json(&format!(
+                "/v1/operations/{}?after_revision={}&wait_seconds=25",
+                encode(&operation.operation_id),
+                operation.revision
+            ))
+            .await?;
+    }
 }
 
 pub(super) async fn run_remove(data_dir: &Path, args: RemoveArgs) -> Result<()> {

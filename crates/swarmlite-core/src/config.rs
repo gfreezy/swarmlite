@@ -87,6 +87,7 @@ impl InstalledNodeConfig {
 
 #[derive(Debug, Clone)]
 pub struct ControllerConfig {
+    pub deploy_listen: SocketAddr,
     pub gateway_enabled: bool,
     pub labels: BTreeMap<String, String>,
     pub listen: SocketAddr,

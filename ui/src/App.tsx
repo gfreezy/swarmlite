@@ -325,7 +325,7 @@ export default function App() {
                           })
                         }
                       >
-                        Rolling restart…
+                        Restart…
                       </Button>
                     </>
                   )}

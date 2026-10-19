@@ -59,6 +59,7 @@ pub struct InitOptions {
 
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
+    pub deploy_listen: SocketAddr,
     pub data_dir: PathBuf,
     pub advertise_address: Option<String>,
     pub runtime: Option<RuntimeKind>,
@@ -102,6 +103,7 @@ enum NodeEvent {
 }
 
 struct NodeSupervisor {
+    deploy_listen: SocketAddr,
     data_dir: PathBuf,
     local_state: LocalState,
     settings: NodeSettings,
@@ -369,6 +371,7 @@ pub async fn run(options: ServeOptions) -> Result<()> {
         "starting node service"
     );
     NodeSupervisor {
+        deploy_listen: options.deploy_listen,
         data_dir: options.data_dir,
         local_state,
         settings,
@@ -389,6 +392,7 @@ pub async fn run(options: ServeOptions) -> Result<()> {
 impl NodeSupervisor {
     async fn run(self) -> Result<()> {
         let Self {
+            deploy_listen,
             data_dir,
             local_state,
             mut settings,
@@ -406,8 +410,14 @@ impl NodeSupervisor {
         let mut controller_shutdown = None;
         if has_controller {
             controller_shutdown = Some(
-                start_controller(&data_dir, &settings, &public_controller, events_tx.clone())
-                    .await?,
+                start_controller(
+                    &data_dir,
+                    &settings,
+                    &public_controller,
+                    deploy_listen,
+                    events_tx.clone(),
+                )
+                .await?,
             );
         }
         let mut gateway_reconciled = false;
@@ -569,12 +579,14 @@ async fn start_controller(
     data_dir: &Path,
     settings: &NodeSettings,
     public_controller: &str,
+    deploy_listen: SocketAddr,
     events: mpsc::UnboundedSender<NodeEvent>,
 ) -> Result<oneshot::Sender<()>> {
     let cluster = settings.cluster.clone();
     let repository =
         StateRepository::open(data_dir, cluster.clone()).map_err(anyhow::Error::msg)?;
     let config = ControllerConfig {
+        deploy_listen,
         gateway_enabled: settings.gateway_enabled,
         labels: settings.labels.clone(),
         listen: SocketAddr::new(

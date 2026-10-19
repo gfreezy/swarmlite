@@ -67,10 +67,11 @@ impl Controller {
     }
 
     pub(super) fn rendered_gateway_config(&self, inner: &Inner) -> serde_json::Value {
-        gateway::config(
+        gateway::config_with_deployment(
             &inner.state,
             &inner.cluster.gateway,
             self.config.advertise_url.clone(),
+            self.config.deploy_listen.port(),
         )
     }
 

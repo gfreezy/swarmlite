@@ -98,10 +98,11 @@ impl Controller {
                 .await?;
         }
 
-        let gateway_config = gateway::config(
+        let gateway_config = gateway::config_with_deployment(
             &versioned.state,
             &versioned.cluster.gateway,
             config.advertise_url.clone(),
+            config.deploy_listen.port(),
         );
         let gateway_snapshot = GatewayRecoverySnapshot::new(
             versioned.cluster.cluster_id.clone(),
@@ -157,16 +158,19 @@ impl Controller {
         let live = current_live_nodes(&inner, self.config.node_timeout_seconds);
         let previous = inner.state.clone();
         let now_unix_ms = unix_ms();
-        let mut changed = scheduler::finish_drains(&mut inner.state, now_unix_ms);
+        let mut changed = self.advance_service_operations_locked(&mut inner);
+        changed |= scheduler::finish_drains(&mut inner.state, now_unix_ms);
         changed |= scheduler::reconcile(&mut inner.state, &live);
         changed |= gateway::refresh_ready_stack_routes(&mut inner.state);
         changed |= self.refresh_stack_deployments_locked(&mut inner, now_unix_ms)?;
+        changed |= self.advance_service_operations_locked(&mut inner);
         if changed && let Err(error) = self.commit_locked(&mut inner).await {
             inner.state = previous;
             return Err(error);
         }
         let config_digests = referenced_config_digests(&inner.state);
         drop(inner);
+        self.start_prepared_service_operation().await;
         let grace_period_ms =
             i64::try_from(CONFIG_GC_GRACE_PERIOD_SECONDS.saturating_mul(1_000)).unwrap_or(i64::MAX);
         match self

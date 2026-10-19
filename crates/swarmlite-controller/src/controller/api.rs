@@ -107,7 +107,8 @@ pub(super) fn router(controller: Arc<Controller>) -> Router {
         .route("/v1/kv/locks/acquire", post(acquire_kv_lock))
         .route("/v1/kv/locks/renew", post(renew_kv_lock))
         .route("/v1/kv/locks/release", post(release_kv_lock))
-        .with_state(controller)
+        .with_state(controller.clone())
+        .merge(super::deploy_api::admin_router(controller))
 }
 
 async fn image_registry_ping(
@@ -860,6 +861,14 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 impl IntoResponse for ControllerError {
     fn into_response(self) -> Response {
         match self {
+            Self::Forbidden => {
+                (StatusCode::FORBIDDEN, Json(json!({"error": "forbidden"}))).into_response()
+            }
+            Self::RateLimited => (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"error": "rate_limited"})),
+            )
+                .into_response(),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({"error": "unauthorized"})),
@@ -896,7 +905,7 @@ impl Controller {
     }
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+pub(super) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
     }

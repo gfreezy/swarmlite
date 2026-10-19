@@ -96,6 +96,7 @@ pub(super) fn adopt_unclaimed_tasks(state: &mut ClusterState, stack_name: &str) 
             state.tasks.insert(
                 candidate.id.clone(),
                 TaskRecord {
+                    image_id: None,
                     job: None,
                     id: candidate.id.clone(),
                     service_id: service.id.clone(),

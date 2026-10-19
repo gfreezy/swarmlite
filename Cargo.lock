@@ -2282,7 +2282,9 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 name = "swarmlite"
 version = "0.1.46"
 dependencies = [
+ "serde_json",
  "swarmlite-cli",
+ "swarmlite-core",
  "tempfile",
 ]
 
@@ -2363,6 +2365,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "swarmlite-client",
  "swarmlite-core",
  "swarmlite-platform",
@@ -2386,6 +2389,7 @@ dependencies = [
  "serde",
  "serde_json",
  "swarmlite-stack",
+ "url",
 ]
 
 [[package]]

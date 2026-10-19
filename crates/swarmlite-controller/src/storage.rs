@@ -19,10 +19,15 @@ use crate::{
 };
 use swarmlite_stack::config_digest;
 
-const PERSISTED_SCHEMA_VERSION: u32 = 12;
+mod service_storage;
+pub(crate) use service_storage::StoredDeployToken;
+
+const PERSISTED_SCHEMA_VERSION: u32 = 13;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
+    #[error("deployment credential is inactive")]
+    CredentialInactive,
     #[error("control-plane state was modified concurrently")]
     Conflict,
     #[error("SQLite storage error: {0}")]
@@ -132,6 +137,7 @@ impl StateRepository {
                 .map_err(backend)?;
             Ok(())
         })?;
+        repository.initialize_service_storage(data_dir)?;
         Ok(repository)
     }
 
@@ -260,7 +266,7 @@ impl StateRepository {
                 .execute(
                     "UPDATE control_plane
                      SET generation = ?1, schema_version = ?2, document = ?3
-                     WHERE singleton = 1 AND generation = ?4 AND cluster_id = ?5",
+                     WHERE singleton = 1 AND generation = ?4 AND cluster_id = ?5 AND schema_version = ?2",
                     params![
                         next_generation_sql,
                         PERSISTED_SCHEMA_VERSION,
@@ -273,6 +279,11 @@ impl StateRepository {
             if changed != 1 {
                 return Err(StorageError::Conflict);
             }
+            service_storage::write_operations(
+                &transaction,
+                &cluster.cluster_id,
+                &state.service_operations,
+            )?;
             transaction.commit().map_err(backend)?;
             Ok(next_generation)
         })
@@ -551,10 +562,13 @@ fn read_versioned(
             "persisted SQLite document belongs to a different or unsupported cluster".to_owned(),
         ));
     }
+    let mut state = value.state.into_runtime();
+    state.service_operations =
+        service_storage::read_operations(connection, &expected_cluster.cluster_id)?;
     Ok(Some(VersionedState {
         generation,
         cluster: value.cluster,
-        state: value.state.into_runtime(),
+        state,
     }))
 }
 
@@ -595,6 +609,7 @@ impl PersistedClusterState {
 
     fn into_runtime(self) -> ClusterState {
         ClusterState {
+            service_operations: BTreeMap::new(),
             stacks: self.stacks,
             services: self.services,
             nodes: BTreeMap::new(),
@@ -631,6 +646,7 @@ impl PersistedTaskRecord {
 
     fn into_runtime(self) -> TaskRecord {
         TaskRecord {
+            image_id: None,
             job: self.job,
             id: self.id,
             service_id: self.service_id,
@@ -870,6 +886,7 @@ x-swarmlite:
         state.nodes.insert(
             "soft-node".into(),
             NodeRecord {
+                supports_service_operations: false,
                 metrics: None,
                 supports_jobs: true,
                 id: "soft-node".into(),
@@ -965,6 +982,7 @@ x-swarmlite:
         state.tasks.insert(
             "task-1".into(),
             TaskRecord {
+                image_id: None,
                 job: None,
                 id: "task-1".into(),
                 service_id: "demo.web".into(),
@@ -1033,8 +1051,87 @@ x-swarmlite:
     }
 
     #[tokio::test]
+    async fn migrates_schema12_with_a_consistent_backup_and_preserves_other_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let cluster = cluster();
+        let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
+        let local = LocalState::open(directory.path()).unwrap();
+        local.put(NODE_KEY, &"retained-node").unwrap();
+        local.authorize_jobs(&["existing-job".into()]).unwrap();
+        assert!(local.claim_job("existing-job").unwrap());
+        let mut value = PersistedControlPlane::new(cluster.clone(), ClusterState::default());
+        value.schema_version = 12;
+        value.state.registry_credentials.insert(
+            "ghcr.io".into(),
+            RegistryCredential {
+                username: "ci".into(),
+                password: "retained-secret".into(),
+            },
+        );
+        repository
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        "INSERT INTO control_plane VALUES (1, 5, 12, ?1, ?2)",
+                        params![cluster.cluster_id, serde_json::to_vec(&value).unwrap()],
+                    )
+                    .map_err(backend)?;
+                Ok(())
+            })
+            .unwrap();
+        let reopened = StateRepository::open(directory.path(), cluster.clone()).unwrap();
+        let loaded = reopened.load().await.unwrap();
+        assert_eq!(loaded.generation, 6);
+        assert_eq!(
+            loaded.state.registry_credentials["ghcr.io"].password,
+            "retained-secret"
+        );
+        assert_eq!(
+            local.get::<String>(NODE_KEY).unwrap().as_deref(),
+            Some("retained-node")
+        );
+        assert!(!local.claim_job("existing-job").unwrap());
+        let backups = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("swarmlite.schema12.")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        let backup = Connection::open(&backups[0]).unwrap();
+        assert_eq!(
+            backup
+                .query_row("SELECT schema_version FROM control_plane", [], |row| row
+                    .get::<_, u32>(0))
+                .unwrap(),
+            12
+        );
+        assert!(
+            backup
+                .query_row(
+                    "SELECT claimed FROM job_attempts WHERE id = 'existing-job'",
+                    [],
+                    |row| row.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&backups[0]).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn rejects_unsupported_control_plane_schema() {
-        for version in [7, 8, 9, 10, 11, 13] {
+        for version in [7, 8, 9, 10, 11, 14] {
             let directory = tempfile::tempdir().unwrap();
             let cluster = cluster();
             let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();

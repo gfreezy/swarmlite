@@ -514,6 +514,7 @@ mod tests {
         state.tasks.insert(
             "task-123".into(),
             TaskRecord {
+                image_id: None,
                 job: None,
                 id: "task-123".into(),
                 service_id: "demo.web".into(),
@@ -583,6 +584,7 @@ mod tests {
             state.tasks.insert(
                 id.into(),
                 TaskRecord {
+                    image_id: None,
                     job: None,
                     id: id.into(),
                     service_id: "demo.web".into(),

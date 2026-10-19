@@ -113,6 +113,32 @@ pub fn config(state: &ClusterState, gateway: &ClusterGatewayConfig, controller: 
     config
 }
 
+/// The deploy route is independent of application stacks and precedes their
+/// redirects/catch-alls. No admin credential is injected into this proxy.
+pub fn config_with_deployment(
+    state: &ClusterState,
+    gateway: &ClusterGatewayConfig,
+    controller: String,
+    deploy_port: u16,
+) -> Value {
+    let mut value = config(state, gateway, controller.clone());
+    let mut upstream = url::Url::parse(&controller).expect("validated controller URL");
+    upstream
+        .set_port(Some(deploy_port))
+        .expect("HTTP controller URL supports a port");
+    let address = match upstream.host().expect("controller URL has a host") {
+        url::Host::Ipv6(host) => format!("[{host}]:{deploy_port}"),
+        host => format!("{host}:{deploy_port}"),
+    };
+    value["apps"]["http"]["servers"]["swarmlite"]["routes"].as_array_mut().expect("generated routes").insert(0, json!({
+        "@id": "swarmlite-system-deploy",
+        "match": [{"protocol": "http", "path_regexp": {"pattern": "^/v1/deploy(/|$)"}}],
+        "handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": address}], "transport": {"protocol": "http", "dial_timeout": 5_000_000_000_u64}}],
+        "terminal": true
+    }));
+    value
+}
+
 fn apply_cache_runtime_config(value: &mut Value, cache: &GatewayCacheConfig) {
     match value {
         Value::Array(values) => {
@@ -352,6 +378,14 @@ fn stack_fragment(state: &ClusterState, stack_name: &str) -> Option<RecoveredSta
                 task.service_id == service_id
                     && task.desired == DesiredTaskState::Running
                     && task.observed == ObservedTaskState::Healthy
+                    && !state.service_operations.values().any(|op| {
+                        op.restarting_task(&task.id)
+                            && op
+                                .tasks
+                                .iter()
+                                .find(|target| !target.completed)
+                                .is_some_and(|target| target.task_id == task.id)
+                    })
             })
             .filter_map(|task| {
                 let node = state.nodes.get(&task.node_id)?;
@@ -572,6 +606,35 @@ x-swarmlite:
     }
 
     #[test]
+    fn deployment_route_is_http_only_terminal_and_precedes_application_routes() {
+        let value = config_with_deployment(
+            &ClusterState::default(),
+            &gateway_with_listen(&[":80", ":443"]),
+            "http://10.0.0.5:17080".into(),
+            17082,
+        );
+        let route = &value["apps"]["http"]["servers"]["swarmlite"]["routes"][0];
+        assert_eq!(route["@id"], "swarmlite-system-deploy");
+        assert_eq!(route["match"][0]["protocol"], "http");
+        assert!(route["match"][0].get("host").is_none());
+        assert_eq!(route["handle"][0]["upstreams"][0]["dial"], "10.0.0.5:17082");
+        assert_eq!(route["terminal"], true);
+        assert!(route["handle"][0].get("headers").is_none());
+        assert!(route["handle"][0].get("lb_try_duration").is_none());
+        let ipv6 = config_with_deployment(
+            &ClusterState::default(),
+            &gateway_with_listen(&[":80"]),
+            "http://[fd00::5]:17080".into(),
+            18082,
+        );
+        assert_eq!(
+            ipv6["apps"]["http"]["servers"]["swarmlite"]["routes"][0]["handle"][0]["upstreams"][0]
+                ["dial"],
+            "[fd00::5]:18082"
+        );
+    }
+
+    #[test]
     fn gateway_owner_probe_precedes_user_routes_and_uses_http_only() {
         let value = config(
             &ClusterState::default(),
@@ -696,6 +759,7 @@ x-swarmlite:
 
     fn node(id: &str, address: &str) -> NodeRecord {
         NodeRecord {
+            supports_service_operations: false,
             metrics: None,
             supports_jobs: true,
             id: id.into(),
@@ -718,6 +782,7 @@ x-swarmlite:
         published: u16,
     ) -> TaskRecord {
         TaskRecord {
+            image_id: None,
             job: None,
             id: id.into(),
             service_id: "demo.web".into(),

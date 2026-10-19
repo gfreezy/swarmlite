@@ -42,6 +42,7 @@ use tokio::io::AsyncReadExt;
 
 mod cluster_cli;
 mod connection;
+mod deploy_token_cli;
 mod job_cli;
 mod node_stats;
 mod ui;
@@ -124,6 +125,11 @@ impl From<RuntimeKindArg> for RuntimeKind {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Manage service-scoped HTTP deployment credentials (administrator only).
+    DeployToken {
+        #[command(subcommand)]
+        action: deploy_token_cli::DeployTokenCommand,
+    },
     /// Open a local web dashboard for the cluster.
     Ui {
         #[command(flatten)]
@@ -146,6 +152,9 @@ enum Command {
     },
     /// Run this node's fixed agent and optional controller/gateway components.
     Serve {
+        /// Restricted HTTP deployment listener (Controller nodes only).
+        #[arg(long, default_value = "0.0.0.0:17082", env = "SWARMLITE_DEPLOY_LISTEN")]
+        deploy_listen: std::net::SocketAddr,
         /// Address other machines use to reach containers on this node.
         #[arg(long, env = "SWARMLITE_ADVERTISE_ADDRESS")]
         advertise_address: Option<String>,
@@ -260,7 +269,7 @@ enum ServiceCommand {
         #[command(flatten)]
         options: cluster_cli::ScaleArgs,
     },
-    /// Perform a rolling restart of a Service.
+    /// Restart existing containers; use --pull to pull and roll out replacements.
     Restart {
         #[command(flatten)]
         options: cluster_cli::RestartArgs,
@@ -1595,6 +1604,7 @@ async fn run() -> Result<()> {
     let installed = InstalledNodeConfig::load_if_exists(SYSTEM_CONFIG_PATH)?;
     let data_dir = node::resolve_data_dir(cli.data_dir.or_else(|| installed.data_dir.clone()))?;
     match cli.command {
+        Command::DeployToken { action } => deploy_token_cli::run(&data_dir, action).await,
         Command::Ui { options } => ui::run(&data_dir, options).await,
         Command::Init { options } => {
             let (runtime, runtime_socket) =
@@ -1634,6 +1644,7 @@ async fn run() -> Result<()> {
             Ok(())
         }
         Command::Serve {
+            deploy_listen,
             advertise_address,
             runtime,
             runtime_socket,
@@ -1641,6 +1652,7 @@ async fn run() -> Result<()> {
             let (runtime, runtime_socket) =
                 installed.runtime_options(runtime.map(Into::into), runtime_socket);
             node::run(node::ServeOptions {
+                deploy_listen,
                 data_dir,
                 advertise_address,
                 runtime,
@@ -2301,7 +2313,6 @@ enum DeploymentOperation {
     Retry,
     Rollback,
     Scale,
-    Restart,
     Remove,
 }
 
@@ -2312,7 +2323,6 @@ impl DeploymentOperation {
             Self::Retry => "retry",
             Self::Rollback => "rollback",
             Self::Scale => "scale",
-            Self::Restart => "restart",
             Self::Remove => "remove",
         }
     }
@@ -2489,7 +2499,6 @@ fn deployment_terminal_progress_summary(
             DeploymentOperation::Retry => "retrying",
             DeploymentOperation::Rollback => "rolling back",
             DeploymentOperation::Scale => "scaling",
-            DeploymentOperation::Restart => "restarting",
             DeploymentOperation::Remove => "removing",
         },
         StackDeploymentStatus::Healthy => match operation {
@@ -2497,7 +2506,6 @@ fn deployment_terminal_progress_summary(
             DeploymentOperation::Retry => "retry complete",
             DeploymentOperation::Rollback => "rollback complete",
             DeploymentOperation::Scale => "scale complete",
-            DeploymentOperation::Restart => "restart complete",
             DeploymentOperation::Remove => "remove complete",
         },
         StackDeploymentStatus::Failed => "failed",
@@ -4098,6 +4106,7 @@ mod tests {
         assert_eq!(
             top_level,
             [
+                "deploy-token",
                 "ui",
                 "service",
                 "job",
@@ -4122,6 +4131,7 @@ mod tests {
             ]
         );
         let grouped_actions = [
+            "deploy-token",
             "config",
             "gateway",
             "node",
@@ -4140,7 +4150,7 @@ mod tests {
             )
         })
         .sum::<usize>();
-        assert_eq!(grouped_actions, 22);
+        assert_eq!(grouped_actions, 25);
     }
 
     #[test]
@@ -4734,6 +4744,7 @@ mod tests {
         state.tasks.insert(
             "1234567890abcdef".into(),
             TaskRecord {
+                image_id: None,
                 job: None,
                 id: "1234567890abcdef".into(),
                 service_id: "demo.web".into(),

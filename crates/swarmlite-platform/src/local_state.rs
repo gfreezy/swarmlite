@@ -22,6 +22,40 @@ pub struct LocalState {
 }
 
 impl LocalState {
+    pub fn claim_service_restart(&self, id: &str, started_at: &str) -> Result<bool> {
+        self.with_connection(|connection| {
+            connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS service_operation_attempts (
+                id TEXT PRIMARY KEY, started_at TEXT NOT NULL, outcome TEXT
+            ) STRICT;",
+            )?;
+            Ok(connection.execute(
+                "INSERT OR IGNORE INTO service_operation_attempts(id, started_at) VALUES (?1, ?2)",
+                params![id, started_at],
+            )? == 1)
+        })
+    }
+
+    pub fn service_restart_attempt(&self, id: &str) -> Result<(String, Option<String>)> {
+        self.with_connection(|connection| {
+            Ok(connection.query_row(
+                "SELECT started_at,outcome FROM service_operation_attempts WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        })
+    }
+
+    pub fn finish_service_restart(&self, id: &str, outcome: &str) -> Result<()> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "UPDATE service_operation_attempts SET outcome = ?2 WHERE id = ?1",
+                params![id, outcome],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Durable attempt ledger. The claim precedes any container creation/start;
     /// uncertainty consumes the attempt. Never garbage-collect claims while stale
     /// assignments or an old controller database could still refer to them.

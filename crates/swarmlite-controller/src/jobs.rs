@@ -194,6 +194,7 @@ mod tests {
             state.nodes.insert(
                 id.into(),
                 NodeRecord {
+                    supports_service_operations: false,
                     metrics: None,
                     supports_jobs: true,
                     id: id.into(),

@@ -20,6 +20,8 @@ join-token           print the generated join command
 connection-info      print the stored Controller address and cluster token
 upgrade              install the latest or a selected GitHub Release
 serve                run this node's fixed components
+deploy-token create|list|revoke
+                     manage service-scoped HTTP deployment credentials
 config get|set|unset|explain read, update, clear, or describe cluster-wide settings
 gateway status|enable|disable
                      inspect all Gateways or update one node's Gateway switch
@@ -28,7 +30,7 @@ node label get|set|remove
                      read or update one node's placement labels
 registry login       store private registry credentials
 service scale|restart
-                     scale or roll long-running Services
+                     scale or restart long-running Services (--pull to pull and replace)
 job run|history|cancel
                      manage one-shot and scheduled jobs
 deploy               deploy or update a Stack
@@ -67,6 +69,7 @@ output (`--json`, `ps --quiet`, and `logs --raw`) never adds styling.
 | [`examples/jobs.yaml`](../examples/jobs.yaml) | Scheduled and manual jobs |
 | [Web UI guide](../ui/README.md) | Navigation, operations, monitoring and frontend development |
 | [`docs/kv-api.md`](../docs/kv-api.md) | Generic Controller KV API |
+| [`docs/ci-deployment.md`](../docs/ci-deployment.md) | HTTP CI deployment, tokens, and restart semantics |
 | [`caddy-storage/README.md`](../caddy-storage/README.md) | Custom Gateway image and Caddy modules |
 
 ## Default ports and paths
@@ -74,6 +77,7 @@ output (`--json`, `ps --quiet`, and `logs --raw`) never adds styling.
 | Value | Default | Purpose |
 | --- | --- | --- |
 | Controller API | TCP `17080` | Agent and management API |
+| Deployment API | TCP `17082` | Restricted HTTP API; normally private behind Gateway HTTP 80 |
 | Gateway HTTP | TCP `80` | HTTP serving and redirect |
 | Gateway HTTPS | TCP `443` | HTTPS serving |
 | Caddy admin API | `127.0.0.1:2019` | Local atomic configuration |

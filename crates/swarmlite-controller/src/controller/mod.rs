@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use axum::extract::DefaultBodyLimit;
+use futures_util::FutureExt;
 use tokio::{
     net::TcpListener,
     sync::{Mutex, watch},
@@ -53,6 +54,7 @@ use swarmlite_stack::{ParsedStack, StackGatewaySpec};
 mod api;
 mod cluster;
 mod commands;
+mod deploy_api;
 mod deployment;
 mod gateway_control;
 mod heartbeat;
@@ -65,6 +67,7 @@ mod nodes;
 mod recovery;
 mod registries;
 mod resources;
+mod service_operations;
 mod sessions;
 mod stacks;
 
@@ -96,12 +99,25 @@ where
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("failed to listen on {}", config.listen))?;
+    let deploy_listener = TcpListener::bind(config.deploy_listen)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to listen on deployment address {}",
+                config.deploy_listen
+            )
+        })?;
+    let deploy_app = deploy_api::public_router(controller.clone());
     let background = controller.clone();
     let control_loop = tokio::spawn(async move { background.control_loop().await });
     info!(address = %config.listen, "controller API listening");
-    let result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
+    info!(address = %config.deploy_listen, "restricted deployment API listening");
+    let shutdown = shutdown.shared();
+    let admin = axum::serve(listener, app).with_graceful_shutdown(shutdown.clone());
+    let deploy = axum::serve(deploy_listener, deploy_app).with_graceful_shutdown(shutdown);
+    let result = futures_util::future::try_join(async { admin.await }, async { deploy.await })
         .await
+        .map(|_| ())
         .map_err(anyhow::Error::from);
     control_loop.abort();
     result
@@ -138,6 +154,8 @@ pub struct Controller {
 #[derive(Debug)]
 enum ControllerError {
     Unauthorized,
+    Forbidden,
+    RateLimited,
     Invalid(String),
     NotFound(String),
     Conflict(String),
@@ -146,7 +164,10 @@ enum ControllerError {
 
 impl From<StorageError> for ControllerError {
     fn from(value: StorageError) -> Self {
-        Self::Storage(value)
+        match value {
+            StorageError::CredentialInactive => Self::Unauthorized,
+            value => Self::Storage(value),
+        }
     }
 }
 

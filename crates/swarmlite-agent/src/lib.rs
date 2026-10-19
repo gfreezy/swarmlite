@@ -121,6 +121,7 @@ async fn run_with_runtime<R: ContainerRuntime>(
         .unwrap_or_default();
     let registry_credentials = RegistryCredentialStore::new(local_state.clone());
     let mut node = NodeRecord {
+        supports_service_operations: true,
         metrics: None,
         supports_jobs: true,
         id: config.node_id.clone(),
@@ -1329,6 +1330,20 @@ async fn reconcile_containers_with_progress<R: ContainerRuntime>(
     reports.extend(futures_util::future::join_all(removals).await);
 
     for unexpanded_assignment in &response.assignments {
+        if let Some(restart) = &unexpanded_assignment.restart {
+            if restart.execute {
+                let result = runtime.restart_task(unexpanded_assignment).await;
+                reports.push(reconcile_report(
+                    &unexpanded_assignment.id,
+                    unexpanded_assignment.deployment_generation,
+                    TaskReconcilePhase::Verify,
+                    result,
+                ));
+            }
+            // Queued replicas and the active restart are never repaired through
+            // create/remove/start while the durable restart window is active.
+            continue;
+        }
         let reporter = progress.map_or_else(RuntimeTaskProgress::default, |progress| {
             progress.reporter(
                 &unexpanded_assignment.id,
@@ -1467,7 +1482,8 @@ async fn prepare_assignment_configs(
     let mut downloads = HashMap::<String, Result<Vec<u8>, String>>::new();
     let mut errors = HashMap::new();
     for assignment in &response.assignments {
-        if assignment.desired != crate::model::DesiredTaskState::Running
+        if assignment.restart.is_some()
+            || assignment.desired != crate::model::DesiredTaskState::Running
             || assignment.spec.configs.is_empty()
             || !assignment_requires_runtime_change(existing.get(&assignment.id), assignment)
         {
@@ -1837,6 +1853,8 @@ mod tests {
             generation: 1,
             cluster: test_cluster(),
             assignments: vec![crate::model::TaskAssignment {
+                restart: None,
+                prepared_image_id: None,
                 job: None,
                 id: task_id.into(),
                 cluster_id: "cluster-test".into(),
@@ -2349,6 +2367,8 @@ mod tests {
             generation: 2,
             cluster: test_cluster(),
             assignments: vec![crate::model::TaskAssignment {
+                restart: None,
+                prepared_image_id: None,
                 job: None,
                 id: "task-1".into(),
                 cluster_id: "cluster-test".into(),
@@ -2439,6 +2459,8 @@ mod tests {
             generation: 1,
             cluster: test_cluster(),
             assignments: vec![crate::model::TaskAssignment {
+                restart: None,
+                prepared_image_id: None,
                 job: None,
                 id: "task-1".into(),
                 cluster_id: "cluster-test".into(),
@@ -2517,6 +2539,8 @@ mod tests {
             generation: 2,
             cluster: test_cluster(),
             assignments: vec![crate::model::TaskAssignment {
+                restart: None,
+                prepared_image_id: None,
                 job: None,
                 id: "task-1".into(),
                 cluster_id: "cluster-test".into(),
@@ -2579,6 +2603,8 @@ mod tests {
             generation: 7,
             cluster: test_cluster(),
             assignments: vec![crate::model::TaskAssignment {
+                restart: None,
+                prepared_image_id: None,
                 job: None,
                 id: "task-failed".into(),
                 cluster_id: "cluster-test".into(),

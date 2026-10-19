@@ -55,6 +55,41 @@ pub struct ControllerClient {
 }
 
 impl ControllerClient {
+    /// Submit an asynchronous administrator operation. The caller retains the
+    /// key for any transport retries; an HTTP 200 is not an acceptance response.
+    pub async fn submit_operation<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        key: &str,
+        body: &B,
+    ) -> Result<T, ControllerClientError> {
+        let response = self
+            .checked(
+                self.request(Method::POST, path)
+                    .header("Idempotency-Key", key)
+                    .json(body),
+                path,
+            )
+            .await?;
+        if response.status() != reqwest::StatusCode::ACCEPTED {
+            return Err(ControllerClientError::Http {
+                endpoint: self.endpoint(path),
+                status: response.status(),
+                body: String::new(),
+                message:
+                    "operation requires 202 Accepted; controller may not support service operations"
+                        .into(),
+            });
+        }
+        response
+            .json()
+            .await
+            .map_err(|source| ControllerClientError::InvalidResponse {
+                endpoint: self.endpoint(path),
+                source,
+            })
+    }
+
     pub fn new(controller: impl Into<String>, token: impl Into<String>) -> Self {
         Self {
             controller: controller.into().trim_end_matches('/').to_owned(),

@@ -18,6 +18,9 @@ use crate::{
 
 use super::*;
 
+#[path = "service_operations_tests.rs"]
+mod service_operations_tests;
+
 fn test_cluster(id: &str) -> ClusterSettings {
     ClusterSettings {
         schema_version: CLUSTER_SCHEMA_VERSION,
@@ -33,6 +36,7 @@ fn test_cluster(id: &str) -> ClusterSettings {
 
 fn test_controller_config(cluster: &ClusterSettings, directory: &Path) -> ControllerConfig {
     ControllerConfig {
+        deploy_listen: "127.0.0.1:0".parse().unwrap(),
         gateway_enabled: true,
         labels: BTreeMap::new(),
         listen: "127.0.0.1:0".parse().unwrap(),
@@ -1521,6 +1525,7 @@ x-swarmlite:
             .as_array()
             .unwrap()
             .iter()
+            .filter(|route| route["@id"] != "swarmlite-system-deploy")
             .flat_map(|route| route["handle"].as_array().into_iter().flatten())
             .find(|handler| handler["handler"] == "reverse_proxy")
             .unwrap()["upstreams"],
@@ -2145,6 +2150,7 @@ fn test_join_request(node_id: &str, address: &str) -> JoinRequest {
 
 fn test_node() -> NodeRecord {
     NodeRecord {
+        supports_service_operations: false,
         metrics: None,
         supports_jobs: true,
         id: "node-a".into(),
@@ -3295,6 +3301,7 @@ async fn recovery_ignores_invalid_service_revisions() {
 
 fn draining_task() -> TaskRecord {
     TaskRecord {
+        image_id: None,
         job: None,
         id: "old-task".into(),
         service_id: "demo.web".into(),

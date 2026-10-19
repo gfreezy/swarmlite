@@ -293,6 +293,12 @@ impl Default for RuntimeImageProgress {
 }
 
 pub trait ContainerRuntime: Send + Sync + 'static {
+    fn restart_task(
+        &self,
+        _assignment: &TaskAssignment,
+    ) -> impl Future<Output = Result<()>> + Send {
+        async { bail!("runtime does not support durable container restart") }
+    }
     fn kind(&self) -> RuntimeKind;
 
     fn socket(&self) -> &str;
@@ -2566,6 +2572,107 @@ impl ContainerRuntime for DockerCompatibleRuntime {
         Ok(result)
     }
 
+    async fn restart_task(&self, assignment: &TaskAssignment) -> Result<()> {
+        let restart = assignment
+            .restart
+            .as_ref()
+            .context("missing restart assignment")?;
+        if !restart.execute || assignment.job.is_some() {
+            bail!("invalid restart assignment");
+        }
+        let ledger = self
+            .job_state
+            .as_ref()
+            .context("restart requires durable local state")?;
+        let inspected = self
+            .client
+            .inspect_container(&restart.container_id, None)
+            .await?;
+        let labels = inspected
+            .config
+            .as_ref()
+            .and_then(|config| config.labels.as_ref())
+            .context("restart target has no ownership labels")?;
+        if inspected.id.as_deref() != Some(&restart.container_id)
+            || labels.get(CLUSTER_LABEL).map(String::as_str) != Some(&assignment.cluster_id)
+            || labels.get(TASK_LABEL).map(String::as_str) != Some(&assignment.id)
+            || labels.get(SERVICE_LABEL).map(String::as_str) != Some(&assignment.service_id)
+            || labels.get(REVISION_LABEL).map(String::as_str)
+                != Some(assignment.revision.to_string().as_str())
+            || inspected.image.as_deref() != Some(&restart.image_id)
+        {
+            bail!("restart target identity changed");
+        }
+        let state = inspected
+            .state
+            .as_ref()
+            .context("restart target has no runtime state")?;
+        let started = state
+            .started_at
+            .as_deref()
+            .filter(|time| !time.is_empty())
+            .context("restart target has no StartedAt evidence")?;
+        let key = format!(
+            "{}:{}:{}:{}",
+            assignment.cluster_id, restart.operation_id, assignment.id, restart.container_id
+        );
+        let claimed = ledger.claim_service_restart(&key, started)?;
+        if !claimed {
+            let (before, outcome) = ledger.service_restart_attempt(&key)?;
+            match outcome.as_deref() {
+                Some("succeeded") => return Ok(()),
+                Some(_) => bail!("restart_outcome_unknown"),
+                None if before != started && state.running == Some(true) => {
+                    ledger.finish_service_restart(&key, "succeeded")?;
+                    return Ok(());
+                }
+                None => {
+                    ledger.finish_service_restart(&key, "restart_outcome_unknown")?;
+                    bail!("restart_outcome_unknown");
+                }
+            }
+        }
+        let remaining = restart
+            .deadline_unix_ms
+            .saturating_sub(chrono::Utc::now().timestamp_millis());
+        if remaining <= 0 {
+            ledger.finish_service_restart(&key, "expired")?;
+            bail!("restart assignment expired");
+        }
+        // No stop-signal override: Docker/Podman use the container's existing
+        // stop signal and grace period. A timeout is uncertain, never retried.
+        let _result = tokio::time::timeout(
+            Duration::from_millis(remaining as u64),
+            self.client.restart_container(
+                &restart.container_id,
+                None::<bollard::query_parameters::RestartContainerOptions>,
+            ),
+        )
+        .await;
+        // Once the request may have reached the daemon, an inspection failure is
+        // an uncertain outcome too. Persist that fact rather than retrying.
+        let after = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.client.inspect_container(&restart.container_id, None),
+        )
+        .await;
+        let confirmed = matches!(after, Ok(Ok(ref container))
+        if container.id.as_deref() == Some(&restart.container_id)
+            && container.image.as_deref() == Some(&restart.image_id)
+            && container.state.as_ref().is_some_and(|state| {
+                state.running == Some(true)
+                    && state.started_at.as_deref()
+                        .is_some_and(|time| !time.is_empty() && time != started)
+            }));
+        if confirmed {
+            ledger.finish_service_restart(&key, "succeeded")?;
+            Ok(())
+        } else {
+            ledger.finish_service_restart(&key, "restart_outcome_unknown")?;
+            bail!("restart_outcome_unknown")
+        }
+    }
+
     async fn resolve_image(&self, image: &str, progress: &RuntimeImageProgress) -> Result<String> {
         let _image_operation = self.image_operations.lock().await;
         progress.report(ImageResolutionStatus::Checking);
@@ -2592,7 +2699,17 @@ impl ContainerRuntime for DockerCompatibleRuntime {
             runtime = %self.kind,
             "creating task container"
         );
-        let container_image = if assignment.image_resolved {
+        let container_image = if let Some(image_id) = &assignment.prepared_image_id {
+            progress.report(TaskReconcilePhase::Inspect);
+            let actual = self
+                .inspect_image_id(image_id)
+                .await
+                .context("prepared image is missing; refusing mutable-tag fallback")?;
+            if actual != *image_id {
+                bail!("prepared image ID mismatch");
+            }
+            image_id.clone()
+        } else if assignment.image_resolved {
             progress.report(TaskReconcilePhase::Inspect);
             let local_image = self.local_image_reference(&assignment.spec.image);
             if self.inspect_image_id(&local_image).await.is_ok() {
@@ -3653,6 +3770,8 @@ mod tests {
 
     fn start_failure_assignment() -> TaskAssignment {
         TaskAssignment {
+            restart: None,
+            prepared_image_id: None,
             job: None,
             id: "task-start-failure".into(),
             cluster_id: "cluster-old".into(),
@@ -3690,6 +3809,130 @@ mod tests {
             spec_hash: "hash".into(),
             image_resolved: true,
         }
+    }
+
+    async fn restart_mock_api(
+        State(state): State<Arc<Mutex<(usize, usize)>>>,
+        method: Method,
+        uri: Uri,
+    ) -> axum::response::Response {
+        let mut state = state.lock().unwrap();
+        if method == Method::POST && uri.path().ends_with("/restart") {
+            state.0 += 1;
+            if state.1 != 0 {
+                state.1 = 2;
+            }
+            return axum::response::Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(Body::empty())
+                .unwrap();
+        }
+        if method == Method::GET && uri.path().ends_with("/containers/container-original/json") {
+            if state.1 == 0 && state.0 > 0 {
+                return axum::response::Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from("daemon inspection unavailable"))
+                    .unwrap();
+            }
+            let body = serde_json::json!({"Id":"container-original", "Image":"sha256:current", "Config":{"Labels": {CLUSTER_LABEL:"cluster-old", TASK_LABEL:"task-start-failure", SERVICE_LABEL:"demo.web", REVISION_LABEL:"1"}}, "State":{"Running":true,"StartedAt":format!("2026-01-01T00:00:0{}Z",state.1)}});
+            return axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+        }
+        axum::response::Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"message":"not found"}"#))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn durable_restart_never_repeats_after_a_reopen_or_uncertain_crash() {
+        for (preclaimed, current_started, expect_success, expected_posts) in [
+            (false, 1, true, 1),
+            (true, 2, true, 0),
+            (true, 1, false, 0),
+            (false, 0, false, 1),
+        ] {
+            let state = Arc::new(Mutex::new((0, current_started)));
+            let app = Router::new()
+                .fallback(any(restart_mock_api))
+                .with_state(state.clone());
+            let (runtime, server) = runtime_for_pull_api(app, DeploymentPolicy::default()).await;
+            let directory = tempfile::tempdir().unwrap();
+            let ledger = crate::local_state::LocalState::open(directory.path()).unwrap();
+            let mut assignment = start_failure_assignment();
+            assignment.restart = Some(swarmlite_core::service_operations::RestartAssignment {
+                operation_id: "op-test".into(),
+                container_id: "container-original".into(),
+                image_id: "sha256:current".into(),
+                deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 60_000,
+                execute: true,
+            });
+            let key = "cluster-old:op-test:task-start-failure:container-original";
+            if preclaimed {
+                assert!(
+                    ledger
+                        .claim_service_restart(key, "2026-01-01T00:00:01Z")
+                        .unwrap()
+                );
+            }
+            let mut runtime = runtime.with_job_state(ledger);
+            let result = runtime.restart_task(&assignment).await;
+            assert_eq!(result.is_ok(), expect_success, "{result:?}");
+            if !expect_success {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("restart_outcome_unknown")
+                );
+                assert_eq!(
+                    runtime
+                        .job_state
+                        .as_ref()
+                        .unwrap()
+                        .service_restart_attempt(key)
+                        .unwrap()
+                        .1
+                        .as_deref(),
+                    Some("restart_outcome_unknown"),
+                );
+            }
+            runtime.job_state =
+                Some(crate::local_state::LocalState::open(directory.path()).unwrap());
+            assert_eq!(
+                runtime.restart_task(&assignment).await.is_ok(),
+                expect_success
+            );
+            assert_eq!(state.lock().unwrap().0, expected_posts);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_prepared_image_never_falls_back_to_pulling_the_tag() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .fallback(any(start_failure_docker_api))
+            .with_state(calls.clone());
+        let (runtime, server) = runtime_for_pull_api(app, DeploymentPolicy::default()).await;
+        let mut assignment = start_failure_assignment();
+        assignment.prepared_image_id = Some("sha256:gone".into());
+        let result = runtime
+            .create_task(&assignment, &RuntimeTaskProgress::default())
+            .await;
+        assert!(result.is_err());
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|call| !call.starts_with("POST"))
+        );
+        server.abort();
     }
 
     fn one_shot_assignment() -> TaskAssignment {
@@ -4516,6 +4759,8 @@ mod tests {
     #[test]
     fn adds_cluster_and_recovery_identity_labels() {
         let assignment = TaskAssignment {
+            restart: None,
+            prepared_image_id: None,
             job: None,
             id: "task-1".into(),
             cluster_id: "cluster-old".into(),
@@ -4578,6 +4823,8 @@ mod tests {
     fn mounts_cached_stack_configs_read_only_alongside_volumes() {
         let digest = "a".repeat(64);
         let assignment = TaskAssignment {
+            restart: None,
+            prepared_image_id: None,
             job: None,
             id: "task-1".into(),
             cluster_id: "cluster-old".into(),
@@ -4656,6 +4903,8 @@ mod tests {
     #[test]
     fn lets_docker_allocate_and_then_reads_the_published_port() {
         let assignment = TaskAssignment {
+            restart: None,
+            prepared_image_id: None,
             job: None,
             id: "task-1".into(),
             cluster_id: "cluster-old".into(),

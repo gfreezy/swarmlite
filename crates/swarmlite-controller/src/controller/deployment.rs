@@ -4,12 +4,13 @@ use super::*;
 enum RevisionPolicy<'a> {
     DetectChanges,
     Force(&'a str),
+    Prepared(&'a str, &'a str),
     Preserve(&'a str),
 }
 
 impl RevisionPolicy<'_> {
     fn forces(self, service: &str) -> bool {
-        matches!(self, Self::Force(target) if target == service)
+        matches!(self, Self::Force(target) | Self::Prepared(target, _) if target == service)
     }
 
     fn preserves(self, service: &str) -> bool {
@@ -70,6 +71,42 @@ impl Drop for StackDeployment<'_> {
 }
 
 impl Controller {
+    pub(super) async fn apply_prepared_service_operation(
+        &self,
+        operation_id: &str,
+        target: &str,
+    ) -> Result<StackDeploymentResponse, ControllerError> {
+        let (service, parsed) = {
+            let inner = self.inner.lock().await;
+            let service = resolve_service(&inner.state, target, "restart --pull")?;
+            let operation = inner
+                .state
+                .service_operations
+                .get(operation_id)
+                .ok_or_else(|| ControllerError::NotFound("operation not found".into()))?;
+            if !operation.view.status.active()
+                || operation.view.deployment_generation.is_some()
+                || operation.target_revision != service.revision + 1
+                || operation.image != service.spec.image
+            {
+                return Err(ControllerError::Conflict(
+                    "operation configuration changed".into(),
+                ));
+            }
+            let parsed = current_stack(&inner.state, &service.stack)?;
+            (service, parsed)
+        };
+        let _deployment = self.begin_stack_deployment(&service.stack)?;
+        self.apply_guarded(
+            &service.stack,
+            parsed,
+            RevisionPolicy::Prepared(&service.name, operation_id),
+            BTreeMap::new(),
+            false,
+        )
+        .await
+    }
+
     pub(super) async fn validate_apply(
         &self,
         stack_name: &str,
@@ -228,6 +265,44 @@ impl Controller {
             gateway: stack_gateway.clone(),
         };
         let mut inner = self.inner.lock().await;
+        let owned_operation = match revision_policy {
+            RevisionPolicy::Prepared(_, id) => Some(id),
+            _ => None,
+        };
+        if let Some(id) = owned_operation {
+            let op =
+                inner.state.service_operations.get(id).ok_or_else(|| {
+                    ControllerError::Conflict("operation no longer exists".into())
+                })?;
+            let service = inner.state.services.get(&op.view.service).ok_or_else(|| {
+                ControllerError::Conflict("operation target no longer exists".into())
+            })?;
+            if !op.view.status.active()
+                || op.view.deployment_generation.is_some()
+                || service.revision.checked_add(1) != Some(op.target_revision)
+                || service.spec.image != op.image
+            {
+                return Err(ControllerError::Conflict(
+                    "operation configuration changed".into(),
+                ));
+            }
+        }
+        let conflicting = inner
+            .state
+            .service_operations
+            .values()
+            .filter(|op| {
+                op.stack == stack_name
+                    && op.view.status.active()
+                    && Some(op.view.operation_id.as_str()) != owned_operation
+            })
+            .map(|op| op.view.operation_id.clone())
+            .collect::<Vec<_>>();
+        if !conflicting.is_empty() && !replace {
+            return Err(ControllerError::Conflict(
+                "stack has an active service operation".into(),
+            ));
+        }
         validate_apply_locked(&inner, stack_name, &stack_gateway, replace)?;
         for (name, spec) in &services {
             if inner
@@ -242,6 +317,12 @@ impl Controller {
             }
         }
         let previous = inner.state.clone();
+        for id in conflicting {
+            if let Some(op) = inner.state.service_operations.get_mut(&id) {
+                super::service_operations::fail(op, "superseded", unix_ms());
+                op.view.revision += 1;
+            }
+        }
         inner
             .state
             .registry_credentials
@@ -438,6 +519,17 @@ impl Controller {
             },
         );
         restore_unclaimed_service_revisions(&mut inner.state, &new_service_ids);
+        if let Some(id) = owned_operation {
+            let operation = inner
+                .state
+                .service_operations
+                .get_mut(id)
+                .expect("owned operation exists");
+            operation.view.deployment_generation = Some(deployment_generation);
+            operation.view.phase = "waiting_health".into();
+            operation.view.revision += 1;
+            operation.updated_at_unix_ms = unix_ms();
+        }
         adopt_unclaimed_tasks(&mut inner.state, stack_name);
         scheduler::reconcile(&mut inner.state, &live);
         gateway::replace_stack_route(&mut inner.state, stack_name);
@@ -518,6 +610,15 @@ impl Controller {
         validate_stack_name(stack_name)?;
         let _deployment = self.begin_stack_deployment(stack_name)?;
         let mut inner = self.inner.lock().await;
+        if inner.state.service_operations.values().any(|op| {
+            op.stack == stack_name
+                && op.view.status.active()
+                && op.view.deployment_generation.is_none()
+        }) {
+            return Err(ControllerError::Conflict(
+                "stack has an active service operation".into(),
+            ));
+        }
         let previous = inner.state.clone();
         let now = unix_ms();
         let service_ids = inner
@@ -579,6 +680,21 @@ impl Controller {
             }
             deployment.generation
         };
+        for operation in inner.state.service_operations.values_mut().filter(|op| {
+            op.stack == stack_name
+                && op.view.deployment_generation == Some(generation)
+                && op.view.status
+                    == swarmlite_core::service_operations::ServiceOperationStatus::Failed
+        }) {
+            operation.view.status =
+                swarmlite_core::service_operations::ServiceOperationStatus::Running;
+            operation.view.error = None;
+            operation.view.blocked = false;
+            operation.view.stalled = false;
+            operation.finished_at_unix_ms = None;
+            operation.updated_at_unix_ms = now;
+            operation.view.revision += 1;
+        }
         for task in
             inner.state.tasks.values_mut().filter(|task| {
                 service_ids.contains(&task.service_id) && task.reconcile_error.is_some()

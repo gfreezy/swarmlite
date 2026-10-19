@@ -17,6 +17,14 @@ pub fn reconcile(state: &mut ClusterState, live_nodes: &BTreeSet<String>) -> boo
         if task.job.is_some() {
             continue;
         }
+        if live_nodes.contains(&task.node_id)
+            && state
+                .service_operations
+                .values()
+                .any(|op| op.restarting_task(&task.id))
+        {
+            continue;
+        }
         if matches!(
             task.desired,
             DesiredTaskState::Running | DesiredTaskState::Draining
@@ -38,6 +46,13 @@ pub fn reconcile(state: &mut ClusterState, live_nodes: &BTreeSet<String>) -> boo
     for service_id in service_ids {
         let service = state.services[&service_id].clone();
         if service.spec.job.is_some() {
+            continue;
+        }
+        if state.service_operations.values().any(|op| {
+            op.view.service == service.id
+                && op.view.status.active()
+                && op.view.kind == swarmlite_core::service_operations::ServiceOperationKind::Restart
+        }) {
             continue;
         }
         if service.deleted || service.spec.replicas == 0 {
@@ -240,11 +255,23 @@ pub(crate) fn schedule_task(
     service: &ServiceRecord,
     live_nodes: &BTreeSet<String>,
 ) -> Option<TaskRecord> {
+    let pinned_operation = state.service_operations.values().find(|op| {
+        op.view.service == service.id
+            && op.target_revision == service.revision
+            && op.view.kind
+                == swarmlite_core::service_operations::ServiceOperationKind::PullRedeploy
+            && op.view.deployment_generation.is_some()
+    });
     let mut candidates = state
         .nodes
         .values()
         .filter(|node| live_nodes.contains(&node.id))
         .filter(|node| matches_constraints(node, &service.spec.constraints))
+        .filter(|node| {
+            pinned_operation.is_none_or(|op| {
+                node.supports_service_operations && op.prepared_images.contains_key(&node.id)
+            })
+        })
         .filter(|node| node_has_replica_capacity(state, node, service))
         .filter(|node| explicit_ports_available(state, node, &service.spec))
         .collect::<Vec<_>>();
@@ -298,6 +325,7 @@ pub(crate) fn schedule_task(
         .collect();
     let slot = (0..service.spec.replicas).find(|slot| !used_slots.contains(slot))?;
     Some(TaskRecord {
+        image_id: None,
         job: None,
         id: Uuid::new_v4().to_string(),
         service_id: service.id.clone(),
@@ -362,7 +390,7 @@ fn node_has_replica_capacity(
     })
 }
 
-fn matches_constraints(node: &NodeRecord, constraints: &[String]) -> bool {
+pub(crate) fn matches_constraints(node: &NodeRecord, constraints: &[String]) -> bool {
     constraints.iter().all(|constraint| {
         let (left, operator, expected) = if let Some((left, right)) = constraint.split_once("!=") {
             (left.trim(), "!=", right.trim())
@@ -517,6 +545,7 @@ mod tests {
             state.nodes.insert(
                 id.into(),
                 NodeRecord {
+                    supports_service_operations: false,
                     metrics: None,
                     supports_jobs: true,
                     id: id.into(),

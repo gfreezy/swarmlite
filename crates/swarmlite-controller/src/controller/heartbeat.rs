@@ -166,6 +166,10 @@ impl Controller {
             }
             match reports.get(&id) {
                 Some(report) => {
+                    if task.image_id != report.image_id {
+                        task.image_id.clone_from(&report.image_id);
+                        soft_changed = true;
+                    }
                     if task.observed != report.observed || task.container_id != report.container_id
                     {
                         task.observed = report.observed.clone();
@@ -212,7 +216,47 @@ impl Controller {
                 None => {}
             }
         }
+        let mut just_restarted = Vec::new();
         for report in &task_results {
+            if let Some(operation) = inner.state.service_operations.values_mut().find(|op| {
+                op.view.status.active()
+                    && op.view.kind
+                        == swarmlite_core::service_operations::ServiceOperationKind::Restart
+                    && op.generation == report.desired_generation
+                    && op.tasks.iter().any(|task| {
+                        task.task_id == report.task_id
+                            && task.node_id == node_id
+                            && task.deadline_unix_ms.is_some()
+                            && !task.completed
+                    })
+            }) {
+                if report.error.is_some() {
+                    let code = if report
+                        .error
+                        .as_deref()
+                        .is_some_and(|message| message.contains("restart_outcome_unknown"))
+                    {
+                        "restart_outcome_unknown"
+                    } else {
+                        "restart_failed"
+                    };
+                    super::service_operations::fail(operation, code, unix_ms());
+                    operation.view.revision += 1;
+                    changed = true;
+                } else if report.applied_generation == Some(operation.generation)
+                    && let Some(target) = operation
+                        .tasks
+                        .iter_mut()
+                        .find(|task| task.task_id == report.task_id)
+                    && !target.restarted
+                {
+                    target.restarted = true;
+                    just_restarted.push(target.task_id.clone());
+                    operation.view.revision += 1;
+                    changed = true;
+                }
+                continue;
+            }
             if let Some(task) = inner
                 .state
                 .tasks
@@ -259,6 +303,13 @@ impl Controller {
             soft_changed |= task_changed;
             changed |= deployment_changed;
         }
+        for id in just_restarted {
+            // The inventory in this heartbeat might have raced with completion.
+            // Require another fresh heartbeat before accepting post-restart health.
+            if let Some(task) = inner.state.tasks.get_mut(&id) {
+                task.observed = ObservedTaskState::Starting;
+            }
+        }
         for progress in &image_progress {
             let progress_changed = apply_image_progress(&mut inner.state, node_id, progress);
             changed |= progress_changed;
@@ -269,6 +320,43 @@ impl Controller {
             );
         }
         for report in &image_results {
+            if let Some(operation) = inner.state.service_operations.values_mut().find(|op| {
+                op.view.kind
+                    == swarmlite_core::service_operations::ServiceOperationKind::PullRedeploy
+                    && op.generation == report.deployment_generation
+                    && op.image == report.image
+                    && op.preparing_nodes.contains(node_id)
+            }) {
+                if !operation.prepared_images.contains_key(node_id) {
+                    let image_id = report.resolved_image_id.as_ref().filter(|id| {
+                        !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control)
+                    });
+                    if let Some(image_id) = image_id.filter(|_| {
+                        report.error.is_none()
+                            && report.services.len() == 1
+                            && report.services[0].service_id == operation.view.service
+                    }) {
+                        operation
+                            .prepared_images
+                            .insert(node_id.into(), image_id.clone());
+                    } else {
+                        if operation.view.deployment_generation.is_none() {
+                            super::service_operations::fail(
+                                operation,
+                                "image_pull_failed",
+                                unix_ms(),
+                            );
+                        } else {
+                            operation.view.blocked = true;
+                            operation.view.error = Some("node_image_preparation_failed".into());
+                        }
+                    }
+                    operation.view.revision += 1;
+                    operation.updated_at_unix_ms = unix_ms();
+                    changed = true;
+                }
+                continue;
+            }
             let report_changed = apply_image_resolution_report(&mut inner.state, node_id, report);
             changed |= report_changed;
             if report_changed {
@@ -325,9 +413,11 @@ impl Controller {
         }
 
         let live = current_live_nodes(&inner, self.config.node_timeout_seconds);
+        changed |= self.advance_service_operations_locked(&mut inner);
         changed |= scheduler::reconcile(&mut inner.state, &live);
         changed |= gateway::refresh_ready_stack_routes(&mut inner.state);
         changed |= self.refresh_stack_deployments_locked(&mut inner, unix_ms())?;
+        changed |= self.advance_service_operations_locked(&mut inner);
         if changed && let Err(error) = self.commit_locked(&mut inner).await {
             inner.state = previous;
             return Err(error.into());
@@ -354,6 +444,50 @@ impl Controller {
             })
             .filter_map(|task| {
                 let service = inner.state.services.get(&task.service_id)?;
+                let restart_operation = inner
+                    .state
+                    .service_operations
+                    .values()
+                    .find(|op| op.restarting_task(&task.id));
+                let restart = restart_operation.and_then(|op| {
+                    op.tasks
+                        .iter()
+                        .find(|target| target.task_id == task.id)
+                        .map(
+                            |target| swarmlite_core::service_operations::RestartAssignment {
+                                operation_id: op.view.operation_id.clone(),
+                                container_id: target.container_id.clone(),
+                                image_id: target.image_id.clone(),
+                                deadline_unix_ms: target.deadline_unix_ms.unwrap_or(0),
+                                execute: op
+                                    .tasks
+                                    .iter()
+                                    .find(|target| !target.completed)
+                                    .is_some_and(|current| current.task_id == task.id)
+                                    && target.deadline_unix_ms.is_some(),
+                            },
+                        )
+                });
+                let pinned_operation = inner.state.service_operations.values().find(|op| {
+                    op.view.kind
+                        == swarmlite_core::service_operations::ServiceOperationKind::PullRedeploy
+                        && op.view.service == service.id
+                        && op.target_revision == task.revision
+                        && op.view.deployment_generation.is_some()
+                });
+                let prepared_image_id = pinned_operation
+                    .and_then(|op| op.prepared_images.get(node_id))
+                    .cloned();
+                if pinned_operation.is_some()
+                    && (prepared_image_id.is_none()
+                        || !inner
+                            .state
+                            .nodes
+                            .get(node_id)
+                            .is_some_and(|node| node.supports_service_operations))
+                {
+                    return None;
+                }
                 if let Some(job) = &task.job {
                     if !inner
                         .state
@@ -381,6 +515,8 @@ impl Controller {
                     .and_then(|stack| stack.deployment.as_ref())
                     .map_or(0, |deployment| deployment.retry_revision);
                 Some(TaskAssignment {
+                    restart,
+                    prepared_image_id,
                     job: task.job.clone(),
                     id: task.id.clone(),
                     cluster_id: self.config.cluster.cluster_id.clone(),
@@ -396,7 +532,8 @@ impl Controller {
                         .map_or_else(|| service.spec.clone(), |job| (*job.spec).clone()),
                     ports: task.ports.clone(),
                     generation,
-                    deployment_generation,
+                    deployment_generation: restart_operation
+                        .map_or(deployment_generation, |op| op.generation),
                     deployment_retry_revision,
                     spec_hash: service_spec_hash(
                         task.job
@@ -407,7 +544,31 @@ impl Controller {
                 })
             })
             .collect();
-        let image_assignments = image_assignments_for_node(&inner.state, node_id);
+        let mut image_assignments = image_assignments_for_node(&inner.state, node_id);
+        image_assignments.extend(
+            inner
+                .state
+                .service_operations
+                .values()
+                .filter(|op| {
+                    op.pins_images(&inner.state)
+                        && inner
+                            .state
+                            .nodes
+                            .get(node_id)
+                            .is_some_and(|node| node.supports_service_operations)
+                        && op.preparing_nodes.contains(node_id)
+                        && !op.prepared_images.contains_key(node_id)
+                })
+                .map(|op| ImageResolutionAssignment {
+                    deployment_generation: op.generation,
+                    image: op.image.clone(),
+                    services: vec![ImageResolutionServiceAssignment {
+                        service_id: op.view.service.clone(),
+                        task_ids: Vec::new(),
+                    }],
+                }),
+        );
         let mut remove_tasks = inner
             .state
             .tasks

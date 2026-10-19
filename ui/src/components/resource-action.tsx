@@ -55,10 +55,10 @@ const definitions: Record<
       "Set the desired number of replicas. The Controller will create or remove tasks to match.",
   },
   "service restart": {
-    title: "Rolling restart",
+    title: "Restart service",
     submit: "Restart service",
     description:
-      "Replace this service’s tasks using its current configuration and rollout policy.",
+      "Restart existing containers without pulling. Enable pull to fetch the configured image and roll out replacement containers.",
   },
   "job run": {
     title: "Run job",

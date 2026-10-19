@@ -266,12 +266,18 @@ swarmlite logs --follow STACK.SERVICE
 swarmlite logs --follow STACK.SERVICE.SLOT
 swarmlite service scale STACK.SERVICE=3
 swarmlite service restart STACK.SERVICE
+swarmlite service restart STACK.SERVICE --pull
 swarmlite rm STACK
 ```
 
 During a rolling update, an old and new task may temporarily share a slot name. Use the task ID
 from `swarmlite ps` to select one exactly. Log sessions select at most 64 tasks and cap `--tail` at
 10,000 lines.
+
+`service restart` restarts existing containers sequentially without pulling or changing their
+task/container/image IDs or writable layers. `--pull` explicitly pulls the configured image and
+rolls out replacements, even when its content is unchanged; the configured `pull_policy` is not
+modified. CI can trigger the same pull-and-replace behavior through the [HTTP deployment API](ci-deployment.md).
 
 ## Images and private registries
 
