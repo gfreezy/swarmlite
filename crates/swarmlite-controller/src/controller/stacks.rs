@@ -97,7 +97,7 @@ pub(super) fn stack_is_active(state: &ClusterState, stack_name: &str) -> bool {
         || state
             .stacks
             .get(stack_name)
-            .is_some_and(|stack| !stack.gateway.http_routes.is_empty())
+            .is_some_and(|stack| stack.gateway.has_routes())
         || state.gateway_routes.contains_key(stack_name)
 }
 
@@ -143,6 +143,35 @@ pub(super) fn validate_gateway_hostname_ownership(
         .iter()
         .flat_map(|route| route.hostnames.iter())
         .collect::<BTreeSet<_>>();
+    let requested_tcp = gateway
+        .tcp_routes
+        .iter()
+        .map(|route| route.listen)
+        .collect::<BTreeSet<_>>();
+    // Reserve both the currently served fragment and a pending desired spec.
+    for (owner, spec) in state
+        .stacks
+        .iter()
+        .map(|(name, stack)| (name, &stack.gateway))
+        .chain(
+            state
+                .gateway_routes
+                .iter()
+                .map(|(name, stack)| (name, &stack.gateway)),
+        )
+        .filter(|(owner, _)| owner.as_str() != stack_name)
+    {
+        if let Some(route) = spec
+            .tcp_routes
+            .iter()
+            .find(|route| requested_tcp.contains(&route.listen))
+        {
+            return Err(ControllerError::Conflict(format!(
+                "gateway TCP port {} is already owned by stack {:?}",
+                route.listen, owner
+            )));
+        }
+    }
     let mut owners = state
         .gateway_routes
         .iter()

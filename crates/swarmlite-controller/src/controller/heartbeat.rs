@@ -599,7 +599,7 @@ impl Controller {
                 &inner.state,
                 &task.stack,
                 deployment.generation,
-                gateway_ready,
+                gateway_ready && super::gateway_control::tcp_stack_ready(&inner, &task.stack),
             )
             .then(|| TaskRemovalAssignment {
                 retain_job_container: false,

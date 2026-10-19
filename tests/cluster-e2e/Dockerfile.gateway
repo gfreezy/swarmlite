@@ -1,0 +1,5 @@
+FROM caddy:2.11.4-alpine
+COPY caddy /usr/bin/caddy
+COPY bootstrap.json /etc/caddy/bootstrap.json
+LABEL io.swarmlite.system=true io.swarmlite.component=gateway
+CMD ["run", "--resume", "--config", "/etc/caddy/bootstrap.json"]

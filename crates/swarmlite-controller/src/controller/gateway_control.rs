@@ -1,5 +1,57 @@
 use super::*;
 
+pub(super) fn tcp_stack_ready(inner: &Inner, stack_name: &str) -> bool {
+    let Some(stack) = inner.state.stacks.get(stack_name) else {
+        return true;
+    };
+    if stack.gateway.tcp_routes.is_empty() {
+        return true;
+    }
+    let enabled = inner
+        .state
+        .members
+        .values()
+        .filter(|member| member.gateway_enabled)
+        .collect::<Vec<_>>();
+    !enabled.is_empty()
+        && enabled.iter().all(|member| {
+            inner
+                .gateway_reports
+                .get(&member.id)
+                .filter(|report| {
+                    report.error.is_none()
+                        && report.applied_generation == Some(inner.gateway_generation)
+                })
+                .and_then(|report| report.tcp.as_ref())
+                .is_some_and(|tcp| {
+                    tcp.error.is_none()
+                        && stack.gateway.tcp_routes.iter().all(|route| {
+                            let id = format!("{stack_name}:{}", route.listen);
+                            let intentionally_empty = inner
+                                .state
+                                .services
+                                .get(&format!("{stack_name}.{}", route.backend.service))
+                                .is_some_and(|service| {
+                                    !service.deleted && service.spec.replicas == 0
+                                });
+                            tcp.routes.iter().any(|status| {
+                                status.id == id
+                                    && status.listen == format!(":{}", route.listen)
+                                    && if intentionally_empty {
+                                        // Scaling to zero still requires the new empty
+                                        // configuration and a successfully bound listener.
+                                        status.listening
+                                            && status.error.is_none()
+                                            && status.backends.is_empty()
+                                    } else {
+                                        status.ready()
+                                    }
+                            })
+                        })
+                })
+        })
+}
+
 impl Controller {
     pub(super) async fn gateway_status(&self) -> GatewayClusterStatusResponse {
         let inner = self.inner.lock().await;
@@ -43,6 +95,7 @@ impl Controller {
                     applied_generation: report.and_then(|report| report.applied_generation),
                     retryable: report.map(|report| report.retryable),
                     error: report.and_then(|report| report.error.clone()),
+                    tcp: report.and_then(|report| report.tcp.clone()),
                 }
             })
             .collect();

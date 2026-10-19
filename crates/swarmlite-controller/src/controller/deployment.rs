@@ -343,8 +343,7 @@ impl Controller {
             })
             .unwrap_or_default();
         let live = current_live_nodes(&inner, self.config.node_timeout_seconds);
-        let wait_for_gateway =
-            !previous_gateway.http_routes.is_empty() || !stack_gateway.http_routes.is_empty();
+        let wait_for_gateway = previous_gateway.has_routes() || stack_gateway.has_routes();
         let desired_ids: BTreeSet<String> = services
             .keys()
             .map(|name| service_id(stack_name, name))
@@ -780,10 +779,18 @@ impl Controller {
                     report.error.is_none() && report.applied_generation == Some(gateway_generation)
                 })
             });
+        let unready_tcp = inner
+            .state
+            .stacks
+            .keys()
+            .filter(|stack| !super::gateway_control::tcp_stack_ready(inner, stack))
+            .cloned()
+            .collect::<BTreeSet<_>>();
         Ok(refresh_stack_deployments(
             &mut inner.state,
             now_unix_ms,
             gateway_ready,
+            &unready_tcp,
         ))
     }
 }
@@ -811,12 +818,25 @@ fn validate_apply_locked(
         .members
         .values()
         .any(|member| member.gateway_enabled);
-    if !has_gateway && !stack_gateway.http_routes.is_empty() {
+    if !has_gateway && stack_gateway.has_routes() {
         return Err(ControllerError::Invalid(
             "gateway routing is enabled but no node has its gateway enabled".to_owned(),
         ));
     }
     validate_gateway_hostname_ownership(&inner.state, stack_name, stack_gateway)?;
+    for route in &stack_gateway.tcp_routes {
+        if inner.cluster.gateway.listen.iter().any(|listen| {
+            listen
+                .rsplit_once(':')
+                .and_then(|(_, port)| port.parse::<u16>().ok())
+                == Some(route.listen)
+        }) {
+            return Err(ControllerError::Invalid(format!(
+                "TCP listen port {} conflicts with the Gateway HTTP listener",
+                route.listen
+            )));
+        }
+    }
     inner
         .generation
         .checked_add(1)
@@ -828,6 +848,7 @@ pub(super) fn refresh_stack_deployments(
     state: &mut ClusterState,
     now_unix_ms: i64,
     gateway_ready: bool,
+    unready_tcp: &BTreeSet<String>,
 ) -> bool {
     let stack_names = state.stacks.keys().cloned().collect::<Vec<_>>();
     let mut changed = false;
@@ -842,17 +863,21 @@ pub(super) fn refresh_stack_deployments(
         if deployment.status.is_terminal() {
             continue;
         }
-        let next_status =
-            if deployment_is_healthy(state, &stack_name, deployment.generation, gateway_ready) {
-                Some(StackDeploymentStatus::Healthy)
-            } else {
-                let deadline_seconds = deployment.progress_deadline_seconds;
-                let timeout_ms =
-                    i64::try_from(deadline_seconds.saturating_mul(1_000)).unwrap_or(i64::MAX);
-                (now_unix_ms.saturating_sub(deployment.last_progress_at_unix_ms) >= timeout_ms
-                    && deployment.status != StackDeploymentStatus::Stalled)
-                    .then_some(StackDeploymentStatus::Stalled)
-            };
+        let next_status = if deployment_is_healthy(
+            state,
+            &stack_name,
+            deployment.generation,
+            gateway_ready && !unready_tcp.contains(&stack_name),
+        ) {
+            Some(StackDeploymentStatus::Healthy)
+        } else {
+            let deadline_seconds = deployment.progress_deadline_seconds;
+            let timeout_ms =
+                i64::try_from(deadline_seconds.saturating_mul(1_000)).unwrap_or(i64::MAX);
+            (now_unix_ms.saturating_sub(deployment.last_progress_at_unix_ms) >= timeout_ms
+                && deployment.status != StackDeploymentStatus::Stalled)
+                .then_some(StackDeploymentStatus::Stalled)
+        };
         if let Some(status) = next_status {
             let deployment = state
                 .stacks

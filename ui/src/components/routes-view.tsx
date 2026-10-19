@@ -25,6 +25,25 @@ interface GatewayNode {
   desired_generation?: number;
   applied_generation?: number;
   error?: string;
+  tcp?: {
+    error?: string;
+    routes: {
+      id: string;
+      listen: string;
+      listening: boolean;
+      error?: string;
+      backends: { address: string; healthy: boolean; error?: string }[];
+    }[];
+  };
+}
+
+interface TcpRouteRow {
+  id: string;
+  stack: string;
+  listen: number;
+  service_id: string;
+  backend: { service: string; port: number };
+  upstreams: string[];
 }
 
 export function RoutesView({
@@ -41,7 +60,7 @@ export function RoutesView({
   const [selected, setSelected] = useState("");
   const routes = usePolling(
     (signal) =>
-      get<{ generation: number; routes: RouteRow[] }>("/routes", signal),
+      get<{ generation: number; routes: RouteRow[]; tcp_routes?: TcpRouteRow[] }>("/routes", signal),
     "routes",
     refreshToken,
   );
@@ -60,6 +79,11 @@ export function RoutesView({
         .toLowerCase()
         .includes(search.toLowerCase()),
     ) || [];
+  const tcpRoutes = routes.data?.tcp_routes?.filter((route) =>
+    `${route.stack} ${route.listen} ${route.service_id} ${route.backend.port}`
+      .toLowerCase()
+      .includes(search.toLowerCase()),
+  ) || [];
   return (
     <>
       <div hidden={Boolean(selected)}>
@@ -87,6 +111,13 @@ export function RoutesView({
                 desired #{node.desired_generation ?? "—"}
               </small>
               {node.error && <p>{node.error}</p>}
+              {node.tcp?.error && <p>TCP status: {node.tcp.error}</p>}
+              {node.tcp?.routes.map((route) => (
+                <small key={route.id} className="block">
+                  TCP {route.listen}: {route.listening ? `${route.backends.filter((backend) => backend.healthy).length}/${route.backends.length} healthy` : "not listening"}
+                  {route.error && ` · ${route.error}`}
+                </small>
+              ))}
             </div>
           ))}
           {!gateways.loading && !gateways.data?.nodes.length && (
@@ -130,6 +161,29 @@ export function RoutesView({
           />
         </div>
         <ErrorNotice error={routes.error} stale={Boolean(routes.data)} />
+        {tcpRoutes.length > 0 && (
+          <Card className="table-card">
+            <CardHeader><CardTitle>TCP forwarding</CardTitle></CardHeader>
+            <CardContent>
+              <Table>
+                <TableHeader><TableRow>
+                  <TableHead>Gateway port</TableHead>
+                  <TableHead>Stack / Service</TableHead>
+                  <TableHead>Container port</TableHead>
+                  <TableHead>Published upstreams</TableHead>
+                </TableRow></TableHeader>
+                <TableBody>{tcpRoutes.map((route) => (
+                  <TableRow key={route.id}>
+                    <TableCell>{route.listen}</TableCell>
+                    <TableCell>{route.service_id}</TableCell>
+                    <TableCell>{route.backend.port}</TableCell>
+                    <TableCell>{route.upstreams.join(", ") || "No endpoints"}</TableCell>
+                  </TableRow>
+                ))}</TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+        )}
         {view === "graph" && filtered.length > 0 && (
           <RouteGraph
             routes={filtered}

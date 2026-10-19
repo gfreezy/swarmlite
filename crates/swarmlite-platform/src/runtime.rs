@@ -720,6 +720,29 @@ impl DockerCompatibleRuntime {
             .and_then(|gateway| gateway.image))
     }
 
+    /// TCP runtime errors are observed independently, never reconciliation
+    /// errors that would retry/reload HTTP or block its drain acknowledgements.
+    pub async fn gateway_tcp_status(&self) -> Result<crate::model::GatewayTcpStatus> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()?;
+        let mut last_error = None;
+        for port in [GATEWAY_STAGED_ADMIN_PORT, GATEWAY_ACTIVE_ADMIN_PORT] {
+            let url = format!("{}/swarmlite/tcp/status", gateway_admin_url(port));
+            match client.get(&url).send().await {
+                Ok(response) if response.status().is_success() => {
+                    return Ok(response.json().await?);
+                }
+                Ok(response) => last_error = Some(format!("{url} returned {}", response.status())),
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
+        bail!(
+            "failed to observe Gateway TCP status: {}",
+            last_error.unwrap_or_default()
+        )
+    }
+
     async fn apply_gateway_config_to(
         &self,
         gateway: &ExistingGatewayContainer,

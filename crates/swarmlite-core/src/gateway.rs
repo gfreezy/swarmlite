@@ -94,7 +94,31 @@ pub fn config(state: &ClusterState, gateway: &ClusterGatewayConfig, controller: 
     if let Some(seconds) = gateway.shutdown.grace_period_seconds {
         http_object.insert("grace_period".to_owned(), duration(seconds));
     }
-    let apps = json!({ "http": http });
+    let mut apps = json!({ "http": http });
+    let tcp_routes = state
+        .gateway_routes
+        .iter()
+        .flat_map(|(stack_name, stack)| {
+            stack.gateway.tcp_routes.iter().map(move |route| {
+                let upstreams = stack
+                    .upstreams
+                    .get(&ServicePortKey::tcp(
+                        &route.backend.service,
+                        route.backend.port,
+                    ))
+                    .cloned()
+                    .unwrap_or_default();
+                json!({
+                    "id": format!("{stack_name}:{}", route.listen),
+                    "listen": format!(":{}", route.listen),
+                    "upstreams": upstreams,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    if !tcp_routes.is_empty() {
+        apps["swarmlite_tcp"] = json!({ "routes": tcp_routes });
+    }
 
     let mut config = json!({
         "admin": {
@@ -338,6 +362,13 @@ pub fn refresh_ready_stack_routes(state: &mut ClusterState) -> bool {
             .iter()
             .flat_map(|route| &route.rules)
             .filter_map(|rule| rule.backend.service.as_deref())
+            .chain(
+                stack
+                    .gateway
+                    .tcp_routes
+                    .iter()
+                    .map(|route| route.backend.service.as_str()),
+            )
             .map(|service| format!("{stack_name}.{service}"))
             .collect::<BTreeSet<_>>();
         let all_running_tasks_reported = state
@@ -357,19 +388,29 @@ pub fn refresh_ready_stack_routes(state: &mut ClusterState) -> bool {
 
 fn stack_fragment(state: &ClusterState, stack_name: &str) -> Option<RecoveredStackGateway> {
     let stack = state.stacks.get(stack_name)?;
-    if stack.gateway.http_routes.is_empty() {
+    if !stack.gateway.has_routes() {
         return None;
     }
     let mut upstreams = BTreeMap::new();
-    for rule in stack
+    let keys = stack
         .gateway
         .http_routes
         .iter()
         .flat_map(|route| &route.rules)
-    {
-        let Some(service_name) = rule.backend.service.as_deref() else {
-            continue;
-        };
+        .filter_map(|rule| {
+            rule.backend.service.as_deref().map(|service| {
+                ServicePortKey::new(service, rule.backend.port, rule.backend.protocol)
+            })
+        })
+        .chain(
+            stack
+                .gateway
+                .tcp_routes
+                .iter()
+                .map(|route| ServicePortKey::tcp(&route.backend.service, route.backend.port)),
+        );
+    for key in keys {
+        let service_name = &key.service;
         let service_id = format!("{stack_name}.{service_name}");
         let addresses = state
             .tasks
@@ -392,7 +433,7 @@ fn stack_fragment(state: &ClusterState, stack_name: &str) -> Option<RecoveredSta
                 let port = task
                     .ports
                     .iter()
-                    .find(|port| port.target == rule.backend.port && port.protocol == "tcp")?;
+                    .find(|port| port.target == key.target_port && port.protocol == "tcp")?;
                 Some(format!(
                     "{}:{}",
                     format_host(&node.address),
@@ -402,10 +443,7 @@ fn stack_fragment(state: &ClusterState, stack_name: &str) -> Option<RecoveredSta
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        upstreams.insert(
-            ServicePortKey::new(service_name, rule.backend.port, rule.backend.protocol),
-            addresses,
-        );
+        upstreams.insert(key, addresses);
     }
     Some(RecoveredStackGateway {
         gateway: stack.gateway.clone(),
@@ -423,6 +461,12 @@ pub fn service_ports(state: &ClusterState, service: &ServiceRecord) -> BTreeSet<
 
 pub fn is_service_routed(state: &ClusterState, service: &ServiceRecord) -> bool {
     !service_ports(state, service).is_empty()
+}
+
+pub fn is_service_http_routed(state: &ClusterState, service: &ServiceRecord) -> bool {
+    state.stacks.get(&service.stack).is_some_and(|stack| {
+        !swarmlite_stack::http_routed_service_ports(&stack.gateway, &service.name).is_empty()
+    })
 }
 
 fn format_host(host: &str) -> String {
@@ -719,6 +763,160 @@ x-swarmlite:
         assert!(server.get("logs").is_none());
         assert!(server.get("protocols").is_none());
         assert!(value.get("logging").is_none());
+        assert_eq!(value["apps"].as_object().unwrap().len(), 1);
+        assert!(value["apps"].get("swarmlite_tcp").is_none());
+    }
+
+    #[test]
+    fn optional_tcp_extensions_leave_http_config_and_v1_recovery_unchanged() {
+        let yaml = "services:\n  web: {image: nginx, expose: [80]}\nx-swarmlite:\n  http_routes:\n    - hostnames: [example.com]\n      rules: [{backend: {service: web, port: 80}}]\n";
+        let parsed = parse_stack(yaml).unwrap();
+        let fragment = RecoveredStackGateway {
+            gateway: parsed.gateway,
+            upstreams: BTreeMap::from([(
+                ServicePortKey::new("web", 80, swarmlite_stack::HttpBackendProtocol::Http),
+                vec!["10.0.0.21:20001".into()],
+            )]),
+        };
+        let mut state = ClusterState::default();
+        state.gateway_routes.insert("demo".into(), fragment);
+        let settings = gateway_with_listen(&[":80", ":443"]);
+        let expected_config = config(&state, &settings, "controller".into());
+        let expected_snapshot =
+            crate::model::GatewayRecoverySnapshot::new("cluster", 7, state.gateway_routes.clone());
+        assert!(expected_config["apps"].get("swarmlite_tcp").is_none());
+        assert_eq!(expected_snapshot.format_version, 1);
+        for extension in [
+            "  tcp_routes: []\n",
+            "  tcp_routes: null\n",
+            "  future_gateway_option: {enabled: true}\n",
+        ] {
+            state.gateway_routes.get_mut("demo").unwrap().gateway =
+                parse_stack(&format!("{yaml}{extension}")).unwrap().gateway;
+            assert_eq!(
+                config(&state, &settings, "controller".into()),
+                expected_config
+            );
+            let snapshot = crate::model::GatewayRecoverySnapshot::new(
+                "cluster",
+                7,
+                state.gateway_routes.clone(),
+            );
+            assert_eq!(snapshot, expected_snapshot);
+            let value = serde_json::to_value(snapshot).unwrap();
+            assert!(
+                value["stacks"]["demo"]["gateway"]
+                    .get("tcp_routes")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn tcp_routes_resolve_healthy_endpoints_update_to_zero_and_round_trip_recovery() {
+        let parsed = parse_stack(
+            r#"
+services:
+  web: { image: nginx, expose: [80] }
+x-swarmlite:
+  tcp_routes:
+    - listen: 8099
+      backend: {service: web, port: 80}
+"#,
+        )
+        .unwrap();
+        let mut state = ClusterState::default();
+        state.stacks.insert(
+            "demo".into(),
+            StackRecord {
+                name: "demo".into(),
+                applied_at_unix_ms: 1,
+                services: vec!["demo.web".into()],
+                gateway: parsed.gateway,
+                deployment: None,
+                deployment_history: BTreeMap::new(),
+            },
+        );
+        state
+            .nodes
+            .insert("node-a".into(), node("node-a", "10.0.0.21"));
+        state
+            .nodes
+            .insert("node-b".into(), node("node-b", "2001:db8::2"));
+        state.tasks.insert(
+            "a".into(),
+            task(
+                "a",
+                "node-a",
+                DesiredTaskState::Running,
+                ObservedTaskState::Healthy,
+                20001,
+            ),
+        );
+        state.tasks.insert(
+            "b".into(),
+            task(
+                "b",
+                "node-b",
+                DesiredTaskState::Running,
+                ObservedTaskState::Healthy,
+                20002,
+            ),
+        );
+        state.tasks.insert(
+            "bad".into(),
+            task(
+                "bad",
+                "node-b",
+                DesiredTaskState::Running,
+                ObservedTaskState::Failed,
+                20003,
+            ),
+        );
+        assert!(refresh_ready_stack_routes(&mut state));
+        let value = config(&state, &gateway_with_listen(&[":80"]), "controller".into());
+        assert_eq!(
+            value["apps"]["swarmlite_tcp"]["routes"][0],
+            json!({
+                "id": "demo:8099", "listen": ":8099", "upstreams": ["10.0.0.21:20001", "[2001:db8::2]:20002"]
+            })
+        );
+        assert!(is_service_routed(&state, &service()));
+        assert!(!is_service_http_routed(&state, &service()));
+        let snapshot =
+            crate::model::GatewayRecoverySnapshot::new("cluster", 1, state.gateway_routes.clone());
+        assert_eq!(snapshot.format_version, 2);
+        snapshot.validate_for_cluster("cluster").unwrap();
+        let encoded = serde_json::to_vec(&snapshot).unwrap();
+        let recovered: crate::model::GatewayRecoverySnapshot =
+            serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(snapshot, recovered);
+        let mut incompatible = recovered.clone();
+        incompatible.format_version = 1;
+        assert!(incompatible.validate_for_cluster("cluster").is_err());
+        let mut duplicate = recovered;
+        duplicate
+            .stacks
+            .insert("other".into(), duplicate.stacks["demo"].clone());
+        assert!(duplicate.validate_for_cluster("cluster").is_err());
+        for task in state.tasks.values_mut() {
+            task.observed = ObservedTaskState::Failed;
+        }
+        assert!(refresh_ready_stack_routes(&mut state));
+        let value = config(&state, &gateway_with_listen(&[":80"]), "controller".into());
+        assert_eq!(
+            value["apps"]["swarmlite_tcp"]["routes"][0]["upstreams"],
+            json!([])
+        );
+        state
+            .stacks
+            .get_mut("demo")
+            .unwrap()
+            .gateway
+            .tcp_routes
+            .clear();
+        assert!(refresh_ready_stack_routes(&mut state));
+        assert!(!state.gateway_routes.contains_key("demo"));
     }
 
     fn service() -> ServiceRecord {

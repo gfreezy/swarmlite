@@ -164,7 +164,6 @@ pub struct ServicePort {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct StackGatewaySpec {
     #[serde(default)]
     pub tls: GatewayTlsMode,
@@ -174,6 +173,12 @@ pub struct StackGatewaySpec {
     pub trusted_proxies: Vec<String>,
     #[serde(default)]
     pub http_routes: Vec<HttpRouteSpec>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_tcp_routes",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub tcp_routes: Vec<TcpRouteSpec>,
 }
 
 impl Default for StackGatewaySpec {
@@ -183,8 +188,38 @@ impl Default for StackGatewaySpec {
             http: GatewayHttpMode::Redirect,
             trusted_proxies: Vec::new(),
             http_routes: Vec::new(),
+            tcp_routes: Vec::new(),
         }
     }
+}
+
+impl StackGatewaySpec {
+    pub fn has_routes(&self) -> bool {
+        !self.http_routes.is_empty() || !self.tcp_routes.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TcpRouteSpec {
+    pub listen: u16,
+    pub backend: TcpBackend,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TcpBackend {
+    pub service: String,
+    pub port: u16,
+}
+
+// An omitted or explicitly empty optional extension must preserve HTTP-only
+// behavior. Known TCP fields still use their ordinary type/semantic validation.
+fn deserialize_tcp_routes<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<TcpRouteSpec>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<TcpRouteSpec>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -383,6 +418,38 @@ pub fn validate_and_normalize(
     services: &BTreeMap<String, ServiceSpec>,
 ) -> Result<()> {
     normalize_trusted_proxies(&mut gateway.trusted_proxies).context("invalid trusted_proxies")?;
+    let mut tcp_ports = BTreeSet::new();
+    for (index, route) in gateway.tcp_routes.iter_mut().enumerate() {
+        if route.listen == 0 || matches!(route.listen, 80 | 443 | 2019..=2021) {
+            bail!("tcp_routes[{index}].listen must be a non-reserved port in 1..=65535");
+        }
+        if !tcp_ports.insert(route.listen) {
+            bail!(
+                "TCP listen port {} appears in more than one route",
+                route.listen
+            );
+        }
+        let backend = &mut route.backend;
+        backend.service = backend.service.trim().to_owned();
+        let service = services.get(&backend.service).with_context(|| {
+            format!(
+                "tcp_routes[{index}] refers to unknown service {:?}",
+                backend.service
+            )
+        })?;
+        if service.job.is_some() {
+            bail!("tcp_routes[{index}] cannot target a job");
+        }
+        if backend.port == 0
+            || !service
+                .expose
+                .iter()
+                .chain(&service.ports)
+                .any(|port| port.target == backend.port && port.protocol == "tcp")
+        {
+            bail!("tcp_routes[{index}] target port must be declared as a TCP expose/ports port");
+        }
+    }
     let mut seen_hostnames = BTreeSet::new();
     for (route_index, route) in gateway.http_routes.iter_mut().enumerate() {
         if route.hostnames.is_empty() {
@@ -592,6 +659,15 @@ pub fn storage(controller: String) -> StorageConfig {
 }
 
 pub fn routed_service_ports(gateway: &StackGatewaySpec, service_name: &str) -> BTreeSet<u16> {
+    http_routed_service_ports(gateway, service_name)
+        .into_iter()
+        .chain(gateway.tcp_routes.iter().filter_map(|route| {
+            (route.backend.service == service_name).then_some(route.backend.port)
+        }))
+        .collect()
+}
+
+pub fn http_routed_service_ports(gateway: &StackGatewaySpec, service_name: &str) -> BTreeSet<u16> {
     gateway
         .http_routes
         .iter()
@@ -610,6 +686,150 @@ const PRIVATE_PROXY_RANGES: [&str; 6] = [
     "fd00::/8",
     "::1",
 ];
+
+#[cfg(test)]
+mod tcp_tests {
+    use super::*;
+
+    fn stack(route: &str, expose: &str) -> Result<ParsedStack> {
+        parse_stack(&format!(
+            "services:\n  db:\n    image: example/db\n    expose: [{expose}]\n    healthcheck:\n      test: [CMD, check]\nx-swarmlite:\n  tcp_routes:\n{route}\n"
+        ))
+    }
+
+    #[test]
+    fn tcp_routes_are_optional_and_empty_extensions_are_not_serialized() {
+        for extension in [
+            "",
+            "x-swarmlite: {}",
+            "x-swarmlite:\n  tcp_routes: []",
+            "x-swarmlite:\n  tcp_routes:",
+            "x-swarmlite:\n  tcp_routes: null",
+        ] {
+            let parsed = parse_stack(&format!(
+                "services:\n  web: {{image: nginx}}\n{extension}\n"
+            ))
+            .unwrap();
+            assert!(parsed.gateway.tcp_routes.is_empty());
+            assert!(!parsed.gateway.has_routes());
+            let value = serde_json::to_value(&parsed.gateway).unwrap();
+            assert!(value.get("tcp_routes").is_none());
+        }
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"tcp_routes": null}),
+            serde_json::json!({"tcp_routes": []}),
+        ] {
+            let gateway: StackGatewaySpec = serde_json::from_value(value).unwrap();
+            assert_eq!(gateway, StackGatewaySpec::default());
+        }
+    }
+
+    #[test]
+    fn ignores_unknown_gateway_and_tcp_extension_fields_in_yaml_and_json() {
+        let parsed = parse_stack(
+            r#"
+services:
+  db: {image: redis, expose: [6379]}
+x-swarmlite:
+  future_gateway_option: {enabled: true}
+  tcp_routes:
+    - listen: 16379
+      future_route_option: [one, two]
+      backend: {service: db, port: 6379, future_backend_option: true}
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.gateway.tcp_routes,
+            vec![TcpRouteSpec {
+                listen: 16379,
+                backend: TcpBackend {
+                    service: "db".into(),
+                    port: 6379
+                },
+            }]
+        );
+        let mut value = serde_json::to_value(&parsed.gateway).unwrap();
+        value["future_gateway_option"] = serde_json::json!({"enabled": true});
+        value["tcp_routes"][0]["future_route_option"] = serde_json::json!([1, 2]);
+        value["tcp_routes"][0]["backend"]["future_backend_option"] = serde_json::json!(true);
+        let decoded: StackGatewaySpec = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, parsed.gateway);
+        let encoded = serde_json::to_string(&decoded).unwrap();
+        assert!(!encoded.contains("future_"));
+    }
+
+    #[test]
+    fn known_tcp_fields_remain_required_and_typed() {
+        for routes in [
+            serde_json::json!(false),
+            serde_json::json!({}),
+            serde_json::json!([{"backend":{"service":"db","port":6379}}]),
+            serde_json::json!([{"listen":16379,"backend":{"service":"db"}}]),
+            serde_json::json!([{"listen":"16379","backend":{"service":"db","port":6379}}]),
+        ] {
+            assert!(
+                serde_json::from_value::<StackGatewaySpec>(
+                    serde_json::json!({"tcp_routes":routes})
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn tcp_routes_preserve_healthchecks_and_collect_only_declared_tcp_ports() {
+        let parsed = stack(
+            "    - listen: 8099\n      backend: {service: db, port: 9000}",
+            "9000",
+        )
+        .unwrap();
+        assert!(parsed.services["db"].healthcheck.is_some());
+        assert_eq!(parsed.gateway.tcp_routes[0].listen, 8099);
+        assert_eq!(
+            routed_service_ports(&parsed.gateway, "db"),
+            BTreeSet::from([9000])
+        );
+        assert!(http_routed_service_ports(&parsed.gateway, "db").is_empty());
+        assert!(parsed.gateway.has_routes());
+    }
+
+    #[test]
+    fn tcp_routes_reject_reserved_duplicate_unknown_and_udp_targets() {
+        for port in [0, 80, 443, 2019, 2020, 2021, 65536] {
+            assert!(
+                stack(
+                    &format!("    - listen: {port}\n      backend: {{service: db, port: 9000}}"),
+                    "9000"
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            stack(
+                "    - listen: 8099\n      backend: {service: missing, port: 9000}",
+                "9000"
+            )
+            .is_err()
+        );
+        assert!(
+            stack(
+                "    - listen: 8099\n      backend: {service: db, port: 9001}",
+                "9000"
+            )
+            .is_err()
+        );
+        assert!(
+            stack(
+                "    - listen: 8099\n      backend: {service: db, port: 9000}",
+                "9000/udp"
+            )
+            .is_err()
+        );
+        assert!(stack("    - listen: 8099\n      backend: {service: db, port: 9000}\n    - listen: 8099\n      backend: {service: db, port: 9000}", "9000").is_err());
+    }
+}
 
 fn normalize_trusted_proxies(proxies: &mut Vec<String>) -> Result<()> {
     let mut normalized = BTreeSet::new();

@@ -11,6 +11,7 @@
 - [Image proxy](#image-proxy)
 - [Config files, volumes, and placement](#config-files-volumes-and-placement)
 - [HTTP and HTTPS routes](#http-and-https-routes)
+- [TCP routes](#tcp-routes)
 - [Remote management over SSH](#remote-management-over-ssh)
 
 This section is for application owners. Cluster installation, node membership, and recovery are in
@@ -501,6 +502,63 @@ Rule precedence is exact path, longest prefix, regex, then a rule without matche
 `serve|disabled` and `http` accepts `redirect|serve|disabled`; `http: redirect` requires
 `tls: serve`. Native cache fields are described by
 [`cache-handler.schema.json`](https://raw.githubusercontent.com/gfreezy/swarmlite/main/crates/swarmlite-stack/schema/cache-handler.schema.json).
+
+## TCP routes
+
+This extension is optional: omit `tcp_routes`, use `[]`, or use `null` to keep HTTP-only behavior.
+Empty TCP extensions are not serialized or sent to Caddy, and HTTP-only recovery snapshots stay
+at v1. New versions ignore unknown fields in `x-swarmlite` and TCP route/backend objects; known
+fields still require valid types, required values and ports. This does not change the behavior
+of already published older binaries, which may reject unknown extensions.
+
+`x-swarmlite.tcp_routes` exposes fixed TCP ports on every enabled Gateway and forwards to
+healthy task-node published ports, even when the Service runs on another node:
+
+```yaml
+services:
+  db:
+    image: redis:7-alpine
+    expose: ["6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+
+x-swarmlite:
+  tcp_routes:
+    - listen: 16379
+      backend: { service: db, port: 6379 }
+```
+
+All three route fields are required. The backend must be a non-Job Service in the same Stack
+with the target TCP port declared in `expose` or `ports`. Entry ports must be unique across
+Stacks; `80`, `443`, `2019..2021`, and configured HTTP listen ports are reserved. Firewall rules
+must allow intended clients to reach the entry and Gateways to reach task-node published ports.
+There is no overlay network or authentication added by TCP forwarding.
+
+Existing Service healthchecks still control task eligibility. The native Caddy app additionally
+checks Gateway-to-backend TCP connectivity: two-second probe interval, one-second probe timeout,
+two failures to remove, one success to restore. Actual proxy dial timeout is three seconds.
+New connections use healthy replicas round-robin, without retrying the same connection. The
+probe sends no business data and does not replace an application healthcheck.
+
+An occupied entry port is a per-route error, retried automatically without rejecting HTTP
+configuration, startup or resume. No healthy backends means new connections close immediately.
+`swarmlite gateway status` and the UI's Routes page show these runtime states separately from
+configuration ACKs. Deployment waits for each TCP route to have a listener and healthy backend
+on every enabled Gateway; unrelated HTTP-only Stack readiness does not depend on TCP health.
+An intentional scale to zero instead waits for a bound listener and an empty backend list;
+the scale operation completes, while new connections still close until replicas are restored.
+
+TCP-only tasks do not use HTTP connection draining. Route changes, reloads and Gateway restarts
+can close connections; clients must reconnect. TLS can pass through as raw bytes, but there is
+no TCP TLS termination, SNI routing, PROXY protocol or UDP support.
+
+Upgrade Controller, Nodes and the Gateway image together before enabling this feature. The
+image must contain `swarmlite_tcp` and `admin.api.swarmlite_tcp`; old published images do not.
+TCP recovery snapshots use v2, so downgrading to an older binary with TCP routes is unsupported.
+See the [design](design/l4-port-mapping.md) and [fault tests](design/l4-port-mapping-validation.md).
 
 ## Remote management over SSH
 

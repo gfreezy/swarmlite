@@ -1,0 +1,3 @@
+FROM swarmlite-e2e-gateway:current
+# Different image identity forces the real candidate/promote/retire workflow.
+LABEL io.swarmlite.e2e.variant=replacement

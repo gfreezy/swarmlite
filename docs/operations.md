@@ -107,7 +107,12 @@ sudo swarmlite gateway disable node-a
 address, rollout generation, retryability, and error state. Its JSON form preserves unset optional
 configuration fields as `null`.
 
-At least one Gateway must be enabled before deploying a Stack with HTTP routes.
+At least one Gateway must be enabled before deploying a Stack with HTTP or TCP routes.
+
+TCP runtime status is listed separately from the configuration ACK: an occupied entry port or
+unhealthy TCP backend does not mark HTTP configuration application as failed. A failed listener
+retries automatically; new connections are closed when a route has no healthy backends.
+See [TCP routes](applications.md#tcp-routes) for configuration and upgrade requirements.
 
 > [!WARNING]
 > Disabling a Gateway first commits and verifies its exact certificate manifest in the Controller;

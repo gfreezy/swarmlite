@@ -221,7 +221,7 @@ fn stop_all_service_tasks(state: &mut ClusterState, service: &ServiceRecord) -> 
 }
 
 fn retire_task(state: &mut ClusterState, task_id: &str, service: &ServiceRecord) -> bool {
-    let routed = gateway::is_service_routed(state, service);
+    let routed = gateway::is_service_http_routed(state, service);
     let task = state.tasks.get_mut(task_id).unwrap();
     if task.desired != DesiredTaskState::Running {
         return false;
@@ -923,6 +923,33 @@ mod tests {
         let binding = &state.tasks.values().next().unwrap().ports[0];
         assert_eq!(binding.target, 8080);
         assert_eq!(binding.published, None);
+    }
+
+    #[test]
+    fn tcp_only_service_allocates_dynamic_ports_but_does_not_drain() {
+        let (mut state, live) = state_with_nodes();
+        route_service(&mut state, "web", 8080);
+        let gateway = &mut state.stacks.get_mut("demo").unwrap().gateway;
+        gateway.http_routes.clear();
+        gateway.tcp_routes.push(swarmlite_stack::TcpRouteSpec {
+            listen: 8099,
+            backend: swarmlite_stack::TcpBackend {
+                service: "web".into(),
+                port: 8080,
+            },
+        });
+        let mut original = service(1, 1);
+        original.spec.ports.clear();
+        state.services.insert(original.id.clone(), original.clone());
+        reconcile(&mut state, &live);
+        let id = state.tasks.keys().next().unwrap().clone();
+        let task = state.tasks.get_mut(&id).unwrap();
+        assert_eq!(task.ports[0].target, 8080);
+        assert_eq!(task.ports[0].published, None);
+        task.observed = ObservedTaskState::Healthy;
+        assert!(retire_task(&mut state, &id, &original));
+        assert_eq!(state.tasks[&id].desired, DesiredTaskState::Stopped);
+        assert!(state.tasks[&id].drain_until_unix_ms.is_none());
     }
 
     #[test]

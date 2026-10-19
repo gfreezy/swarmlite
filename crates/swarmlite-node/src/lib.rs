@@ -421,8 +421,25 @@ impl NodeSupervisor {
             );
         }
         let mut gateway_reconciled = false;
+        let mut tcp_configured = false;
+        let mut tcp_poll = tokio::time::interval(std::time::Duration::from_secs(2));
+        tcp_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
+                _ = tcp_poll.tick(), if settings.gateway_enabled && tcp_configured => {
+                    let tcp = match runtime.gateway_tcp_status().await {
+                        Ok(status) => status,
+                        Err(error) => crate::model::GatewayTcpStatus {
+                            error: Some(format!("{error:#}")),
+                            ..Default::default()
+                        },
+                    };
+                    gateway_report_tx.send_if_modified(|report| {
+                        if report.tcp.as_ref() == Some(&tcp) { return false; }
+                        report.tcp = Some(tcp);
+                        true
+                    });
+                }
                 signal = tokio::signal::ctrl_c() => {
                     if let Err(error) = signal {
                         warn!(%error, "failed to listen for shutdown signal");
@@ -438,6 +455,9 @@ impl NodeSupervisor {
                         bail!("node agent stopped publishing control updates");
                     }
                     let control = control_rx.borrow_and_update().clone();
+                    tcp_configured = control.gateway_config.as_ref().is_some_and(|assignment| {
+                        assignment.config["apps"].get("swarmlite_tcp").is_some()
+                    });
                     let had_gateway = settings.gateway_enabled;
                     if control.cluster.controller_id != settings.cluster.controller_id {
                         bail!("controller identity changes are not supported; replace the cluster to move the controller");
@@ -550,6 +570,7 @@ fn gateway_operation_report(
             image,
             error: None,
             retryable: true,
+            tcp: None,
         },
         Err(error) => {
             let retryable = gateway_error_is_retryable(&error);
@@ -560,6 +581,7 @@ fn gateway_operation_report(
                 image,
                 error: Some(error),
                 retryable,
+                tcp: None,
             }
         }
     }

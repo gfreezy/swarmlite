@@ -123,3 +123,19 @@ test("routes distinguish retained upstreams from gateway application and link se
   );
   await waitFor(() => expect(screen.queryByText("example.com")).toBeNull());
 });
+
+test("TCP forwarding and bind errors are distinct from HTTP configuration acknowledgements", async () => {
+  vi.mocked(get).mockImplementation(async (path) =>
+    path === "/gateways"
+      ? { generation: 9, nodes: [{ node_id: "node1", address: "10.0.0.1", status: "ready", desired_generation: 9, applied_generation: 9,
+          tcp: { routes: [{ id: "demo:8099", listen: ":8099", listening: false, error: "address already in use", backends: [] }] },
+        }] }
+      : { generation: 9, routes: [], tcp_routes: [{ id: "demo:8099", stack: "demo", listen: 8099, service_id: "demo.db", backend: {service: "db", port: 9000}, upstreams: ["10.0.0.2:20001"] }] },
+  );
+  render(<RoutesView services={[]} onService={vi.fn()} refreshToken={0} />);
+  await screen.findByText("TCP forwarding");
+  expect(screen.getByText("demo.db")).toBeTruthy();
+  expect(screen.getByText("10.0.0.2:20001")).toBeTruthy();
+  expect(screen.getByText(/TCP :8099: not listening.*address already in use/)).toBeTruthy();
+  expect(screen.getByText("ready")).toBeTruthy();
+});

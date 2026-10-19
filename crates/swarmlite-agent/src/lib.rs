@@ -2009,6 +2009,7 @@ mod tests {
             image: None,
             error: Some("Docker temporarily unavailable".into()),
             retryable: true,
+            tcp: None,
         };
         let mut retries = GatewayRetryState::default();
         assert!(!retries.retry_due(&transient, now));
@@ -2022,6 +2023,7 @@ mod tests {
             image: None,
             error: Some("Gateway port 80 is occupied".into()),
             retryable: false,
+            tcp: None,
         };
         retries.reset();
         assert!(!retries.retry_due(&port_conflict, now));

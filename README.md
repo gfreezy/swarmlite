@@ -3,7 +3,7 @@
 **Container orchestration for a small fleet of machines, with a CLI and an embedded Web UI.**
 
 Swarmlite is written in Rust and runs on Docker or Podman. Deploy Compose-style Stack files,
-roll out service updates, schedule jobs, publish HTTPS routes, and inspect your cluster from
+roll out service updates, schedule jobs, publish HTTPS and TCP routes, and inspect your cluster from
 one binary. It is designed for machines in a trusted LAN or region.
 
 [Quick start](#quick-start) · [Web UI](#web-ui) · [Node monitoring](#node-monitoring) ·
@@ -20,7 +20,7 @@ one binary. It is designed for machines in a trusted LAN or region.
 | --- | --- |
 | Deploy services | Compose-style YAML, replicas, placement constraints, rolling updates, retry and rollback |
 | Run jobs | Manual runs, cron schedules, timeouts, execution history and logs |
-| Publish routes | Caddy HTTPS, hostname/path routing, rewrites, external backends and optional response caching |
+| Publish routes | Caddy HTTPS, hostname/path routing, rewrites, external backends, optional response caching and native TCP forwarding |
 | Operate visually | Resource navigation, rich inspection, routing graph, logs and contextual management actions |
 | Monitor nodes | CPU, memory, filesystems, disk and network I/O; SQLite history with automatic aggregation up to 365 days |
 | Manage remotely | SSH connections from the CLI and Web UI; Stack files stay on your workstation |
@@ -133,6 +133,44 @@ swarmlite ui
 The CLI opens a temporary SSH tunnel and reads the protected connection settings on the server.
 Your Stack file stays local. SSH aliases and `ProxyJump` are supported.
 [SSH setup and non-root access](docs/applications.md#remote-management-over-ssh).
+
+## TCP forwarding
+
+Use a fixed Gateway port to reach a Service on any task node:
+
+```yaml
+services:
+  redis:
+    image: redis:7-alpine
+    expose: ["6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+
+x-swarmlite:
+  tcp_routes:
+    - listen: 16379
+      backend:
+        service: redis
+        port: 6379
+```
+
+Clients connect to `Gateway:16379`; the Gateway forwards to a task's dynamic host port, then to
+container port `6379`. Open the entry port only to trusted clients and allow Gateways to reach
+task-node published ports. Multiple Gateways expose the same entry; healthy replicas share new
+connections. Service healthchecks are retained, with additional Gateway TCP-connect probes.
+
+An occupied entry port disables only that TCP route and is retried automatically; no healthy
+backends means new connections are closed. Check `swarmlite gateway status` or the UI's Routes
+page for TCP listener/backend errors separately from the HTTP configuration ACK. TCP updates and
+Gateway restarts can interrupt connections; clients must reconnect. There is no TCP draining.
+
+This feature requires a Gateway image containing the new native `swarmlite_tcp` module; upgrade
+Controller, Nodes and Gateway images together before using it. It is not present in older
+published images. See the [design and limitations](docs/design/l4-port-mapping.md) and
+[fault validation](docs/design/l4-port-mapping-validation.md).
 
 ## Web UI
 
@@ -291,3 +329,5 @@ cargo build --release --locked
 Cargo builds and embeds the React/TypeScript/Vite frontend. No separate frontend deployment is needed.
 See the [development guide](docs/development.md) for workspace structure, tests and the release workflow,
 and the [UI development guide](ui/README.md#frontend-development) for Vite setup.
+The opt-in [whole-cluster TCP E2E](tests/cluster-e2e/README.md) exercises three isolated
+Docker nodes, rolling upgrades, Gateway image replacement and failure recovery.

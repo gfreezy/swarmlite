@@ -19,7 +19,7 @@ async fn gateways(State(state): State<Arc<UiState>>) -> ApiResult<Value> {
 async fn routes_view(State(state): State<Arc<UiState>>) -> ApiResult<Value> {
     let status: StatusResponse = bounded(state.connection.get_json("/v1/status")).await?;
     Ok(Json(
-        json!({"generation":status.state.gateway_generation,"routes":route_rows(&status.state)}),
+        json!({"generation":status.state.gateway_generation,"routes":route_rows(&status.state),"tcp_routes":tcp_route_rows(&status.state)}),
     ))
 }
 
@@ -29,6 +29,16 @@ fn address(host: &str, port: u16) -> String {
     } else {
         format!("{host}:{port}")
     }
+}
+
+fn tcp_route_rows(state: &ClusterState) -> Vec<Value> {
+    state.gateway_routes.iter().flat_map(|(stack, fragment)| {
+        fragment.gateway.tcp_routes.iter().map(move |route| {
+            let upstreams = fragment.upstreams.get(&ServicePortKey::tcp(&route.backend.service, route.backend.port)).cloned().unwrap_or_default();
+            json!({"id":format!("{stack}:{}",route.listen),"stack":stack,"listen":route.listen,
+                "service_id":format!("{stack}.{}",route.backend.service),"backend":route.backend,"upstreams":upstreams})
+        })
+    }).collect()
 }
 
 fn route_rows(state: &ClusterState) -> Vec<Value> {
@@ -248,6 +258,32 @@ mod tests {
         assert_eq!(rows[0]["upstreams"][0], "[::1]:21000");
         assert_eq!(rows[0]["replicas"], json!([]));
         assert_eq!(address("::1", 80), "[::1]:80");
+    }
+
+    #[test]
+    fn tcp_routes_keep_retained_upstreams_and_empty_routes() {
+        let mut state = ClusterState::default();
+        state.gateway_routes.insert(
+            "demo".into(),
+            swarmlite_core::model::RecoveredStackGateway {
+                gateway: serde_json::from_value(json!({"tcp_routes":[
+                    {"listen":8099,"backend":{"service":"web","port":80}},
+                    {"listen":8100,"backend":{"service":"web","port":81}}
+                ]}))
+                .unwrap(),
+                upstreams: BTreeMap::from([(
+                    ServicePortKey::tcp("web", 80),
+                    vec!["[::1]:21000".into()],
+                )]),
+            },
+        );
+        let rows = tcp_route_rows(&state);
+        assert_eq!(rows[0]["id"], "demo:8099");
+        assert_eq!(rows[0]["service_id"], "demo.web");
+        assert_eq!(rows[0]["upstreams"][0], "[::1]:21000");
+        assert_eq!(rows[1]["listen"], 8100);
+        assert_eq!(rows[1]["upstreams"], json!([]));
+        assert!(route_rows(&state).is_empty());
     }
 
     #[test]

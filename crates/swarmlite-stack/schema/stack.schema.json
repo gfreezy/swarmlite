@@ -451,9 +451,15 @@
           "type": "array",
           "items": { "$ref": "#/$defs/httpRoute" },
           "default": []
+        },
+        "tcp_routes": {
+          "type": ["array", "null"],
+          "items": { "$ref": "#/$defs/tcpRoute" },
+          "default": [],
+          "description": "Optional Gateway TCP listeners forwarded to healthy service task ports. Omitted, null or empty disables TCP forwarding."
         }
       },
-      "additionalProperties": false
+      "additionalProperties": true
     },
     "registryCredential": {
       "type": "object",
@@ -489,6 +495,23 @@
         "minLength": 1
       },
       "description": "IP addresses, CIDR ranges, or the private_ranges shortcut whose incoming X-Forwarded-* headers are trusted."
+    },
+    "tcpRoute": {
+      "type": "object",
+      "required": ["listen", "backend"],
+      "properties": {
+        "listen": { "type": "integer", "minimum": 1, "maximum": 65535, "not": { "enum": [80, 443, 2019, 2020, 2021] } },
+        "backend": {
+          "type": "object",
+          "required": ["service", "port"],
+          "properties": {
+            "service": { "type": "string", "minLength": 1 },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
     },
     "httpRoute": {
       "type": "object",

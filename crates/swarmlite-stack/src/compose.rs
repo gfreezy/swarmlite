@@ -10,7 +10,7 @@ use serde_yaml::Value;
 
 use crate::{
     GatewayHttpMode, GatewayTlsMode, HealthcheckSpec, HttpRouteSpec, PullPolicy,
-    ServiceConfigMount, ServicePort, ServiceSpec, StackGatewaySpec,
+    ServiceConfigMount, ServicePort, ServiceSpec, StackGatewaySpec, TcpRouteSpec,
 };
 
 #[derive(Debug, Clone)]
@@ -67,7 +67,6 @@ struct RawConfigSource {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawSwarmlite {
     name: Option<String>,
     #[serde(default)]
@@ -80,6 +79,8 @@ struct RawSwarmlite {
     trusted_proxies: Vec<String>,
     #[serde(default)]
     http_routes: Vec<HttpRouteSpec>,
+    #[serde(default, deserialize_with = "crate::deserialize_tcp_routes")]
+    tcp_routes: Vec<TcpRouteSpec>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +97,7 @@ impl RawSwarmlite {
             http: self.http,
             trusted_proxies: self.trusted_proxies,
             http_routes: self.http_routes,
+            tcp_routes: self.tcp_routes,
         }
     }
 }

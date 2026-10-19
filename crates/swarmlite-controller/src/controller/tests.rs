@@ -1125,10 +1125,16 @@ fn progress_deadline_stalls_without_finishing_and_progress_resumes_it() {
     );
 
     assert!(!deployment::refresh_stack_deployments(
-        &mut state, 5_999, false
+        &mut state,
+        5_999,
+        false,
+        &BTreeSet::new()
     ));
     assert!(deployment::refresh_stack_deployments(
-        &mut state, 6_000, false
+        &mut state,
+        6_000,
+        false,
+        &BTreeSet::new()
     ));
     let stalled = state.stacks["demo"].deployment.as_ref().unwrap();
     assert_eq!(stalled.status, StackDeploymentStatus::Stalled);
@@ -1555,6 +1561,7 @@ x-swarmlite:
                     image: None,
                     error: None,
                     retryable: true,
+                    tcp: None,
                 },
             },
         )
@@ -1637,6 +1644,7 @@ x-swarmlite:
                     image: None,
                     error: None,
                     retryable: true,
+                    tcp: None,
                 },
             },
         )
@@ -1663,6 +1671,7 @@ x-swarmlite:
                     image: None,
                     error: None,
                     retryable: true,
+                    tcp: None,
                 },
             },
         )
@@ -1687,6 +1696,7 @@ x-swarmlite:
                     image: None,
                     error: None,
                     retryable: true,
+                    tcp: None,
                 },
             },
         )
@@ -1717,6 +1727,7 @@ x-swarmlite:
                     image: None,
                     error: None,
                     retryable: true,
+                    tcp: None,
                 },
             },
         )
@@ -2200,6 +2211,322 @@ x-swarmlite:
         ControllerError::Conflict(message)
             if message.contains("example.com") && message.contains("first")
     ));
+}
+
+fn tcp_gateway(listen: u16) -> StackGatewaySpec {
+    parse_stack(&format!("services:\n  web: {{image: nginx, expose: [80]}}\nx-swarmlite:\n  tcp_routes:\n    - listen: {listen}\n      backend: {{service: web, port: 80}}\n")).unwrap().gateway
+}
+
+#[test]
+fn tcp_ports_reserve_both_published_and_pending_stack_routes() {
+    let mut state = ClusterState::default();
+    state.stacks.insert(
+        "first".into(),
+        StackRecord {
+            name: "first".into(),
+            applied_at_unix_ms: 1,
+            services: vec!["first.web".into()],
+            gateway: tcp_gateway(8099),
+            deployment: None,
+            deployment_history: BTreeMap::new(),
+        },
+    );
+    state.gateway_routes.insert(
+        "first".into(),
+        crate::model::RecoveredStackGateway {
+            gateway: tcp_gateway(8100),
+            upstreams: BTreeMap::new(),
+        },
+    );
+    for port in [8099, 8100] {
+        assert!(validate_gateway_hostname_ownership(&state, "second", &tcp_gateway(port)).is_err());
+        assert!(validate_gateway_hostname_ownership(&state, "first", &tcp_gateway(port)).is_ok());
+    }
+}
+
+#[tokio::test]
+async fn tcp_gateway_validates_http_ports_and_reports_readiness_separately() {
+    let (controller, _, _directory) = test_controller("tcp-readiness").await;
+    let mut request = test_join_request("node-a", "127.0.0.1");
+    request.gateway_enabled = true;
+    controller.join_node("node-a", request).await.unwrap();
+    let mut parsed = parse_stack("services:\n  web: {image: nginx, expose: [80]}\n").unwrap();
+    parsed.gateway = tcp_gateway(18089);
+    {
+        let mut inner = controller.inner.lock().await;
+        inner.cluster.gateway.listen = vec![":18089".into()];
+    }
+    let error = controller
+        .validate_apply("demo", &parsed)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, ControllerError::Invalid(message) if message.contains("HTTP listener"))
+    );
+    parsed.gateway = tcp_gateway(8099);
+    controller.validate_apply("demo", &parsed).await.unwrap();
+    let mut inner = controller.inner.lock().await;
+    inner.state.stacks.insert(
+        "demo".into(),
+        StackRecord {
+            name: "demo".into(),
+            applied_at_unix_ms: 1,
+            services: vec!["demo.web".into()],
+            gateway: parsed.gateway,
+            deployment: None,
+            deployment_history: BTreeMap::new(),
+        },
+    );
+    assert!(!super::gateway_control::tcp_stack_ready(&inner, "demo"));
+    let nodes = inner
+        .state
+        .members
+        .values()
+        .filter(|node| node.gateway_enabled)
+        .map(|node| node.id.clone())
+        .collect::<Vec<_>>();
+    let gateway_generation = inner.gateway_generation;
+    for node in &nodes {
+        inner.gateway_reports.insert(
+            node.clone(),
+            GatewayReport {
+                applied_generation: Some(gateway_generation),
+                tcp: Some(crate::model::GatewayTcpStatus {
+                    error: None,
+                    routes: vec![crate::model::GatewayTcpRouteStatus {
+                        id: "demo:8099".into(),
+                        listen: ":8099".into(),
+                        listening: false,
+                        error: Some("address already in use".into()),
+                        backends: vec![],
+                    }],
+                }),
+                ..Default::default()
+            },
+        );
+    }
+    assert!(!super::gateway_control::tcp_stack_ready(&inner, "demo"));
+    assert!(
+        inner
+            .gateway_reports
+            .values()
+            .all(|report| report.error.is_none())
+    );
+    for node in &nodes {
+        let route = &mut inner
+            .gateway_reports
+            .get_mut(node)
+            .unwrap()
+            .tcp
+            .as_mut()
+            .unwrap()
+            .routes[0];
+        route.listening = true;
+        route.error = None;
+        route.backends.push(crate::model::GatewayTcpBackendStatus {
+            address: "127.0.0.1:20001".into(),
+            healthy: true,
+            error: None,
+        });
+    }
+    assert!(super::gateway_control::tcp_stack_ready(&inner, "demo"));
+    inner
+        .gateway_reports
+        .get_mut(&nodes[0])
+        .unwrap()
+        .applied_generation = None;
+    assert!(!super::gateway_control::tcp_stack_ready(&inner, "demo"));
+    assert!(super::gateway_control::tcp_stack_ready(
+        &inner,
+        "unrelated-http-stack"
+    ));
+
+    for report in inner.gateway_reports.values_mut() {
+        report.applied_generation = Some(gateway_generation);
+        report.tcp.as_mut().unwrap().routes[0].backends.clear();
+    }
+    assert!(!super::gateway_control::tcp_stack_ready(&inner, "demo"));
+    let mut service = test_service();
+    service.spec.replicas = 0;
+    inner.state.services.insert(service.id.clone(), service);
+    // Intentional scale-to-zero must finish with a bound listener and an empty
+    // upstream list; it cannot require a healthy replica that was set to zero.
+    assert!(super::gateway_control::tcp_stack_ready(&inner, "demo"));
+    inner
+        .gateway_reports
+        .get_mut(&nodes[0])
+        .unwrap()
+        .tcp
+        .as_mut()
+        .unwrap()
+        .routes[0]
+        .backends
+        .push(crate::model::GatewayTcpBackendStatus {
+            address: "127.0.0.1:20001".into(),
+            healthy: true,
+            error: None,
+        });
+    assert!(!super::gateway_control::tcp_stack_ready(&inner, "demo"));
+    inner
+        .gateway_reports
+        .get_mut(&nodes[0])
+        .unwrap()
+        .tcp
+        .as_mut()
+        .unwrap()
+        .routes[0]
+        .backends
+        .clear();
+    inner
+        .state
+        .services
+        .get_mut("demo.web")
+        .unwrap()
+        .spec
+        .replicas = 1;
+    assert!(!super::gateway_control::tcp_stack_ready(&inner, "demo"));
+    inner
+        .state
+        .services
+        .get_mut("demo.web")
+        .unwrap()
+        .spec
+        .replicas = 0;
+    inner
+        .gateway_reports
+        .get_mut(&nodes[0])
+        .unwrap()
+        .tcp
+        .as_mut()
+        .unwrap()
+        .routes[0]
+        .listening = false;
+    assert!(!super::gateway_control::tcp_stack_ready(&inner, "demo"));
+}
+
+#[tokio::test]
+async fn tcp_deployment_tracks_task_ports_and_waits_for_route_health_not_just_config_ack() {
+    let cluster = test_cluster("tcp-deployment");
+    let directory = tempfile::tempdir().unwrap();
+    let repository = StateRepository::open(directory.path(), cluster.clone()).unwrap();
+    let mut config = test_controller_config(&cluster, directory.path());
+    config.gateway_enabled = false;
+    let controller = Controller::new(config, "test-token".into(), repository)
+        .await
+        .unwrap();
+    let mut request = test_join_request("node-a", "127.0.0.1");
+    request.gateway_enabled = true;
+    controller.join_node("node-a", request).await.unwrap();
+    let mut heartbeat = NodeHeartbeat {
+        node: test_node(),
+        tasks: Vec::new(),
+        task_inventory_error: None,
+        task_results: Vec::new(),
+        task_progress: Vec::new(),
+        image_results: Vec::new(),
+        image_progress: Vec::new(),
+        gateway: GatewayReport::default(),
+    };
+    controller
+        .heartbeat("node-a", heartbeat.clone())
+        .await
+        .unwrap();
+    let parsed = parse_stack("services:\n  web: {image: nginx:alpine, expose: [80]}\nx-swarmlite:\n  tcp_routes:\n    - listen: 8099\n      backend: {service: web, port: 80}\n").unwrap();
+    let service_spec = parsed.services["web"].clone();
+    let accepted = controller.apply("demo", parsed).await.unwrap();
+    let task = controller
+        .inner
+        .lock()
+        .await
+        .state
+        .tasks
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    assert_eq!(task.ports[0].target, 80);
+    assert_eq!(task.ports[0].published, None);
+    heartbeat.tasks.push(recovered_task_report(
+        "tcp-deployment",
+        "demo",
+        &task.id,
+        task.revision,
+        &service_spec,
+        20001,
+    ));
+    heartbeat.task_results.push(TaskReconcileReport {
+        task_id: task.id.clone(),
+        desired_generation: accepted.generation,
+        applied_generation: Some(accepted.generation),
+        phase: crate::model::TaskReconcilePhase::Create,
+        error: None,
+    });
+    let assignment = controller
+        .heartbeat("node-a", heartbeat.clone())
+        .await
+        .unwrap()
+        .gateway_config
+        .unwrap();
+    assert_eq!(
+        assignment.config["apps"]["swarmlite_tcp"]["routes"][0],
+        serde_json::json!({"id":"demo:8099","listen":":8099","upstreams":["127.0.0.1:20001"]})
+    );
+    assert_eq!(assignment.recovery_snapshot.format_version, 2);
+    heartbeat.gateway = GatewayReport {
+        applied_generation: Some(assignment.generation),
+        tcp: Some(crate::model::GatewayTcpStatus {
+            error: None,
+            routes: vec![crate::model::GatewayTcpRouteStatus {
+                id: "demo:8099".into(),
+                listen: ":8099".into(),
+                listening: false,
+                error: Some("address already in use".into()),
+                backends: vec![crate::model::GatewayTcpBackendStatus {
+                    address: "127.0.0.1:20001".into(),
+                    healthy: true,
+                    error: None,
+                }],
+            }],
+        }),
+        ..Default::default()
+    };
+    controller
+        .heartbeat("node-a", heartbeat.clone())
+        .await
+        .unwrap();
+    let status = controller.gateway_status().await;
+    let node = status
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "node-a")
+        .unwrap();
+    assert_eq!(node.status, GatewayNodeStatusKind::Ready);
+    assert!(node.error.is_none());
+    let pending = controller
+        .wait_for_deployment("demo", Some(accepted.generation), None, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(pending.status, StackDeploymentStatus::Reconciling);
+    let route = &mut heartbeat.gateway.tcp.as_mut().unwrap().routes[0];
+    route.listening = true;
+    route.error = None;
+    route.backends[0].healthy = false;
+    controller
+        .heartbeat("node-a", heartbeat.clone())
+        .await
+        .unwrap();
+    let pending = controller
+        .wait_for_deployment("demo", Some(accepted.generation), None, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(pending.status, StackDeploymentStatus::Reconciling);
+    heartbeat.gateway.tcp.as_mut().unwrap().routes[0].backends[0].healthy = true;
+    controller.heartbeat("node-a", heartbeat).await.unwrap();
+    let completed = controller
+        .wait_for_deployment("demo", Some(accepted.generation), None, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(completed.status, StackDeploymentStatus::Healthy);
 }
 
 #[tokio::test]
@@ -2790,6 +3117,10 @@ async fn caddy_acknowledgement_starts_drain_deadline() {
                     image: Some("ghcr.io/feichao/swarmlite-gateway:v0.1.25".into()),
                     error: None,
                     retryable: true,
+                    tcp: Some(crate::model::GatewayTcpStatus {
+                        error: Some("unrelated TCP status unavailable".into()),
+                        ..Default::default()
+                    }),
                 },
             },
         )
@@ -2827,6 +3158,7 @@ async fn gateway_failures_are_exposed_in_status() {
                     image: Some("ghcr.io/feichao/swarmlite-gateway:v0.1.22".into()),
                     error: Some("failed to bind gateway port 80".into()),
                     retryable: false,
+                    tcp: None,
                 },
             },
         )

@@ -13,7 +13,7 @@ pub use swarmlite_stack::{
 };
 
 pub const CLUSTER_SCHEMA_VERSION: u32 = 9;
-pub const GATEWAY_RECOVERY_FORMAT_VERSION: u32 = 1;
+pub const GATEWAY_RECOVERY_FORMAT_VERSION: u32 = 2;
 pub const DEFAULT_GATEWAY_IMAGE: &str = concat!(
     "ghcr.io/gfreezy/swarmlite-caddy:v",
     env!("CARGO_PKG_VERSION")
@@ -747,6 +747,14 @@ pub struct ServicePortKey {
 }
 
 impl ServicePortKey {
+    pub fn tcp(service: impl Into<String>, target_port: u16) -> Self {
+        Self {
+            service: service.into(),
+            target_port,
+            protocol: "tcp".to_owned(),
+        }
+    }
+
     pub fn new(
         service: impl Into<String>,
         target_port: u16,
@@ -791,7 +799,7 @@ impl FromStr for ServicePortKey {
         if service.is_empty() || target_port == 0 {
             return Err("service and target_port must be non-empty".to_owned());
         }
-        if !matches!(protocol, "http" | "https" | "h2c") {
+        if !matches!(protocol, "http" | "https" | "h2c" | "tcp") {
             return Err(format!("unsupported backend protocol {protocol:?}"));
         }
         Ok(Self {
@@ -845,7 +853,15 @@ impl GatewayRecoverySnapshot {
         stacks: BTreeMap<String, RecoveredStackGateway>,
     ) -> Self {
         Self {
-            format_version: GATEWAY_RECOVERY_FORMAT_VERSION,
+            // Keep HTTP-only snapshots readable by the previous release.
+            format_version: if stacks
+                .values()
+                .any(|stack| !stack.gateway.tcp_routes.is_empty())
+            {
+                GATEWAY_RECOVERY_FORMAT_VERSION
+            } else {
+                1
+            },
             cluster_id: cluster_id.into(),
             generation,
             stacks,
@@ -853,9 +869,9 @@ impl GatewayRecoverySnapshot {
     }
 
     pub fn validate_for_cluster(&self, cluster_id: &str) -> Result<(), String> {
-        if self.format_version != GATEWAY_RECOVERY_FORMAT_VERSION {
+        if !matches!(self.format_version, 1 | GATEWAY_RECOVERY_FORMAT_VERSION) {
             return Err(format!(
-                "unsupported gateway recovery snapshot format {}; expected {}",
+                "unsupported gateway recovery snapshot format {}; expected 1 or {}",
                 self.format_version, GATEWAY_RECOVERY_FORMAT_VERSION
             ));
         }
@@ -868,20 +884,37 @@ impl GatewayRecoverySnapshot {
         if self.generation == 0 {
             return Err("gateway recovery snapshot generation must be positive".to_owned());
         }
+        let mut tcp_ports = BTreeSet::new();
         for (stack_key, stack) in &self.stacks {
+            for route in &stack.gateway.tcp_routes {
+                if self.format_version < 2
+                    || route.listen == 0
+                    || matches!(route.listen, 80 | 443 | 2019..=2021)
+                    || !tcp_ports.insert(route.listen)
+                {
+                    return Err(
+                        "invalid, reserved or duplicate TCP listener in recovery snapshot"
+                            .to_owned(),
+                    );
+                }
+            }
             swarmlite_stack::validate_stack_name(stack_key)
                 .map_err(|error| format!("invalid recovered stack {stack_key:?}: {error}"))?;
-            let expected_keys = stack
-                .gateway
-                .http_routes
-                .iter()
-                .flat_map(|route| &route.rules)
-                .filter_map(|rule| {
-                    rule.backend.service.as_deref().map(|service| {
-                        ServicePortKey::new(service, rule.backend.port, rule.backend.protocol)
+            let expected_keys =
+                stack
+                    .gateway
+                    .http_routes
+                    .iter()
+                    .flat_map(|route| &route.rules)
+                    .filter_map(|rule| {
+                        rule.backend.service.as_deref().map(|service| {
+                            ServicePortKey::new(service, rule.backend.port, rule.backend.protocol)
+                        })
                     })
-                })
-                .collect::<BTreeSet<_>>();
+                    .chain(stack.gateway.tcp_routes.iter().map(|route| {
+                        ServicePortKey::tcp(&route.backend.service, route.backend.port)
+                    }))
+                    .collect::<BTreeSet<_>>();
             let actual_keys = stack.upstreams.keys().cloned().collect::<BTreeSet<_>>();
             if actual_keys != expected_keys {
                 return Err(format!(
@@ -1306,6 +1339,42 @@ pub struct GatewayReport {
     pub error: Option<String>,
     #[serde(default = "default_gateway_retryable")]
     pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp: Option<GatewayTcpStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct GatewayTcpStatus {
+    #[serde(default)]
+    pub routes: Vec<GatewayTcpRouteStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayTcpRouteStatus {
+    pub id: String,
+    pub listen: String,
+    pub listening: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub backends: Vec<GatewayTcpBackendStatus>,
+}
+
+impl GatewayTcpRouteStatus {
+    pub fn ready(&self) -> bool {
+        self.listening
+            && self.error.is_none()
+            && self.backends.iter().any(|backend| backend.healthy)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayTcpBackendStatus {
+    pub address: String,
+    pub healthy: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 const fn default_gateway_retryable() -> bool {
@@ -1319,6 +1388,7 @@ impl Default for GatewayReport {
             image: None,
             error: None,
             retryable: true,
+            tcp: None,
         }
     }
 }
@@ -1530,6 +1600,8 @@ pub struct GatewayNodeStatus {
     pub applied_generation: Option<u64>,
     pub retryable: Option<bool>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp: Option<GatewayTcpStatus>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2069,6 +2141,25 @@ mod tests {
     }
 
     #[test]
+    fn legacy_gateway_reports_without_tcp_keep_the_same_wire_shape() {
+        let legacy = serde_json::json!({
+            "applied_generation": 7,
+            "image": "gateway:v1",
+            "retryable": true
+        });
+        let report: GatewayReport = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(report.tcp.is_none());
+        assert_eq!(serde_json::to_value(&report).unwrap(), legacy);
+        let mut future = legacy;
+        future["error"] = serde_json::Value::Null;
+        future["future_gateway_option"] = serde_json::json!({"enabled": true});
+        assert_eq!(
+            serde_json::from_value::<GatewayReport>(future).unwrap(),
+            report
+        );
+    }
+
+    #[test]
     fn snapshot_round_trip_uses_stable_service_port_map_keys() {
         let gateway = swarmlite_stack::parse_stack(
             r#"
@@ -2098,6 +2189,8 @@ x-swarmlite:
         );
 
         let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert_eq!(snapshot.format_version, 1);
+        assert!(!encoded.contains("tcp_routes"));
         assert!(encoded.contains(r#""web:80:h2c""#));
         let decoded: GatewayRecoverySnapshot = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, snapshot);

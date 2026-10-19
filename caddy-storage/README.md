@@ -2,7 +2,7 @@
 
 When a node has its Gateway enabled, `swarmlite serve` creates an independent Caddy container with
 its own restart policy and slot-local `/data`, `/config`, and `/cache` volumes. The default gateway
-image includes this directory's `caddy.storage.swarmlite`,
+image includes this directory's native `swarmlite_tcp`, `caddy.storage.swarmlite`,
 `http.handlers.swarmlite_gateway_probe`, and native `http.handlers.cache` modules, Caddy's
 `http.handlers.encode`, and the standard `zstd` and `gzip` encoders. The response cache persists
 directly to SQLite; cache-handler, Souin, and their storage-provider abstraction are not linked.
@@ -55,6 +55,8 @@ The image reference is stored in the controller's SQLite database. The selected 
 `caddy`, `caddy.storage.swarmlite`, `admin.api.swarmlite_storage`,
 `http.handlers.swarmlite_gateway_probe`,
 `http.handlers.cache`, `http.handlers.encode`, `http.encoders.zstd`, and `http.encoders.gzip`.
+TCP forwarding additionally requires `swarmlite_tcp` and `admin.api.swarmlite_tcp`; upgrade the
+Gateway image before enabling Stack `tcp_routes`.
 Gateway nodes resolve the actual local image ID. A different reference with the same image digest
 does not restart Caddy. A different digest starts a blank blue/green candidate with fresh `/data`,
 `/config`, and `/cache` volumes; Controller-owned state is restored before it binds public ports.
@@ -162,7 +164,58 @@ Keep that directory on persistent local storage. The equivalent Caddyfile global
 }
 ```
 
-## Failure behavior
+## Native TCP forwarding
+
+Stack `x-swarmlite.tcp_routes` is rendered into the same Caddy configuration as HTTP, using this
+directory's `swarmlite_tcp` app, not caddy-l4 or host firewall rules:
+
+```json
+{
+  "apps": {
+    "swarmlite_tcp": {
+      "routes": [{
+        "id": "demo:8099",
+        "listen": ":8099",
+        "upstreams": ["10.0.0.21:20001", "[fd00::22]:20004"]
+      }]
+    }
+  }
+}
+```
+
+The Gateway listens on the published entry port and forwards raw TCP bytes to a task node's
+dynamic published port. Controller only supplies healthy running tasks; existing Service
+healthchecks retain their normal behavior. The app additionally probes TCP connectivity every
+two seconds with a one-second timeout. A backend starts unhealthy, becomes healthy on one
+successful probe, and is removed after two consecutive failed probes. A client dial failure
+removes it immediately; the dial timeout is three seconds. New connections are distributed
+round-robin over healthy backends, with no retry or replay of the same connection.
+
+Listener bind failures are per-route runtime status, never app startup errors. The app retries
+binding every two seconds. Empty or fully unhealthy upstream lists close new connections while
+keeping the listener. These failures do not reject HTTP updates or prevent cold start, autosave
+resume, certificate loading, or the existing Gateway replacement workflow. Reserved HTTP/admin
+ports and actual HTTP listener ports cannot be shared with a TCP route. Malformed manually
+authored configuration and missing modules can still reject a complete Caddy configuration.
+
+`GET /swarmlite/tcp/status` on the existing local admin API returns listener errors and per-backend
+health. The Node polls it separately from configuration reconciliation and reports `GatewayReport.tcp`;
+TCP runtime errors do not become HTTP configuration errors. A configuration ACK alone does not
+mean TCP is available. Stack deployment readiness checks each enabled Gateway's TCP routes in
+addition to its configuration ACK.
+
+Probe concurrency is capped at 32 per process and active proxy connections at 1,024 per app;
+excess connections are closed. Large backend sets can lengthen the probe cycle. Probes send no
+application data and cannot replace application-level checks. Stream copying supports half-close,
+but configuration replacement and Stop close old connections without draining. Clients must
+reconnect. The shared process still shares panic, OOM, and other process-level failures with HTTP.
+
+Run `go test -race ./...` for the native app's real-process startup, reload, cleanup, health,
+certificate-resume, and overlapping-process replacement tests. See the
+[design](../docs/design/l4-port-mapping.md) and
+[validation record](../docs/design/l4-port-mapping-validation.md) for limits and Linux results.
+
+## Storage failure behavior
 
 - `Store` and `Delete` complete locally first; publishing to KV is best effort.
 - `Load` reads locally first. A KV hit on a local miss is copied into local storage.

@@ -3818,6 +3818,58 @@ fn format_gateway_status(response: &GatewayClusterStatusResponse, color: bool) -
         &rows,
         color,
     );
+    let tcp_rows = response
+        .nodes
+        .iter()
+        .flat_map(|node| {
+            node.tcp.iter().flat_map(move |tcp| {
+                tcp.routes.iter().map(move |route| {
+                    let healthy = route
+                        .backends
+                        .iter()
+                        .filter(|backend| backend.healthy)
+                        .count();
+                    vec![
+                        node.node_id.clone(),
+                        route.id.clone(),
+                        route.listen.clone(),
+                        style_bool(route.listening, color),
+                        format!("{healthy}/{}", route.backends.len()),
+                        route
+                            .error
+                            .as_deref()
+                            .map(single_line)
+                            .unwrap_or_else(|| "-".into()),
+                    ]
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    if !tcp_rows.is_empty() {
+        writeln!(
+            output,
+            "\n{}",
+            ansi(color, "1;36", "TCP routes (runtime status)")
+        )
+        .unwrap();
+        append_table(
+            &mut output,
+            &["NODE", "ROUTE", "LISTEN", "LISTENING", "HEALTHY", "ERROR"],
+            &tcp_rows,
+            color,
+        );
+    }
+    for node in &response.nodes {
+        if let Some(error) = node.tcp.as_ref().and_then(|tcp| tcp.error.as_deref()) {
+            writeln!(
+                output,
+                "TCP status {}: {}",
+                node.node_id,
+                single_line(error)
+            )
+            .unwrap();
+        }
+    }
     output
 }
 
@@ -5230,6 +5282,16 @@ mod tests {
                 applied_generation: Some(7),
                 retryable: Some(true),
                 error: None,
+                tcp: Some(swarmlite_core::model::GatewayTcpStatus {
+                    error: None,
+                    routes: vec![swarmlite_core::model::GatewayTcpRouteStatus {
+                        id: "demo:8099".into(),
+                        listen: ":8099".into(),
+                        listening: false,
+                        error: Some("address already in use".into()),
+                        backends: vec![],
+                    }],
+                }),
             }],
         };
 
@@ -5245,6 +5307,9 @@ mod tests {
         assert!(output.contains("GATEWAY IMAGE"));
         assert!(output.contains("ghcr.io/feichao/swarmlite-gateway:v0.1.25"));
         assert!(output.contains("ready"));
+        assert!(output.contains("TCP routes (runtime status)"));
+        assert!(output.contains("demo:8099"));
+        assert!(output.contains("address already in use"));
 
         let colored = format_gateway_status(&response, true);
         assert!(colored.contains("\x1b[2mfalse\x1b[0m"));
