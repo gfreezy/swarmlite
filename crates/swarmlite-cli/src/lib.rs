@@ -599,6 +599,16 @@ define_config_keys! {
         description: "Public Caddy listeners used by every Gateway.",
         apply: "hot reload"
     },
+    GatewayDeployDomain => {
+        key: "gateway.deploy.domain",
+        field: ClusterConfigField::GatewayDeployDomain,
+        type: "string",
+        values: None,
+        constraints: "exact DNS hostname without scheme, port, path, IP, or wildcard; at most 253 ASCII bytes",
+        default: "unset; HTTP deployment with a Gateway address placeholder",
+        description: "HTTPS deployment domain on every Gateway. Setting it rejects HTTP deployment requests; unsetting it re-enables plaintext HTTP deployment.",
+        apply: "hot reload; verify all Gateway generations have converged"
+    },
     GatewayMetricsEnabled => {
         key: "gateway.metrics.enabled",
         field: ClusterConfigField::GatewayMetricsEnabled,
@@ -942,6 +952,12 @@ fn config_set_update(key: ConfigKey, value: String) -> Result<ClusterConfigUpdat
                 return Err(invalid_config_value(key, &value));
             }
             update.gateway_image = Some(value);
+        }
+        ConfigKey::GatewayDeployDomain => {
+            update.gateway_deploy_domain = Some(
+                swarmlite_core::model::normalize_deploy_domain(&value)
+                    .ok_or_else(|| invalid_config_value(key, &value))?,
+            );
         }
         ConfigKey::GatewayListen => {
             let listen = value
@@ -1290,6 +1306,12 @@ impl ConfigKey {
                 .map_or(CurrentConfigValue::Unset, CurrentConfigValue::String),
             Self::GatewayImage => CurrentConfigValue::String(config.gateway.image.clone()),
             Self::GatewayListen => CurrentConfigValue::List(config.gateway.listen.clone()),
+            Self::GatewayDeployDomain => config
+                .gateway
+                .deploy
+                .domain
+                .clone()
+                .map_or(CurrentConfigValue::Unset, CurrentConfigValue::String),
             Self::GatewayMetricsEnabled => optional_bool(config.gateway.metrics.enabled),
             Self::GatewayMetricsPerHost => optional_bool(config.gateway.metrics.per_host),
             Self::GatewayCacheMaxSizeBytes => optional_u64(config.gateway.cache.max_size_bytes),
@@ -1738,6 +1760,16 @@ async fn run() -> Result<()> {
                 let client =
                     connection::resolve(&data_dir, connection.controller, connection.token).await?;
                 let response = cluster_config(&client, Some(&update)).await?;
+                if key == ConfigKey::GatewayDeployDomain {
+                    eprintln!(
+                        "{}",
+                        ansi(
+                            stderr_color(),
+                            "33",
+                            "Deployment domain unset; plaintext HTTP deployment will be re-enabled. Update the CI URL and verify that all Gateways have applied the desired generation."
+                        )
+                    );
+                }
                 print_pretty_json(&response, stdout_color())?;
                 Ok(())
             }
@@ -3654,6 +3686,15 @@ fn format_gateway_status(response: &GatewayClusterStatusResponse, color: bool) -
     .unwrap();
     writeln!(
         output,
+        "  Deployment entry:               {}",
+        config.deploy.domain.as_deref().map_or_else(
+            || ansi(color, "33", "HTTP; domain unset"),
+            |domain| ansi(color, "36", format!("https://{domain} (HTTP denied)")),
+        )
+    )
+    .unwrap();
+    writeln!(
+        output,
         "  Metrics enabled:                {}",
         format_optional_bool(config.metrics.enabled, color)
     )
@@ -4972,6 +5013,7 @@ mod tests {
             ("proxy.no-proxy", "localhost,.internal.example.com"),
             ("gateway.image", "ghcr.io/example/caddy:v1"),
             ("gateway.listen", ":80,:443"),
+            ("gateway.deploy.domain", "deploy.example.com"),
             ("gateway.metrics.enabled", "true"),
             ("gateway.metrics.per-host", "false"),
             ("gateway.cache.max-size-bytes", "1073741824"),
@@ -5036,6 +5078,29 @@ mod tests {
         let mmap_disabled =
             config_set_update(ConfigKey::GatewayCacheSqliteMmapSizeBytes, "0".into()).unwrap();
         assert_eq!(mmap_disabled.gateway_cache_sqlite_mmap_size_bytes, Some(0));
+    }
+
+    #[test]
+    fn deployment_domain_config_normalizes_and_validates() {
+        let update =
+            config_set_update(ConfigKey::GatewayDeployDomain, "Deploy.Example.COM".into()).unwrap();
+        assert_eq!(
+            update.gateway_deploy_domain.as_deref(),
+            Some("deploy.example.com")
+        );
+        for value in [
+            "",
+            "https://deploy.example.com",
+            "deploy.example.com:443",
+            "*.example.com",
+            "127.0.0.1",
+        ] {
+            assert!(config_set_update(ConfigKey::GatewayDeployDomain, value.into()).is_err());
+        }
+        assert_eq!(
+            config_keys_in_scope("gateway.deploy").unwrap(),
+            vec![ConfigKey::GatewayDeployDomain]
+        );
     }
 
     #[test]

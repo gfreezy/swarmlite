@@ -154,12 +154,42 @@ pub fn config_with_deployment(
         url::Host::Ipv6(host) => format!("[{host}]:{deploy_port}"),
         host => format!("{host}:{deploy_port}"),
     };
-    value["apps"]["http"]["servers"]["swarmlite"]["routes"].as_array_mut().expect("generated routes").insert(0, json!({
+    let mut proxy = json!({
         "@id": "swarmlite-system-deploy",
         "match": [{"protocol": "http", "path_regexp": {"pattern": "^/v1/deploy(/|$)"}}],
         "handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": address}], "transport": {"protocol": "http", "dial_timeout": 5_000_000_000_u64}}],
         "terminal": true
+    });
+    let mut deployment_routes = Vec::new();
+    if let Some(domain) = gateway.deploy.domain.as_deref() {
+        proxy["match"][0]["protocol"] = json!("https");
+        proxy["match"][0]["host"] = json!([domain]);
+        deployment_routes.push(json!({
+            "@id": "swarmlite-system-deploy-http-denied",
+            "match": [{"protocol": "http", "path_regexp": {"pattern": "^/v1/deploy(/|$)"}}],
+            "handle": [{"handler": "static_response", "status_code": 403, "body": "Deployment requires HTTPS.\n"}],
+            "terminal": true
+        }));
+        // A business HTTP-only route must not suppress the system domain's
+        // automatic certificate management.
+        if let Some(skip) =
+            value["apps"]["http"]["servers"]["swarmlite"]["automatic_https"]["skip"].as_array_mut()
+        {
+            skip.retain(|host| host.as_str() != Some(domain));
+        }
+    }
+    deployment_routes.push(proxy);
+    // Reserve the namespace even for wrong HTTPS hosts or unsupported protocols.
+    deployment_routes.push(json!({
+        "@id": "swarmlite-system-deploy-unmatched",
+        "match": [{"path_regexp": {"pattern": "^/v1/deploy(/|$)"}}],
+        "handle": [{"handler": "static_response", "status_code": 404}],
+        "terminal": true
     }));
+    value["apps"]["http"]["servers"]["swarmlite"]["routes"]
+        .as_array_mut()
+        .expect("generated routes")
+        .splice(0..0, deployment_routes);
     value
 }
 
@@ -665,6 +695,10 @@ x-swarmlite:
         assert_eq!(route["terminal"], true);
         assert!(route["handle"][0].get("headers").is_none());
         assert!(route["handle"][0].get("lb_try_duration").is_none());
+        assert_eq!(
+            value["apps"]["http"]["servers"]["swarmlite"]["routes"][1]["@id"],
+            "swarmlite-system-deploy-unmatched"
+        );
         let ipv6 = config_with_deployment(
             &ClusterState::default(),
             &gateway_with_listen(&[":80"]),
@@ -675,6 +709,82 @@ x-swarmlite:
             ipv6["apps"]["http"]["servers"]["swarmlite"]["routes"][0]["handle"][0]["upstreams"][0]
                 ["dial"],
             "[fd00::5]:18082"
+        );
+    }
+
+    #[test]
+    fn deployment_domain_requires_https_and_reserves_the_namespace_for_every_host() {
+        let mut gateway = gateway_with_listen(&[":80", ":443"]);
+        gateway.deploy.domain = Some("deploy.example.com".into());
+        let state = ClusterState::default();
+        let original = config(&state, &gateway, "http://10.0.0.5:17080".into());
+        let value = config_with_deployment(&state, &gateway, "http://10.0.0.5:17080".into(), 17082);
+        let server = &value["apps"]["http"]["servers"]["swarmlite"];
+        assert_eq!(server["listen"], json!([":80", ":443"]));
+        assert_eq!(server["automatic_https"]["disable_redirects"], true);
+        let routes = server["routes"].as_array().unwrap();
+        let deny = &routes[0];
+        assert_eq!(deny["match"][0]["protocol"], "http");
+        assert!(deny["match"][0].get("host").is_none());
+        assert_eq!(deny["handle"][0]["handler"], "static_response");
+        assert_eq!(deny["handle"][0]["status_code"], 403);
+        assert!(deny["handle"][0].get("headers").is_none());
+        let proxy = &routes[1];
+        assert_eq!(proxy["match"][0]["protocol"], "https");
+        assert_eq!(proxy["match"][0]["host"], json!(["deploy.example.com"]));
+        assert_eq!(proxy["handle"][0]["upstreams"][0]["dial"], "10.0.0.5:17082");
+        assert_eq!(routes[2]["handle"][0]["status_code"], 404);
+        assert!(routes[2]["match"][0].get("host").is_none());
+        assert!(routes[2]["match"][0].get("protocol").is_none());
+        for route in &routes[..3] {
+            assert_eq!(route["terminal"], true);
+            assert_eq!(
+                route["match"][0]["path_regexp"]["pattern"],
+                "^/v1/deploy(/|$)"
+            );
+        }
+        assert_eq!(
+            &routes[3..],
+            original["apps"]["http"]["servers"]["swarmlite"]["routes"]
+                .as_array()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn http_only_business_routes_do_not_disable_the_deployment_certificate() {
+        let mut gateway = ClusterGatewayConfig::default();
+        gateway.deploy.domain = Some("deploy.example.com".into());
+        let mut state = ClusterState::default();
+        state.gateway_routes.insert(
+            "business".into(),
+            RecoveredStackGateway {
+                gateway: serde_json::from_value(json!({
+                    "tls": "disabled", "http": "serve",
+                    "http_routes": [{"hostnames": ["deploy.example.com", "http.example.com"],
+                        "rules": [{"backend": {"host": "upstream.example.com", "port": 80}}]}]
+                }))
+                .unwrap(),
+                upstreams: BTreeMap::new(),
+            },
+        );
+        let original = config(&state, &gateway, "http://10.0.0.5:17080".into());
+        assert_eq!(
+            original["apps"]["http"]["servers"]["swarmlite"]["automatic_https"]["skip"],
+            json!(["deploy.example.com", "http.example.com"])
+        );
+        let value = config_with_deployment(&state, &gateway, "http://10.0.0.5:17080".into(), 17082);
+        assert_eq!(
+            value["apps"]["http"]["servers"]["swarmlite"]["automatic_https"]["skip"],
+            json!(["http.example.com"])
+        );
+        assert_eq!(
+            &value["apps"]["http"]["servers"]["swarmlite"]["routes"]
+                .as_array()
+                .unwrap()[3..],
+            original["apps"]["http"]["servers"]["swarmlite"]["routes"]
+                .as_array()
+                .unwrap()
         );
     }
 

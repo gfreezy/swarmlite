@@ -1,6 +1,6 @@
 # CI 通过 HTTP 部署：实现方案
 
-状态：已实现；使用方法见 [HTTP CI deployment](../ci-deployment.md)。已覆盖 workspace 单元测试和 Linux Docker + 独立 Caddy 的 HTTP 部署、原地 restart、Controller 重启恢复 E2E；尚未在真实 Podman daemon 上验证。
+状态：第 1–11 节记录 v0.1.47 已实现的 HTTP 基础方案；使用方法见 [HTTP(S) CI deployment](../ci-deployment.md)。已覆盖 workspace 单元测试和 Linux Docker + 独立 Caddy 的 HTTP 部署、原地 restart、Controller 重启恢复 E2E；尚未在真实 Podman daemon 上验证。第 12 节的可选域名 HTTPS 扩展已实现，入口策略和 URL 输出规则覆盖前文对应规则；公网多 Gateway 的公共 CA 签发和续期仍需环境联调。
 
 ## 1. 目标与范围
 
@@ -31,7 +31,7 @@ swarmlite deploy-token list --show-secret
 swarmlite deploy-token revoke <token-id>
 ```
 
-`--expires-in` 默认 `90d`，接受正数时长（如 `24h`、`90d`）或显式的 `never`。`never` 表示不自动过期，不表示不可撤销；不使用 `0` 或极大的时间戳代表永久。永久 Token 与有限期 Token 使用相同的 Service 授权和查看规则，未撤销时可通过 `list --show-secret` 再次查看。创建永久 Token 时显示明确的“永久有效，需手动撤销或轮换”提示；HTTP 明文传输的风险不因永久有效而改变。
+`--expires-in` 默认 `90d`，接受正数时长（如 `24h`、`90d`）或显式的 `never`。`never` 表示不自动过期，不表示不可撤销；不使用 `0` 或极大的时间戳代表永久。永久 Token 与有限期 Token 使用相同的 Service 授权和查看规则，未撤销时可通过 `list --show-secret` 再次查看。创建永久 Token 时显示明确的 `Token never expires; revoke or rotate it manually.` 提示；HTTP 明文传输的风险不因永久有效而改变。
 
 每个 Token 第一版只绑定一个确切的 Service ID，不绑定 image reference。管理者更新该 Service 的镜像引用后，原 Token 仍可刷新其当前配置的镜像，无需重新发放凭据。CI 仍不能通过部署接口自行修改镜像引用。
 
@@ -46,7 +46,7 @@ swarmlite deploy-token revoke <token-id>
 ```text
 SERVICE     production.api
 STATUS      active
-EXPIRES     never (永久)
+EXPIRES     never (permanent)
 DEPLOY_URL  http://<GATEWAY_HOST>/v1/deploy/services/production.api/redeploy
 TOKEN       sldt_demo.example-secret
 CURL        curl --fail-with-body --silent --show-error --request POST --header 'Authorization: Bearer sldt_demo.example-secret' --header 'Idempotency-Key: manual:550e8400-e29b-41d4-a716-446655440000' --header 'Content-Type: application/json' --data '{}' 'http://<GATEWAY_HOST>/v1/deploy/services/production.api/redeploy'
@@ -54,10 +54,10 @@ CURL        curl --fail-with-body --silent --show-error --request POST --header 
 
 CLI 每次生成 curl 示例时创建一个新的随机请求键；复制同一条命令重试会复用原键，不重复发布。新的独立发布需重新生成命令或替换请求键。CI 自动化仍使用下述由 workflow 标识构成的稳定键，而不反复生成随机键。
 
-CLI 配色复用现有 `ansi()`、表格渲染和全局 `--color auto|always|never`，不新增独立配色参数或依赖：
+CLI 的错误、日志、提示和状态文案统一使用英文。配色复用现有 `ansi()`、表格渲染和全局 `--color auto|always|never`，不新增独立配色参数或依赖：
 
-- 表头和字段名加粗，Service 名使用青色，Token ID 等次要元数据使用暗色；有限有效期显示明确的 UTC 到期时间，永久显示 `never (永久)`。
-- `active` 使用绿色，`expired` / `revoked` 使用红色；`never (永久)`、地址占位符 `<GATEWAY_HOST>` 和警告使用黄色。状态和风险同时用文字说明，不只靠颜色区分。
+- 表头和字段名加粗，Service 名使用青色，Token ID 等次要元数据使用暗色；有限有效期显示明确的 UTC 到期时间，永久显示 `never (permanent)`。
+- `active` 使用绿色，`expired` / `revoked` 使用红色；`never (permanent)`、地址占位符 `<GATEWAY_HOST>` 和警告使用黄色。状态和风险同时用文字说明，不只靠颜色区分。
 - 完整 Token 值和 curl 命令保持纯文本，不插入 ANSI 控制码；可为它们的字段名着色。curl 内的地址占位符也保持纯文本，避免干扰复制和替换。
 - 默认 `auto` 分别按 stdout/stderr 是否为终端决定颜色；管道、重定向、`TERM=dumb` 或设置 `NO_COLOR` 时不着色。沿用 `SWARMLITE_COLOR`，显式 `--color always` 强制着色、`--color never` 完全关闭；彩色与无色输出的字段、文字和表格对齐保持一致。HTTP API 不包含 ANSI 控制码。
 
@@ -168,7 +168,7 @@ DELETE /v1/deploy-tokens/{id}
 POST   /v1/services/{id}/restart
 ```
 
-创建 Token 的 `expires_in` 为字符串，省略时使用 `"90d"`，传 `"never"` 创建永久 Token；不接受显式 `null`、零、负数、无效或溢出的时长，这些情况返回 `400`。Controller 根据接收时间计算有限期 Token 的到期时间；创建和列表响应中的 `expires_at_unix_ms` 为可空的 UTC Unix 毫秒时间戳，永久时明确返回 `null`，不省略字段。CLI 将 `null` 渲染为 `never (永久)`，不显示为未知或已过期。
+创建 Token 的 `expires_in` 为字符串，省略时使用 `"90d"`，传 `"never"` 创建永久 Token；不接受显式 `null`、零、负数、无效或溢出的时长，这些情况返回 `400`。Controller 根据接收时间计算有限期 Token 的到期时间；创建和列表响应中的 `expires_at_unix_ms` 为可空的 UTC Unix 毫秒时间戳，永久时明确返回 `null`，不省略字段。CLI 将 `null` 渲染为 `never (permanent)`，不显示为未知或已过期。
 
 Token 创建和列表 API 不返回推断的公网 URL，也不新增 `deploy_url` 字段；管理员 CLI 使用已有 Service ID 元数据生成带 `<GATEWAY_HOST>` 占位符的 URL 模板。`GET /v1/deploy-tokens` 默认仅返回元数据；显式传入 `show_secret=true` 时，才额外返回有效且未撤销的完整 Token，对应 CLI 的 `list --show-secret`。CLI 在可显示完整 Token 时渲染带相同地址占位符的 curl 模板，不在 URL 路径或 query 中嵌入密钥。Token 管理接口仅允许 Admin；创建和显式查看密钥的响应设置 `Cache-Control: no-store`，审计仅记录查看者、Token ID 和时间，不记录密钥或响应体。
 
@@ -327,3 +327,52 @@ Token 轮换、固定 tag 发布顺序和凭据撤销分别解决不同问题：
 以 Linux Docker 的真实 Runtime E2E 验证上述身份/镜像/恢复不变量，复用 mock Docker API 做异常边界覆盖，并验证 Podman restart 行为。重点覆盖“提交成功但响应丢失”和“Runtime 完成但 ledger 结果尚未写入”的崩溃窗口，不把普通 happy-path 单测当成幂等证明。
 
 A–D 全部通过后再开放公网部署入口；发布时遵循仓库既有 release workflow。
+
+## 12. 可选域名 HTTPS 扩展
+
+### 配置与两种入口模式
+
+新增集群配置 `gateway.deploy.domain`，由管理员显式填写，沿用现有配置持久化、Gateway assignment/generation 和热更新机制，下发到所有启用的 Gateway：
+
+```bash
+swarmlite config set gateway.deploy.domain deploy.example.com
+swarmlite config get gateway.deploy.domain
+swarmlite config unset gateway.deploy.domain
+```
+
+配置值仅接受一个确切的 DNS 主机名，不接受 scheme、端口、路径、IP 或通配符；空值通过 `unset` 表达。不新增 `deploy-advertise-url`，不发现或推断公网 IP。DNS 由使用者管理，可以指向多个 Gateway 或其前置负载均衡入口。
+
+| 集群配置 | Token 创建、列表输出的部署地址 | Gateway 部署接口策略 |
+| --- | --- | --- |
+| 已设置 `gateway.deploy.domain=deploy.example.com` | `https://deploy.example.com/v1/deploy/services/{service_id}/redeploy` | 仅允许匹配该域名的 HTTPS 443 入口；拒绝 HTTP 部署请求 |
+| 未设置域名 | `http://<GATEWAY_HOST>/v1/deploy/services/{service_id}/redeploy` | 保留现有 HTTP 80 入口，地址由使用者替换，不要求 Host 匹配域名 |
+
+这里的“禁用 80”仅指拒绝通过 HTTP 调用 `/v1/deploy` 及其子路径，不关闭 Gateway 整个 80 监听，不影响其他业务 HTTP 路由、证书验证和 Gateway 探测。自定义监听配置仍由管理员负责，不自动覆盖；HTTPS 模式需要提供可达的 443 入口。
+
+设置域名后，HTTP 部署路由在业务路由和自动重定向之前以 terminal 规则返回 `403`，不转发、不触发部署，也不重定向到 HTTPS。所有 Host 下的该 HTTP 路径均拒绝，不能通过 IP 或其他域名绕过。HTTPS 部署路由同时匹配配置域名和部署路径；其他 Host 的部署路径不回退到业务应用。协议判断使用 Gateway 实际连接的 TLS 状态，不信任客户端传入的 `X-Forwarded-Proto`。
+
+复用现有 Caddy 自动证书和证书存储协调能力；证书获取、续期或域名解析失败时，HTTPS 请求失败，不重新开放 HTTP 部署接口。多个 Gateway 的证书验证、签发锁和续期行为必须通过真实联调确认，不能只凭 DNS 配置或共享存储接口宣称已支持。
+
+### Token 与 CLI 输出
+
+Token 仍仅绑定 Service ID，不绑定域名。创建和 `list` 根据命令执行时读取的当前集群配置生成 URL：已设置域名时直接输出真实 HTTPS 地址；未设置时才保留 `<GATEWAY_HOST>`。`list --show-secret` 和创建时输出的 curl 使用同样规则，域名模式的命令无需替换地址即可复制执行。
+
+URL 不存入 Token 记录，Token API 不增加 `deploy_url` 字段；管理员 CLI 通过现有管理 API 读取集群配置，不从 SSH 隧道地址、Controller 地址或请求 Host 推断入口。读取配置失败时明确报错，不把失败当成“未配置域名”而输出 HTTP 地址。
+
+修改或取消域名不会撤销已有 Token；重新查看时显示当前地址，使用者需同步更新 CI 的 `DEPLOY_URL`。域名由旧值变为新值时，旧域名不再作为部署入口；取消域名会恢复 HTTP 模式，配置命令应明确提示明文传输风险。
+
+真实 HTTPS URL、Token 和 curl 命令保持可复制的纯文本值，字段名沿用现有 CLI 配色；未配置域名时保留地址占位符和 HTTP 风险警告。域名模式的 CI 示例使用 HTTPS、正常验证证书，不允许 `--insecure` 或自动降级到 HTTP。
+
+### 网络边界与验收
+
+HTTPS 在 Gateway 终止，Gateway 到 Controller 的现有内网 HTTP 上游和部署协议不变。设置域名不关闭 Controller 的 `17082` 内部监听，也不使其自动具备 TLS；该端口必须继续通过防火墙限制为 Gateway 可达，不能暴露公网。Gateway 拒绝 HTTP 请求不能补救凭据已经被客户端以明文发送的问题，CI 必须直接使用输出的 HTTPS URL。
+
+实现范围为集群配置模型和校验、配置 CLI、Gateway HTTPS/HTTP 拒绝路由及配置下发、Token CLI 读取配置并渲染地址、相关测试和文档；不改变部署 Token 授权、幂等或 operation 协议。
+
+验收至少覆盖：
+
+- 未配置域名时保留现有 HTTP 80 部署和占位符输出；设置域名后，创建和列表均输出正确编码的真实 HTTPS URL，curl 可直接使用。
+- 已配置域名时，所有 Host 的 HTTP 部署 POST/GET 均被拒绝，不发生重定向、上游请求或部署；其他业务 HTTP、证书验证与 Gateway 探测不受影响。
+- 正确域名可通过 HTTPS 提交和查询；错误域名、IP 或非部署路径不能误入部署或管理接口，证书故障不回退 HTTP。
+- 配置变更后所有在线 Gateway 按现有 generation 机制收敛，重新连接的 Gateway 获取当前配置；域名变更、取消与 Controller 重启后 URL 输出和路由策略一致，已有 Token 无需重新创建。下发期间可能存在旧配置节点，切换完成前需确认所有公网 Gateway 已收敛，不能宣称全局原子切换。
+- 多 Gateway 场景验证独立节点的首次证书签发、跨节点挑战、共享锁、续期与节点故障；Token CLI 配置读取失败时不输出可能误导的 HTTP URL。

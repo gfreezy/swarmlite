@@ -250,7 +250,7 @@ fn http_ci_deployment_and_in_place_restart_with_real_docker_and_gateway() {
         "--expires-in",
         "never",
     ]));
-    assert!(output.contains("never (永久)"));
+    assert!(output.contains("never (permanent)"));
     assert!(output.contains("http://<GATEWAY_HOST>"));
     let token = output
         .lines()
@@ -264,6 +264,31 @@ fn http_ci_deployment_and_in_place_restart_with_real_docker_and_gateway() {
         .to_owned();
     assert!(!success(cluster.cli(&["deploy-token", "list"])).contains(&token));
     assert!(success(cluster.cli(&["deploy-token", "list", "--show-secret"])).contains(&token));
+
+    // The same credential follows the current domain, including after a real
+    // Controller restart; neither URL changes nor unsetting it reissue tokens.
+    for domain in ["deploy.example.com", "new.example.com"] {
+        success(cluster.cli(&["config", "set", "gateway.deploy.domain", domain]));
+        cluster.stop();
+        cluster.start();
+        for args in [
+            vec!["deploy-token", "list"],
+            vec!["deploy-token", "list", "--show-secret"],
+        ] {
+            let output = success(cluster.cli(&args));
+            assert!(output.contains(&format!(
+                "https://{domain}/v1/deploy/services/{service}/redeploy"
+            )));
+            assert!(!output.contains("<GATEWAY_HOST>"));
+            if args.contains(&"--show-secret") {
+                assert!(output.contains(&token));
+            } else {
+                assert!(!output.contains(&token));
+            }
+        }
+    }
+    success(cluster.cli(&["config", "unset", "gateway.deploy.domain"]));
+    assert!(success(cluster.cli(&["deploy-token", "list"])).contains("http://<GATEWAY_HOST>"));
 
     // Exercise the actual generated system route through a separate Caddy
     // container, including precedence over an application's HTTP redirect.

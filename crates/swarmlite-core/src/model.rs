@@ -95,6 +95,8 @@ pub struct ClusterGatewayConfig {
     pub shutdown: GatewayShutdownConfig,
     #[serde(default, skip_serializing_if = "GatewayHttpConfig::is_empty")]
     pub http: GatewayHttpConfig,
+    #[serde(default, skip_serializing_if = "GatewayDeployConfig::is_empty")]
+    pub deploy: GatewayDeployConfig,
 }
 
 impl Default for ClusterGatewayConfig {
@@ -108,8 +110,42 @@ impl Default for ClusterGatewayConfig {
             logging: GatewayLoggingConfig::default(),
             shutdown: GatewayShutdownConfig::default(),
             http: GatewayHttpConfig::default(),
+            deploy: GatewayDeployConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayDeployConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+}
+
+impl GatewayDeployConfig {
+    pub fn is_empty(&self) -> bool {
+        self.domain.is_none()
+    }
+}
+
+/// Only an exact DNS name is accepted: no URL, IP, wildcard, or port.
+pub fn normalize_deploy_domain(value: &str) -> Option<String> {
+    if value.len() > 253
+        || !value.contains('.')
+        || !matches!(url::Host::parse(value), Ok(url::Host::Domain(_)))
+        || value.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return None;
+    }
+    Some(value.to_ascii_lowercase())
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -561,6 +597,8 @@ pub struct ClusterConfigUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway_listen: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_deploy_domain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway_metrics_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway_metrics_per_host: Option<bool>,
@@ -634,6 +672,8 @@ pub enum ClusterConfigField {
     GatewayImage,
     #[serde(rename = "gateway.listen")]
     GatewayListen,
+    #[serde(rename = "gateway.deploy.domain")]
+    GatewayDeployDomain,
     #[serde(rename = "gateway.metrics.enabled")]
     GatewayMetricsEnabled,
     #[serde(rename = "gateway.metrics.per-host")]
@@ -1446,6 +1486,8 @@ pub struct GatewayClusterStatusResponse {
 pub struct GatewayPublicConfig {
     pub image: String,
     pub listen: Vec<String>,
+    #[serde(default)]
+    pub deploy: GatewayDeployConfig,
     pub metrics: GatewayPublicMetricsConfig,
     pub cache: GatewayPublicCacheConfig,
     pub logging: GatewayPublicLoggingConfig,
@@ -1458,6 +1500,7 @@ impl From<&ClusterGatewayConfig> for GatewayPublicConfig {
         Self {
             image: config.image.clone(),
             listen: config.listen.clone(),
+            deploy: config.deploy.clone(),
             metrics: GatewayPublicMetricsConfig {
                 enabled: config.metrics.enabled,
                 per_host: config.metrics.per_host,
@@ -2100,6 +2143,7 @@ mod tests {
         assert_eq!(decoded.logging, GatewayLoggingConfig::default());
         assert_eq!(decoded.shutdown, GatewayShutdownConfig::default());
         assert_eq!(decoded.http, GatewayHttpConfig::default());
+        assert!(decoded.deploy.domain.is_none());
         assert!(!refresh_managed_gateway_image(&mut decoded));
     }
 
@@ -2109,15 +2153,60 @@ mod tests {
         assert!(unset.get("metrics").is_none());
         assert!(unset.get("cache").is_none());
         assert!(unset.get("http").is_none());
+        assert!(unset.get("deploy").is_none());
 
         let mut configured = ClusterGatewayConfig::default();
         configured.metrics.enabled = Some(false);
         configured.cache.max_size_bytes = Some(2_147_483_648);
         configured.http.timeouts.read_header_seconds = Some(0);
+        configured.deploy.domain = Some("deploy.example.com".into());
         let configured = serde_json::to_value(configured).unwrap();
         assert_eq!(configured["metrics"]["enabled"], false);
         assert_eq!(configured["cache"]["max_size_bytes"], 2_147_483_648_u64);
         assert_eq!(configured["http"]["timeouts"]["read_header_seconds"], 0);
+        assert_eq!(configured["deploy"]["domain"], "deploy.example.com");
+    }
+
+    #[test]
+    fn deployment_domain_is_an_exact_normalized_dns_name() {
+        assert_eq!(
+            normalize_deploy_domain("Deploy.Example.COM").as_deref(),
+            Some("deploy.example.com")
+        );
+        assert!(normalize_deploy_domain("xn--bcher-kva.example").is_some());
+        for value in [
+            "",
+            "localhost",
+            " https://deploy.example.com",
+            "deploy.example.com ",
+            "https://deploy.example.com",
+            "deploy.example.com:443",
+            "deploy.example.com/path",
+            "deploy.example.com?x=1",
+            "deploy.example.com#x",
+            "*.example.com",
+            "127.0.0.1",
+            "127.1",
+            "[::1]",
+            "deploy..example.com",
+            ".example.com",
+            "deploy.example.com.",
+            "-deploy.example.com",
+            "deploy-.example.com",
+            "deploy_example.com",
+            "部署.example.com",
+            "deploy.example.com\n",
+        ] {
+            assert!(
+                normalize_deploy_domain(value).is_none(),
+                "accepted {value:?}"
+            );
+        }
+        assert!(normalize_deploy_domain(&format!("{}.example.com", "a".repeat(64))).is_none());
+        assert!(
+            normalize_deploy_domain(&format!("{}.com", vec!["a".repeat(63); 4].join(".")))
+                .is_none()
+        );
     }
 
     #[test]

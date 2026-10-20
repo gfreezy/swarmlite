@@ -235,6 +235,7 @@ one segment use `-`. Invalid values report the applicable enum candidates or num
 | `gateway.http.timeouts.idle-seconds` | non-negative integer | Keep-Alive idle timeout |
 | `gateway.http.max-header-bytes` | non-negative integer | Maximum request-header bytes |
 | `gateway.http.http3-enabled` | `true`/`false` | HTTP/3 on the Gateway UDP 443 listener |
+| `gateway.deploy.domain` | exact DNS hostname | HTTPS deployment domain; rejects HTTP deployment when set; unset restores HTTP and URL placeholders |
 
 For example:
 

@@ -2884,6 +2884,126 @@ async fn gateway_cache_config_rejects_unsafe_values() {
 }
 
 #[tokio::test]
+async fn deployment_domain_is_validated_persisted_and_updates_gateway_assignments() {
+    let (controller, repository, directory) = test_controller("deploy-domain").await;
+    let initial = controller.inner.lock().await.gateway_generation;
+    let updated = controller
+        .update_cluster_config(ClusterConfigUpdate {
+            gateway_deploy_domain: Some("Deploy.Example.COM".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        updated.config.gateway.deploy.domain.as_deref(),
+        Some("deploy.example.com")
+    );
+    assert_eq!(
+        repository.load().await.unwrap().cluster.gateway,
+        updated.config.gateway
+    );
+    let generation = {
+        let inner = controller.inner.lock().await;
+        assert!(inner.gateway_generation > initial);
+        let assignment = controller.gateway_assignment(&inner, true).unwrap();
+        assert_eq!(
+            assignment.config["apps"]["http"]["servers"]["swarmlite"]["routes"][1]["match"][0]["host"],
+            serde_json::json!(["deploy.example.com"])
+        );
+        assert_eq!(
+            assignment.config["apps"]["http"]["servers"]["swarmlite"]["routes"][0]["handle"][0]["status_code"],
+            403
+        );
+        assert!(controller.gateway_assignment(&inner, false).is_none());
+        inner.gateway_generation
+    };
+    assert_eq!(
+        controller
+            .gateway_status()
+            .await
+            .config
+            .deploy
+            .domain
+            .as_deref(),
+        Some("deploy.example.com")
+    );
+
+    for domain in [
+        "",
+        "http://deploy.example.com",
+        "deploy.example.com:443",
+        "127.0.0.1",
+        "*.example.com",
+        "deploy.example.com/path",
+    ] {
+        assert!(matches!(
+            controller
+                .update_cluster_config(ClusterConfigUpdate {
+                    gateway_deploy_domain: Some(domain.into()),
+                    ..Default::default()
+                })
+                .await,
+            Err(ControllerError::Invalid(_))
+        ));
+    }
+    assert!(
+        controller
+            .update_cluster_config(ClusterConfigUpdate {
+                gateway_deploy_domain: Some("other.example.com".into()),
+                unset: BTreeSet::from([ClusterConfigField::GatewayDeployDomain]),
+                ..Default::default()
+            })
+            .await
+            .is_err()
+    );
+    assert_eq!(controller.inner.lock().await.gateway_generation, generation);
+
+    let restored = Controller::new(
+        test_controller_config(&updated.config, directory.path()),
+        "0123456789abcdef".into(),
+        StateRepository::open(directory.path(), updated.config.clone()).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        restored
+            .get_cluster_config()
+            .await
+            .unwrap()
+            .config
+            .gateway
+            .deploy,
+        updated.config.gateway.deploy
+    );
+    assert_eq!(restored.inner.lock().await.gateway_generation, generation);
+    let cleared = restored
+        .update_cluster_config(ClusterConfigUpdate {
+            unset: BTreeSet::from([ClusterConfigField::GatewayDeployDomain]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(cleared.config.gateway.deploy.domain.is_none());
+    let inner = restored.inner.lock().await;
+    assert!(inner.gateway_generation > generation);
+    assert_eq!(
+        inner.gateway_config["apps"]["http"]["servers"]["swarmlite"]["routes"][0]["match"][0]["protocol"],
+        "http"
+    );
+    assert_eq!(
+        repository
+            .load()
+            .await
+            .unwrap()
+            .cluster
+            .gateway
+            .deploy
+            .domain,
+        None
+    );
+}
+
+#[tokio::test]
 async fn gateway_config_preserves_explicit_values_and_unsets_them() {
     let (controller, repository, _directory) = test_controller("gateway-config-test").await;
     let updated = controller

@@ -60,6 +60,25 @@ async fn permanent_token_can_be_viewed_revoked_and_used_after_image_change() {
             .as_deref(),
         Some(secret)
     );
+    // Entry configuration is not part of credential authorization.
+    for domain in ["deploy.example.com", "new.example.com"] {
+        controller
+            .update_cluster_config(ClusterConfigUpdate {
+                gateway_deploy_domain: Some(domain.into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(controller.deploy_principal(secret, false).is_ok());
+    }
+    controller
+        .update_cluster_config(ClusterConfigUpdate {
+            unset: BTreeSet::from([ClusterConfigField::GatewayDeployDomain]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(controller.deploy_principal(secret, false).is_ok());
     {
         let mut inner = controller.inner.lock().await;
         inner.state.services.get_mut("demo.web").unwrap().spec.image =

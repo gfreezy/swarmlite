@@ -46,6 +46,10 @@ impl Controller {
                 ClusterConfigField::GatewayListen,
             ),
             (
+                update.gateway_deploy_domain.is_some(),
+                ClusterConfigField::GatewayDeployDomain,
+            ),
+            (
                 update.gateway_metrics_enabled.is_some(),
                 ClusterConfigField::GatewayMetricsEnabled,
             ),
@@ -220,6 +224,7 @@ impl Controller {
                 ClusterConfigField::GatewayListen => {
                     cluster.gateway.listen.clone_from(&gateway_defaults.listen)
                 }
+                ClusterConfigField::GatewayDeployDomain => cluster.gateway.deploy.domain = None,
                 ClusterConfigField::GatewayMetricsEnabled => cluster.gateway.metrics.enabled = None,
                 ClusterConfigField::GatewayMetricsPerHost => {
                     cluster.gateway.metrics.per_host = None
@@ -343,6 +348,15 @@ impl Controller {
         }
         if let Some(value) = update.gateway_listen {
             cluster.gateway.listen = value;
+        }
+        if let Some(value) = update.gateway_deploy_domain {
+            cluster.gateway.deploy.domain = Some(
+                crate::model::normalize_deploy_domain(&value).ok_or_else(|| {
+                    ControllerError::Invalid(
+                        "gateway.deploy.domain must be an exact DNS hostname without a scheme, port, path, IP, or wildcard".into(),
+                    )
+                })?,
+            );
         }
         if let Some(value) = update.gateway_metrics_enabled {
             cluster.gateway.metrics.enabled = Some(value);

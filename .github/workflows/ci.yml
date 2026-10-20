@@ -49,6 +49,11 @@ jobs:
       - name: Run Rust tests
         run: cargo test --workspace --all-features --locked
 
+      - name: Test deployment HTTPS and HTTP policy with real Gateways
+        run: |
+          docker pull caddy:2
+          cargo test --test deploy_gateway_tls --locked -- --ignored --nocapture
+
       - name: Run Docker image proxy E2E
         run: cargo test -p swarmlite-platform --test image_proxy_e2e --locked -- --ignored --nocapture
 
